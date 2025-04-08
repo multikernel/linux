@@ -219,6 +219,9 @@ static void __init copy_bootdata(char *real_mode_data)
 	sme_unmap_bootdata(real_mode_data);
 }
 
+unsigned long orig_boot_params;
+EXPORT_SYMBOL(orig_boot_params);
+
 asmlinkage __visible void __init __noreturn x86_64_start_kernel(char * real_mode_data)
 {
 	/*
@@ -287,6 +290,8 @@ asmlinkage __visible void __init __noreturn x86_64_start_kernel(char * real_mode
 
 	/* set init_top_pgt kernel high mapping*/
 	init_top_pgt[511] = early_top_pgt[511];
+
+	orig_boot_params = (unsigned long) real_mode_data;
 
 	x86_64_start_reservations(real_mode_data);
 }
