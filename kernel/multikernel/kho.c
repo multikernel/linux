@@ -85,6 +85,42 @@ int mk_kho_preserve_dtb(struct kimage *image, void *fdt, int mk_id)
 }
 
 /**
+ * mk_kho_preserve_host_ipi() - Preserve host's IPI buffer address in KHO
+ * @image: Target kimage
+ * @fdt: FDT being built for KHO
+ *
+ * Called during kexec preparation to pass the host's IPI receive buffer
+ * address to the spawn kernel so it can send messages back to the host.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+int mk_kho_preserve_host_ipi(struct kimage *image, void *fdt)
+{
+	int ret = 0;
+
+	if (!root_instance->ipi_data) {
+		pr_debug("No host IPI buffer to preserve\n");
+		return 0;
+	}
+
+	pr_info("Preserving host IPI buffer: phys=0x%llx, pages=%u\n",
+		(unsigned long long)root_instance->ipi_phys, root_instance->ipi_pages);
+
+	ret |= fdt_begin_node(fdt, "host-ipi-buffer");
+	ret |= fdt_property_u64(fdt, "phys-addr", root_instance->ipi_phys);
+	ret |= fdt_property_u32(fdt, "pages", root_instance->ipi_pages);
+	ret |= fdt_end_node(fdt);
+
+	if (ret) {
+		pr_err("Failed to add host IPI buffer to KHO FDT: %d\n", ret);
+		return ret;
+	}
+
+	pr_info("Preserved host IPI buffer in KHO\n");
+	return 0;
+}
+
+/**
  * mk_dt_extract_instance_info() - Extract instance ID and name from DTB
  * @dtb_data: Device tree blob data
  * @dtb_size: Size of DTB data
@@ -193,7 +229,8 @@ static int __init mk_kho_restore_cpus(struct mk_dt_config *config)
 	return 0;
 }
 
-static struct mk_instance * __init alloc_mk_instance(int instance_id, const char *name)
+static struct mk_instance * __init alloc_mk_instance(int instance_id, const char *name,
+						     bool alloc_ipi)
 {
 	struct mk_instance *instance;
 	int ret;
@@ -207,10 +244,25 @@ static struct mk_instance * __init alloc_mk_instance(int instance_id, const char
 	if (!instance->name)
 		goto err_free_instance;
 
+	if (alloc_ipi) {
+		instance->ipi_data = (struct mk_shared_data *)__get_free_pages(
+			GFP_KERNEL | __GFP_ZERO, get_order(sizeof(struct mk_shared_data)));
+		if (!instance->ipi_data) {
+			pr_err("Failed to allocate IPI buffer for instance %d\n", instance_id);
+			goto err_free_name;
+		}
+		instance->ipi_phys = virt_to_phys(instance->ipi_data);
+		instance->ipi_pages = (sizeof(struct mk_shared_data) + PAGE_SIZE - 1) / PAGE_SIZE;
+
+		pr_info("Allocated IPI buffer for instance %d: phys=0x%llx, virt=%px, pages=%u\n",
+			instance_id, (unsigned long long)instance->ipi_phys,
+			instance->ipi_data, instance->ipi_pages);
+	}
+
 	instance->cpus = kzalloc(BITS_TO_LONGS(NR_CPUS) * sizeof(unsigned long),
 				 GFP_KERNEL);
 	if (!instance->cpus)
-		goto err_free_name;
+		goto err_free_ipi;
 
 	instance->state = MK_STATE_READY;
 	INIT_LIST_HEAD(&instance->memory_regions);
@@ -231,11 +283,64 @@ static struct mk_instance * __init alloc_mk_instance(int instance_id, const char
 
 err_free_cpus:
 	kfree(instance->cpus);
+err_free_ipi:
+	if (alloc_ipi)
+		free_pages((unsigned long)instance->ipi_data,
+			   get_order(sizeof(struct mk_shared_data)));
 err_free_name:
 	kfree(instance->name);
 err_free_instance:
 	kfree(instance);
 	return NULL;
+}
+
+static int __init mk_kho_restore_ipi(const void *kho_fdt, struct mk_instance *instance)
+{
+	int ipi_node;
+	const fdt64_t *phys_prop;
+	const fdt32_t *pages_prop;
+	int len;
+	phys_addr_t ipi_phys = 0;
+	u32 ipi_pages = 0;
+	size_t ipi_size = 0;
+
+	ipi_node = fdt_subnode_offset(kho_fdt, 0, "ipi-buffer");
+	if (ipi_node < 0) {
+		instance->ipi_data = NULL;
+		pr_debug("No IPI buffer available from KHO\n");
+		return 0;
+	}
+
+	phys_prop = fdt_getprop(kho_fdt, ipi_node, "phys-addr", &len);
+	if (phys_prop && len == sizeof(*phys_prop))
+		ipi_phys = (phys_addr_t)fdt64_to_cpu(*phys_prop);
+
+	pages_prop = fdt_getprop(kho_fdt, ipi_node, "pages", &len);
+	if (pages_prop && len == sizeof(*pages_prop)) {
+		ipi_pages = fdt32_to_cpu(*pages_prop);
+		ipi_size = (size_t)ipi_pages << PAGE_SHIFT;
+	}
+
+	if (!ipi_phys || !ipi_pages) {
+		instance->ipi_data = NULL;
+		pr_debug("IPI buffer node exists but incomplete info (phys=0x%llx, pages=%u)\n",
+			 (unsigned long long)ipi_phys, ipi_pages);
+		return 0;
+	}
+
+	instance->ipi_data = memremap(ipi_phys, ipi_size, MEMREMAP_WB);
+	if (!instance->ipi_data) {
+		pr_err("Failed to map IPI buffer at 0x%llx (pages: %u, size: %zu)\n",
+		       (unsigned long long)ipi_phys, ipi_pages, ipi_size);
+		return -ENOMEM;
+	}
+
+	instance->ipi_phys = ipi_phys;
+	instance->ipi_pages = ipi_pages;
+	pr_info("Restored IPI buffer for root instance: phys=0x%llx, virt=%px, pages=%u, size=%zu\n",
+		(unsigned long long)ipi_phys, instance->ipi_data, ipi_pages, ipi_size);
+
+	return 0;
 }
 
 /**
@@ -263,7 +368,7 @@ int __init mk_kho_restore_dtbs(void)
 	if (!fdt_phys) {
 		pr_info("No KHO FDT available for multikernel DTB restoration\n");
 
-		instance = alloc_mk_instance(0, "/");
+		instance = alloc_mk_instance(0, "/", true);
 		if (!instance) {
 			pr_err("Failed to allocate root instance\n");
 			return -ENOMEM;
@@ -353,7 +458,7 @@ int __init mk_kho_restore_dtbs(void)
 	}
 
 	/* Create a new instance for this DTB */
-	instance = alloc_mk_instance(instance_id, instance_name);
+	instance = alloc_mk_instance(instance_id, instance_name, false);
 	if (!instance) {
 		ret = -ENOMEM;
 		goto config_free;
@@ -371,6 +476,13 @@ int __init mk_kho_restore_dtbs(void)
 
 	memcpy(instance->dtb_data, dtb_virt, dtb_len);
 	instance->dtb_size = dtb_len;
+
+	ret = mk_kho_restore_ipi(kho_fdt, instance);
+	if (ret) {
+		pr_err("Failed to restore IPI buffer: %d\n", ret);
+		goto cleanup_dtb_data;
+	}
+
 	root_instance = instance;
 
 	pr_info("Successfully restored multikernel root instance %d ('%s') from KHO (%d bytes)\n",
@@ -380,6 +492,8 @@ int __init mk_kho_restore_dtbs(void)
 	early_memunmap((void *)kho_fdt, PAGE_SIZE);
 	return 0;
 
+cleanup_dtb_data:
+	kfree(instance->dtb_data);
 cleanup_instance_name:
 	kfree(instance->name);
 	kfree(instance->dtb_data);

@@ -229,6 +229,14 @@ static int root_device_tree_seq_show(struct seq_file *sf, void *v)
 			}
 		}
 
+		if (root_instance->ipi_data) {
+			seq_printf(sf, "\tipi-buffer {\n");
+			seq_printf(sf, "\t\tphys-addr = <0x%llx>;\n",
+				   (unsigned long long)root_instance->ipi_phys);
+			seq_printf(sf, "\t\tpages = <%u>;\n", root_instance->ipi_pages);
+			seq_printf(sf, "\t};\n");
+		}
+
 		seq_printf(sf, "};\n");
 	} else {
 		seq_printf(sf, "Write multikernel device tree here to propagate to instances\n");

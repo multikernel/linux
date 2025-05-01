@@ -1198,6 +1198,36 @@ int mk_kexec_finalize(struct kimage *target_image)
 		return ret;
 	}
 
+	ret = mk_kho_preserve_host_ipi(target_image, fdt);
+	if (ret) {
+		pr_err("Failed to preserve host IPI buffer: %d\n", ret);
+		fdt_end_node(fdt);
+		fdt_finish(fdt);
+		return ret;
+	}
+
+	/* Add IPI buffer information if allocated */
+	if (target_image->kho.ipi) {
+		u64 ipi_phys = (u64)target_image->kho.ipi;
+		size_t ipi_buffer_size = sizeof(struct mk_shared_data);
+		u32 ipi_pages = (u32)(PAGE_ALIGN(ipi_buffer_size) >> PAGE_SHIFT);
+
+		ret = fdt_begin_node(fdt, "ipi-buffer");
+		ret |= fdt_property_u64(fdt, "phys-addr", ipi_phys);
+		ret |= fdt_property_u32(fdt, "pages", ipi_pages);
+		ret |= fdt_end_node(fdt);
+
+		if (ret) {
+			pr_err("Failed to add IPI buffer to FDT: %d\n", ret);
+			fdt_end_node(fdt);
+			fdt_finish(fdt);
+			return ret;
+		}
+
+		pr_info("Added IPI buffer to FDT: phys=0x%llx, pages=%u (%zu bytes)\n",
+			ipi_phys, ipi_pages, ipi_buffer_size);
+	}
+
 	ret = fdt_end_node(fdt);
 	ret |= fdt_finish(fdt);
 	if (ret) {

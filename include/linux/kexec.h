@@ -422,6 +422,8 @@ struct kimage {
 	struct {
 		struct kexec_segment *scratch;
 		phys_addr_t fdt;
+		phys_addr_t ipi;  /* IPI buffer physical address (host->spawn) */
+		phys_addr_t host_ipi;  /* Host's receive buffer (spawn->host) */
 	} kho;
 
 	/* Core ELF header buffer */

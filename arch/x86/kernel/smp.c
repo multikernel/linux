@@ -273,10 +273,13 @@ DEFINE_IDTENTRY_SYSVEC(sysvec_call_function_single)
 }
 
 #ifdef CONFIG_MULTIKERNEL
+void generic_multikernel_interrupt(void);
+
 DEFINE_IDTENTRY_SYSVEC(sysvec_multikernel)
 {
 	apic_eoi();
 	inc_irq_stat(irq_call_count);
+	generic_multikernel_interrupt();
 }
 #endif /* CONFIG_MULTIKERNEL */
 
