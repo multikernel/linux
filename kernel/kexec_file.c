@@ -103,6 +103,8 @@ int kexec_image_post_load_cleanup_default(struct kimage *image)
  * Free up memory used by kernel, initrd, and command line. This is temporary
  * memory allocation which is not needed any more after these buffers have
  * been loaded into separate segments and have been copied elsewhere.
+ *
+ * Note: cmdline_buf is kept so it can be displayed in /proc/kimage.
  */
 void kimage_file_post_load_cleanup(struct kimage *image)
 {
@@ -113,9 +115,6 @@ void kimage_file_post_load_cleanup(struct kimage *image)
 
 	vfree(image->initrd_buf);
 	image->initrd_buf = NULL;
-
-	kfree(image->cmdline_buf);
-	image->cmdline_buf = NULL;
 
 	vfree(pi->purgatory_buf);
 	pi->purgatory_buf = NULL;

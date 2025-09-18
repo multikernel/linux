@@ -13,6 +13,8 @@
 #include <linux/slab.h>
 #include <linux/fs.h>
 #include <linux/kexec.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 #include <linux/mutex.h>
 #include <linux/list.h>
 #include <linux/liveupdate.h>
@@ -645,8 +647,11 @@ void kimage_free(struct kimage *image)
 	 * Free up any temporary buffers allocated. This might hit if
 	 * error occurred much later after buffer allocation.
 	 */
-	if (image->file_mode)
+	if (image->file_mode) {
+		kfree(image->cmdline_buf);
+		image->cmdline_buf = NULL;
 		kimage_file_post_load_cleanup(image);
+	}
 
 	kfree(image);
 }
@@ -1210,6 +1215,61 @@ struct kimage *kexec_image;
 struct kimage *kexec_crash_image;
 static int kexec_load_disabled;
 
+/*
+ * Proc interface for /proc/kimage
+ */
+static int kimage_proc_show(struct seq_file *m, void *v)
+{
+	struct kimage *image;
+	const char *type_names[] = {
+		[KEXEC_TYPE_DEFAULT] = "default",
+		[KEXEC_TYPE_CRASH] = "crash",
+		[KEXEC_TYPE_MULTIKERNEL] = "multikernel"
+	};
+
+	seq_printf(m, "MK_ID  Type        Start Address   Segments  Mode  Cmdline\n");
+	seq_printf(m, "-----  ----------  --------------  --------  ----  -------\n");
+
+	kimage_list_lock();
+	if (!list_empty(&kexec_image_list)) {
+		list_for_each_entry(image, &kexec_image_list, list) {
+			const char *type_name = "unknown";
+
+			if (image->type < ARRAY_SIZE(type_names) && type_names[image->type])
+				type_name = type_names[image->type];
+
+			seq_printf(m, "%5d  %-10s  0x%012lx  %8lu  %-4s  ",
+				image->mk_id, type_name, image->start, image->nr_segments,
+				image->file_mode ? "file" : "sys");
+
+			if (image->file_mode && image->cmdline_buf && image->cmdline_buf_len > 0) {
+				unsigned long len = image->cmdline_buf_len;
+
+				if (len > 0 && image->cmdline_buf[len - 1] == '\0')
+					len--;
+				if (len > 0)
+					seq_printf(m, "\"%.*s\"", (int)len, image->cmdline_buf);
+			}
+			seq_printf(m, "\n");
+		}
+	}
+	kimage_list_unlock();
+
+	return 0;
+}
+
+static int kimage_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, kimage_proc_show, NULL);
+}
+
+static const struct proc_ops kimage_proc_ops = {
+	.proc_open	= kimage_proc_open,
+	.proc_read	= seq_read,
+	.proc_lseek	= seq_lseek,
+	.proc_release	= single_release,
+};
+
 #ifdef CONFIG_SYSCTL
 static int kexec_limit_handler(const struct ctl_table *table, int write,
 			       void *buffer, size_t *lenp, loff_t *ppos)
@@ -1280,6 +1340,21 @@ static int __init kexec_core_sysctl_init(void)
 }
 late_initcall(kexec_core_sysctl_init);
 #endif
+
+static int __init kimage_proc_init(void)
+{
+	struct proc_dir_entry *entry;
+
+	entry = proc_create("kimage", 0444, NULL, &kimage_proc_ops);
+	if (!entry) {
+		pr_err("Failed to create /proc/kimage\n");
+		return -ENOMEM;
+	}
+
+	pr_debug("Created /proc/kimage interface\n");
+	return 0;
+}
+late_initcall(kimage_proc_init);
 
 bool kexec_load_permitted(int kexec_image_type)
 {
