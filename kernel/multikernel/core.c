@@ -487,9 +487,16 @@ static int __init multikernel_init(void)
 {
 	int ret;
 
+	ret = mk_messaging_init();
+	if (ret < 0) {
+		pr_err("Failed to initialize multikernel messaging: %d\n", ret);
+		return ret;
+	}
+
 	ret = mk_kernfs_init();
 	if (ret < 0) {
 		pr_err("Failed to initialize multikernel sysfs interface: %d\n", ret);
+		mk_messaging_cleanup();
 		return ret;
 	}
 

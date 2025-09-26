@@ -88,6 +88,225 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 
 void generic_multikernel_interrupt(void);
 
+/*
+ * Multikernel Messaging System
+ */
+
+/**
+ * Message type definitions - organized by category
+ */
+
+/* Top-level message categories */
+#define MK_MSG_IO           0x1000
+#define MK_MSG_RESOURCE     0x2000
+#define MK_MSG_SYSTEM       0x3000
+#define MK_MSG_USER         0x4000
+
+/* I/O interrupt forwarding subtypes */
+#define MK_IO_IRQ_FORWARD   (MK_MSG_IO + 1)
+#define MK_IO_IRQ_BALANCE   (MK_MSG_IO + 2)
+#define MK_IO_IRQ_MASK      (MK_MSG_IO + 3)
+#define MK_IO_IRQ_UNMASK    (MK_MSG_IO + 4)
+
+/* Resource management subtypes */
+#define MK_RES_CPU_ADD      (MK_MSG_RESOURCE + 1)
+#define MK_RES_CPU_REMOVE   (MK_MSG_RESOURCE + 2)
+#define MK_RES_MEM_ADD      (MK_MSG_RESOURCE + 3)
+#define MK_RES_MEM_REMOVE   (MK_MSG_RESOURCE + 4)
+#define MK_RES_QUERY        (MK_MSG_RESOURCE + 5)
+#define MK_RES_ACK          (MK_MSG_RESOURCE + 0x100)  /* Response/acknowledgment */
+
+/* System management subtypes */
+#define MK_SYS_HEARTBEAT    (MK_MSG_SYSTEM + 1)
+#define MK_SYS_SHUTDOWN     (MK_MSG_SYSTEM + 2)
+
+/**
+ * Core message structure
+ */
+struct mk_message {
+	u32 msg_type;           /* Message type identifier */
+	u32 msg_subtype;        /* Subtype for specific operations */
+	u64 msg_id;             /* Optional message ID for correlation */
+	u32 payload_len;        /* Length of payload data */
+	u8 payload[];           /* Variable payload (up to remaining IPI buffer) */
+};
+
+/**
+ * Payload structures for specific message types
+ */
+
+/* I/O interrupt forwarding */
+struct mk_io_irq_payload {
+	u32 irq_number;         /* Hardware IRQ number */
+	u32 vector;             /* Interrupt vector */
+	u32 device_id;          /* Device identifier (optional) */
+	u32 flags;              /* Control flags (priority, etc.) */
+};
+
+/* IRQ control flags */
+#define MK_IRQ_HIGH_PRIORITY    0x01
+#define MK_IRQ_LOW_LATENCY      0x02
+#define MK_IRQ_EDGE_TRIGGERED   0x04
+#define MK_IRQ_LEVEL_TRIGGERED  0x08
+
+/* CPU resource operations */
+struct mk_cpu_resource_payload {
+	u32 cpu_id;             /* Physical CPU ID */
+	u32 numa_node;          /* NUMA node (optional) */
+	u32 flags;              /* CPU capabilities/attributes */
+	int sender_instance_id; /* Sender instance ID for ACK */
+};
+
+/* CPU capability flags */
+#define MK_CPU_HAS_AVX512       0x01
+#define MK_CPU_HAS_TSX          0x02
+#define MK_CPU_HYPERTHREAD      0x04
+
+/* Memory resource operations */
+struct mk_mem_resource_payload {
+	u64 start_pfn;          /* Starting page frame number */
+	u64 nr_pages;           /* Number of pages */
+	u32 numa_node;          /* NUMA node */
+	u32 mem_type;           /* Memory type (normal/DMA/etc.) */
+	int sender_instance_id; /* Sender instance ID for ACK */
+};
+
+/* Memory types */
+#define MK_MEM_NORMAL           0x01
+#define MK_MEM_DMA              0x02
+#define MK_MEM_DMA32            0x04
+#define MK_MEM_HIGHMEM          0x08
+
+/* Resource operation response/ACK */
+struct mk_resource_ack {
+	u32 operation;          /* Original operation (MK_RES_CPU_ADD, etc.) */
+	u32 result;             /* Result code: 0 = success, negative = error */
+	u32 resource_id;        /* CPU ID, memory PFN, etc. */
+	u32 reserved;           /* For future use */
+};
+
+/**
+ * Message handler callback type
+ */
+typedef void (*mk_msg_handler_t)(u32 msg_type, u32 subtype,
+				 void *payload, u32 payload_len, void *ctx);
+
+/* Opaque type for pending message tracking */
+struct mk_pending_msg;
+
+/**
+ * Message API functions
+ */
+
+/**
+ * mk_send_message - Send a message to another CPU
+ * @instance_id: Target multikernel instance ID
+ * @msg_type: Message type identifier
+ * @subtype: Message subtype
+ * @payload: Pointer to payload data (can be NULL)
+ * @payload_len: Length of payload data
+ *
+ * Returns 0 on success, negative error code on failure
+ */
+int mk_send_message(int instance_id, u32 msg_type, u32 subtype,
+		    void *payload, u32 payload_len);
+
+/**
+ * mk_register_msg_handler - Register handler for specific message type
+ * @msg_type: Message type to handle
+ * @handler: Handler function
+ * @ctx: Context pointer passed to handler
+ *
+ * Returns 0 on success, negative error code on failure
+ */
+int mk_register_msg_handler(u32 msg_type, mk_msg_handler_t handler, void *ctx);
+
+/**
+ * mk_unregister_msg_handler - Unregister message handler
+ * @msg_type: Message type to unregister
+ * @handler: Handler function to remove
+ *
+ * Returns 0 on success, negative error code on failure
+ */
+int mk_unregister_msg_handler(u32 msg_type, mk_msg_handler_t handler);
+
+/* Pending message tracking for request-response pattern */
+struct mk_pending_msg *mk_msg_pending_add(u32 msg_type, u32 operation, u32 resource_id);
+void mk_msg_pending_complete(u32 msg_type, u32 operation, u32 resource_id, int result);
+int mk_msg_pending_wait(struct mk_pending_msg *pending, unsigned long timeout_ms);
+
+/**
+ * Convenience functions for common message types
+ */
+
+/* I/O interrupt forwarding */
+static inline int mk_send_irq_forward(int instance_id, u32 irq_number,
+				      u32 vector, u32 device_id, u32 flags)
+{
+	struct mk_io_irq_payload payload = {
+		.irq_number = irq_number,
+		.vector = vector,
+		.device_id = device_id,
+		.flags = flags
+	};
+	return mk_send_message(instance_id, MK_MSG_IO, MK_IO_IRQ_FORWARD,
+			       &payload, sizeof(payload));
+}
+
+/* CPU resource management */
+static inline int mk_send_cpu_add(int instance_id, u32 cpu_id,
+				  u32 numa_node, u32 flags)
+{
+	struct mk_cpu_resource_payload payload = {
+		.cpu_id = cpu_id,
+		.numa_node = numa_node,
+		.flags = flags
+	};
+	return mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_CPU_ADD,
+			       &payload, sizeof(payload));
+}
+
+static inline int mk_send_cpu_remove(int instance_id, u32 cpu_id)
+{
+	struct mk_cpu_resource_payload payload = {
+		.cpu_id = cpu_id,
+		.numa_node = 0,
+		.flags = 0
+	};
+	return mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_CPU_REMOVE,
+			       &payload, sizeof(payload));
+}
+
+/* Memory resource management */
+static inline int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
+				  u32 numa_node, u32 mem_type)
+{
+	struct mk_mem_resource_payload payload = {
+		.start_pfn = start_pfn,
+		.nr_pages = nr_pages,
+		.numa_node = numa_node,
+		.mem_type = mem_type
+	};
+	return mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_MEM_ADD,
+			       &payload, sizeof(payload));
+}
+
+static inline int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages)
+{
+	struct mk_mem_resource_payload payload = {
+		.start_pfn = start_pfn,
+		.nr_pages = nr_pages,
+		.numa_node = 0,
+		.mem_type = 0
+	};
+	return mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_MEM_REMOVE,
+			       &payload, sizeof(payload));
+}
+
+/* Messaging system functions */
+int __init mk_messaging_init(void);
+void mk_messaging_cleanup(void);
+
 struct resource;
 
 extern phys_addr_t multikernel_alloc(size_t size);
