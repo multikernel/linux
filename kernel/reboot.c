@@ -718,7 +718,7 @@ EXPORT_SYMBOL_GPL(kernel_power_off);
 DEFINE_MUTEX(system_transition_mutex);
 
 struct multikernel_boot_args {
-	int cpu;
+	int mk_id;
 };
 
 /*
@@ -807,7 +807,7 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 	case LINUX_REBOOT_CMD_MULTIKERNEL:
 		if (copy_from_user(&boot_args, arg, sizeof(boot_args)))
 			return -EFAULT;
-		ret = multikernel_kexec(boot_args.cpu);
+		ret = multikernel_kexec_by_id(boot_args.mk_id);
 		break;
 #endif
 

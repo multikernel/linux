@@ -41,6 +41,7 @@
 #include <linux/hugetlb.h>
 #include <linux/objtool.h>
 #include <linux/kmsg_dump.h>
+#include <linux/multikernel.h>
 #include <linux/dma-map-ops.h>
 #include <linux/sysfs.h>
 #include <linux/memblock.h>
@@ -256,6 +257,9 @@ struct kimage *do_kimage_alloc_init(void)
 
 	/* Initialize the list node for multikernel support */
 	INIT_LIST_HEAD(&image->list);
+
+	image->mk_id = 0;
+	image->mk_instance = NULL;
 
 #ifdef CONFIG_CRASH_HOTPLUG
 	image->hp_action = KEXEC_CRASH_HP_NONE;
@@ -595,6 +599,14 @@ void kimage_free(struct kimage *image)
 		kimage_update_compat_pointers(NULL, KEXEC_TYPE_DEFAULT);
 	else if (image == kexec_crash_image)
 		kimage_update_compat_pointers(NULL, KEXEC_TYPE_CRASH);
+
+	if (image->type == KEXEC_TYPE_MULTIKERNEL && image->mk_instance) {
+		image->mk_instance->kimage = NULL;
+		mk_instance_set_state(image->mk_instance, MK_STATE_READY);
+		mk_instance_put(image->mk_instance);
+		image->mk_instance = NULL;
+		pr_info("Freed multikernel ID %d\n", image->mk_id);
+	}
 
 #ifdef CONFIG_CRASH_DUMP
 	if (image->vmcoreinfo_data_copy) {
@@ -1538,26 +1550,74 @@ kset_exit:
 
 subsys_initcall(init_kexec_sysctl);
 
-int multikernel_kexec(int cpu)
+/*
+ * Find a multikernel image by ID using mk_instance lookup
+ */
+struct kimage *kimage_find_by_id(int mk_id)
 {
-	int rc;
+	struct mk_instance *instance;
+	struct kimage *image = NULL;
 
-	pr_info("multikernel kexec: cpu %d\n", cpu);
+	if (mk_id <= 0)
+		return NULL;
 
-	if (cpu_online(cpu)) {
-		pr_err("The CPU is currently running with this kernel instance.");
-		return -EBUSY;
+	/* Use mk_instance system to find the associated kimage */
+	instance = mk_instance_find(mk_id);
+	if (instance) {
+		image = instance->kimage;
+		mk_instance_put(instance); /* Release reference from find */
 	}
+
+	return image;
+}
+
+int multikernel_kexec_by_id(int mk_id)
+{
+	struct kimage *mk_image;
+	struct mk_instance *instance;
+	int cpu = -1;
+	int rc;
 
 	if (!kexec_trylock())
 		return -EBUSY;
-	if (!kexec_image) {
+
+	mk_image = kimage_find_by_id(mk_id);
+	if (!mk_image) {
+		pr_err("No multikernel image found with ID %d\n", mk_id);
 		rc = -EINVAL;
 		goto unlock;
 	}
 
+	instance = mk_image->mk_instance;
+	if (instance->cpus && !bitmap_empty(instance->cpus, NR_CPUS)) {
+		int phys_cpu = find_first_bit(instance->cpus, NR_CPUS);
+		cpu = arch_cpu_from_physical_id(phys_cpu);
+		if (cpu < 0) {
+			pr_err("Physical CPU %d not found in logical CPU map\n", phys_cpu);
+			rc = -EINVAL;
+			goto unlock;
+		}
+		pr_info("multikernel kexec: using physical CPU %d (logical %d) from instance bitmap %*pbl\n",
+			phys_cpu, cpu, NR_CPUS, instance->cpus);
+	} else {
+		pr_err("No CPU assignment found for multikernel instance %d - CPU assignment is required\n",
+		       mk_id);
+		rc = -EINVAL;
+		goto unlock;
+	}
+
+	if (cpu_online(cpu)) {
+		pr_err("CPU %d is currently online and cannot be used for multikernel instance %d\n",
+		       cpu, mk_id);
+		rc = -EBUSY;
+		goto unlock;
+	}
+
+	pr_info("Using multikernel image with ID %d (entry point: 0x%lx) on CPU %d\n",
+		mk_image->mk_id, mk_image->start, cpu);
+
 	cpus_read_lock();
-	rc = multikernel_kick_ap(cpu, kexec_image->start);
+	rc = multikernel_kick_ap(cpu, mk_image->start);
 	cpus_read_unlock();
 
 unlock:

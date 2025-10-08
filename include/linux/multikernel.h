@@ -100,6 +100,9 @@ struct mk_instance {
 	void *dtb_data;                 /* Device tree blob data */
 	size_t dtb_size;                /* Size of DTB */
 
+	/* Kexec integration */
+	struct kimage *kimage;          /* Associated kimage object */
+
 	/* Sysfs representation */
 	struct kernfs_node *kn;            /* Kernfs node for this instance */
 
