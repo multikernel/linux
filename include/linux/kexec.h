@@ -132,6 +132,7 @@ struct purgatory_info {
 };
 
 struct kimage;
+struct mk_instance;
 
 typedef int (kexec_probe_t)(const char *kernel_buf, unsigned long kernel_size);
 typedef void *(kexec_load_t)(struct kimage *image, char *kernel_buf,
@@ -434,6 +435,12 @@ struct kimage {
 
 	/* For multikernel support: linked list node */
 	struct list_head list;
+
+	/* Multikernel unique ID (0 = current kernel, >0 = multikernel images) */
+	int mk_id;
+
+	/* Multikernel instance cross-reference */
+	struct mk_instance *mk_instance;
 };
 
 /* kexec interface functions */
@@ -441,7 +448,8 @@ extern void machine_kexec(struct kimage *image);
 extern int machine_kexec_prepare(struct kimage *image);
 extern void machine_kexec_cleanup(struct kimage *image);
 extern int kernel_kexec(void);
-extern int multikernel_kexec(int cpu);
+extern int multikernel_kexec_by_id(int mk_id);
+extern struct kimage *kimage_find_by_id(int mk_id);
 extern struct page *kimage_alloc_control_pages(struct kimage *image,
 						unsigned int order);
 
@@ -469,7 +477,8 @@ bool kexec_load_permitted(int kexec_image_type);
 /* List of defined/legal kexec file flags */
 #define KEXEC_FILE_FLAGS	(KEXEC_FILE_UNLOAD | KEXEC_FILE_ON_CRASH | \
 				 KEXEC_FILE_NO_INITRAMFS | KEXEC_FILE_DEBUG | \
-				 KEXEC_FILE_NO_CMA | KEXEC_FILE_FORCE_DTB)
+				 KEXEC_FILE_NO_CMA | KEXEC_FILE_FORCE_DTB | \
+				 KEXEC_MK_ID_MASK)
 
 /* flag to track if kexec reboot is in progress */
 extern bool kexec_in_progress;
