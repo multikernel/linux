@@ -179,4 +179,6 @@ config CRASH_MAX_MEMORY_RANGES
 	  the computation behind the value provided through the
 	  /sys/kernel/crash_elfcorehdr_size attribute.
 
+source "kernel/multikernel/Kconfig"
+
 endmenu

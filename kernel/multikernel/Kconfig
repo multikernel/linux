@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Multikernel configuration
+#
+
+config MULTIKERNEL
+	bool "Multikernel support"
+	depends on KEXEC_CORE
+	help
+	  Enable multikernel support, which allows running multiple kernel
+	  instances simultaneously with resource isolation and inter-kernel
+	  communication capabilities.
+
+	  This feature provides:
+	  - Sysfs interface for multikernel instance management
+	  - Device tree based resource specification
+	  - Memory pool management for kernel instances
+	  - Integration with kexec for kernel loading
+
+	  If unsure, say N.
