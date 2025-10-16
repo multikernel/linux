@@ -7,7 +7,10 @@
 #include <linux/init.h>
 #include <linux/cpumask.h>
 #include <linux/cpu.h>
+#include <linux/io.h>
+#include <linux/kexec.h>
 #include <linux/multikernel.h>
+#include <asm/page.h>
 #include "internal.h"
 
 /**
@@ -383,6 +386,101 @@ int mk_instance_reserve_resources(struct mk_instance *instance,
 	}
 
 	return 0;
+}
+
+/**
+ * Per-instance memory pool management
+ */
+
+/**
+ * mk_instance_alloc() - Allocate memory from instance pool
+ * @instance: Instance to allocate from
+ * @size: Size to allocate
+ * @align: Alignment requirement (must be power of 2)
+ *
+ * Returns virtual address of allocated memory, or NULL on failure.
+ * The returned address is a direct-mapped kernel virtual address,
+ * which can be converted back to physical using virt_to_phys().
+ */
+void *mk_instance_alloc(struct mk_instance *instance, size_t size, size_t align)
+{
+	phys_addr_t phys_addr;
+	void *virt_addr;
+
+	if (!instance || !instance->instance_pool) {
+		pr_debug("mk_instance_alloc: instance %p has no pool\n", instance);
+		return NULL;
+	}
+
+	/* Allocate from instance pool with alignment */
+	phys_addr = multikernel_instance_alloc(instance->instance_pool, size, align);
+	if (!phys_addr) {
+		pr_debug("Failed to allocate %zu bytes from instance pool (align=0x%zx)\n", size, align);
+		return NULL;
+	}
+
+	virt_addr = phys_to_virt(phys_addr);
+	if (!virt_addr) {
+		pr_err("Failed to map instance memory at 0x%llx\n", (unsigned long long)phys_addr);
+		multikernel_instance_free(instance->instance_pool, phys_addr, size);
+		return NULL;
+	}
+
+	return virt_addr;
+}
+
+/**
+ * mk_instance_free() - Free memory back to instance pool
+ * @instance: Instance to free to
+ * @virt_addr: Virtual address to free
+ * @size: Size to free
+ */
+void mk_instance_free(struct mk_instance *instance, void *virt_addr, size_t size)
+{
+	phys_addr_t phys_addr;
+
+	if (!instance || !instance->instance_pool || !virt_addr)
+		return;
+
+	phys_addr = virt_to_phys(virt_addr);
+	multikernel_instance_free(instance->instance_pool, phys_addr, size);
+}
+
+/**
+ * Kimage-based memory pool access functions
+ *
+ * These provide convenient wrappers for accessing instance memory pools
+ * through the kimage structure, commonly used in kexec code paths.
+ */
+
+/**
+ * mk_kimage_alloc() - Allocate memory from kimage's instance pool
+ * @image: kimage with associated mk_instance
+ * @size: Size to allocate
+ * @align: Alignment requirement (must be power of 2)
+ *
+ * Returns virtual address of allocated memory, or NULL on failure.
+ */
+void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align)
+{
+	if (!image || !image->mk_instance)
+		return NULL;
+
+	return mk_instance_alloc(image->mk_instance, size, align);
+}
+
+/**
+ * mk_kimage_free() - Free memory back to kimage's instance pool
+ * @image: kimage with associated mk_instance
+ * @virt_addr: Virtual address to free
+ * @size: Size to free
+ */
+void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size)
+{
+	if (!image || !image->mk_instance)
+		return;
+
+	mk_instance_free(image->mk_instance, virt_addr, size);
 }
 
 static int __init multikernel_init(void)

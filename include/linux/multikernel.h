@@ -278,6 +278,12 @@ int mk_instance_reserve_resources(struct mk_instance *instance,
  */
 void mk_instance_free_memory(struct mk_instance *instance);
 
+void *mk_instance_alloc(struct mk_instance *instance, size_t size, size_t align);
+void mk_instance_free(struct mk_instance *instance, void *virt_addr, size_t size);
+
+void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align);
+void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size);
+
 /**
  * String conversion helpers
  */
