@@ -118,6 +118,47 @@ static int setup_e820_entries(struct boot_params *params)
 	return 0;
 }
 
+static int setup_e820_entries_multikernel(struct boot_params *params)
+{
+	unsigned int nr_e820_entries = 0;
+	int i;
+
+	/* For multikernel spawn, the spawn kernel needs RAM in the first 1MB to allocate
+	 * its real-mode trampoline (see arch/x86/realmode/init.c reserve_real_mode()).
+	 *
+	 * We use e820_table (the kernel's modified e820 map) rather than
+	 * e820_table_kexec, so we automatically exclude regions the kernel has
+	 * reserved (like 0x0-0xFFF containing IVT/BDA).
+	 */
+
+	for (i = 0; i < e820_table->nr_entries && nr_e820_entries < E820_MAX_ENTRIES_ZEROPAGE; i++) {
+		struct e820_entry *entry = &e820_table->entries[i];
+		u64 entry_end = entry->addr + entry->size;
+
+		if (entry->addr >= 0x100000)
+			continue;
+
+		if (entry->type != E820_TYPE_RAM)
+			continue;
+
+		params->e820_table[nr_e820_entries].addr = entry->addr;
+		params->e820_table[nr_e820_entries].size = entry->size;
+		params->e820_table[nr_e820_entries].type = entry->type;
+		/* Truncate if it extends beyond 1MB */
+		if (entry_end > 0x100000)
+			params->e820_table[nr_e820_entries].size = 0x100000 - entry->addr;
+
+		nr_e820_entries++;
+	}
+
+	params->e820_entries = nr_e820_entries;
+
+	pr_info("Set up multikernel e820 map with %d entries from first 1MB\n",
+		nr_e820_entries);
+
+	return 0;
+}
+
 enum { RNG_SEED_LENGTH = 32 };
 
 static void
@@ -326,7 +367,13 @@ setup_boot_parameters(struct kimage *image, struct boot_params *params,
 			return ret;
 	} else
 #endif
+	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
+		ret = setup_e820_entries_multikernel(params);
+		if (ret)
+			return ret;
+	} else {
 		setup_e820_entries(params);
+	}
 
 	nr_e820_entries = params->e820_entries;
 

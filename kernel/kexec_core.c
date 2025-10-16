@@ -473,7 +473,6 @@ static struct page *kimage_alloc_crash_control_pages(struct kimage *image,
 }
 #endif
 
-
 struct page *kimage_alloc_control_pages(struct kimage *image,
 					 unsigned int order)
 {
@@ -481,6 +480,7 @@ struct page *kimage_alloc_control_pages(struct kimage *image,
 
 	switch (image->type) {
 	case KEXEC_TYPE_DEFAULT:
+	case KEXEC_TYPE_MULTIKERNEL:
 		pages = kimage_alloc_normal_control_pages(image, order);
 		break;
 #ifdef CONFIG_CRASH_DUMP
@@ -600,12 +600,20 @@ void kimage_free(struct kimage *image)
 	else if (image == kexec_crash_image)
 		kimage_update_compat_pointers(NULL, KEXEC_TYPE_CRASH);
 
-	if (image->type == KEXEC_TYPE_MULTIKERNEL && image->mk_instance) {
-		image->mk_instance->kimage = NULL;
-		mk_instance_set_state(image->mk_instance, MK_STATE_READY);
-		mk_instance_put(image->mk_instance);
-		image->mk_instance = NULL;
-		pr_info("Freed multikernel ID %d\n", image->mk_id);
+	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
+		unsigned long i;
+
+		for (i = 0; i < image->nr_segments; i++) {
+			void *virt_addr = phys_to_virt(image->segment[i].mem);
+			mk_kimage_free(image, virt_addr, image->segment[i].memsz);
+		}
+
+		if (image->mk_instance) {
+			image->mk_instance->kimage = NULL;
+			mk_instance_set_state(image->mk_instance, MK_STATE_READY);
+			mk_instance_put(image->mk_instance);
+			image->mk_instance = NULL;
+		}
 	}
 
 #ifdef CONFIG_CRASH_DUMP
@@ -615,31 +623,33 @@ void kimage_free(struct kimage *image)
 	}
 #endif
 
-	kimage_free_extra_pages(image);
-	for_each_kimage_entry(image, ptr, entry) {
-		if (entry & IND_INDIRECTION) {
-			/* Free the previous indirection page */
-			if (ind & IND_INDIRECTION)
-				kimage_free_entry(ind);
-			/* Save this indirection page until we are
-			 * done with it.
-			 */
-			ind = entry;
-		} else if (entry & IND_SOURCE)
-			kimage_free_entry(entry);
+	if (image->type != KEXEC_TYPE_MULTIKERNEL) {
+		kimage_free_extra_pages(image);
+		for_each_kimage_entry(image, ptr, entry) {
+			if (entry & IND_INDIRECTION) {
+				/* Free the previous indirection page */
+				if (ind & IND_INDIRECTION)
+					kimage_free_entry(ind);
+				/* Save this indirection page until we are
+				 * done with it.
+				 */
+				ind = entry;
+			} else if (entry & IND_SOURCE)
+				kimage_free_entry(entry);
+		}
+		/* Free the final indirection page */
+		if (ind & IND_INDIRECTION)
+			kimage_free_entry(ind);
+
+		/* Free CMA allocations */
+		kimage_free_cma(image);
 	}
-	/* Free the final indirection page */
-	if (ind & IND_INDIRECTION)
-		kimage_free_entry(ind);
 
 	/* Handle any machine specific cleanup */
 	machine_kexec_cleanup(image);
 
 	/* Free the kexec control pages... */
 	kimage_free_page_list(&image->control_pages);
-
-	/* Free CMA allocations */
-	kimage_free_cma(image);
 
 	/*
 	 * Free up any temporary buffers allocated. This might hit if

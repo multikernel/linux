@@ -478,7 +478,7 @@ bool kexec_load_permitted(int kexec_image_type);
 #define KEXEC_FILE_FLAGS	(KEXEC_FILE_UNLOAD | KEXEC_FILE_ON_CRASH | \
 				 KEXEC_FILE_NO_INITRAMFS | KEXEC_FILE_DEBUG | \
 				 KEXEC_FILE_NO_CMA | KEXEC_FILE_FORCE_DTB | \
-				 KEXEC_MK_ID_MASK)
+				 KEXEC_MK_ID_MASK | KEXEC_MULTIKERNEL)
 
 /* flag to track if kexec reboot is in progress */
 extern bool kexec_in_progress;
