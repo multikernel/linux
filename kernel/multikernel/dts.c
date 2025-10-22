@@ -22,6 +22,8 @@
 #include <linux/cpumask.h>
 #include <linux/multikernel.h>
 
+#include "internal.h"
+
 /**
  * Configuration initialization and cleanup
  */
@@ -219,6 +221,49 @@ int mk_dt_parse(const void *dtb_data, size_t dtb_size,
 
 	pr_info("Successfully parsed multikernel device tree with %zu bytes memory, %d CPUs\n",
 		config->memory_size, config->cpus ? bitmap_weight(config->cpus, NR_CPUS) : 0);
+	return 0;
+}
+
+/**
+ * mk_dt_parse_resources() - Parse resources from a resources node
+ * @fdt: Device tree blob
+ * @resources_node: Offset of the resources node
+ * @instance_name: Name of the instance (for logging)
+ * @config: Output configuration structure
+ *
+ * Parses all resources (memory, CPUs) from a resources node.
+ * This is the core parsing logic used by both full DTB parsing and
+ * overlay instance creation.
+ *
+ * Returns 0 on success, negative error code on failure.
+ */
+int mk_dt_parse_resources(const void *fdt, int resources_node,
+			  const char *instance_name, struct mk_dt_config *config)
+{
+	int ret;
+
+	if (!fdt || resources_node < 0 || !instance_name || !config) {
+		pr_err("Invalid parameters to mk_dt_parse_resources\n");
+		return -EINVAL;
+	}
+
+	ret = mk_dt_parse_memory(fdt, resources_node, config);
+	if (ret) {
+		pr_err("Failed to parse memory regions for '%s': %d\n", instance_name, ret);
+		mk_dt_config_free(config);
+		return ret;
+	}
+
+	ret = mk_dt_parse_cpus(fdt, resources_node, config);
+	if (ret) {
+		pr_err("Failed to parse CPU resources for '%s': %d\n", instance_name, ret);
+		mk_dt_config_free(config);
+		return ret;
+	}
+
+	pr_info("Successfully parsed instance '%s': %zu bytes memory, %d CPUs\n",
+		instance_name, config->memory_size,
+		config->cpus ? bitmap_weight(config->cpus, NR_CPUS) : 0);
 	return 0;
 }
 
@@ -439,4 +484,130 @@ void mk_dt_print_config(const struct mk_dt_config *config)
 	}
 
 	pr_info("  DTB: %zu bytes\n", config->dtb_size);
+}
+
+/**
+ * mk_dt_generate_instance_dtb() - Generate a proper instance DTB from config
+ * @name: Instance name
+ * @id: Instance ID
+ * @config: Configuration with parsed resources
+ * @out_dtb: Output pointer for generated DTB (caller must kfree)
+ * @out_size: Output size of generated DTB
+ *
+ * Generates a full device tree with /instances/<name>/resources structure
+ * suitable for passing to spawn kernel via KHO.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+int mk_dt_generate_instance_dtb(const char *name, int id,
+				 const struct mk_dt_config *config,
+				 void **out_dtb, size_t *out_size)
+{
+	void *fdt;
+	int ret;
+	size_t fdt_size = 4096; /* Start with 4K, will grow if needed */
+
+	if (!name || !config || !out_dtb || !out_size)
+		return -EINVAL;
+
+	fdt = kmalloc(fdt_size, GFP_KERNEL);
+	if (!fdt)
+		return -ENOMEM;
+
+	ret = fdt_create(fdt, fdt_size);
+	if (ret) {
+		pr_err("Failed to create FDT: %d\n", ret);
+		goto err_free;
+	}
+
+	ret = fdt_finish_reservemap(fdt);
+	if (ret) {
+		pr_err("Failed to finish reservemap: %d\n", ret);
+		goto err_free;
+	}
+
+	/* Begin root node */
+	ret = fdt_begin_node(fdt, "");
+	if (ret) goto err_free;
+
+	ret = fdt_property_string(fdt, "compatible", "multikernel-v1");
+	if (ret) goto err_free;
+
+	/* Create /instances node */
+	ret = fdt_begin_node(fdt, "instances");
+	if (ret) goto err_free;
+
+	/* Create /instances/<name> node */
+	ret = fdt_begin_node(fdt, name);
+	if (ret) goto err_free;
+
+	ret = fdt_property_u32(fdt, "id", id);
+	if (ret) goto err_free;
+
+	ret = fdt_property_string(fdt, "compatible", "multikernel-v1");
+	if (ret) goto err_free;
+
+	/* Create /instances/<name>/resources node */
+	ret = fdt_begin_node(fdt, "resources");
+	if (ret) goto err_free;
+
+	if (config->memory_size > 0) {
+		ret = fdt_property_u64(fdt, "memory-bytes", config->memory_size);
+		if (ret) goto err_free;
+	}
+
+	if (config->cpus && !bitmap_empty(config->cpus, NR_CPUS)) {
+		int cpu;
+		u32 *cpu_array;
+		int cpu_count = bitmap_weight(config->cpus, NR_CPUS);
+		int idx = 0;
+
+		cpu_array = kmalloc(cpu_count * sizeof(u32), GFP_KERNEL);
+		if (!cpu_array) {
+			ret = -ENOMEM;
+			goto err_free;
+		}
+
+		for_each_set_bit(cpu, config->cpus, NR_CPUS) {
+			cpu_array[idx++] = cpu_to_fdt32(cpu);
+		}
+
+		ret = fdt_property(fdt, "cpus", cpu_array, cpu_count * sizeof(u32));
+		kfree(cpu_array);
+		if (ret) goto err_free;
+	}
+
+	/* End resources node */
+	ret = fdt_end_node(fdt);
+	if (ret) goto err_free;
+
+	/* End instance node */
+	ret = fdt_end_node(fdt);
+	if (ret) goto err_free;
+
+	/* End instances node */
+	ret = fdt_end_node(fdt);
+	if (ret) goto err_free;
+
+	/* End root node */
+	ret = fdt_end_node(fdt);
+	if (ret) goto err_free;
+
+	/* Finish FDT */
+	ret = fdt_finish(fdt);
+	if (ret) {
+		pr_err("Failed to finish FDT: %d\n", ret);
+		goto err_free;
+	}
+
+	*out_dtb = fdt;
+	*out_size = fdt_totalsize(fdt);
+
+	pr_info("Generated instance DTB for '%s' (ID %d): %zu bytes\n",
+		name, id, *out_size);
+	return 0;
+
+err_free:
+	kfree(fdt);
+	return ret;
 }

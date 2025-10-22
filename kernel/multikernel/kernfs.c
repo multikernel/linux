@@ -33,8 +33,8 @@
 
 /* Global multikernel filesystem state */
 static struct kernfs_root *mk_kernfs_root;        /* Kernfs root for multikernel filesystem */
-static struct kernfs_node *mk_root_kn;            /* Root kernfs node */
-static struct kernfs_node *mk_instances_kn;       /* Instances subdirectory node */
+struct kernfs_node *mk_root_kn;                    /* Root kernfs node */
+struct kernfs_node *mk_instances_kn;               /* Instances subdirectory node */
 LIST_HEAD(mk_instance_list);                      /* List of all instances */
 DEFINE_MUTEX(mk_instance_mutex);                  /* Protects instance list */
 DEFINE_IDR(mk_instance_idr);               /* ID allocator for instances */
@@ -54,8 +54,6 @@ static void mk_free_fs_context(struct fs_context *fc);
 static int mk_init_fs_context(struct fs_context *fc);
 static void mk_kill_sb(struct super_block *sb);
 static int mk_create_instance_files(struct mk_instance *instance);
-static int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
-				        int instance_node, size_t full_dtb_size);
 
 /* Kernfs syscall operations */
 static struct kernfs_syscall_ops mk_kernfs_syscall_ops = {
@@ -181,190 +179,119 @@ static ssize_t root_device_tree_write(struct kernfs_open_file *of, char *buf, si
 	return count;
 }
 
-/* Helper function to extract instance DTB from a specific node */
-static int mk_extract_instance_dtb_from_node(const void *fdt, int instance_node,
-					      const char *instance_name,
-					      void **instance_dtb, size_t *instance_size)
-{
-	void *new_fdt;
-	int ret;
-	size_t new_size = PAGE_SIZE;
-
-	/* Create new DTB with just this instance */
-	new_fdt = kmalloc(new_size, GFP_KERNEL);
-	if (!new_fdt)
-		return -ENOMEM;
-
-	ret = fdt_create(new_fdt, new_size);
-	ret |= fdt_finish_reservemap(new_fdt);
-	ret |= fdt_begin_node(new_fdt, "");
-	ret |= fdt_property_string(new_fdt, "compatible", "multikernel-v1");
-	ret |= fdt_begin_node(new_fdt, "instances");
-
-	/* Copy the instance node */
-	ret |= fdt_begin_node(new_fdt, instance_name);
-
-	/* Copy all properties from the instance node */
-	int prop_offset = fdt_first_property_offset(fdt, instance_node);
-	while (prop_offset >= 0) {
-		const struct fdt_property *prop = fdt_get_property_by_offset(fdt, prop_offset, NULL);
-		if (prop) {
-			const char *prop_name = fdt_string(fdt, fdt32_to_cpu(prop->nameoff));
-			ret |= fdt_property(new_fdt, prop_name, prop->data, fdt32_to_cpu(prop->len));
-		}
-		prop_offset = fdt_next_property_offset(fdt, prop_offset);
-	}
-
-	/* Copy all subnodes from the instance node (including resources) */
-	int subnode;
-	fdt_for_each_subnode(subnode, fdt, instance_node) {
-		const char *subnode_name = fdt_get_name(fdt, subnode, NULL);
-		if (!subnode_name)
-			continue;
-
-		ret |= fdt_begin_node(new_fdt, subnode_name);
-
-		/* Copy all properties from the subnode */
-		prop_offset = fdt_first_property_offset(fdt, subnode);
-		while (prop_offset >= 0) {
-			const struct fdt_property *prop = fdt_get_property_by_offset(fdt, prop_offset, NULL);
-			if (prop) {
-				const char *prop_name = fdt_string(fdt, fdt32_to_cpu(prop->nameoff));
-				ret |= fdt_property(new_fdt, prop_name, prop->data, fdt32_to_cpu(prop->len));
-			}
-			prop_offset = fdt_next_property_offset(fdt, prop_offset);
-		}
-
-		ret |= fdt_end_node(new_fdt); /* end subnode */
-	}
-	ret |= fdt_end_node(new_fdt); /* end instance */
-	ret |= fdt_end_node(new_fdt); /* end instances */
-	ret |= fdt_end_node(new_fdt); /* end root */
-	ret |= fdt_finish(new_fdt);
-
-	if (ret) {
-		pr_err("Failed to create instance DTB: %d\n", ret);
-		kfree(new_fdt);
-		return ret;
-	}
-
-	*instance_dtb = new_fdt;
-	*instance_size = fdt_totalsize(new_fdt);
-
-	return 0;
-}
-
-static int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
-				       int instance_node, size_t full_dtb_size)
+/**
+ * mk_create_instance_from_dtb() - Create a multikernel instance from DTB resources node
+ * @name: Instance name
+ * @id: Instance ID
+ * @fdt: Device tree containing the DTB resources node
+ * @resources_node: Offset of the resources node in the FDT
+ * @dtb_size: Size of the full DTB (for storage)
+ *
+ * Creates a multikernel instance by parsing resources directly from a resources node.
+ * This is used by overlay instance-create operations where the resources are directly
+ * available.
+ *
+ * Returns 0 on success, negative error code on failure.
+ */
+int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
+				      int resources_node, size_t dtb_size)
 {
 	struct mk_instance *instance;
 	struct kernfs_node *kn;
 	struct mk_dt_config config;
-	void *instance_dtb;
-	size_t instance_dtb_size;
+	void *dtb_copy;
 	int ret;
 
-	ret = mk_extract_instance_dtb_from_node(fdt, instance_node, name,
-						&instance_dtb, &instance_dtb_size);
-	if (ret) {
-		pr_err("Failed to extract DTB for instance '%s': %d\n", name, ret);
-		return ret;
-	}
+	pr_info("Creating instance '%s' (ID %d) from resources node\n", name, id);
 
 	instance = kzalloc(sizeof(*instance), GFP_KERNEL);
-	if (!instance) {
-		kfree(instance_dtb);
+	if (!instance)
 		return -ENOMEM;
-	}
 
 	instance->id = id;
 	instance->name = kstrdup(name, GFP_KERNEL);
 	if (!instance->name) {
 		ret = -ENOMEM;
-		goto cleanup_instance;
+		goto err_free_instance;
 	}
-
-	instance->state = MK_STATE_EMPTY;
-	INIT_LIST_HEAD(&instance->list);
-	INIT_LIST_HEAD(&instance->memory_regions);
-	instance->region_count = 0;
-	kref_init(&instance->refcount);
 
 	instance->cpus = kzalloc(BITS_TO_LONGS(NR_CPUS) * sizeof(unsigned long), GFP_KERNEL);
 	if (!instance->cpus) {
 		ret = -ENOMEM;
-		goto cleanup_instance_name;
+		goto err_free_name;
 	}
 
-	/* Create kernfs directory under instances/ */
+	mk_dt_config_init(&config);
+	ret = mk_dt_parse_resources(fdt, resources_node, name, &config);
+	if (ret) {
+		pr_err("Failed to parse resources for instance '%s': %d\n", name, ret);
+		goto err_free_cpumask;
+	}
+
+	ret = mk_dt_generate_instance_dtb(name, id, &config, &dtb_copy, &dtb_size);
+	if (ret) {
+		pr_err("Failed to generate DTB for instance '%s': %d\n", name, ret);
+		goto err_free_config;
+	}
+
+	instance->dtb_data = dtb_copy;
+	instance->dtb_size = dtb_size;
+
+	INIT_LIST_HEAD(&instance->memory_regions);
+	INIT_LIST_HEAD(&instance->list);
+	kref_init(&instance->refcount);
+
 	kn = kernfs_create_dir(mk_instances_kn, name, 0755, instance);
 	if (IS_ERR(kn)) {
 		ret = PTR_ERR(kn);
 		pr_err("Failed to create kernfs directory for instance '%s': %d\n", name, ret);
-		goto cleanup_instance_name;
+		goto err_free_config;
 	}
-
 	instance->kn = kn;
 	mk_instance_get(instance);
 
-	/* Parse and validate the instance DTB */
-	mk_dt_config_init(&config);
-	ret = mk_dt_parse(instance_dtb, instance_dtb_size, &config);
+	ret = mk_create_instance_files(instance);
 	if (ret) {
-		pr_err("Failed to parse DTB for instance '%s': %d\n", name, ret);
-		goto cleanup_kernfs;
+		pr_err("Failed to create files for instance '%s': %d\n", name, ret);
+		goto err_remove_dir;
 	}
 
-	/* Reserve resources */
 	ret = mk_instance_reserve_resources(instance, &config);
 	if (ret) {
 		pr_err("Failed to reserve resources for instance '%s': %d\n", name, ret);
-		goto cleanup_config;
+		goto err_remove_dir;
 	}
 
-	/* Store DTB data in instance */
-	instance->dtb_data = instance_dtb;
-	instance->dtb_size = instance_dtb_size;
-
-	/* Create instance attribute files */
-	ret = mk_create_instance_files(instance);
-	if (ret) {
-		pr_err("Failed to create attribute files for instance '%s': %d\n", name, ret);
-		goto cleanup_config;
-	}
-
-	/* Store in IDR for quick lookup */
-	ret = idr_alloc(&mk_instance_idr, instance, id, id + 1, GFP_KERNEL);
-	if (ret < 0) {
-		pr_err("Failed to allocate IDR slot %d for instance '%s': %d\n", id, name, ret);
-		goto cleanup_config;
-	}
-
-	/* Add to global list */
 	list_add_tail(&instance->list, &mk_instance_list);
 
-	/* Update instance state */
-	mk_instance_set_state(instance, MK_STATE_READY);
+	ret = idr_alloc(&mk_instance_idr, instance, id, id + 1, GFP_KERNEL);
+	if (ret < 0) {
+		pr_err("Failed to register instance '%s' in IDR: %d\n", name, ret);
+		list_del(&instance->list);
+		goto err_free_resources;
+	}
 
-	/* Activate the kernfs node */
 	kernfs_activate(kn);
-
-	/* Clean up parsed config */
+	mk_instance_set_state(instance, MK_STATE_READY);
 	mk_dt_config_free(&config);
 
-	pr_info("Created instance '%s' (ID: %d) from multikernel DTB\n", name, id);
+	pr_info("Successfully created instance '%s' (ID %d)\n", name, id);
 	return 0;
 
-cleanup_config:
-	mk_dt_config_free(&config);
-cleanup_kernfs:
+err_free_resources:
+	mk_instance_free_memory(instance);
+err_remove_dir:
 	kernfs_remove(kn);
 	mk_instance_put(instance);
-cleanup_instance_name:
+err_free_config:
+	mk_dt_config_free(&config);
+	kfree(instance->dtb_data);
+err_free_cpumask:
+	kfree(instance->cpus);
+err_free_name:
 	kfree(instance->name);
-cleanup_instance:
+err_free_instance:
 	kfree(instance);
-	kfree(instance_dtb);
 	return ret;
 }
 
@@ -417,9 +344,53 @@ static int mk_kernfs_mkdir(struct kernfs_node *parent, const char *name, umode_t
 	return -EPERM;
 }
 
+
 static int mk_kernfs_rmdir(struct kernfs_node *kn)
 {
 	return -EPERM;
+}
+
+/**
+ * mk_instance_destroy - Destroy a multikernel instance
+ * @instance: Instance to destroy
+ *
+ * Removes the instance from the global list, IDR, and kernfs.
+ * The instance must not be active or loading.
+ * Caller must hold mk_instance_mutex.
+ *
+ * Returns 0 on success, negative error code on failure.
+ */
+int mk_instance_destroy(struct mk_instance *instance)
+{
+	lockdep_assert_held(&mk_instance_mutex);
+
+	if (!instance) {
+		pr_err("NULL instance passed to mk_instance_destroy\n");
+		return -EINVAL;
+	}
+
+	if (instance->state == MK_STATE_ACTIVE) {
+		pr_err("Cannot remove active instance '%s' (ID: %d). Instance must be stopped first.\n",
+		       instance->name, instance->id);
+		return -EBUSY;
+	}
+
+	if (instance->state == MK_STATE_LOADED) {
+		pr_err("Cannot remove instance '%s' (ID: %d) with loaded kernel. Unload it first.\n",
+		       instance->name, instance->id);
+		return -EBUSY;
+	}
+
+	list_del(&instance->list);
+	idr_remove(&mk_instance_idr, instance->id);
+	if (instance->kn) {
+		kernfs_remove(instance->kn);
+		instance->kn = NULL;
+		mk_instance_put(instance);
+	}
+	mk_instance_put(instance);
+
+	return 0;
 }
 
 /**
@@ -526,6 +497,12 @@ int mk_kernfs_init(void)
 		unregister_filesystem(&mk_fs_type);
 		kernfs_destroy_root(mk_kernfs_root);
 		return ret;
+	}
+
+	ret = mk_overlay_init();
+	if (ret < 0) {
+		pr_warn("Failed to initialize overlay support: %d\n", ret);
+		/* Continue without overlay support - this is not fatal */
 	}
 
 	/* Activate the kernfs root */
