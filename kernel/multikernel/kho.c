@@ -333,6 +333,64 @@ static int __init mk_kho_restore_ipi(const void *kho_fdt, struct mk_instance *in
 	return 0;
 }
 
+static struct mk_instance * __init mk_kho_restore_host_instance(const void *kho_fdt)
+{
+	struct mk_instance *host_instance;
+	int host_ipi_node;
+	const fdt64_t *phys_prop;
+	const fdt32_t *pages_prop;
+	phys_addr_t host_ipi_phys = 0;
+	u32 host_ipi_pages = 0;
+	size_t host_ipi_size = 0;
+	int len;
+
+	host_ipi_node = fdt_subnode_offset(kho_fdt, 0, "host-ipi-buffer");
+	if (host_ipi_node < 0) {
+		pr_warn("No host-ipi-buffer node in KHO (spawn won't be able to send to host)\n");
+		return NULL;
+	}
+
+	phys_prop = fdt_getprop(kho_fdt, host_ipi_node, "phys-addr", &len);
+	if (phys_prop && len == sizeof(*phys_prop))
+		host_ipi_phys = (phys_addr_t)fdt64_to_cpu(*phys_prop);
+
+	pages_prop = fdt_getprop(kho_fdt, host_ipi_node, "pages", &len);
+	if (pages_prop && len == sizeof(*pages_prop)) {
+		host_ipi_pages = fdt32_to_cpu(*pages_prop);
+		host_ipi_size = (size_t)host_ipi_pages << PAGE_SHIFT;
+	}
+
+	if (!host_ipi_phys || !host_ipi_pages) {
+		pr_warn("Incomplete host IPI buffer info (phys=0x%llx, pages=%u)\n",
+			(unsigned long long)host_ipi_phys, host_ipi_pages);
+		return NULL;
+	}
+
+	host_instance = alloc_mk_instance(0, "/", false);
+	if (!host_instance)
+		return NULL;
+
+	/* Set CPU 0 as default target for host IPIs (physical ID) */
+	set_bit(0, host_instance->cpus);
+
+	host_instance->ipi_data = memremap(host_ipi_phys, host_ipi_size, MEMREMAP_WB);
+	if (!host_instance->ipi_data) {
+		pr_err("Failed to map host IPI buffer at 0x%llx\n",
+		       (unsigned long long)host_ipi_phys);
+		kfree(host_instance->name);
+		kfree(host_instance);
+		return NULL;
+	}
+	host_instance->ipi_phys = host_ipi_phys;
+	host_instance->ipi_pages = host_ipi_pages;
+	pr_info("Restored host IPI buffer: phys=0x%llx, virt=%px, pages=%u\n",
+		(unsigned long long)host_ipi_phys, host_instance->ipi_data,
+		host_ipi_pages);
+	pr_info("Registered host instance (ID 0) for spawn→host communication\n");
+
+	return host_instance;
+}
+
 /**
  * mk_kho_restore_dtbs() - Restore DTB from KHO shared memory
  *
@@ -347,7 +405,7 @@ int __init mk_kho_restore_dtbs(void)
 	void *dtb_virt;
 	int dtb_len;
 	int ret, cpu;
-	struct mk_instance *instance;
+	struct mk_instance *instance, *host_instance;
 	struct mk_dt_config config;
 	int instance_id;
 	const char *instance_name;
@@ -475,6 +533,10 @@ int __init mk_kho_restore_dtbs(void)
 	}
 
 	root_instance = instance;
+
+	host_instance = mk_kho_restore_host_instance(kho_fdt);
+	if (!host_instance)
+		pr_warn("Failed to restore host instance (spawn→host communication unavailable)\n");
 
 	pr_info("Successfully restored multikernel root instance %d ('%s') from KHO (%d bytes)\n",
 		instance_id, instance_name, dtb_len);
