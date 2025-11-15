@@ -32,6 +32,7 @@
 #include <linux/types.h>
 #include <linux/iommu.h>
 #include <linux/dma-map-ops.h>
+#include <linux/multikernel.h>
 
 #include "base.h"
 #include "power/power.h"
@@ -698,7 +699,7 @@ EXPORT_SYMBOL_GPL(platform_device_add_data);
 int platform_device_add(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	u32 i;
+	u32 i = 0;
 	int ret;
 
 	if (!dev->parent)
@@ -726,6 +727,13 @@ int platform_device_add(struct platform_device *pdev)
 		pdev->id_auto = true;
 		dev_set_name(dev, "%s.%d.auto", pdev->name, pdev->id);
 		break;
+	}
+
+	if (!mk_platform_device_allowed(pdev->name, NULL)) {
+		pr_info("Platform device '%s' blocked by multikernel allowlist\n",
+			pdev->name);
+		ret = -EPERM;
+		goto failed;
 	}
 
 	for (i = 0; i < pdev->num_resources; i++) {

@@ -320,6 +320,25 @@ struct mk_pci_device {
 };
 
 /**
+ * Platform device specification
+ *
+ * Represents a single platform/ACPI device that should be accessible to an instance.
+ * Platform devices are identified by ACPI HID (Hardware ID) or device name.
+ *
+ * Examples:
+ *   - i8042 keyboard controller: hid="PNP0303" or name="i8042"
+ *   - Serial port: hid="PNP0501"
+ *   - RTC: hid="PNP0B00"
+ */
+#define MK_PLATFORM_DEVICE_ID_LEN 16
+#define MK_PLATFORM_DEVICE_NAME_LEN 32
+struct mk_platform_device {
+	char hid[MK_PLATFORM_DEVICE_ID_LEN];      /* ACPI Hardware ID (e.g., "PNP0303") */
+	char name[MK_PLATFORM_DEVICE_NAME_LEN];   /* Platform device name (e.g., "i8042") */
+	struct list_head list;                     /* Link to device list */
+};
+
+/**
  * Complete multikernel device tree configuration
  *
  * This structure handles memory size requirements and CPU assignment
@@ -340,8 +359,13 @@ struct mk_dt_config {
 	int pci_device_count;            /* Number of PCI devices */
 	bool pci_devices_valid;          /* Whether PCI device list is valid */
 
+	/* Platform device resources */
+	struct list_head platform_devices;   /* List of struct mk_platform_device */
+	int platform_device_count;           /* Number of platform devices */
+	bool platform_devices_valid;         /* Whether platform device list is valid */
+
 	/* Extensibility: Reserved fields for future use */
-	u32 reserved[9];                 /* Reduced due to added fields */
+	u32 reserved[7];                 /* Reduced due to added fields */
 
 	/* Raw device tree data */
 	void *dtb_data;
@@ -373,6 +397,11 @@ struct mk_instance {
 	struct list_head pci_devices;    /* List of struct mk_pci_device */
 	int pci_device_count;            /* Number of PCI devices */
 	bool pci_devices_valid;          /* Whether PCI device list is valid */
+
+	/* Platform device resources */
+	struct list_head platform_devices;   /* List of struct mk_platform_device */
+	int platform_device_count;           /* Number of platform devices */
+	bool platform_devices_valid;         /* Whether platform device list is valid */
 
 	/* Device tree information */
 	void *dtb_data;                 /* Device tree blob data */
@@ -691,5 +720,20 @@ int __init mk_kho_restore_dtbs(void);
  * Returns: true if device is allowed, false otherwise
  */
 bool mk_pci_device_allowed(struct pci_bus *bus, int devfn, u16 vendor, u16 device);
+
+/**
+ * mk_platform_device_allowed() - Check if a platform device is allowed by DTB allowlist
+ * @name: Platform device name (e.g., "i8042", "serial8250")
+ * @hid: ACPI Hardware ID if available (e.g., "PNP0303"), can be NULL
+ *
+ * Checks if the specified platform device is allowed according to the DTB
+ * configuration in the root instance. If no root instance exists or no
+ * platform device restrictions are configured, all devices are allowed.
+ *
+ * The check matches against either the device name or ACPI HID for portability.
+ *
+ * Returns: true if device is allowed, false otherwise
+ */
+bool mk_platform_device_allowed(const char *name, const char *hid);
 
 #endif /* _LINUX_MULTIKERNEL_H */

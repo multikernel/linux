@@ -17,6 +17,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/pci.h>
 #include <linux/platform_device.h>
+#include <linux/multikernel.h>
 
 #include "internal.h"
 
@@ -135,6 +136,12 @@ struct platform_device *acpi_create_platform_device(struct acpi_device *adev,
 		} else {
 			return ERR_PTR(-EINVAL);
 		}
+	}
+
+	if (!mk_platform_device_allowed(acpi_device_name(adev), acpi_device_hid(adev))) {
+		pr_info("ACPI platform device '%s' (HID: %s) blocked by multikernel allowlist\n",
+			acpi_device_name(adev), acpi_device_hid(adev));
+		return ERR_PTR(-EPERM);
 	}
 
 	INIT_LIST_HEAD(&resource_list);

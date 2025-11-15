@@ -55,11 +55,16 @@ void mk_dt_config_init(struct mk_dt_config *config)
 	INIT_LIST_HEAD(&config->pci_devices);
 	config->pci_device_count = 0;
 	config->pci_devices_valid = true;
+
+	INIT_LIST_HEAD(&config->platform_devices);
+	config->platform_device_count = 0;
+	config->platform_devices_valid = true;
 }
 
 void mk_dt_config_free(struct mk_dt_config *config)
 {
-	struct mk_pci_device *pci_dev, *tmp;
+	struct mk_pci_device *pci_dev, *tmp_pci;
+	struct mk_platform_device *plat_dev, *tmp_plat;
 
 	if (!config)
 		return;
@@ -68,12 +73,22 @@ void mk_dt_config_free(struct mk_dt_config *config)
 
 	/* Free PCI device list */
 	if (config->pci_devices_valid) {
-		list_for_each_entry_safe(pci_dev, tmp, &config->pci_devices, list) {
+		list_for_each_entry_safe(pci_dev, tmp_pci, &config->pci_devices, list) {
 			list_del(&pci_dev->list);
 			kfree(pci_dev);
 		}
 		config->pci_device_count = 0;
 		config->pci_devices_valid = false;
+	}
+
+	/* Free platform device list */
+	if (config->platform_devices_valid) {
+		list_for_each_entry_safe(plat_dev, tmp_plat, &config->platform_devices, list) {
+			list_del(&plat_dev->list);
+			kfree(plat_dev);
+		}
+		config->platform_device_count = 0;
+		config->platform_devices_valid = false;
 	}
 
 	/* Reset memory size */
@@ -253,6 +268,54 @@ static int mk_dt_parse_single_pci_device(const void *source_fdt, int dev_node,
 	return 0;
 }
 
+static int mk_dt_parse_single_platform_device(const void *source_fdt, int dev_node,
+					      struct mk_dt_config *config,
+					      const char *device_name)
+{
+	const char *hid_str = NULL, *name_str = NULL;
+	struct mk_platform_device *plat_dev;
+	const char *node_name;
+	int len;
+
+	node_name = fdt_get_name(source_fdt, dev_node, NULL);
+
+	hid_str = fdt_getprop(source_fdt, dev_node, "acpi-hid", &len);
+
+	name_str = fdt_getprop(source_fdt, dev_node, "device-name", &len);
+
+	if (!hid_str && !name_str) {
+		pr_err("Platform device '%s' (node '%s') has neither acpi-hid nor device-name\n",
+		       device_name, node_name ? node_name : "<unnamed>");
+		return -EINVAL;
+	}
+
+	plat_dev = kzalloc(sizeof(*plat_dev), GFP_KERNEL);
+	if (!plat_dev) {
+		pr_err("Failed to allocate memory for platform device\n");
+		return -ENOMEM;
+	}
+
+	if (hid_str) {
+		strncpy(plat_dev->hid, hid_str, MK_PLATFORM_DEVICE_ID_LEN - 1);
+		plat_dev->hid[MK_PLATFORM_DEVICE_ID_LEN - 1] = '\0';
+	}
+
+	if (name_str) {
+		strncpy(plat_dev->name, name_str, MK_PLATFORM_DEVICE_NAME_LEN - 1);
+		plat_dev->name[MK_PLATFORM_DEVICE_NAME_LEN - 1] = '\0';
+	}
+
+	list_add_tail(&plat_dev->list, &config->platform_devices);
+	config->platform_device_count++;
+
+	pr_info("Added platform device '%s': name='%s' hid='%s'\n",
+		device_name,
+		plat_dev->name[0] ? plat_dev->name : "(none)",
+		plat_dev->hid[0] ? plat_dev->hid : "(none)");
+
+	return 0;
+}
+
 /**
  * Device parsing using string array with device-type dispatching
  *
@@ -274,12 +337,20 @@ static int mk_dt_parse_single_pci_device(const void *source_fdt, int dev_node,
  *               vendor-id = <0x1af4>;
  *               device-id = <0x1041>;
  *           };
+ *           serial_console {
+ *               device-type = "platform";
+ *               device-name = "serial8250";
+ *           };
+ *           keyboard {
+ *               device-type = "platform";
+ *               acpi-hid = "PNP0303";
+ *           };
  *       };
  *   };
  *
  * Example overlay:
  *   resources {
- *       device-names = "enp9s0_dev", "serial_console";
+ *       device-names = "enp9s0_dev", "serial_console", "keyboard";
  *   };
  */
 static int mk_dt_parse_devices(const void *fdt, int chosen_node,
@@ -346,6 +417,20 @@ static int mk_dt_parse_devices(const void *fdt, int chosen_node,
 							    config, device_name);
 			if (ret) {
 				pr_err("Failed to parse PCI device '%s': %d\n",
+				       device_name, ret);
+				return ret;
+			}
+		} else if (strcmp(device_type, "platform") == 0) {
+			if (!config->platform_devices_valid) {
+				pr_warn("Platform device '%s' found but platform device list not available\n",
+					device_name);
+				offset += strlen(device_name) + 1;
+				continue;
+			}
+			ret = mk_dt_parse_single_platform_device(base_fdt, dev_node,
+								 config, device_name);
+			if (ret) {
+				pr_err("Failed to parse platform device '%s': %d\n",
 				       device_name, ret);
 				return ret;
 			}
@@ -435,9 +520,9 @@ int mk_dt_parse(const void *dtb_data, size_t dtb_size,
 		return ret;
 	}
 
-	pr_info("Successfully parsed multikernel device tree with %zu bytes memory, %d CPUs, and %d PCI devices\n",
+	pr_info("Successfully parsed multikernel device tree with %zu bytes memory, %d CPUs, %d PCI devices, and %d platform devices\n",
 		config->memory_size, config->cpus ? bitmap_weight(config->cpus, NR_CPUS) : 0,
-		config->pci_device_count);
+		config->pci_device_count, config->platform_device_count);
 	return 0;
 }
 
@@ -485,10 +570,10 @@ int mk_dt_parse_resources(const void *fdt, int resources_node,
 		return ret;
 	}
 
-	pr_info("Successfully parsed instance '%s': %zu bytes memory, %d CPUs, %d PCI devices\n",
+	pr_info("Successfully parsed instance '%s': %zu bytes memory, %d CPUs, %d PCI devices, %d platform devices\n",
 		instance_name, config->memory_size,
 		config->cpus ? bitmap_weight(config->cpus, NR_CPUS) : 0,
-		config->pci_device_count);
+		config->pci_device_count, config->platform_device_count);
 	return 0;
 }
 
@@ -684,6 +769,7 @@ int mk_dt_get_property_size(const void *dtb_data, size_t dtb_size,
 void mk_dt_print_config(const struct mk_dt_config *config)
 {
 	struct mk_pci_device *pci_dev;
+	struct mk_platform_device *plat_dev;
 
 	if (!config) {
 		pr_info("Multikernel DT config: (null)\n");
@@ -724,6 +810,21 @@ void mk_dt_print_config(const struct mk_dt_config *config)
 		}
 	} else {
 		pr_info("  PCI devices: unavailable\n");
+	}
+
+	if (config->platform_devices_valid) {
+		if (config->platform_device_count == 0) {
+			pr_info("  Platform devices: none specified\n");
+		} else {
+			pr_info("  Platform devices: %d device(s)\n", config->platform_device_count);
+			list_for_each_entry(plat_dev, &config->platform_devices, list) {
+				pr_info("    - name='%s' hid='%s'\n",
+					plat_dev->name[0] ? plat_dev->name : "(none)",
+					plat_dev->hid[0] ? plat_dev->hid : "(none)");
+			}
+		}
+	} else {
+		pr_info("  Platform devices: unavailable\n");
 	}
 
 	pr_info("  DTB: %zu bytes\n", config->dtb_size);
@@ -842,6 +943,30 @@ int mk_dt_generate_instance_dtb(const char *name, int id,
 			if (ret) goto err_free;
 			ret = fdt_property_u32(fdt, "function", pci_dev->func);
 			if (ret) goto err_free;
+
+			ret = fdt_end_node(fdt);
+			if (ret) goto err_free;
+		}
+	}
+
+	if (config->platform_devices_valid && config->platform_device_count > 0) {
+		struct mk_platform_device *plat_dev;
+		int dev_idx = 0;
+		list_for_each_entry(plat_dev, &config->platform_devices, list) {
+			char node_name[64];
+			snprintf(node_name, sizeof(node_name), "platform@%d", dev_idx++);
+
+			ret = fdt_begin_node(fdt, node_name);
+			if (ret) goto err_free;
+
+			if (plat_dev->hid[0]) {
+				ret = fdt_property_string(fdt, "hid", plat_dev->hid);
+				if (ret) goto err_free;
+			}
+			if (plat_dev->name[0]) {
+				ret = fdt_property_string(fdt, "name", plat_dev->name);
+				if (ret) goto err_free;
+			}
 
 			ret = fdt_end_node(fdt);
 			if (ret) goto err_free;

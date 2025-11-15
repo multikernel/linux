@@ -262,6 +262,9 @@ static struct mk_instance * __init alloc_mk_instance(int instance_id, const char
 	INIT_LIST_HEAD(&instance->pci_devices);
 	instance->pci_devices_valid = false;
 	instance->pci_device_count = 0;
+	INIT_LIST_HEAD(&instance->platform_devices);
+	instance->platform_devices_valid = false;
+	instance->platform_device_count = 0;
 
 	mutex_lock(&mk_instance_mutex);
 	ret = idr_alloc(&mk_instance_idr, instance, instance_id, instance_id + 1, GFP_KERNEL);
@@ -324,6 +327,43 @@ static int __init mk_kho_copy_pci_devices(const struct mk_dt_config *config,
 	}
 
 	pr_info("Copied %d PCI devices to root instance\n", instance->pci_device_count);
+	return 0;
+}
+
+static int __init mk_kho_copy_platform_devices(const struct mk_dt_config *config,
+					       struct mk_instance *instance)
+{
+	struct mk_platform_device *src_dev, *dst_dev;
+
+	if (!config->platform_devices_valid || config->platform_device_count == 0) {
+		INIT_LIST_HEAD(&instance->platform_devices);
+		instance->platform_device_count = 0;
+		instance->platform_devices_valid = false;
+		pr_debug("No platform devices in DTB\n");
+		return 0;
+	}
+
+	INIT_LIST_HEAD(&instance->platform_devices);
+	instance->platform_device_count = 0;
+	instance->platform_devices_valid = true;
+
+	list_for_each_entry(src_dev, &config->platform_devices, list) {
+		dst_dev = kzalloc(sizeof(*dst_dev), GFP_KERNEL);
+		if (!dst_dev) {
+			pr_err("Failed to allocate platform device entry\n");
+			return -ENOMEM;
+		}
+
+		strncpy(dst_dev->hid, src_dev->hid, MK_PLATFORM_DEVICE_ID_LEN - 1);
+		dst_dev->hid[MK_PLATFORM_DEVICE_ID_LEN - 1] = '\0';
+		strncpy(dst_dev->name, src_dev->name, MK_PLATFORM_DEVICE_NAME_LEN - 1);
+		dst_dev->name[MK_PLATFORM_DEVICE_NAME_LEN - 1] = '\0';
+
+		list_add_tail(&dst_dev->list, &instance->platform_devices);
+		instance->platform_device_count++;
+	}
+
+	pr_info("Copied %d platform devices to root instance\n", instance->platform_device_count);
 	return 0;
 }
 
@@ -573,13 +613,19 @@ int __init mk_kho_restore_dtbs(void)
 	ret = mk_kho_copy_pci_devices(&config, instance);
 	if (ret) {
 		pr_err("Failed to copy PCI devices: %d\n", ret);
-		goto cleanup_pci_devices;
+		goto cleanup_devices;
+	}
+
+	ret = mk_kho_copy_platform_devices(&config, instance);
+	if (ret) {
+		pr_err("Failed to copy platform devices: %d\n", ret);
+		goto cleanup_devices;
 	}
 
 	ret = mk_kho_restore_ipi(kho_fdt, instance);
 	if (ret) {
 		pr_err("Failed to restore IPI buffer: %d\n", ret);
-		goto cleanup_pci_devices;
+		goto cleanup_devices;
 	}
 
 	root_instance = instance;
@@ -595,12 +641,19 @@ int __init mk_kho_restore_dtbs(void)
 	early_memunmap((void *)kho_fdt, PAGE_SIZE);
 	return 0;
 
-cleanup_pci_devices:
+cleanup_devices:
 	if (instance->pci_devices_valid) {
-		struct mk_pci_device *pci_dev, *tmp;
-		list_for_each_entry_safe(pci_dev, tmp, &instance->pci_devices, list) {
+		struct mk_pci_device *pci_dev, *tmp_pci;
+		list_for_each_entry_safe(pci_dev, tmp_pci, &instance->pci_devices, list) {
 			list_del(&pci_dev->list);
 			kfree(pci_dev);
+		}
+	}
+	if (instance->platform_devices_valid) {
+		struct mk_platform_device *plat_dev, *tmp_plat;
+		list_for_each_entry_safe(plat_dev, tmp_plat, &instance->platform_devices, list) {
+			list_del(&plat_dev->list);
+			kfree(plat_dev);
 		}
 	}
 	kfree(instance->dtb_data);
@@ -675,6 +728,36 @@ bool mk_pci_device_allowed(struct pci_bus *bus, int devfn, u16 vendor, u16 devic
 }
 EXPORT_SYMBOL_GPL(mk_pci_device_allowed);
 
+bool mk_platform_device_allowed(const char *name, const char *hid)
+{
+	struct mk_platform_device *plat_dev;
+
+	if (!root_instance->dtb_data)
+		return true;
+
+	if (!root_instance->platform_devices_valid)
+		return false;
+
+	if (list_empty(&root_instance->platform_devices) || root_instance->platform_device_count == 0)
+		return false;
+
+	list_for_each_entry(plat_dev, &root_instance->platform_devices, list) {
+		if (hid && plat_dev->hid[0] && strcmp(plat_dev->hid, hid) == 0) {
+			pr_info("Platform device '%s' allowed by HID match: hid='%s'\n",
+				name ? name : "(none)", hid);
+			return true;
+		}
+
+		if (name && plat_dev->name[0] && strcmp(plat_dev->name, name) == 0) {
+			pr_info("Platform device '%s' allowed by name match\n", name);
+			return true;
+		}
+	}
+
+	return false;
+}
+EXPORT_SYMBOL_GPL(mk_platform_device_allowed);
+
 #else /* !CONFIG_KEXEC_HANDOVER */
 
 /* No root instance when KHO is not enabled */
@@ -691,5 +774,11 @@ bool mk_pci_device_allowed(u16 vendor, u16 device, u16 domain, u8 bus, u8 devfn,
 	return true;
 }
 EXPORT_SYMBOL_GPL(mk_pci_device_allowed);
+
+bool mk_platform_device_allowed(const char *name, const char *hid)
+{
+	return true;
+}
+EXPORT_SYMBOL_GPL(mk_platform_device_allowed);
 
 #endif /* CONFIG_KEXEC_HANDOVER */

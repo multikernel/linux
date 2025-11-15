@@ -246,6 +246,7 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 	INIT_LIST_HEAD(&instance->memory_regions);
 	INIT_LIST_HEAD(&instance->list);
 	INIT_LIST_HEAD(&instance->pci_devices);
+	INIT_LIST_HEAD(&instance->platform_devices);
 	kref_init(&instance->refcount);
 
 	kn = kernfs_create_dir(mk_instances_kn, name, 0755, instance);
