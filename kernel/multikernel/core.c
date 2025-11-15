@@ -131,9 +131,19 @@ int mk_instance_set_kexec_active(int mk_id)
  * CPU management functions for instances
  */
 
+/**
+ * mk_instance_offline_cpus - Offline CPUs for a multikernel instance
+ * @instance: Instance whose CPUs should be offlined
+ *
+ * Uses the hotplug infrastructure to offline all CPUs assigned to the instance.
+ * This ensures consistent operation tracking and proper resource management.
+ *
+ * Returns 0 on success, negative error code on failure.
+ */
 static int mk_instance_offline_cpus(struct mk_instance *instance)
 {
 	int phys_cpu, logical_cpu, ret = 0, failed_count = 0;
+	struct mk_cpu_resource_payload payload;
 
 	pr_info("Bringing CPUs offline for multikernel instance %d (%s): %*pbl\n",
 		instance->id, instance->name, NR_CPUS, instance->cpus);
@@ -145,23 +155,12 @@ static int mk_instance_offline_cpus(struct mk_instance *instance)
 			continue;
 		}
 
-		if (!cpu_online(logical_cpu)) {
-			pr_debug("CPU %d (phys %d) already offline for instance %d\n",
-				 logical_cpu, phys_cpu, instance->id);
-			continue;
-		}
-
-		pr_info("Taking CPU %d offline for multikernel instance %d\n", logical_cpu, instance->id);
-
-		ret = remove_cpu(logical_cpu);
-		if (ret) {
-			pr_err("Failed to take CPU %d offline for instance %d: %d\n",
-				logical_cpu, instance->id, ret);
+		payload.cpu_id = phys_cpu;
+		payload.numa_node = cpu_to_node(logical_cpu);
+		payload.flags = 0;
+		ret = mk_handle_cpu_remove(&payload, sizeof(payload));
+		if (ret)
 			failed_count++;
-		} else {
-			pr_info("Successfully took CPU %d offline for instance %d\n",
-				logical_cpu, instance->id);
-		}
 	}
 
 	if (failed_count > 0) {
@@ -618,9 +617,17 @@ static int __init multikernel_init(void)
 		return ret;
 	}
 
+	ret = mk_hotplug_init();
+	if (ret < 0) {
+		pr_err("Failed to initialize multikernel hotplug: %d\n", ret);
+		mk_messaging_cleanup();
+		return ret;
+	}
+
 	ret = mk_kernfs_init();
 	if (ret < 0) {
 		pr_err("Failed to initialize multikernel sysfs interface: %d\n", ret);
+		mk_hotplug_cleanup();
 		mk_messaging_cleanup();
 		return ret;
 	}

@@ -251,55 +251,15 @@ static inline int mk_send_irq_forward(int instance_id, u32 irq_number,
 			       &payload, sizeof(payload));
 }
 
-/* CPU resource management */
-static inline int mk_send_cpu_add(int instance_id, u32 cpu_id,
-				  u32 numa_node, u32 flags)
-{
-	struct mk_cpu_resource_payload payload = {
-		.cpu_id = cpu_id,
-		.numa_node = numa_node,
-		.flags = flags
-	};
-	return mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_CPU_ADD,
-			       &payload, sizeof(payload));
-}
-
-static inline int mk_send_cpu_remove(int instance_id, u32 cpu_id)
-{
-	struct mk_cpu_resource_payload payload = {
-		.cpu_id = cpu_id,
-		.numa_node = 0,
-		.flags = 0
-	};
-	return mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_CPU_REMOVE,
-			       &payload, sizeof(payload));
-}
+/* CPU resource management - these wait for operation to complete */
+int mk_send_cpu_add(int instance_id, u32 cpu_id, u32 numa_node, u32 flags);
+int mk_send_cpu_remove(int instance_id, u32 cpu_id);
 
 /* Memory resource management */
-static inline int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
-				  u32 numa_node, u32 mem_type)
-{
-	struct mk_mem_resource_payload payload = {
-		.start_pfn = start_pfn,
-		.nr_pages = nr_pages,
-		.numa_node = numa_node,
-		.mem_type = mem_type
-	};
-	return mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_MEM_ADD,
-			       &payload, sizeof(payload));
-}
-
-static inline int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages)
-{
-	struct mk_mem_resource_payload payload = {
-		.start_pfn = start_pfn,
-		.nr_pages = nr_pages,
-		.numa_node = 0,
-		.mem_type = 0
-	};
-	return mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_MEM_REMOVE,
-			       &payload, sizeof(payload));
-}
+/* Memory hotplug functions */
+int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
+		    u32 numa_node, u32 mem_type);
+int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages);
 
 /* Messaging system functions */
 int __init mk_messaging_init(void);
