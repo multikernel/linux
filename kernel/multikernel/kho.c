@@ -38,6 +38,7 @@
  * kernel as a source or target for resource transfers (e.g., mk,instance="/").
  */
 struct mk_instance *root_instance = NULL;
+EXPORT_SYMBOL_GPL(root_instance);
 
 /**
  * mk_kho_preserve_dtb() - Preserve multikernel DTB for kexec

@@ -81,3 +81,20 @@ config HYPERV_VSOCKETS
 
 	  To compile this driver as a module, choose M here: the module will be
 	  called hv_sock. If unsure, say N.
+
+config MULTIKERNEL_VSOCKETS
+	tristate "Multikernel transport for Virtual Sockets"
+	depends on VSOCKETS && MULTIKERNEL
+	help
+	  This module implements a multikernel transport for Virtual Sockets,
+	  enabling AF_VSOCK sockets to work between different kernel instances
+	  on the same physical machine.
+
+	  This transport uses multikernel's IPI messaging and shared memory
+	  infrastructure for communication. CID mapping is direct: CID = instance_id.
+
+	  To use this transport, applications must explicitly set the socket option
+	  SO_VM_SOCKETS_TRANSPORT to VSOCK_TRANSPORT_MULTIKERNEL.
+
+	  To compile this driver as a module, choose M here: the module will be
+	  called mk_transport. If unsure, say N.

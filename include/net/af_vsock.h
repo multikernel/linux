@@ -43,6 +43,8 @@ struct vsock_sock {
 					 */
 	u32 cached_peer;  /* Context ID of last dgram destination check. */
 	const struct cred *owner;
+	/* Transport type preference (VSOCK_TRANSPORT_*) */
+	u8 transport_type;
 	/* Rest are SOCK_STREAM only. */
 	long connect_timeout;
 	/* Listening socket that this came from. */
@@ -103,6 +105,8 @@ struct vsock_transport_send_notify_data {
 #define VSOCK_TRANSPORT_F_DGRAM		0x00000004
 /* Transport provides local (loopback) communication */
 #define VSOCK_TRANSPORT_F_LOCAL		0x00000008
+/* Transport provides multikernel communication */
+#define VSOCK_TRANSPORT_F_MULTIKERNEL	0x00000010
 
 struct vsock_transport {
 	struct module *module;

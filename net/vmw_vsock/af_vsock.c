@@ -147,6 +147,8 @@ static const struct vsock_transport *transport_g2h;
 static const struct vsock_transport *transport_dgram;
 /* Transport used for local communication */
 static const struct vsock_transport *transport_local;
+/* Transport used for multikernel communication */
+static const struct vsock_transport *transport_multikernel;
 static DEFINE_MUTEX(vsock_register_mutex);
 
 /**** UTILS ****/
@@ -468,23 +470,40 @@ int vsock_assign_transport(struct vsock_sock *vsk, struct vsock_sock *psk)
 
 	mutex_lock(&vsock_register_mutex);
 
-	switch (sk->sk_type) {
-	case SOCK_DGRAM:
-		new_transport = transport_dgram;
-		break;
-	case SOCK_STREAM:
-	case SOCK_SEQPACKET:
-		if (vsock_use_local_transport(remote_cid))
-			new_transport = transport_local;
-		else if (remote_cid <= VMADDR_CID_HOST || !transport_h2g ||
-			 (remote_flags & VMADDR_FLAG_TO_HOST))
-			new_transport = transport_g2h;
-		else
-			new_transport = transport_h2g;
-		break;
-	default:
-		ret = -ESOCKTNOSUPPORT;
-		goto err;
+	if (vsk->transport_type == VSOCK_TRANSPORT_MULTIKERNEL) {
+		switch (sk->sk_type) {
+		case SOCK_STREAM:
+		case SOCK_SEQPACKET:
+			new_transport = transport_multikernel;
+			break;
+		case SOCK_DGRAM:
+			/* Multikernel transport doesn't support dgram yet */
+			ret = -ESOCKTNOSUPPORT;
+			goto err;
+		default:
+			ret = -ESOCKTNOSUPPORT;
+			goto err;
+		}
+	} else {
+		/* Default VM transport selection */
+		switch (sk->sk_type) {
+		case SOCK_DGRAM:
+			new_transport = transport_dgram;
+			break;
+		case SOCK_STREAM:
+		case SOCK_SEQPACKET:
+			if (vsock_use_local_transport(remote_cid))
+				new_transport = transport_local;
+			else if (remote_cid <= VMADDR_CID_HOST || !transport_h2g ||
+				 (remote_flags & VMADDR_FLAG_TO_HOST))
+				new_transport = transport_g2h;
+			else
+				new_transport = transport_h2g;
+			break;
+		default:
+			ret = -ESOCKTNOSUPPORT;
+			goto err;
+		}
 	}
 
 	if (vsk->transport && vsk->transport == new_transport) {
@@ -575,6 +594,15 @@ bool vsock_find_cid(unsigned int cid)
 
 	if (transport_local && cid == VMADDR_CID_LOCAL)
 		return true;
+
+	if (transport_multikernel && cid == VMADDR_CID_ANY)
+		return true;
+
+	if (transport_multikernel) {
+		u32 local_cid = transport_multikernel->get_local_cid();
+		if (cid == local_cid)
+			return true;
+	}
 
 	return false;
 }
@@ -801,6 +829,9 @@ static struct sock *__vsock_create(struct net *net,
 	vsk = vsock_sk(sk);
 	vsock_addr_init(&vsk->local_addr, VMADDR_CID_ANY, VMADDR_PORT_ANY);
 	vsock_addr_init(&vsk->remote_addr, VMADDR_CID_ANY, VMADDR_PORT_ANY);
+
+	/* Default to VM transport */
+	vsk->transport_type = VSOCK_TRANSPORT_VM;
 
 	sk->sk_destruct = vsock_sk_destruct;
 	sk->sk_backlog_rcv = vsock_queue_rcv_skb;
@@ -1961,6 +1992,27 @@ static int vsock_connectible_setsockopt(struct socket *sock,
 		break;
 	}
 
+	case SO_VM_SOCKETS_TRANSPORT: {
+		int transport_type;
+
+		/* Can only set transport type before connection */
+		if (sk->sk_state != TCP_CLOSE) {
+			err = -EISCONN;
+			break;
+		}
+
+		COPY_IN(transport_type);
+
+		if (transport_type != VSOCK_TRANSPORT_VM &&
+		    transport_type != VSOCK_TRANSPORT_MULTIKERNEL) {
+			err = -EINVAL;
+			break;
+		}
+
+		vsk->transport_type = transport_type;
+		break;
+	}
+
 	default:
 		err = -ENOPROTOOPT;
 		break;
@@ -2016,6 +2068,11 @@ static int vsock_connectible_getsockopt(struct socket *sock,
 	case SO_VM_SOCKETS_CONNECT_TIMEOUT_OLD:
 		lv = sock_get_timeout(vsk->connect_timeout, &v,
 				      optname == SO_VM_SOCKETS_CONNECT_TIMEOUT_OLD);
+		break;
+
+	case SO_VM_SOCKETS_TRANSPORT:
+		v.val64 = vsk->transport_type;
+		lv = sizeof(v.val64);
 		break;
 
 	default:
@@ -2716,7 +2773,7 @@ EXPORT_SYMBOL_GPL(vsock_core_get_transport);
 
 int vsock_core_register(const struct vsock_transport *t, int features)
 {
-	const struct vsock_transport *t_h2g, *t_g2h, *t_dgram, *t_local;
+	const struct vsock_transport *t_h2g, *t_g2h, *t_dgram, *t_local, *t_mk;
 	int err = mutex_lock_interruptible(&vsock_register_mutex);
 
 	if (err)
@@ -2726,6 +2783,7 @@ int vsock_core_register(const struct vsock_transport *t, int features)
 	t_g2h = transport_g2h;
 	t_dgram = transport_dgram;
 	t_local = transport_local;
+	t_mk = transport_multikernel;
 
 	if (features & VSOCK_TRANSPORT_F_H2G) {
 		if (t_h2g) {
@@ -2759,10 +2817,19 @@ int vsock_core_register(const struct vsock_transport *t, int features)
 		t_local = t;
 	}
 
+	if (features & VSOCK_TRANSPORT_F_MULTIKERNEL) {
+		if (t_mk) {
+			err = -EBUSY;
+			goto err_busy;
+		}
+		t_mk = t;
+	}
+
 	transport_h2g = t_h2g;
 	transport_g2h = t_g2h;
 	transport_dgram = t_dgram;
 	transport_local = t_local;
+	transport_multikernel = t_mk;
 
 err_busy:
 	mutex_unlock(&vsock_register_mutex);
@@ -2785,6 +2852,9 @@ void vsock_core_unregister(const struct vsock_transport *t)
 
 	if (transport_local == t)
 		transport_local = NULL;
+
+	if (transport_multikernel == t)
+		transport_multikernel = NULL;
 
 	mutex_unlock(&vsock_register_mutex);
 }

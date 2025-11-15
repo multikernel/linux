@@ -87,6 +87,17 @@
 
 #define SO_VM_SOCKETS_CONNECT_TIMEOUT_NEW 8
 
+/* Option name for selecting vsock transport type.  Use as the option name
+ * in setsockopt(3) or getsockopt(3) to set or get the transport type for
+ * a vSocket.  The value is a signed integer.
+ */
+
+#define SO_VM_SOCKETS_TRANSPORT 9
+
+/* Transport type values for SO_VM_SOCKETS_TRANSPORT */
+#define VSOCK_TRANSPORT_VM          0  /* VM vsock (virtio, vmci, etc.) - default */
+#define VSOCK_TRANSPORT_MULTIKERNEL 1  /* Multikernel transport */
+
 #if !defined(__KERNEL__)
 #if __BITS_PER_LONG == 64 || (defined(__x86_64__) && defined(__ILP32__))
 #define SO_VM_SOCKETS_CONNECT_TIMEOUT SO_VM_SOCKETS_CONNECT_TIMEOUT_OLD

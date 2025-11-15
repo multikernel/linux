@@ -99,6 +99,7 @@ void generic_multikernel_interrupt(void);
 #define MK_MSG_RESOURCE     0x2000
 #define MK_MSG_SYSTEM       0x3000
 #define MK_MSG_USER         0x4000
+#define MK_MSG_NETWORK      0x5000
 
 /* I/O interrupt forwarding subtypes */
 #define MK_IO_IRQ_FORWARD   (MK_MSG_IO + 1)
@@ -120,6 +121,10 @@ void generic_multikernel_interrupt(void);
 #define MK_SYS_HEARTBEAT    (MK_MSG_SYSTEM + 1)
 #define MK_SYS_SHUTDOWN     (MK_MSG_SYSTEM + 2)
 #define MK_SYS_SHUTDOWN_ACK (MK_MSG_SYSTEM + 3)
+
+/* Network/vsock subtypes */
+#define MK_NET_VSOCK_PKT    (MK_MSG_NETWORK + 1)  /* vsock packet */
+#define MK_NET_DATA_READY   (MK_MSG_NETWORK + 2)  /* Data available notification */
 
 /**
  * Core message structure
@@ -319,6 +324,13 @@ enum mk_instance_state {
 	MK_STATE_ACTIVE,        /* Kernel running */
 	MK_STATE_FAILED,        /* Error occurred */
 };
+
+/**
+ * Root instance pointer - points to the current running kernel instance
+ * In the host kernel, this is instance 0.
+ * In a spawn kernel, this is the spawned instance (1, 2, etc.).
+ */
+extern struct mk_instance *root_instance;
 
 /**
  * Memory region wrapper
