@@ -24,3 +24,8 @@ extern struct kernfs_node *mk_overlay_root_kn;
 int mk_overlay_init(void);
 void mk_overlay_exit(void);
 int mk_overlay_rmdir(struct kernfs_node *kn);
+
+/* hotplug.c */
+int mk_hotplug_init(void);
+void mk_hotplug_cleanup(void);
+int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_len);
