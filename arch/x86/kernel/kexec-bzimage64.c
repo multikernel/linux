@@ -20,6 +20,7 @@
 #include <linux/of_fdt.h>
 #include <linux/efi.h>
 #include <linux/random.h>
+#include <linux/multikernel.h>
 
 #include <asm/bootparam.h>
 #include <asm/setup.h>
@@ -118,8 +119,10 @@ static int setup_e820_entries(struct boot_params *params)
 	return 0;
 }
 
-static int setup_e820_entries_multikernel(struct boot_params *params)
+static int setup_e820_entries_multikernel(struct kimage *image, struct boot_params *params)
 {
+	struct mk_instance *instance = image->mk_instance;
+	struct mk_memory_region *region;
 	unsigned int nr_e820_entries = 0;
 	int i;
 
@@ -151,9 +154,32 @@ static int setup_e820_entries_multikernel(struct boot_params *params)
 		nr_e820_entries++;
 	}
 
+	pr_info("Set up multikernel e820 map with %d entries from first 1MB\n",
+		nr_e820_entries);
+
+	if (instance && !list_empty(&instance->memory_regions)) {
+		list_for_each_entry(region, &instance->memory_regions, list) {
+			if (nr_e820_entries >= E820_MAX_ENTRIES_ZEROPAGE) {
+				pr_warn("E820 table full, cannot add all memory regions\n");
+				break;
+			}
+
+			params->e820_table[nr_e820_entries].addr = region->res.start;
+			params->e820_table[nr_e820_entries].size = resource_size(&region->res);
+			params->e820_table[nr_e820_entries].type = E820_TYPE_RAM;
+
+			pr_info("Added memory region to e820: 0x%llx-0x%llx (%llu MB)\n",
+				(unsigned long long)region->res.start,
+				(unsigned long long)region->res.end,
+				(unsigned long long)resource_size(&region->res) >> 20);
+
+			nr_e820_entries++;
+		}
+	}
+
 	params->e820_entries = nr_e820_entries;
 
-	pr_info("Set up multikernel e820 map with %d entries from first 1MB\n",
+	pr_info("Final multikernel e820 map has %d total entries\n",
 		nr_e820_entries);
 
 	return 0;
@@ -376,7 +402,7 @@ setup_boot_parameters(struct kimage *image, struct boot_params *params,
 	} else
 #endif
 	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
-		ret = setup_e820_entries_multikernel(params);
+		ret = setup_e820_entries_multikernel(image, params);
 		if (ret)
 			return ret;
 	} else {
