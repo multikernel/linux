@@ -1010,6 +1010,34 @@ static int do_boot_cpu(u32 apicid, unsigned int cpu, struct task_struct *idle)
 	idle->thread.sp = (unsigned long)task_pt_regs(idle);
 	initial_code = (unsigned long)start_secondary;
 
+	/*
+	 * For multikernel, update the shared trampoline to point to this
+	 * kernel's code and page tables. Multiple kernels share the same
+	 * trampoline in the first 1MB, so each must update it before booting
+	 * a CPU to ensure the CPU boots into the correct kernel with the
+	 * correct page tables.
+	 */
+	if (IS_ENABLED(CONFIG_MULTIKERNEL)) {
+		struct trampoline_header *th =
+			(struct trampoline_header *)__va(real_mode_header->trampoline_header);
+		u64 *trampoline_pgd = (u64 *)__va(real_mode_header->trampoline_pgd);
+		u64 efer;
+		int i;
+
+		th->start = (u64)secondary_startup_64;
+		rdmsrq(MSR_EFER, efer);
+		th->efer = efer & ~EFER_LMA;
+		th->cr4 = mmu_cr4_features;
+		th->flags = 0;
+		th->lock = 0;
+
+		extern pgd_t trampoline_pgd_entry;
+		trampoline_pgd[0] = trampoline_pgd_entry.pgd;
+
+		for (i = pgd_index(__PAGE_OFFSET); i < PTRS_PER_PGD; i++)
+			trampoline_pgd[i] = init_top_pgt[i].pgd;
+	}
+
 	if (IS_ENABLED(CONFIG_X86_32)) {
 		early_gdt_descr.address = (unsigned long)get_cpu_gdt_rw(cpu);
 		initial_stack  = idle->thread.sp;
