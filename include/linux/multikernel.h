@@ -343,6 +343,23 @@ struct mk_memory_region {
 };
 
 /**
+ * PCI device specification
+ *
+ * Represents a single PCI device that should be accessible to an instance.
+ * Format: vendor:device@domain:bus:slot.func
+ */
+struct mk_pci_device {
+	char name[64];     /* Device name from DTB (e.g., "enp9s0_dev") */
+	u16 vendor;        /* PCI vendor ID */
+	u16 device;        /* PCI device ID */
+	u16 domain;        /* PCI domain number */
+	u8 bus;            /* PCI bus number */
+	u8 slot;           /* PCI slot number */
+	u8 func;           /* PCI function number */
+	struct list_head list;  /* Link to device list */
+};
+
+/**
  * Complete multikernel device tree configuration
  *
  * This structure handles memory size requirements and CPU assignment
@@ -358,8 +375,13 @@ struct mk_dt_config {
 	/* CPU resources */
 	unsigned long *cpus;             /* Bitmap of physical CPU IDs */
 
+	/* PCI device resources */
+	struct list_head pci_devices;    /* List of struct mk_pci_device */
+	int pci_device_count;            /* Number of PCI devices */
+	bool pci_devices_valid;          /* Whether PCI device list is valid */
+
 	/* Extensibility: Reserved fields for future use */
-	u32 reserved[12];                /* Increased due to removed fields */
+	u32 reserved[9];                 /* Reduced due to added fields */
 
 	/* Raw device tree data */
 	void *dtb_data;
@@ -386,6 +408,11 @@ struct mk_instance {
 
 	/* CPU resources */
 	unsigned long *cpus;             /* Bitmap of assigned physical CPU IDs */
+
+	/* PCI device resources */
+	struct list_head pci_devices;    /* List of struct mk_pci_device */
+	int pci_device_count;            /* Number of PCI devices */
+	bool pci_devices_valid;          /* Whether PCI device list is valid */
 
 	/* Device tree information */
 	void *dtb_data;                 /* Device tree blob data */
@@ -621,10 +648,12 @@ int mk_instance_set_kexec_active(int mk_id);
  */
 #define MK_DT_RESOURCE_MEMORY   "memory-bytes"
 #define MK_DT_RESOURCE_CPUS     "cpus"
+#define MK_DT_RESOURCE_DEVICES  "devices"
 
 static const char * const mk_resource_properties[] = {
 	MK_DT_RESOURCE_MEMORY,
 	MK_DT_RESOURCE_CPUS,
+	MK_DT_RESOURCE_DEVICES,
 	NULL  /* Sentinel */
 };
 
@@ -679,5 +708,28 @@ int mk_kho_preserve_host_ipi(struct kimage *image, void *fdt);
  * Returns: 0 on success, negative error code on failure
  */
 int __init mk_kho_restore_dtbs(void);
+
+/**
+ * PCI Device Enforcement Functions
+ */
+
+/**
+ * mk_pci_device_allowed() - Check if a PCI device is allowed
+ * @bus: PCI bus the device is on
+ * @devfn: PCI device/function number
+ * @vendor: PCI vendor ID
+ * @device: PCI device ID
+ *
+ * Checks if the specified PCI device is allowed according to the DTB
+ * configuration in the root instance. For bridges, automatically reads
+ * the secondary/subordinate bus numbers and checks if the bridge is on
+ * the path to any allowed devices.
+ *
+ * This function encapsulates all multikernel-specific PCI logic including
+ * reading config space to determine bridge topology.
+ *
+ * Returns: true if device is allowed, false otherwise
+ */
+bool mk_pci_device_allowed(struct pci_bus *bus, int devfn, u16 vendor, u16 device);
 
 #endif /* _LINUX_MULTIKERNEL_H */

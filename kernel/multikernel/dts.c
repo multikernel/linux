@@ -24,6 +24,21 @@
 
 #include "internal.h"
 
+static const void *mk_dt_get_base_fdt(void)
+{
+	if (!root_instance || !root_instance->dtb_data) {
+		pr_err("No base DTB available (root_instance not initialized)\n");
+		return NULL;
+	}
+
+	if (fdt_check_header(root_instance->dtb_data) != 0) {
+		pr_err("Base DTB has invalid header\n");
+		return NULL;
+	}
+
+	return root_instance->dtb_data;
+}
+
 /**
  * Configuration initialization and cleanup
  */
@@ -36,14 +51,30 @@ void mk_dt_config_init(struct mk_dt_config *config)
 	config->cpus = kzalloc(BITS_TO_LONGS(NR_CPUS) * sizeof(unsigned long), GFP_KERNEL);
 	if (!config->cpus)
 		pr_warn("Failed to allocate CPU bitmap, CPU assignment disabled\n");
+
+	INIT_LIST_HEAD(&config->pci_devices);
+	config->pci_device_count = 0;
+	config->pci_devices_valid = true;
 }
 
 void mk_dt_config_free(struct mk_dt_config *config)
 {
+	struct mk_pci_device *pci_dev, *tmp;
+
 	if (!config)
 		return;
 
 	kfree(config->cpus);
+
+	/* Free PCI device list */
+	if (config->pci_devices_valid) {
+		list_for_each_entry_safe(pci_dev, tmp, &config->pci_devices, list) {
+			list_del(&pci_dev->list);
+			kfree(pci_dev);
+		}
+		config->pci_device_count = 0;
+		config->pci_devices_valid = false;
+	}
 
 	/* Reset memory size */
 	config->memory_size = 0;
@@ -58,6 +89,8 @@ static int mk_dt_parse_memory(const void *fdt, int chosen_node,
 			      struct mk_dt_config *config);
 static int mk_dt_parse_cpus(const void *fdt, int chosen_node,
 			    struct mk_dt_config *config);
+static int mk_dt_parse_devices(const void *fdt, int chosen_node,
+			       struct mk_dt_config *config);
 static int mk_dt_validate_memory(const struct mk_dt_config *config);
 static int mk_dt_validate_cpus(const struct mk_dt_config *config);
 
@@ -157,6 +190,182 @@ static int mk_dt_parse_cpus(const void *fdt, int chosen_node,
 	return 0;
 }
 
+static int mk_dt_parse_single_pci_device(const void *source_fdt, int dev_node,
+					 struct mk_dt_config *config,
+					 const char *device_name)
+{
+	const char *pci_id_str;
+	const fdt32_t *vendor_prop, *device_prop;
+	struct mk_pci_device *pci_dev;
+	unsigned int domain, bus, slot, func;
+	const char *node_name;
+	int len;
+
+	node_name = fdt_get_name(source_fdt, dev_node, NULL);
+
+	pci_id_str = fdt_getprop(source_fdt, dev_node, "pci-id", &len);
+	if (!pci_id_str) {
+		pr_err("No pci-id property in device '%s' (node '%s')\n",
+		       device_name, node_name ? node_name : "<unnamed>");
+		return -EINVAL;
+	}
+
+	if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
+		pr_err("Invalid pci-id format: '%s' (expected domain:bus:slot.func)\n",
+		       pci_id_str);
+		return -EINVAL;
+	}
+
+	vendor_prop = fdt_getprop(source_fdt, dev_node, "vendor-id", &len);
+	if (!vendor_prop || len != 4) {
+		pr_err("Missing or invalid vendor-id in device '%s' (node '%s')\n",
+		       device_name, node_name ? node_name : "<unnamed>");
+		return -EINVAL;
+	}
+
+	device_prop = fdt_getprop(source_fdt, dev_node, "device-id", &len);
+	if (!device_prop || len != 4) {
+		pr_err("Missing or invalid device-id in device '%s' (node '%s')\n",
+		       device_name, node_name ? node_name : "<unnamed>");
+		return -EINVAL;
+	}
+
+	pci_dev = kzalloc(sizeof(*pci_dev), GFP_KERNEL);
+	if (!pci_dev) {
+		pr_err("Failed to allocate memory for PCI device\n");
+		return -ENOMEM;
+	}
+
+	pci_dev->vendor = (u16)fdt32_to_cpu(*vendor_prop);
+	pci_dev->device = (u16)fdt32_to_cpu(*device_prop);
+	pci_dev->domain = (u16)domain;
+	pci_dev->bus = (u8)bus;
+	pci_dev->slot = (u8)slot;
+	pci_dev->func = (u8)func;
+
+	list_add_tail(&pci_dev->list, &config->pci_devices);
+	config->pci_device_count++;
+
+	pr_info("Added PCI device '%s': %04x:%04x@%04x:%02x:%02x.%x\n",
+		device_name, pci_dev->vendor, pci_dev->device,
+		pci_dev->domain, pci_dev->bus, pci_dev->slot, pci_dev->func);
+
+	return 0;
+}
+
+/**
+ * Device parsing using string array with device-type dispatching
+ *
+ * Format: device-names = "dev1", "dev2", ...;
+ *
+ * This approach:
+ * - Uses simple string names instead of phandles
+ * - No need for dtc -@ compilation
+ * - No __symbols__ or __fixups__ complexity
+ * - Just looks up /resources/devices/{name} in base DTB
+ * - Reads device-type property first to dispatch to correct parser
+ *
+ * Example base DTB:
+ *   resources {
+ *       devices {
+ *           enp9s0_dev {
+ *               device-type = "pci";
+ *               pci-id = "0000:09:00.0";
+ *               vendor-id = <0x1af4>;
+ *               device-id = <0x1041>;
+ *           };
+ *       };
+ *   };
+ *
+ * Example overlay:
+ *   resources {
+ *       device-names = "enp9s0_dev", "serial_console";
+ *   };
+ */
+static int mk_dt_parse_devices(const void *fdt, int chosen_node,
+			       struct mk_dt_config *config)
+{
+	const void *base_fdt;
+	const char *prop_data;
+	const char *device_name;
+	const char *device_type;
+	char device_path[256];
+	int len, offset, dev_node, ret;
+	int device_count = 0;
+
+	prop_data = fdt_getprop(fdt, chosen_node, "device-names", &len);
+	if (!prop_data) {
+		return 0;
+	}
+
+	if (len == 0) {
+		pr_debug("Empty device-names property\n");
+		return 0;
+	}
+
+	base_fdt = mk_dt_get_base_fdt();
+	if (!base_fdt) {
+		pr_err("No base DTB available - cannot resolve device names\n");
+		return -ENOENT;
+	}
+
+	offset = 0;
+	while (offset < len) {
+		device_name = prop_data + offset;
+
+		if (device_name[0] == '\0')
+			break;
+
+		device_count++;
+
+		snprintf(device_path, sizeof(device_path),
+			 "/resources/devices/%s", device_name);
+
+		dev_node = fdt_path_offset(base_fdt, device_path);
+		if (dev_node < 0) {
+			pr_err("Device '%s' not found in base DTB at path '%s'\n",
+			       device_name, device_path);
+			return -ENOENT;
+		}
+
+		device_type = fdt_getprop(base_fdt, dev_node, "device-type", NULL);
+		if (!device_type) {
+			pr_err("Missing device-type property in device '%s'\n",
+			       device_name);
+			return -EINVAL;
+		}
+
+		if (strcmp(device_type, "pci") == 0) {
+			if (!config->pci_devices_valid) {
+				pr_warn("PCI device '%s' found but PCI device list not available\n",
+					device_name);
+				offset += strlen(device_name) + 1;
+				continue;
+			}
+			ret = mk_dt_parse_single_pci_device(base_fdt, dev_node,
+							    config, device_name);
+			if (ret) {
+				pr_err("Failed to parse PCI device '%s': %d\n",
+				       device_name, ret);
+				return ret;
+			}
+		} else {
+			pr_err("Unknown device-type '%s' for device '%s'\n",
+			       device_type, device_name);
+			return -EINVAL;
+		}
+
+		offset += strlen(device_name) + 1;
+	}
+
+	if (device_count == 0) {
+		pr_debug("No device names found in property\n");
+		return 0;
+	}
+
+	return 0;
+}
+
 /**
  * Main device tree parsing function
  */
@@ -219,8 +428,16 @@ int mk_dt_parse(const void *dtb_data, size_t dtb_size,
 		return ret;
 	}
 
-	pr_info("Successfully parsed multikernel device tree with %zu bytes memory, %d CPUs\n",
-		config->memory_size, config->cpus ? bitmap_weight(config->cpus, NR_CPUS) : 0);
+	ret = mk_dt_parse_devices(fdt, resources_node, config);
+	if (ret) {
+		pr_err("Failed to parse device resources: %d\n", ret);
+		mk_dt_config_free(config);
+		return ret;
+	}
+
+	pr_info("Successfully parsed multikernel device tree with %zu bytes memory, %d CPUs, and %d PCI devices\n",
+		config->memory_size, config->cpus ? bitmap_weight(config->cpus, NR_CPUS) : 0,
+		config->pci_device_count);
 	return 0;
 }
 
@@ -261,9 +478,17 @@ int mk_dt_parse_resources(const void *fdt, int resources_node,
 		return ret;
 	}
 
-	pr_info("Successfully parsed instance '%s': %zu bytes memory, %d CPUs\n",
+	ret = mk_dt_parse_devices(fdt, resources_node, config);
+	if (ret) {
+		pr_err("Failed to parse device resources for '%s': %d\n", instance_name, ret);
+		mk_dt_config_free(config);
+		return ret;
+	}
+
+	pr_info("Successfully parsed instance '%s': %zu bytes memory, %d CPUs, %d PCI devices\n",
 		instance_name, config->memory_size,
-		config->cpus ? bitmap_weight(config->cpus, NR_CPUS) : 0);
+		config->cpus ? bitmap_weight(config->cpus, NR_CPUS) : 0,
+		config->pci_device_count);
 	return 0;
 }
 
@@ -458,6 +683,8 @@ int mk_dt_get_property_size(const void *dtb_data, size_t dtb_size,
  */
 void mk_dt_print_config(const struct mk_dt_config *config)
 {
+	struct mk_pci_device *pci_dev;
+
 	if (!config) {
 		pr_info("Multikernel DT config: (null)\n");
 		return;
@@ -481,6 +708,22 @@ void mk_dt_print_config(const struct mk_dt_config *config)
 		}
 	} else {
 		pr_info("  CPU assignment: unavailable (allocation failed)\n");
+	}
+
+	if (config->pci_devices_valid) {
+		if (config->pci_device_count == 0) {
+			pr_info("  PCI devices: none specified\n");
+		} else {
+			pr_info("  PCI devices: %d device(s)\n", config->pci_device_count);
+			list_for_each_entry(pci_dev, &config->pci_devices, list) {
+				pr_info("    - %04x:%04x@%04x:%02x:%02x.%x\n",
+					pci_dev->vendor, pci_dev->device,
+					pci_dev->domain, pci_dev->bus,
+					pci_dev->slot, pci_dev->func);
+			}
+		}
+	} else {
+		pr_info("  PCI devices: unavailable\n");
 	}
 
 	pr_info("  DTB: %zu bytes\n", config->dtb_size);
@@ -575,6 +818,34 @@ int mk_dt_generate_instance_dtb(const char *name, int id,
 		ret = fdt_property(fdt, "cpus", cpu_array, cpu_count * sizeof(u32));
 		kfree(cpu_array);
 		if (ret) goto err_free;
+	}
+
+	if (config->pci_devices_valid && config->pci_device_count > 0) {
+		struct mk_pci_device *pci_dev;
+		list_for_each_entry(pci_dev, &config->pci_devices, list) {
+			char node_name[32];
+			snprintf(node_name, sizeof(node_name), "pci@%04x:%04x",
+				 pci_dev->vendor, pci_dev->device);
+
+			ret = fdt_begin_node(fdt, node_name);
+			if (ret) goto err_free;
+
+			ret = fdt_property_u32(fdt, "vendor", pci_dev->vendor);
+			if (ret) goto err_free;
+			ret = fdt_property_u32(fdt, "device", pci_dev->device);
+			if (ret) goto err_free;
+			ret = fdt_property_u32(fdt, "domain", pci_dev->domain);
+			if (ret) goto err_free;
+			ret = fdt_property_u32(fdt, "bus", pci_dev->bus);
+			if (ret) goto err_free;
+			ret = fdt_property_u32(fdt, "slot", pci_dev->slot);
+			if (ret) goto err_free;
+			ret = fdt_property_u32(fdt, "function", pci_dev->func);
+			if (ret) goto err_free;
+
+			ret = fdt_end_node(fdt);
+			if (ret) goto err_free;
+		}
 	}
 
 	/* End resources node */

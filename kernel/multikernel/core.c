@@ -10,6 +10,7 @@
 #include <linux/io.h>
 #include <linux/kexec.h>
 #include <linux/multikernel.h>
+#include <linux/pci.h>
 #include <asm/page.h>
 #include "internal.h"
 
@@ -19,6 +20,7 @@
 static void mk_instance_release(struct kref *kref)
 {
 	struct mk_instance *instance = container_of(kref, struct mk_instance, refcount);
+	struct mk_pci_device *pci_dev, *pci_tmp;
 
 	pr_debug("Releasing multikernel instance %d (%s)\n", instance->id, instance->name);
 
@@ -26,6 +28,16 @@ static void mk_instance_release(struct kref *kref)
 
 	/* Free CPU bitmap */
 	kfree(instance->cpus);
+
+	/* Free PCI device list */
+	if (instance->pci_devices_valid) {
+		list_for_each_entry_safe(pci_dev, pci_tmp, &instance->pci_devices, list) {
+			list_del(&pci_dev->list);
+			kfree(pci_dev);
+		}
+		instance->pci_device_count = 0;
+		instance->pci_devices_valid = false;
+	}
 
 	kfree(instance->dtb_data);
 	kfree(instance->name);
@@ -198,6 +210,110 @@ static int mk_instance_reserve_cpus(struct mk_instance *instance,
 	}
 
 	return 0;
+}
+
+static int mk_instance_unbind_pci_device(const struct mk_pci_device *pci_dev)
+{
+	struct pci_dev *dev;
+
+	dev = pci_get_domain_bus_and_slot(pci_dev->domain, pci_dev->bus,
+					  PCI_DEVFN(pci_dev->slot, pci_dev->func));
+	if (!dev) {
+		pr_warn("PCI device %04x:%04x@%04x:%02x:%02x.%x not found in system\n",
+			pci_dev->vendor, pci_dev->device, pci_dev->domain,
+			pci_dev->bus, pci_dev->slot, pci_dev->func);
+		return -ENODEV;
+	}
+
+	if (dev->vendor != pci_dev->vendor || dev->device != pci_dev->device) {
+		pr_err("PCI device ID mismatch at %04x:%02x:%02x.%x: expected %04x:%04x, found %04x:%04x\n",
+		       pci_dev->domain, pci_dev->bus, pci_dev->slot, pci_dev->func,
+		       pci_dev->vendor, pci_dev->device, dev->vendor, dev->device);
+		pci_dev_put(dev);
+		return -EINVAL;
+	}
+
+	if (dev->driver) {
+		pr_info("Unbinding PCI device %04x:%04x@%04x:%02x:%02x.%x from driver %s\n",
+			pci_dev->vendor, pci_dev->device, pci_dev->domain,
+			pci_dev->bus, pci_dev->slot, pci_dev->func,
+			dev->driver->name);
+		device_release_driver(&dev->dev);
+	} else {
+		pr_debug("PCI device %04x:%04x@%04x:%02x:%02x.%x has no driver bound\n",
+			 pci_dev->vendor, pci_dev->device, pci_dev->domain,
+			 pci_dev->bus, pci_dev->slot, pci_dev->func);
+	}
+
+	pci_dev_put(dev);
+	return 0;
+}
+
+static int mk_instance_reserve_pci_devices(struct mk_instance *instance,
+					   const struct mk_dt_config *config)
+{
+	struct mk_pci_device *src_dev, *dst_dev, *tmp;
+	int ret;
+
+	if (instance->pci_devices_valid) {
+		list_for_each_entry_safe(dst_dev, tmp, &instance->pci_devices, list) {
+			list_del(&dst_dev->list);
+			kfree(dst_dev);
+		}
+		instance->pci_device_count = 0;
+	} else {
+		INIT_LIST_HEAD(&instance->pci_devices);
+	}
+
+	if (!config->pci_devices_valid || config->pci_device_count == 0) {
+		instance->pci_devices_valid = false;
+		instance->pci_device_count = 0;
+		pr_debug("No PCI devices to reserve for instance %d (%s)\n",
+			 instance->id, instance->name);
+		return 0;
+	}
+
+	list_for_each_entry(src_dev, &config->pci_devices, list) {
+		dst_dev = kzalloc(sizeof(*dst_dev), GFP_KERNEL);
+		if (!dst_dev) {
+			pr_err("Failed to allocate PCI device entry for instance %d (%s)\n",
+			       instance->id, instance->name);
+			ret = -ENOMEM;
+			goto cleanup;
+		}
+
+		dst_dev->vendor = src_dev->vendor;
+		dst_dev->device = src_dev->device;
+		dst_dev->domain = src_dev->domain;
+		dst_dev->bus = src_dev->bus;
+		dst_dev->slot = src_dev->slot;
+		dst_dev->func = src_dev->func;
+
+		list_add_tail(&dst_dev->list, &instance->pci_devices);
+		instance->pci_device_count++;
+
+		ret = mk_instance_unbind_pci_device(dst_dev);
+		if (ret) {
+			pr_warn("Failed to unbind PCI device %04x:%04x@%04x:%02x:%02x.%x: %d\n",
+				dst_dev->vendor, dst_dev->device, dst_dev->domain,
+				dst_dev->bus, dst_dev->slot, dst_dev->func, ret);
+			/* Continue with other devices even if one fails */
+		}
+	}
+
+	instance->pci_devices_valid = true;
+	pr_info("Reserved %d PCI devices for instance %d (%s)\n",
+		instance->pci_device_count, instance->id, instance->name);
+	return 0;
+
+cleanup:
+	list_for_each_entry_safe(dst_dev, tmp, &instance->pci_devices, list) {
+		list_del(&dst_dev->list);
+		kfree(dst_dev);
+	}
+	instance->pci_device_count = 0;
+	instance->pci_devices_valid = false;
+	return ret;
 }
 
 /**
@@ -383,6 +499,15 @@ int mk_instance_reserve_resources(struct mk_instance *instance,
 		       instance->id, instance->name, ret);
 		/* Don't fail the whole operation for CPU reservation failure */
 		pr_warn("Continuing without CPU assignment\n");
+	}
+
+	/* Reserve PCI device resources */
+	ret = mk_instance_reserve_pci_devices(instance, config);
+	if (ret) {
+		pr_err("Failed to reserve PCI device resources for instance %d (%s): %d\n",
+		       instance->id, instance->name, ret);
+		/* Don't fail the whole operation for PCI reservation failure */
+		pr_warn("Continuing without PCI device assignment\n");
 	}
 
 	return 0;

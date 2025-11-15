@@ -14,6 +14,7 @@
 #include <linux/list.h>
 #include <linux/multikernel.h>
 #include <linux/io.h>
+#include <linux/pci.h>
 #ifdef CONFIG_KEXEC_HANDOVER
 #include <linux/kexec_handover.h>
 #include <linux/libfdt.h>
@@ -258,6 +259,9 @@ static struct mk_instance * __init alloc_mk_instance(int instance_id, const char
 	INIT_LIST_HEAD(&instance->memory_regions);
 	INIT_LIST_HEAD(&instance->list);
 	kref_init(&instance->refcount);
+	INIT_LIST_HEAD(&instance->pci_devices);
+	instance->pci_devices_valid = false;
+	instance->pci_device_count = 0;
 
 	mutex_lock(&mk_instance_mutex);
 	ret = idr_alloc(&mk_instance_idr, instance, instance_id, instance_id + 1, GFP_KERNEL);
@@ -282,6 +286,45 @@ err_free_name:
 err_free_instance:
 	kfree(instance);
 	return NULL;
+}
+
+static int __init mk_kho_copy_pci_devices(const struct mk_dt_config *config,
+					  struct mk_instance *instance)
+{
+	struct mk_pci_device *src_dev, *dst_dev;
+
+	if (!config->pci_devices_valid || config->pci_device_count == 0) {
+		INIT_LIST_HEAD(&instance->pci_devices);
+		instance->pci_device_count = 0;
+		instance->pci_devices_valid = false;
+		pr_debug("No PCI devices in DTB\n");
+		return 0;
+	}
+
+	INIT_LIST_HEAD(&instance->pci_devices);
+	instance->pci_device_count = 0;
+	instance->pci_devices_valid = true;
+
+	list_for_each_entry(src_dev, &config->pci_devices, list) {
+		dst_dev = kzalloc(sizeof(*dst_dev), GFP_KERNEL);
+		if (!dst_dev) {
+			pr_err("Failed to allocate PCI device entry\n");
+			return -ENOMEM;
+		}
+
+		dst_dev->vendor = src_dev->vendor;
+		dst_dev->device = src_dev->device;
+		dst_dev->domain = src_dev->domain;
+		dst_dev->bus = src_dev->bus;
+		dst_dev->slot = src_dev->slot;
+		dst_dev->func = src_dev->func;
+
+		list_add_tail(&dst_dev->list, &instance->pci_devices);
+		instance->pci_device_count++;
+	}
+
+	pr_info("Copied %d PCI devices to root instance\n", instance->pci_device_count);
+	return 0;
 }
 
 static int __init mk_kho_restore_ipi(const void *kho_fdt, struct mk_instance *instance)
@@ -491,6 +534,7 @@ int __init mk_kho_restore_dtbs(void)
 
 	pr_info("DTB contains instance ID %d, name '%s'\n", instance_id, instance_name);
 
+	/* Parse DTB configuration - skip validation since host already validated */
 	mk_dt_config_init(&config);
 
 	/* In the new flat format, the root node IS the instance node */
@@ -526,10 +570,16 @@ int __init mk_kho_restore_dtbs(void)
 	memcpy(instance->dtb_data, dtb_virt, dtb_len);
 	instance->dtb_size = dtb_len;
 
+	ret = mk_kho_copy_pci_devices(&config, instance);
+	if (ret) {
+		pr_err("Failed to copy PCI devices: %d\n", ret);
+		goto cleanup_pci_devices;
+	}
+
 	ret = mk_kho_restore_ipi(kho_fdt, instance);
 	if (ret) {
 		pr_err("Failed to restore IPI buffer: %d\n", ret);
-		goto cleanup_dtb_data;
+		goto cleanup_pci_devices;
 	}
 
 	root_instance = instance;
@@ -545,7 +595,14 @@ int __init mk_kho_restore_dtbs(void)
 	early_memunmap((void *)kho_fdt, PAGE_SIZE);
 	return 0;
 
-cleanup_dtb_data:
+cleanup_pci_devices:
+	if (instance->pci_devices_valid) {
+		struct mk_pci_device *pci_dev, *tmp;
+		list_for_each_entry_safe(pci_dev, tmp, &instance->pci_devices, list) {
+			list_del(&pci_dev->list);
+			kfree(pci_dev);
+		}
+	}
 	kfree(instance->dtb_data);
 cleanup_instance_name:
 	kfree(instance->name);
@@ -563,6 +620,61 @@ cleanup_fdt:
 /* Run at early_initcall to enforce CPU restrictions before per-CPU allocations */
 early_initcall(mk_kho_restore_dtbs);
 
+bool mk_pci_device_allowed(struct pci_bus *bus, int devfn, u16 vendor, u16 device)
+{
+	struct mk_pci_device *pci_dev;
+	u16 domain = pci_domain_nr(bus);
+	u8 bus_num = bus->number;
+	u8 slot = PCI_SLOT(devfn);
+	u8 func = PCI_FUNC(devfn);
+	u8 hdr_type;
+	bool is_bridge = false;
+
+	if (!root_instance)
+		return true;
+
+	if (!root_instance->pci_devices_valid || root_instance->pci_device_count == 0)
+		return true;
+
+	/* Check if this exact device is whitelisted */
+	list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
+		if (pci_dev->vendor == vendor &&
+		    pci_dev->device == device &&
+		    pci_dev->domain == domain &&
+		    pci_dev->bus == bus_num &&
+		    pci_dev->slot == slot &&
+		    pci_dev->func == func)
+			return true;
+	}
+
+	if (pci_bus_read_config_byte(bus, devfn, PCI_HEADER_TYPE, &hdr_type) == 0) {
+		u8 secondary_bus = 0, subordinate_bus = 0;
+
+		is_bridge = ((hdr_type & PCI_HEADER_TYPE_MASK) == PCI_HEADER_TYPE_BRIDGE);
+		if (is_bridge) {
+			pci_bus_read_config_byte(bus, devfn, PCI_SECONDARY_BUS, &secondary_bus);
+			pci_bus_read_config_byte(bus, devfn, PCI_SUBORDINATE_BUS, &subordinate_bus);
+
+			/* Allow bridge if there's a whitelisted device on any bus
+			 * between secondary and subordinate (inclusive) */
+			if (secondary_bus > 0 && subordinate_bus >= secondary_bus) {
+				list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
+					if (pci_dev->domain == domain &&
+					    pci_dev->bus >= secondary_bus &&
+					    pci_dev->bus <= subordinate_bus)
+						return true;
+				}
+			}
+		}
+	}
+
+	pr_debug("PCI %s %04x:%04x@%04x:%02x:%02x.%x not allowed by DTB\n",
+		is_bridge ? "bridge" : "device",
+		vendor, device, domain, bus_num, slot, func);
+	return false;
+}
+EXPORT_SYMBOL_GPL(mk_pci_device_allowed);
+
 #else /* !CONFIG_KEXEC_HANDOVER */
 
 /* No root instance when KHO is not enabled */
@@ -573,5 +685,11 @@ int __init mk_kho_restore_dtbs(void)
 {
 	return 0;
 }
+
+bool mk_pci_device_allowed(u16 vendor, u16 device, u16 domain, u8 bus, u8 devfn, bool is_bridge)
+{
+	return true;
+}
+EXPORT_SYMBOL_GPL(mk_pci_device_allowed);
 
 #endif /* CONFIG_KEXEC_HANDOVER */

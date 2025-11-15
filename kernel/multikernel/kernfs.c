@@ -144,12 +144,18 @@ static ssize_t root_device_tree_write(struct kernfs_open_file *of, char *buf, si
 	void *new_dtb;
 	int ret;
 
-	pr_info("Loading host kernel device tree configuration (%zu bytes)\n", count);
+	pr_info("Loading host kernel device tree configuration (%zu bytes at offset %lld)\n", count, off);
 
 	/* Validate DTB header */
 	ret = fdt_check_header(fdt);
 	if (ret) {
 		pr_err("Invalid device tree header: %d\n", ret);
+		return -EINVAL;
+	}
+
+	if (fdt_totalsize(fdt) != count) {
+		pr_err("DTB size mismatch: header says %u bytes, received %zu bytes\n",
+		       fdt_totalsize(fdt), count);
 		return -EINVAL;
 	}
 
@@ -239,6 +245,7 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 
 	INIT_LIST_HEAD(&instance->memory_regions);
 	INIT_LIST_HEAD(&instance->list);
+	INIT_LIST_HEAD(&instance->pci_devices);
 	kref_init(&instance->refcount);
 
 	kn = kernfs_create_dir(mk_instances_kn, name, 0755, instance);
