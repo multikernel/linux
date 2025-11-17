@@ -1726,7 +1726,7 @@ int kho_fill_kimage(struct kimage *image)
 	int err = 0;
 	struct kexec_buf scratch;
 
-	if (!kho_out.finalized)
+	if (!kho_out.finalized) // EO -> pourquoi cette variable est à false
 		return 0;
 
 	image->kho.fdt = page_to_phys(kho_out.ser.fdt);

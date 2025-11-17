@@ -2767,6 +2767,63 @@ void pci_device_add(struct pci_dev *dev, struct pci_bus *bus)
 	pci_doe_sysfs_init(dev);
 }
 
+// EO -> pci_whitelist
+static char *pci_whitelist;
+
+static int __init pci_whitelist_setup(char *str)
+{
+	pci_whitelist = str;
+	return 1;
+}
+__setup("pci_whitelist=", pci_whitelist_setup);
+
+static bool pci_device_whitelisted(struct pci_dev *dev)
+{
+	if (!pci_whitelist || !*pci_whitelist)
+		return true;
+
+	char *orig_list = kstrdup(pci_whitelist, GFP_KERNEL);
+	char *list = orig_list;
+	char *entry;
+	bool found = false;
+
+	pr_info("PCI whitelist: %s\n", list);
+	for (entry = strsep(&list, ","); entry; entry = strsep(&list, ",")) {
+		char *at_pos = strchr(entry, '@');
+
+		if (at_pos) {
+			*at_pos = '\0';
+			char *vendor_part = entry;
+			char *bus_part = at_pos + 1;
+			unsigned int vendor, device;
+			unsigned int domain, bus, slot, func;
+
+			if (sscanf(vendor_part, "%x:%x", &vendor, &device) != 2)
+				continue;
+
+			if (sscanf(bus_part, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4)
+				continue;
+
+			pr_info("Checking device %04x:%04x@%04x:%02x:%02x.%d\n", vendor, device, domain, bus, slot, func);
+			pr_info("Device: %04x:%04x@%04x:%02x:%02x.%d\n", dev->vendor, dev->device, pci_domain_nr(dev->bus), dev->bus->number, PCI_SLOT(dev->devfn), PCI_FUNC(dev->devfn));
+			unsigned int parsed_devfn = PCI_DEVFN(slot, func);
+
+			if (dev->vendor == vendor &&
+			    dev->device == device &&
+			    pci_domain_nr(dev->bus) == domain &&
+			    dev->bus->number == bus &&
+			    dev->devfn == parsed_devfn) {
+				found = true;
+				break;
+			}
+		}
+	}
+
+	kfree(orig_list);
+	return found;
+}
+// EO -> fin pci_whitelist
+
 struct pci_dev *pci_scan_single_device(struct pci_bus *bus, int devfn)
 {
 	struct pci_dev *dev;
@@ -2780,7 +2837,12 @@ struct pci_dev *pci_scan_single_device(struct pci_bus *bus, int devfn)
 	dev = pci_scan_device(bus, devfn);
 	if (!dev)
 		return NULL;
-
+//EO -> pci_whitelist
+	if (!pci_device_whitelisted(dev)) {
+		pr_info("Device %04x:%04x not whitelisted, skipping\n", dev->vendor, dev->device);
+		return NULL;
+	}
+//EO -> fin pci_whitelist
 	pci_device_add(dev, bus);
 
 	return dev;

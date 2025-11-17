@@ -115,7 +115,7 @@ static struct page *kimage_alloc_page(struct kimage *image,
 				       gfp_t gfp_mask,
 				       unsigned long dest);
 
-int sanity_check_segment_list(struct kimage *image)
+int sanity_check_segment_list(struct kimage *image) // EO -> heureuka on dirait notre coupable
 {
 	int i;
 	unsigned long nr_segments = image->nr_segments;
@@ -140,10 +140,10 @@ int sanity_check_segment_list(struct kimage *image)
 
 		mstart = image->segment[i].mem;
 		mend   = mstart + image->segment[i].memsz;
-		if (mstart > mend)
+		if (mstart > mend)  
 			return -EADDRNOTAVAIL;
 		if ((mstart & ~PAGE_MASK) || (mend & ~PAGE_MASK))
-			return -EADDRNOTAVAIL;
+			return -EADDRNOTAVAIL; // EO -> a ce niveau la fonction return -EADDRNOTAVAIL cause de l'erreur remonté en user space à kexec_file_load
 		if (mend >= KEXEC_DESTINATION_MEMORY_LIMIT)
 			return -EADDRNOTAVAIL;
 	}

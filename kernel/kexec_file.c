@@ -205,7 +205,8 @@ kimage_validate_signature(struct kimage *image)
 static int kexec_post_load(struct kimage *image, unsigned long flags)
 {
 #ifdef CONFIG_IMA_KEXEC
-	if (!(flags & KEXEC_FILE_ON_CRASH))
+	// if (!(flags & KEXEC_FILE_ON_CRASH )) // EO -> sauter l'IMA pour le moment
+	if (!(flags & (KEXEC_FILE_ON_CRASH | KEXEC_MULTIKERNEL))) // EO -> ligne ajouté
 		ima_kexec_post_load(image);
 #endif
 	return machine_kexec_post_load(image);
@@ -239,7 +240,7 @@ kimage_file_prepare_segments(struct kimage *image, int kernel_fd, int initrd_fd,
 		goto out;
 
 #ifdef CONFIG_KEXEC_SIG
-	ret = kimage_validate_signature(image);
+	ret = kimage_validate_signature(image); // EO -> desactiver dans le menuconfig
 
 	if (ret)
 		goto out;
@@ -303,7 +304,7 @@ out:
 }
 
 static int
-kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
+kimage_file_alloc_init(struct kimage **rimage, int kernel_fd, 
 		       int initrd_fd, const char __user *cmdline_ptr,
 		       unsigned long cmdline_len, unsigned long flags)
 {
@@ -403,8 +404,8 @@ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 	if (ret)
 		goto out_free_image;
 
-	ret = sanity_check_segment_list(image);
-	if (ret)
+	ret = sanity_check_segment_list(image); // EO -> l'erreur vient de cette fonction
+	if (ret) // EO -> on sort ici avec une erreur EADDRNOTAVAIL (-99)
 		goto out_free_post_load_bufs;
 
 	ret = -ENOMEM;
@@ -439,7 +440,7 @@ out_free_image:
 	return ret;
 }
 
-SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
+SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd, // EO -> definition de l'appel systeme  kexec_file_load
 		unsigned long, cmdline_len, const char __user *, cmdline_ptr,
 		unsigned long, flags)
 {
@@ -486,7 +487,7 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 		}
 	}
 
-	ret = kimage_file_alloc_init(&image, kernel_fd, initrd_fd, cmdline_ptr,
+	ret = kimage_file_alloc_init(&image, kernel_fd, initrd_fd, cmdline_ptr, 
 				     cmdline_len, flags);
 	if (ret)
 		goto out;

@@ -440,7 +440,8 @@ void *mk_instance_alloc(struct mk_instance *instance, size_t size, size_t align)
 	}
 
 	/* Map to virtual address space */
-	virt_addr = memremap(phys_addr, size, MEMREMAP_WB);
+	//virt_addr = memremap(phys_addr, size, MEMREMAP_WB); // EO -> actuelement
+	virt_addr = phys_to_virt(phys_addr); // EO -> ajout patch
 	if (!virt_addr) {
 		pr_err("Failed to map instance memory at 0x%llx\n", (unsigned long long)phys_addr);
 		multikernel_instance_free(instance->instance_pool, phys_addr, size);
@@ -464,7 +465,7 @@ void mk_instance_free(struct mk_instance *instance, void *virt_addr, size_t size
 		return;
 
 	phys_addr = virt_to_phys(virt_addr);
-	memunmap(virt_addr);
+	//memunmap(virt_addr); // EO -> actuelement
 	multikernel_instance_free(instance->instance_pool, phys_addr, size);
 }
 
