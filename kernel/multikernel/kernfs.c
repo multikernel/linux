@@ -198,6 +198,12 @@ static ssize_t root_device_tree_write(struct kernfs_open_file *of, char *buf, si
 		}
 	}
 
+	ret = mk_baseline_validate_and_initialize(fdt, count);
+	if (ret) {
+		pr_err("Baseline validation and initialization failed: %d\n", ret);
+		return ret;
+	}
+
 	new_dtb = kmalloc(count, GFP_KERNEL);
 	if (!new_dtb) {
 		pr_err("Failed to allocate memory for host kernel DTB\n");

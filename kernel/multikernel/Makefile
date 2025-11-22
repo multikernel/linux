@@ -3,8 +3,9 @@
 # Makefile for multikernel support
 #
 
-obj-y += core.o mem.o kernfs.o dts.o kho.o ipi.o messaging.o overlay.o hotplug.o
+obj-y += core.o mem.o kernfs.o dts.o kho.o ipi.o messaging.o overlay.o hotplug.o baseline.o
 
 # Add libfdt include path for device tree parsing
 CFLAGS_dts.o = -I $(srctree)/scripts/dtc/libfdt
 CFLAGS_overlay.o = -I $(srctree)/scripts/dtc/libfdt
+CFLAGS_baseline.o = -I $(srctree)/scripts/dtc/libfdt

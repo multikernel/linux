@@ -32,3 +32,6 @@ int mk_overlay_rmdir(struct kernfs_node *kn);
 int mk_hotplug_init(void);
 void mk_hotplug_cleanup(void);
 int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_len);
+
+/* baseline.c */
+int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size);

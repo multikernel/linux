@@ -162,45 +162,47 @@ bool multikernel_allow_emergency_restart(void)
  */
 
 /**
- * mk_instance_offline_cpus - Offline CPUs for a multikernel instance
- * @instance: Instance whose CPUs should be offlined
+ * mk_instance_verify_cpus - Verify CPUs for instance are offline and available
+ * @instance: Instance whose CPUs should be verified
  *
- * Uses the hotplug infrastructure to offline all CPUs assigned to the instance.
- * This ensures consistent operation tracking and proper resource management.
+ * Verifies that CPUs assigned to the instance are already offline (from baseline
+ * initialization) and available for use. Does NOT offline CPUs - that's done
+ * during baseline loading.
  *
  * Returns 0 on success, negative error code on failure.
  */
-static int mk_instance_offline_cpus(struct mk_instance *instance)
+static int mk_instance_verify_cpus(struct mk_instance *instance)
 {
-	int phys_cpu, logical_cpu, ret = 0, failed_count = 0;
-	struct mk_cpu_resource_payload payload;
+	int phys_cpu, logical_cpu;
+	int unavailable = 0;
 
-	pr_info("Bringing CPUs offline for multikernel instance %d (%s): %*pbl\n",
+	pr_info("Verifying CPUs for multikernel instance %d (%s): %*pbl\n",
 		instance->id, instance->name, NR_CPUS, instance->cpus);
 
 	for_each_set_bit(phys_cpu, instance->cpus, NR_CPUS) {
 		logical_cpu = arch_cpu_from_physical_id(phys_cpu);
 		if (logical_cpu < 0) {
-			pr_debug("Physical CPU %d not found in logical CPU map\n", phys_cpu);
+			pr_err("Physical CPU %d not found in logical CPU map\n", phys_cpu);
+			unavailable++;
 			continue;
 		}
 
-		payload.cpu_id = phys_cpu;
-		payload.numa_node = cpu_to_node(logical_cpu);
-		payload.flags = 0;
-		ret = mk_handle_cpu_remove(&payload, sizeof(payload));
-		if (ret)
-			failed_count++;
+		if (cpu_online(logical_cpu)) {
+			pr_err("CPU %u (logical %d) is still online - baseline not loaded or CPU not in pool\n",
+			       phys_cpu, logical_cpu);
+			unavailable++;
+		}
 	}
 
-	if (failed_count > 0) {
-		pr_warn("Failed to take %d CPUs offline for instance %d (%s)\n",
-			 failed_count, instance->id, instance->name);
+	if (unavailable > 0) {
+		pr_err("Instance %d (%s): %d CPUs are not available (still online)\n",
+		       instance->id, instance->name, unavailable);
+		pr_err("Ensure baseline DTB is loaded with 'cat baseline.dtb > /sys/fs/multikernel/device_tree'\n");
 		return -EBUSY;
 	}
 
-	pr_info("Successfully took all assigned CPUs offline for instance %d (%s)\n",
-		instance->id, instance->name);
+	pr_info("Successfully verified %d CPUs for instance %d (%s) - all offline and available\n",
+		bitmap_weight(instance->cpus, NR_CPUS), instance->id, instance->name);
 	return 0;
 }
 
@@ -209,8 +211,8 @@ static int mk_instance_offline_cpus(struct mk_instance *instance)
  * @instance: Instance to assign CPU resources to
  * @config: Device tree configuration with CPU assignment
  *
- * Copies CPU assignment from config to instance. This is the actual
- * "reservation" function that assigns CPUs to the instance.
+ * Copies CPU assignment from config to instance and verifies CPUs are
+ * offline and available. CPUs must already be offlined by baseline initialization.
  *
  * Returns 0 on success, negative error code on failure.
  */
@@ -226,10 +228,10 @@ static int mk_instance_reserve_cpus(struct mk_instance *instance,
 			instance->id, instance->name,
 			NR_CPUS, instance->cpus, bitmap_weight(instance->cpus, NR_CPUS));
 
-		ret = mk_instance_offline_cpus(instance);
+		ret = mk_instance_verify_cpus(instance);
 		if (ret) {
-			pr_warn("Failed to bring some CPUs offline for instance %d (%s): %d\n",
-				instance->id, instance->name, ret);
+			pr_err("Failed to verify CPU availability for instance %d (%s): %d\n",
+			       instance->id, instance->name, ret);
 			return ret;
 		}
 	} else {
@@ -238,43 +240,6 @@ static int mk_instance_reserve_cpus(struct mk_instance *instance,
 		return -EINVAL;
 	}
 
-	return 0;
-}
-
-static int mk_instance_unbind_pci_device(const struct mk_pci_device *pci_dev)
-{
-	struct pci_dev *dev;
-
-	dev = pci_get_domain_bus_and_slot(pci_dev->domain, pci_dev->bus,
-					  PCI_DEVFN(pci_dev->slot, pci_dev->func));
-	if (!dev) {
-		pr_warn("PCI device %04x:%04x@%04x:%02x:%02x.%x not found in system\n",
-			pci_dev->vendor, pci_dev->device, pci_dev->domain,
-			pci_dev->bus, pci_dev->slot, pci_dev->func);
-		return -ENODEV;
-	}
-
-	if (dev->vendor != pci_dev->vendor || dev->device != pci_dev->device) {
-		pr_err("PCI device ID mismatch at %04x:%02x:%02x.%x: expected %04x:%04x, found %04x:%04x\n",
-		       pci_dev->domain, pci_dev->bus, pci_dev->slot, pci_dev->func,
-		       pci_dev->vendor, pci_dev->device, dev->vendor, dev->device);
-		pci_dev_put(dev);
-		return -EINVAL;
-	}
-
-	if (dev->driver) {
-		pr_info("Unbinding PCI device %04x:%04x@%04x:%02x:%02x.%x from driver %s\n",
-			pci_dev->vendor, pci_dev->device, pci_dev->domain,
-			pci_dev->bus, pci_dev->slot, pci_dev->func,
-			dev->driver->name);
-		device_release_driver(&dev->dev);
-	} else {
-		pr_debug("PCI device %04x:%04x@%04x:%02x:%02x.%x has no driver bound\n",
-			 pci_dev->vendor, pci_dev->device, pci_dev->domain,
-			 pci_dev->bus, pci_dev->slot, pci_dev->func);
-	}
-
-	pci_dev_put(dev);
 	return 0;
 }
 
@@ -320,14 +285,6 @@ static int mk_instance_reserve_pci_devices(struct mk_instance *instance,
 
 		list_add_tail(&dst_dev->list, &instance->pci_devices);
 		instance->pci_device_count++;
-
-		ret = mk_instance_unbind_pci_device(dst_dev);
-		if (ret) {
-			pr_warn("Failed to unbind PCI device %04x:%04x@%04x:%02x:%02x.%x: %d\n",
-				dst_dev->vendor, dst_dev->device, dst_dev->domain,
-				dst_dev->bus, dst_dev->slot, dst_dev->func, ret);
-			/* Continue with other devices even if one fails */
-		}
 	}
 
 	instance->pci_devices_valid = true;
