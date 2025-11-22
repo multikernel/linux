@@ -141,6 +141,14 @@ static int mk_do_cpu_add(u32 cpu_id, u32 numa_node, u32 flags)
 		mutex_unlock(&mk_hotplug_mutex);
 	}
 
+	mutex_lock(&mk_instance_mutex);
+	ret = mk_dt_update_global_dtb();
+	mutex_unlock(&mk_instance_mutex);
+	if (ret) {
+		pr_warn("Failed to update global DTB after CPU add: %d\n", ret);
+		/* Non-fatal - CPU is already added, just DTB view may be stale */
+	}
+
 	pr_info("Multikernel hotplug: Successfully added CPU %d (phys %u)\n",
 		logical_cpu, cpu_id);
 
@@ -193,6 +201,14 @@ static int mk_do_cpu_remove(u32 cpu_id)
 		mutex_lock(&mk_hotplug_mutex);
 		list_add_tail(&op->list, &mk_hotplug_ops);
 		mutex_unlock(&mk_hotplug_mutex);
+	}
+
+	mutex_lock(&mk_instance_mutex);
+	ret = mk_dt_update_global_dtb();
+	mutex_unlock(&mk_instance_mutex);
+	if (ret) {
+		pr_warn("Failed to update global DTB after CPU remove: %d\n", ret);
+		/* Non-fatal - CPU is already removed, just DTB view may be stale */
 	}
 
 	pr_info("Multikernel hotplug: Successfully removed CPU %d (phys %u)\n",

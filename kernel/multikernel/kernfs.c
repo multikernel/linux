@@ -39,7 +39,7 @@ LIST_HEAD(mk_instance_list);                      /* List of all instances */
 DEFINE_MUTEX(mk_instance_mutex);                  /* Protects instance list */
 DEFINE_IDR(mk_instance_idr);               /* ID allocator for instances */
 
-static DEFINE_MUTEX(mk_host_dtb_mutex);           /* Protects host DTB access */
+DEFINE_MUTEX(mk_host_dtb_mutex);           /* Protects host DTB access */
 
 /* Filesystem context structure */
 struct mk_fs_context {
@@ -126,15 +126,45 @@ static int status_seq_show(struct seq_file *sf, void *v)
 	return 0;
 }
 
-/* Root-level device_tree attribute - shows binary DTB */
+/* Root-level device_tree attribute - shows merged global DTB */
 static int root_device_tree_seq_show(struct seq_file *sf, void *v)
 {
-	mutex_lock(&mk_host_dtb_mutex);
-	if (root_instance->dtb_data)
-		seq_write(sf, root_instance->dtb_data, root_instance->dtb_size);
-	mutex_unlock(&mk_host_dtb_mutex);
+	void *dtb_data = NULL;
+	size_t dtb_size = 0;
+	int ret;
+
+	ret = mk_dt_generate_global_dtb(&dtb_data, &dtb_size);
+	if (ret) {
+		pr_err("Failed to generate global DTB: %d\n", ret);
+		return ret;
+	}
+
+	seq_write(sf, dtb_data, dtb_size);
+	kfree(dtb_data);
 	return 0;
 }
+
+/* Instance device_tree attribute - binary DTB (read-only) */
+static ssize_t instance_device_tree_read(struct kernfs_open_file *of,
+					 char *buf, size_t count, loff_t off)
+{
+	struct mk_instance *instance = of->kn->priv;
+	size_t to_read;
+
+	if (!instance->dtb_data || instance->dtb_size == 0) {
+		pr_debug("Instance '%s': No device tree loaded\n", instance->name);
+		return -ENOENT;
+	}
+
+	if (off >= instance->dtb_size)
+		return 0;
+
+	to_read = min(count, instance->dtb_size - (size_t)off);
+	memcpy(buf, instance->dtb_data + off, to_read);
+
+	return to_read;
+}
+
 
 /* Root-level device_tree write - accepts host kernel configuration only */
 static ssize_t root_device_tree_write(struct kernfs_open_file *of, char *buf, size_t count, loff_t off)
@@ -283,6 +313,12 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 	mk_instance_set_state(instance, MK_STATE_READY);
 	mk_dt_config_free(&config);
 
+	ret = mk_dt_update_global_dtb();
+	if (ret) {
+		pr_warn("Failed to update global DTB after instance creation: %d\n", ret);
+		/* Non-fatal - instance is created, just global view may be stale */
+	}
+
 	pr_info("Successfully created instance '%s' (ID %d)\n", name, id);
 	return 0;
 
@@ -320,6 +356,11 @@ static const struct kernfs_ops mk_root_device_tree_ops = {
 	.atomic_write_len = SZ_1M,  /* Accept DTBs up to 1MB atomically */
 };
 
+/* Instance device_tree operations (read-only, binary) */
+static const struct kernfs_ops mk_instance_device_tree_ops = {
+	.read = instance_device_tree_read,
+};
+
 /**
  * Create instance attributes in kernfs
  */
@@ -340,6 +381,14 @@ static int mk_create_instance_files(struct mk_instance *instance)
 				  &mk_status_ops, instance, NULL, NULL);
 	if (IS_ERR(kn)) {
 		pr_err("Failed to create status file for instance %s\n", instance->name);
+		return PTR_ERR(kn);
+	}
+
+	kn = __kernfs_create_file(instance->kn, "device_tree", 0444,
+				  GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, 0,
+				  &mk_instance_device_tree_ops, instance, NULL, NULL);
+	if (IS_ERR(kn)) {
+		pr_err("Failed to create device_tree file for instance %s\n", instance->name);
 		return PTR_ERR(kn);
 	}
 
@@ -370,6 +419,8 @@ static int mk_kernfs_rmdir(struct kernfs_node *kn)
  */
 int mk_instance_destroy(struct mk_instance *instance)
 {
+	int ret;
+
 	lockdep_assert_held(&mk_instance_mutex);
 
 	if (!instance) {
@@ -397,6 +448,12 @@ int mk_instance_destroy(struct mk_instance *instance)
 		mk_instance_put(instance);
 	}
 	mk_instance_put(instance);
+
+	ret = mk_dt_update_global_dtb();
+	if (ret) {
+		pr_warn("Failed to update global DTB after instance destruction: %d\n", ret);
+		/* Non-fatal - instance is destroyed, just global view may be stale */
+	}
 
 	return 0;
 }

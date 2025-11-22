@@ -1007,3 +1007,274 @@ err_free:
 	kfree(fdt);
 	return ret;
 }
+
+static int mk_dt_copy_node_recursive(void *dst_fdt, const void *src_fdt, int src_node)
+{
+	int ret, prop_offset, subnode;
+	const struct fdt_property *prop;
+	const char *prop_name, *node_name;
+	int len;
+
+	/* Copy all properties */
+	prop_offset = fdt_first_property_offset(src_fdt, src_node);
+	while (prop_offset >= 0) {
+		prop = fdt_get_property_by_offset(src_fdt, prop_offset, &len);
+		if (prop) {
+			prop_name = fdt_string(src_fdt, fdt32_to_cpu(prop->nameoff));
+			ret = fdt_property(dst_fdt, prop_name, prop->data, len);
+			if (ret)
+				return ret;
+		}
+		prop_offset = fdt_next_property_offset(src_fdt, prop_offset);
+	}
+
+	/* Copy all subnodes recursively */
+	fdt_for_each_subnode(subnode, src_fdt, src_node) {
+		node_name = fdt_get_name(src_fdt, subnode, NULL);
+		if (!node_name)
+			continue;
+
+		ret = fdt_begin_node(dst_fdt, node_name);
+		if (ret)
+			return ret;
+
+		ret = mk_dt_copy_node_recursive(dst_fdt, src_fdt, subnode);
+		if (ret)
+			return ret;
+
+		ret = fdt_end_node(dst_fdt);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+int mk_dt_generate_global_dtb(void **out_dtb, size_t *out_size)
+{
+	void *fdt;
+	const void *base_fdt;
+	int ret;
+	size_t fdt_size = 16384;
+	struct mk_instance *instance;
+
+	if (!out_dtb || !out_size)
+		return -EINVAL;
+
+	lockdep_assert_held(&mk_instance_mutex);
+
+	fdt = kmalloc(fdt_size, GFP_KERNEL);
+	if (!fdt)
+		return -ENOMEM;
+
+	ret = fdt_create(fdt, fdt_size);
+	if (ret) {
+		pr_err("Failed to create global FDT: %d\n", ret);
+		goto err_free;
+	}
+
+	ret = fdt_finish_reservemap(fdt);
+	if (ret)
+		goto err_free;
+
+	ret = fdt_begin_node(fdt, "");
+	if (ret) goto err_free;
+
+	ret = fdt_property_string(fdt, "compatible", "multikernel-v1");
+	if (ret) goto err_free;
+
+	mutex_lock(&mk_host_dtb_mutex);
+	base_fdt = root_instance ? root_instance->dtb_data : NULL;
+
+	if (base_fdt && fdt_check_header(base_fdt) == 0) {
+		int resources_node = fdt_path_offset(base_fdt, "/resources");
+		if (resources_node >= 0) {
+			ret = fdt_begin_node(fdt, "resources");
+			if (ret) {
+				mutex_unlock(&mk_host_dtb_mutex);
+				goto err_free;
+			}
+
+			ret = mk_dt_copy_node_recursive(fdt, base_fdt, resources_node);
+			if (ret) {
+				mutex_unlock(&mk_host_dtb_mutex);
+				goto err_free;
+			}
+
+			ret = fdt_end_node(fdt);
+			if (ret) {
+				mutex_unlock(&mk_host_dtb_mutex);
+				goto err_free;
+			}
+		}
+	}
+	mutex_unlock(&mk_host_dtb_mutex);
+
+	ret = fdt_begin_node(fdt, "instances");
+	if (ret) goto err_free;
+
+	list_for_each_entry(instance, &mk_instance_list, list) {
+		if (instance->id == 0)
+			continue;
+
+		if (!instance->name || !instance->dtb_data)
+			continue;
+
+		ret = fdt_begin_node(fdt, instance->name);
+		if (ret)
+			goto err_free;
+
+		ret = fdt_property_u32(fdt, "id", instance->id);
+		if (ret)
+			goto err_free;
+
+		ret = fdt_property_string(fdt, "compatible", "multikernel-v1");
+		if (ret)
+			goto err_free;
+
+		ret = fdt_property_string(fdt, "status", mk_state_to_string(instance->state));
+		if (ret)
+			goto err_free;
+
+		ret = fdt_begin_node(fdt, "resources");
+		if (ret)
+			goto err_free;
+
+		if (!list_empty(&instance->memory_regions)) {
+			struct mk_memory_region *region;
+			u64 total_size = 0;
+			u64 base_addr = 0;
+			bool first = true;
+
+			list_for_each_entry(region, &instance->memory_regions, list) {
+				if (first) {
+					base_addr = region->res.start;
+					first = false;
+				}
+				total_size += resource_size(&region->res);
+			}
+
+			if (total_size > 0) {
+				ret = fdt_property_u64(fdt, "memory-base", base_addr);
+				if (ret)
+					goto err_free;
+
+				ret = fdt_property_u64(fdt, "memory-bytes", total_size);
+				if (ret)
+					goto err_free;
+			}
+		}
+
+		if (instance->cpus && !bitmap_empty(instance->cpus, NR_CPUS)) {
+			int cpu;
+			u32 *cpu_array;
+			int cpu_count = bitmap_weight(instance->cpus, NR_CPUS);
+			int idx = 0;
+
+			cpu_array = kmalloc(cpu_count * sizeof(u32), GFP_KERNEL);
+			if (!cpu_array) {
+				ret = -ENOMEM;
+				goto err_free;
+			}
+
+			for_each_set_bit(cpu, instance->cpus, NR_CPUS) {
+				cpu_array[idx++] = cpu_to_fdt32(cpu);
+			}
+
+			ret = fdt_property(fdt, "cpus", cpu_array, cpu_count * sizeof(u32));
+			kfree(cpu_array);
+			if (ret)
+				goto err_free;
+		}
+
+		if (instance->pci_devices_valid && instance->pci_device_count > 0) {
+			struct mk_pci_device *pci_dev;
+			list_for_each_entry(pci_dev, &instance->pci_devices, list) {
+				char node_name[32];
+				snprintf(node_name, sizeof(node_name), "pci@%04x:%04x",
+					 pci_dev->vendor, pci_dev->device);
+
+				ret = fdt_begin_node(fdt, node_name);
+				if (ret)
+					goto err_free;
+
+				ret = fdt_property_u32(fdt, "vendor", pci_dev->vendor);
+				if (ret)
+					goto err_free;
+				ret = fdt_property_u32(fdt, "device", pci_dev->device);
+				if (ret)
+					goto err_free;
+				ret = fdt_property_u32(fdt, "domain", pci_dev->domain);
+				if (ret)
+					goto err_free;
+				ret = fdt_property_u32(fdt, "bus", pci_dev->bus);
+				if (ret)
+					goto err_free;
+				ret = fdt_property_u32(fdt, "slot", pci_dev->slot);
+				if (ret)
+					goto err_free;
+				ret = fdt_property_u32(fdt, "function", pci_dev->func);
+				if (ret)
+					goto err_free;
+
+				ret = fdt_end_node(fdt);
+				if (ret)
+					goto err_free;
+			}
+		}
+
+		ret = fdt_end_node(fdt); /* End resources node */
+		if (ret)
+			goto err_free;
+
+		ret = fdt_end_node(fdt); /* End instance node */
+		if (ret)
+			goto err_free;
+	}
+
+	ret = fdt_end_node(fdt); /* End instances node */
+	if (ret) goto err_free;
+
+	ret = fdt_end_node(fdt); /* End root node */
+	if (ret) goto err_free;
+
+	ret = fdt_finish(fdt);
+	if (ret) {
+		pr_err("Failed to finish global FDT: %d\n", ret);
+		goto err_free;
+	}
+
+	*out_dtb = fdt;
+	*out_size = fdt_totalsize(fdt);
+
+	pr_debug("Generated global DTB: %zu bytes\n", *out_size);
+	return 0;
+
+err_free:
+	kfree(fdt);
+	return ret;
+}
+
+int mk_dt_update_global_dtb(void)
+{
+	void *new_dtb;
+	size_t new_size;
+	int ret;
+
+	lockdep_assert_held(&mk_instance_mutex);
+
+	ret = mk_dt_generate_global_dtb(&new_dtb, &new_size);
+	if (ret) {
+		pr_err("Failed to generate updated global DTB: %d\n", ret);
+		return ret;
+	}
+
+	mutex_lock(&mk_host_dtb_mutex);
+	kfree(root_instance->dtb_data);
+	root_instance->dtb_data = new_dtb;
+	root_instance->dtb_size = new_size;
+	mutex_unlock(&mk_host_dtb_mutex);
+
+	pr_info("Updated global device tree: %zu bytes\n", new_size);
+	return 0;
+}

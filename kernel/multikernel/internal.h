@@ -1,5 +1,6 @@
 extern struct resource multikernel_res;
 extern struct mutex mk_instance_mutex;
+extern struct mutex mk_host_dtb_mutex;
 extern struct idr mk_instance_idr;
 extern struct list_head mk_instance_list;
 extern struct mk_instance *root_instance;
@@ -18,6 +19,8 @@ int mk_dt_parse_resources(const void *fdt, int resources_node,
 int mk_dt_generate_instance_dtb(const char *name, int id,
 				 const struct mk_dt_config *config,
 				 void **out_dtb, size_t *out_size);
+int mk_dt_generate_global_dtb(void **out_dtb, size_t *out_size);
+int mk_dt_update_global_dtb(void);
 
 /* overlay.c */
 extern struct kernfs_node *mk_overlay_root_kn;
