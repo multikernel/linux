@@ -316,6 +316,52 @@ static int mk_dt_parse_single_platform_device(const void *source_fdt, int dev_no
 	return 0;
 }
 
+static int mk_dt_parse_embedded_devices(const void *fdt, int resources_node,
+					struct mk_dt_config *config)
+{
+	int devices_node, dev_node, ret;
+	const char *device_name, *device_type;
+	int len;
+
+	devices_node = fdt_subnode_offset(fdt, resources_node, "devices");
+	if (devices_node < 0) {
+		pr_debug("No devices node found in resources\n");
+		return 0;
+	}
+
+	fdt_for_each_subnode(dev_node, fdt, devices_node) {
+		device_name = fdt_get_name(fdt, dev_node, NULL);
+		if (!device_name)
+			continue;
+
+		device_type = fdt_getprop(fdt, dev_node, "device-type", &len);
+		if (!device_type)
+			continue; /* Not a device node, skip */
+
+		if (strcmp(device_type, "pci") == 0) {
+			if (!config->pci_devices_valid)
+				continue;
+			ret = mk_dt_parse_single_pci_device(fdt, dev_node, config, device_name);
+			if (ret) {
+				pr_err("Failed to parse embedded PCI device '%s': %d\n",
+				       device_name, ret);
+				return ret;
+			}
+		} else if (strcmp(device_type, "platform") == 0) {
+			if (!config->platform_devices_valid)
+				continue;
+			ret = mk_dt_parse_single_platform_device(fdt, dev_node, config, device_name);
+			if (ret) {
+				pr_err("Failed to parse embedded platform device '%s': %d\n",
+				       device_name, ret);
+				return ret;
+			}
+		}
+	}
+
+	return 0;
+}
+
 /**
  * Device parsing using string array with device-type dispatching
  *
@@ -364,9 +410,10 @@ static int mk_dt_parse_devices(const void *fdt, int chosen_node,
 	int len, offset, dev_node, ret;
 	int device_count = 0;
 
+	/* First try device-names property (overlay format) */
 	prop_data = fdt_getprop(fdt, chosen_node, "device-names", &len);
 	if (!prop_data) {
-		return 0;
+		return mk_dt_parse_embedded_devices(fdt, chosen_node, config);
 	}
 
 	if (len == 0) {
@@ -831,27 +878,24 @@ void mk_dt_print_config(const struct mk_dt_config *config)
 }
 
 /**
- * mk_dt_generate_instance_dtb() - Generate a proper instance DTB from config
- * @name: Instance name
- * @id: Instance ID
- * @config: Configuration with parsed resources
+ * mk_dt_generate_instance_dtb() - Generate instance DTB from kernel data structures
+ * @instance: Instance with transferred resources (CPUs, memory, devices)
  * @out_dtb: Output pointer for generated DTB (caller must kfree)
  * @out_size: Output size of generated DTB
  *
- * Generates a full device tree with /instances/<name>/resources structure
- * suitable for passing to spawn kernel via KHO.
- *
  * Returns: 0 on success, negative error code on failure
  */
-int mk_dt_generate_instance_dtb(const char *name, int id,
-				 const struct mk_dt_config *config,
+int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 				 void **out_dtb, size_t *out_size)
 {
 	void *fdt;
 	int ret;
 	size_t fdt_size = 4096; /* Start with 4K, will grow if needed */
 
-	if (!name || !config || !out_dtb || !out_size)
+	if (!instance || !out_dtb || !out_size)
+		return -EINVAL;
+
+	if (!instance->name)
 		return -EINVAL;
 
 	fdt = kmalloc(fdt_size, GFP_KERNEL);
@@ -870,40 +914,46 @@ int mk_dt_generate_instance_dtb(const char *name, int id,
 		goto err_free;
 	}
 
-	/* Begin root node */
-	ret = fdt_begin_node(fdt, "");
+	ret = fdt_begin_node(fdt, instance->name);
 	if (ret) goto err_free;
 
 	ret = fdt_property_string(fdt, "compatible", "multikernel-v1");
 	if (ret) goto err_free;
 
-	/* Create /instances node */
-	ret = fdt_begin_node(fdt, "instances");
+	ret = fdt_property_u32(fdt, "id", instance->id);
 	if (ret) goto err_free;
 
-	/* Create /instances/<name> node */
-	ret = fdt_begin_node(fdt, name);
-	if (ret) goto err_free;
-
-	ret = fdt_property_u32(fdt, "id", id);
-	if (ret) goto err_free;
-
-	ret = fdt_property_string(fdt, "compatible", "multikernel-v1");
-	if (ret) goto err_free;
-
-	/* Create /instances/<name>/resources node */
 	ret = fdt_begin_node(fdt, "resources");
 	if (ret) goto err_free;
 
-	if (config->memory_size > 0) {
-		ret = fdt_property_u64(fdt, "memory-bytes", config->memory_size);
-		if (ret) goto err_free;
+	if (!list_empty(&instance->memory_regions)) {
+		struct mk_memory_region *region;
+		u64 total_size = 0;
+		u64 base_addr = 0;
+		bool first = true;
+
+		list_for_each_entry(region, &instance->memory_regions, list) {
+			if (first) {
+				base_addr = region->res.start;
+				first = false;
+			}
+			total_size += resource_size(&region->res);
+		}
+
+		if (total_size > 0) {
+			ret = fdt_property_u64(fdt, "memory-base", base_addr);
+			if (ret) goto err_free;
+
+			ret = fdt_property_u64(fdt, "memory-bytes", total_size);
+			if (ret) goto err_free;
+		}
 	}
 
-	if (config->cpus && !bitmap_empty(config->cpus, NR_CPUS)) {
+	/* CPU resources */
+	if (instance->cpus && !bitmap_empty(instance->cpus, NR_CPUS)) {
 		int cpu;
 		u32 *cpu_array;
-		int cpu_count = bitmap_weight(config->cpus, NR_CPUS);
+		int cpu_count = bitmap_weight(instance->cpus, NR_CPUS);
 		int idx = 0;
 
 		cpu_array = kmalloc(cpu_count * sizeof(u32), GFP_KERNEL);
@@ -912,7 +962,7 @@ int mk_dt_generate_instance_dtb(const char *name, int id,
 			goto err_free;
 		}
 
-		for_each_set_bit(cpu, config->cpus, NR_CPUS) {
+		for_each_set_bit(cpu, instance->cpus, NR_CPUS) {
 			cpu_array[idx++] = cpu_to_fdt32(cpu);
 		}
 
@@ -921,67 +971,68 @@ int mk_dt_generate_instance_dtb(const char *name, int id,
 		if (ret) goto err_free;
 	}
 
-	if (config->pci_devices_valid && config->pci_device_count > 0) {
-		struct mk_pci_device *pci_dev;
-		list_for_each_entry(pci_dev, &config->pci_devices, list) {
-			char node_name[32];
-			snprintf(node_name, sizeof(node_name), "pci@%04x:%04x",
-				 pci_dev->vendor, pci_dev->device);
+	if ((instance->pci_devices_valid && instance->pci_device_count > 0) ||
+	    (instance->platform_devices_valid && instance->platform_device_count > 0)) {
+		ret = fdt_begin_node(fdt, "devices");
+		if (ret) goto err_free;
 
-			ret = fdt_begin_node(fdt, node_name);
-			if (ret) goto err_free;
+		if (instance->pci_devices_valid && instance->pci_device_count > 0) {
+			struct mk_pci_device *pci_dev;
 
-			ret = fdt_property_u32(fdt, "vendor", pci_dev->vendor);
-			if (ret) goto err_free;
-			ret = fdt_property_u32(fdt, "device", pci_dev->device);
-			if (ret) goto err_free;
-			ret = fdt_property_u32(fdt, "domain", pci_dev->domain);
-			if (ret) goto err_free;
-			ret = fdt_property_u32(fdt, "bus", pci_dev->bus);
-			if (ret) goto err_free;
-			ret = fdt_property_u32(fdt, "slot", pci_dev->slot);
-			if (ret) goto err_free;
-			ret = fdt_property_u32(fdt, "function", pci_dev->func);
-			if (ret) goto err_free;
+			list_for_each_entry(pci_dev, &instance->pci_devices, list) {
+				char node_name[64];
+				char pci_id_str[32];
 
-			ret = fdt_end_node(fdt);
-			if (ret) goto err_free;
-		}
-	}
+				snprintf(node_name, sizeof(node_name), "%s",
+					 pci_dev->name[0] ? pci_dev->name : "unnamed_pci");
+				snprintf(pci_id_str, sizeof(pci_id_str), "%04x:%02x:%02x.%x",
+					 pci_dev->domain, pci_dev->bus, pci_dev->slot, pci_dev->func);
 
-	if (config->platform_devices_valid && config->platform_device_count > 0) {
-		struct mk_platform_device *plat_dev;
-		int dev_idx = 0;
-		list_for_each_entry(plat_dev, &config->platform_devices, list) {
-			char node_name[64];
-			snprintf(node_name, sizeof(node_name), "platform@%d", dev_idx++);
+				ret = fdt_begin_node(fdt, node_name);
+				if (ret) goto err_free;
 
-			ret = fdt_begin_node(fdt, node_name);
-			if (ret) goto err_free;
+				ret = fdt_property_string(fdt, "device-type", "pci");
+				if (ret) goto err_free;
 
-			if (plat_dev->hid[0]) {
-				ret = fdt_property_string(fdt, "hid", plat_dev->hid);
+				ret = fdt_property_string(fdt, "pci-id", pci_id_str);
+				if (ret) goto err_free;
+
+				ret = fdt_property_u32(fdt, "vendor-id", pci_dev->vendor);
+				if (ret) goto err_free;
+
+				ret = fdt_property_u32(fdt, "device-id", pci_dev->device);
+				if (ret) goto err_free;
+
+				ret = fdt_end_node(fdt);
 				if (ret) goto err_free;
 			}
-			if (plat_dev->name[0]) {
-				ret = fdt_property_string(fdt, "name", plat_dev->name);
+		}
+
+		if (instance->platform_devices_valid && instance->platform_device_count > 0) {
+			struct mk_platform_device *plat_dev;
+
+			list_for_each_entry(plat_dev, &instance->platform_devices, list) {
+				ret = fdt_begin_node(fdt, plat_dev->name);
+				if (ret) goto err_free;
+
+				ret = fdt_property_string(fdt, "device-type", "platform");
+				if (ret) goto err_free;
+
+				if (plat_dev->name[0]) {
+					ret = fdt_property_string(fdt, "device-name", plat_dev->name);
+					if (ret) goto err_free;
+				}
+
+				ret = fdt_end_node(fdt);
 				if (ret) goto err_free;
 			}
-
-			ret = fdt_end_node(fdt);
-			if (ret) goto err_free;
 		}
+
+		ret = fdt_end_node(fdt); /* /resources/devices */
+		if (ret) goto err_free;
 	}
 
 	/* End resources node */
-	ret = fdt_end_node(fdt);
-	if (ret) goto err_free;
-
-	/* End instance node */
-	ret = fdt_end_node(fdt);
-	if (ret) goto err_free;
-
-	/* End instances node */
 	ret = fdt_end_node(fdt);
 	if (ret) goto err_free;
 
@@ -1000,281 +1051,10 @@ int mk_dt_generate_instance_dtb(const char *name, int id,
 	*out_size = fdt_totalsize(fdt);
 
 	pr_info("Generated instance DTB for '%s' (ID %d): %zu bytes\n",
-		name, id, *out_size);
+			instance->name, instance->id, *out_size);
 	return 0;
 
 err_free:
 	kfree(fdt);
 	return ret;
-}
-
-static int mk_dt_copy_node_recursive(void *dst_fdt, const void *src_fdt, int src_node)
-{
-	int ret, prop_offset, subnode;
-	const struct fdt_property *prop;
-	const char *prop_name, *node_name;
-	int len;
-
-	/* Copy all properties */
-	prop_offset = fdt_first_property_offset(src_fdt, src_node);
-	while (prop_offset >= 0) {
-		prop = fdt_get_property_by_offset(src_fdt, prop_offset, &len);
-		if (prop) {
-			prop_name = fdt_string(src_fdt, fdt32_to_cpu(prop->nameoff));
-			ret = fdt_property(dst_fdt, prop_name, prop->data, len);
-			if (ret)
-				return ret;
-		}
-		prop_offset = fdt_next_property_offset(src_fdt, prop_offset);
-	}
-
-	/* Copy all subnodes recursively */
-	fdt_for_each_subnode(subnode, src_fdt, src_node) {
-		node_name = fdt_get_name(src_fdt, subnode, NULL);
-		if (!node_name)
-			continue;
-
-		ret = fdt_begin_node(dst_fdt, node_name);
-		if (ret)
-			return ret;
-
-		ret = mk_dt_copy_node_recursive(dst_fdt, src_fdt, subnode);
-		if (ret)
-			return ret;
-
-		ret = fdt_end_node(dst_fdt);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
-}
-
-int mk_dt_generate_global_dtb(void **out_dtb, size_t *out_size)
-{
-	void *fdt;
-	const void *base_fdt;
-	int ret;
-	size_t fdt_size = 16384;
-	struct mk_instance *instance;
-
-	if (!out_dtb || !out_size)
-		return -EINVAL;
-
-	lockdep_assert_held(&mk_instance_mutex);
-
-	fdt = kmalloc(fdt_size, GFP_KERNEL);
-	if (!fdt)
-		return -ENOMEM;
-
-	ret = fdt_create(fdt, fdt_size);
-	if (ret) {
-		pr_err("Failed to create global FDT: %d\n", ret);
-		goto err_free;
-	}
-
-	ret = fdt_finish_reservemap(fdt);
-	if (ret)
-		goto err_free;
-
-	ret = fdt_begin_node(fdt, "");
-	if (ret) goto err_free;
-
-	ret = fdt_property_string(fdt, "compatible", "multikernel-v1");
-	if (ret) goto err_free;
-
-	mutex_lock(&mk_host_dtb_mutex);
-	base_fdt = root_instance ? root_instance->dtb_data : NULL;
-
-	if (base_fdt && fdt_check_header(base_fdt) == 0) {
-		int resources_node = fdt_path_offset(base_fdt, "/resources");
-		if (resources_node >= 0) {
-			ret = fdt_begin_node(fdt, "resources");
-			if (ret) {
-				mutex_unlock(&mk_host_dtb_mutex);
-				goto err_free;
-			}
-
-			ret = mk_dt_copy_node_recursive(fdt, base_fdt, resources_node);
-			if (ret) {
-				mutex_unlock(&mk_host_dtb_mutex);
-				goto err_free;
-			}
-
-			ret = fdt_end_node(fdt);
-			if (ret) {
-				mutex_unlock(&mk_host_dtb_mutex);
-				goto err_free;
-			}
-		}
-	}
-	mutex_unlock(&mk_host_dtb_mutex);
-
-	ret = fdt_begin_node(fdt, "instances");
-	if (ret) goto err_free;
-
-	list_for_each_entry(instance, &mk_instance_list, list) {
-		if (instance->id == 0)
-			continue;
-
-		if (!instance->name || !instance->dtb_data)
-			continue;
-
-		ret = fdt_begin_node(fdt, instance->name);
-		if (ret)
-			goto err_free;
-
-		ret = fdt_property_u32(fdt, "id", instance->id);
-		if (ret)
-			goto err_free;
-
-		ret = fdt_property_string(fdt, "compatible", "multikernel-v1");
-		if (ret)
-			goto err_free;
-
-		ret = fdt_property_string(fdt, "status", mk_state_to_string(instance->state));
-		if (ret)
-			goto err_free;
-
-		ret = fdt_begin_node(fdt, "resources");
-		if (ret)
-			goto err_free;
-
-		if (!list_empty(&instance->memory_regions)) {
-			struct mk_memory_region *region;
-			u64 total_size = 0;
-			u64 base_addr = 0;
-			bool first = true;
-
-			list_for_each_entry(region, &instance->memory_regions, list) {
-				if (first) {
-					base_addr = region->res.start;
-					first = false;
-				}
-				total_size += resource_size(&region->res);
-			}
-
-			if (total_size > 0) {
-				ret = fdt_property_u64(fdt, "memory-base", base_addr);
-				if (ret)
-					goto err_free;
-
-				ret = fdt_property_u64(fdt, "memory-bytes", total_size);
-				if (ret)
-					goto err_free;
-			}
-		}
-
-		if (instance->cpus && !bitmap_empty(instance->cpus, NR_CPUS)) {
-			int cpu;
-			u32 *cpu_array;
-			int cpu_count = bitmap_weight(instance->cpus, NR_CPUS);
-			int idx = 0;
-
-			cpu_array = kmalloc(cpu_count * sizeof(u32), GFP_KERNEL);
-			if (!cpu_array) {
-				ret = -ENOMEM;
-				goto err_free;
-			}
-
-			for_each_set_bit(cpu, instance->cpus, NR_CPUS) {
-				cpu_array[idx++] = cpu_to_fdt32(cpu);
-			}
-
-			ret = fdt_property(fdt, "cpus", cpu_array, cpu_count * sizeof(u32));
-			kfree(cpu_array);
-			if (ret)
-				goto err_free;
-		}
-
-		if (instance->pci_devices_valid && instance->pci_device_count > 0) {
-			struct mk_pci_device *pci_dev;
-			list_for_each_entry(pci_dev, &instance->pci_devices, list) {
-				char node_name[32];
-				snprintf(node_name, sizeof(node_name), "pci@%04x:%04x",
-					 pci_dev->vendor, pci_dev->device);
-
-				ret = fdt_begin_node(fdt, node_name);
-				if (ret)
-					goto err_free;
-
-				ret = fdt_property_u32(fdt, "vendor", pci_dev->vendor);
-				if (ret)
-					goto err_free;
-				ret = fdt_property_u32(fdt, "device", pci_dev->device);
-				if (ret)
-					goto err_free;
-				ret = fdt_property_u32(fdt, "domain", pci_dev->domain);
-				if (ret)
-					goto err_free;
-				ret = fdt_property_u32(fdt, "bus", pci_dev->bus);
-				if (ret)
-					goto err_free;
-				ret = fdt_property_u32(fdt, "slot", pci_dev->slot);
-				if (ret)
-					goto err_free;
-				ret = fdt_property_u32(fdt, "function", pci_dev->func);
-				if (ret)
-					goto err_free;
-
-				ret = fdt_end_node(fdt);
-				if (ret)
-					goto err_free;
-			}
-		}
-
-		ret = fdt_end_node(fdt); /* End resources node */
-		if (ret)
-			goto err_free;
-
-		ret = fdt_end_node(fdt); /* End instance node */
-		if (ret)
-			goto err_free;
-	}
-
-	ret = fdt_end_node(fdt); /* End instances node */
-	if (ret) goto err_free;
-
-	ret = fdt_end_node(fdt); /* End root node */
-	if (ret) goto err_free;
-
-	ret = fdt_finish(fdt);
-	if (ret) {
-		pr_err("Failed to finish global FDT: %d\n", ret);
-		goto err_free;
-	}
-
-	*out_dtb = fdt;
-	*out_size = fdt_totalsize(fdt);
-
-	pr_debug("Generated global DTB: %zu bytes\n", *out_size);
-	return 0;
-
-err_free:
-	kfree(fdt);
-	return ret;
-}
-
-int mk_dt_update_global_dtb(void)
-{
-	void *new_dtb;
-	size_t new_size;
-	int ret;
-
-	lockdep_assert_held(&mk_instance_mutex);
-
-	ret = mk_dt_generate_global_dtb(&new_dtb, &new_size);
-	if (ret) {
-		pr_err("Failed to generate updated global DTB: %d\n", ret);
-		return ret;
-	}
-
-	mutex_lock(&mk_host_dtb_mutex);
-	kfree(root_instance->dtb_data);
-	root_instance->dtb_data = new_dtb;
-	root_instance->dtb_size = new_size;
-	mutex_unlock(&mk_host_dtb_mutex);
-
-	pr_info("Updated global device tree: %zu bytes\n", new_size);
-	return 0;
 }

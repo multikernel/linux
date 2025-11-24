@@ -161,25 +161,32 @@ bool multikernel_allow_emergency_restart(void)
  * CPU management functions for instances
  */
 
-/**
- * mk_instance_verify_cpus - Verify CPUs for instance are offline and available
- * @instance: Instance whose CPUs should be verified
- *
- * Verifies that CPUs assigned to the instance are already offline (from baseline
- * initialization) and available for use. Does NOT offline CPUs - that's done
- * during baseline loading.
- *
- * Returns 0 on success, negative error code on failure.
- */
-static int mk_instance_verify_cpus(struct mk_instance *instance)
+static int mk_instance_transfer_cpus(struct mk_instance *instance,
+				     const unsigned long *cpus)
 {
 	int phys_cpu, logical_cpu;
 	int unavailable = 0;
+	int requested_count;
 
-	pr_info("Verifying CPUs for multikernel instance %d (%s): %*pbl\n",
-		instance->id, instance->name, NR_CPUS, instance->cpus);
+	if (!cpus || !instance->cpus || !root_instance || !root_instance->cpus) {
+		pr_err("Invalid CPU bitmaps for transfer\n");
+		return -EINVAL;
+	}
 
-	for_each_set_bit(phys_cpu, instance->cpus, NR_CPUS) {
+	requested_count = bitmap_weight(cpus, NR_CPUS);
+	if (requested_count == 0) {
+		pr_info("No CPUs requested for instance %d (%s)\n",
+			instance->id, instance->name);
+		return 0;
+	}
+
+	for_each_set_bit(phys_cpu, cpus, NR_CPUS) {
+		if (!test_bit(phys_cpu, root_instance->cpus)) {
+			pr_err("CPU %u not available in root instance pool\n", phys_cpu);
+			unavailable++;
+			continue;
+		}
+
 		logical_cpu = arch_cpu_from_physical_id(phys_cpu);
 		if (logical_cpu < 0) {
 			pr_err("Physical CPU %d not found in logical CPU map\n", phys_cpu);
@@ -188,57 +195,117 @@ static int mk_instance_verify_cpus(struct mk_instance *instance)
 		}
 
 		if (cpu_online(logical_cpu)) {
-			pr_err("CPU %u (logical %d) is still online - baseline not loaded or CPU not in pool\n",
+			pr_err("CPU %u (logical %d) is still online - not properly offlined\n",
 			       phys_cpu, logical_cpu);
 			unavailable++;
 		}
 	}
 
 	if (unavailable > 0) {
-		pr_err("Instance %d (%s): %d CPUs are not available (still online)\n",
+		pr_err("Instance %d (%s): %d CPUs are not available\n",
 		       instance->id, instance->name, unavailable);
-		pr_err("Ensure baseline DTB is loaded with 'cat baseline.dtb > /sys/fs/multikernel/device_tree'\n");
 		return -EBUSY;
 	}
 
-	pr_info("Successfully verified %d CPUs for instance %d (%s) - all offline and available\n",
-		bitmap_weight(instance->cpus, NR_CPUS), instance->id, instance->name);
+	for_each_set_bit(phys_cpu, cpus, NR_CPUS) {
+		clear_bit(phys_cpu, root_instance->cpus);
+		set_bit(phys_cpu, instance->cpus);
+	}
+
+	pr_info("Transferred %d CPUs from root to instance %d (%s): %*pbl\n",
+		requested_count, instance->id, instance->name,
+		NR_CPUS, instance->cpus);
+
 	return 0;
 }
 
-/**
- * mk_instance_reserve_cpus() - Assign CPU resources to an instance
- * @instance: Instance to assign CPU resources to
- * @config: Device tree configuration with CPU assignment
- *
- * Copies CPU assignment from config to instance and verifies CPUs are
- * offline and available. CPUs must already be offlined by baseline initialization.
- *
- * Returns 0 on success, negative error code on failure.
- */
 static int mk_instance_reserve_cpus(struct mk_instance *instance,
 				    const struct mk_dt_config *config)
 {
-	int ret;
-
-	if (config->cpus && instance->cpus) {
-		bitmap_copy(instance->cpus, config->cpus, NR_CPUS);
-
-		pr_info("CPU assignment for instance %d (%s): %*pbl (%d CPUs)\n",
-			instance->id, instance->name,
-			NR_CPUS, instance->cpus, bitmap_weight(instance->cpus, NR_CPUS));
-
-		ret = mk_instance_verify_cpus(instance);
-		if (ret) {
-			pr_err("Failed to verify CPU availability for instance %d (%s): %d\n",
-			       instance->id, instance->name, ret);
-			return ret;
-		}
-	} else {
-		pr_warn("Cannot reserve CPU resources to instance %d (%s) - instance CPU mask not available\n",
+	if (!config->cpus) {
+		pr_warn("No CPU configuration for instance %d (%s)\n",
 			instance->id, instance->name);
+		return 0;
+	}
+
+	return mk_instance_transfer_cpus(instance, config->cpus);
+}
+
+static int mk_instance_transfer_pci_devices(struct mk_instance *instance,
+					     const struct list_head *requested_devices,
+					     int requested_count)
+{
+	struct mk_pci_device *req_dev, *root_dev, *tmp;
+	int transferred = 0;
+	int not_found = 0;
+	bool found;
+
+	if (!root_instance || !root_instance->pci_devices_valid) {
+		pr_err("No root instance or PCI devices not initialized\n");
 		return -EINVAL;
 	}
+
+	if (requested_count == 0 || list_empty(requested_devices)) {
+		pr_info("No PCI devices requested for instance %d (%s)\n",
+			instance->id, instance->name);
+		instance->pci_devices_valid = true;
+		return 0;
+	}
+
+	list_for_each_entry(req_dev, requested_devices, list) {
+		found = false;
+		list_for_each_entry(root_dev, &root_instance->pci_devices, list) {
+			if (root_dev->vendor == req_dev->vendor &&
+			    root_dev->device == req_dev->device &&
+			    root_dev->domain == req_dev->domain &&
+			    root_dev->bus == req_dev->bus &&
+			    root_dev->slot == req_dev->slot &&
+			    root_dev->func == req_dev->func) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			pr_err("PCI device %04x:%04x@%04x:%02x:%02x.%x not available in root pool\n",
+			       req_dev->vendor, req_dev->device, req_dev->domain,
+			       req_dev->bus, req_dev->slot, req_dev->func);
+			not_found++;
+		}
+	}
+
+	if (not_found > 0) {
+		pr_err("Instance %d (%s): %d PCI devices not available\n",
+		       instance->id, instance->name, not_found);
+		return -ENOENT;
+	}
+
+	list_for_each_entry(req_dev, requested_devices, list) {
+		list_for_each_entry_safe(root_dev, tmp, &root_instance->pci_devices, list) {
+			if (root_dev->vendor == req_dev->vendor &&
+			    root_dev->device == req_dev->device &&
+			    root_dev->domain == req_dev->domain &&
+			    root_dev->bus == req_dev->bus &&
+			    root_dev->slot == req_dev->slot &&
+			    root_dev->func == req_dev->func) {
+
+				list_del(&root_dev->list);
+				list_add_tail(&root_dev->list, &instance->pci_devices);
+				root_instance->pci_device_count--;
+				instance->pci_device_count++;
+				transferred++;
+
+				pr_debug("Transferred PCI device %04x:%04x@%04x:%02x:%02x.%x to instance %d\n",
+					 root_dev->vendor, root_dev->device, root_dev->domain,
+					 root_dev->bus, root_dev->slot, root_dev->func,
+					 instance->id);
+				break;
+			}
+		}
+	}
+
+	instance->pci_devices_valid = true;
+	pr_info("Transferred %d PCI devices from root to instance %d (%s), root pool remaining: %d devices\n",
+		transferred, instance->id, instance->name, root_instance->pci_device_count);
 
 	return 0;
 }
@@ -246,78 +313,24 @@ static int mk_instance_reserve_cpus(struct mk_instance *instance,
 static int mk_instance_reserve_pci_devices(struct mk_instance *instance,
 					   const struct mk_dt_config *config)
 {
-	struct mk_pci_device *src_dev, *dst_dev, *tmp;
-	int ret;
-
-	if (instance->pci_devices_valid) {
-		list_for_each_entry_safe(dst_dev, tmp, &instance->pci_devices, list) {
-			list_del(&dst_dev->list);
-			kfree(dst_dev);
-		}
-		instance->pci_device_count = 0;
-	} else {
-		INIT_LIST_HEAD(&instance->pci_devices);
-	}
-
 	if (!config->pci_devices_valid || config->pci_device_count == 0) {
-		instance->pci_devices_valid = false;
+		instance->pci_devices_valid = true;
 		instance->pci_device_count = 0;
 		pr_debug("No PCI devices to reserve for instance %d (%s)\n",
 			 instance->id, instance->name);
 		return 0;
 	}
 
-	list_for_each_entry(src_dev, &config->pci_devices, list) {
-		dst_dev = kzalloc(sizeof(*dst_dev), GFP_KERNEL);
-		if (!dst_dev) {
-			pr_err("Failed to allocate PCI device entry for instance %d (%s)\n",
-			       instance->id, instance->name);
-			ret = -ENOMEM;
-			goto cleanup;
-		}
-
-		dst_dev->vendor = src_dev->vendor;
-		dst_dev->device = src_dev->device;
-		dst_dev->domain = src_dev->domain;
-		dst_dev->bus = src_dev->bus;
-		dst_dev->slot = src_dev->slot;
-		dst_dev->func = src_dev->func;
-
-		list_add_tail(&dst_dev->list, &instance->pci_devices);
-		instance->pci_device_count++;
-	}
-
-	instance->pci_devices_valid = true;
-	pr_info("Reserved %d PCI devices for instance %d (%s)\n",
-		instance->pci_device_count, instance->id, instance->name);
-	return 0;
-
-cleanup:
-	list_for_each_entry_safe(dst_dev, tmp, &instance->pci_devices, list) {
-		list_del(&dst_dev->list);
-		kfree(dst_dev);
-	}
-	instance->pci_device_count = 0;
-	instance->pci_devices_valid = false;
-	return ret;
+	return mk_instance_transfer_pci_devices(instance,
+						&config->pci_devices,
+						config->pci_device_count);
 }
 
 /**
  * Memory management functions for instances
  */
 
-/**
- * mk_instance_reserve_memory() - Reserve memory regions for an instance
- * @instance: Instance to reserve memory for
- * @config: Device tree configuration with memory size
- *
- * Creates an instance pool from the specified memory size and creates
- * memory regions from the pool chunks for resource hierarchy management.
- *
- * Returns 0 on success, negative error code on failure.
- */
-static int mk_instance_reserve_memory(struct mk_instance *instance,
-				      const struct mk_dt_config *config)
+static int mk_instance_transfer_memory(struct mk_instance *instance, u64 size)
 {
 	struct gen_pool *pool;
 	struct gen_pool_chunk *chunk;
@@ -325,16 +338,32 @@ static int mk_instance_reserve_memory(struct mk_instance *instance,
 	int ret = 0;
 	int region_num = 0;
 
-	/* Handle case where no memory size is specified */
-	if (config->memory_size == 0) {
-		pr_info("No memory size specified for instance %d (%s)\n",
-		       instance->id, instance->name);
+	if (size == 0) {
+		pr_info("No memory requested for instance %d (%s)\n",
+			instance->id, instance->name);
 		return 0;
 	}
 
-	/* Create instance memory pool */
+	if (!root_instance) {
+		pr_err("No root instance - cannot transfer memory\n");
+		return -EINVAL;
+	}
+
+	/* Calculate available memory from root_instance regions */
+	u64 available = 0;
+	struct mk_memory_region *root_region;
+	list_for_each_entry(root_region, &root_instance->memory_regions, list) {
+		available += resource_size(&root_region->res);
+	}
+
+	if (size > available) {
+		pr_err("Requested memory (0x%llx) exceeds available pool (0x%llx)\n",
+		       size, available);
+		return -ENOMEM;
+	}
+
 	instance->instance_pool = multikernel_create_instance_pool(instance->id,
-								   config->memory_size,
+								   size,
 								   PAGE_SHIFT);
 	if (!instance->instance_pool) {
 		pr_err("Failed to create instance pool for instance %d (%s)\n",
@@ -342,24 +371,19 @@ static int mk_instance_reserve_memory(struct mk_instance *instance,
 		return -ENOMEM;
 	}
 
-	instance->pool_size = config->memory_size;
+	instance->pool_size = size;
 	pool = (struct gen_pool *)instance->instance_pool;
 
-	/* Create memory regions from pool chunks for resource hierarchy */
 	list_for_each_entry(chunk, &pool->chunks, next_chunk) {
-		resource_size_t size = chunk->end_addr - chunk->start_addr + 1;
+		resource_size_t chunk_size = chunk->end_addr - chunk->start_addr + 1;
 
-		/* Allocate a new region structure for the instance */
 		region = kzalloc(sizeof(*region), GFP_KERNEL);
 		if (!region) {
+			pr_err("Failed to allocate memory region structure\n");
 			ret = -ENOMEM;
 			goto cleanup;
 		}
 
-		/* Set up the resource structure from chunk */
-		region->res.start = chunk->start_addr;
-		region->res.end = chunk->end_addr;
-		region->res.flags = IORESOURCE_MEM | IORESOURCE_BUSY;
 		region->res.name = kasprintf(GFP_KERNEL, "mk-instance-%d-%s-region-%d",
 					     instance->id, instance->name, region_num);
 		if (!region->res.name) {
@@ -368,45 +392,49 @@ static int mk_instance_reserve_memory(struct mk_instance *instance,
 			goto cleanup;
 		}
 
-		/* Link region to its chunk */
+		region->res.start = chunk->start_addr;
+		region->res.end = chunk->end_addr;
+		region->res.flags = IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
 		region->chunk = chunk;
 
-		/* Insert as child of multikernel_res */
 		ret = insert_resource(&multikernel_res, &region->res);
 		if (ret) {
-			pr_err("Failed to insert memory region as child resource: %d\n", ret);
+			pr_err("Failed to insert resource for instance %d region %d: %d\n",
+			       instance->id, region_num, ret);
 			kfree(region->res.name);
 			kfree(region);
 			goto cleanup;
 		}
 
-		/* Add to instance's memory region list */
 		INIT_LIST_HEAD(&region->list);
 		list_add_tail(&region->list, &instance->memory_regions);
 		instance->region_count++;
 		region_num++;
 
-		pr_debug("Created memory region for instance %d (%s): 0x%llx-0x%llx (%llu bytes)\n",
-			 instance->id, instance->name,
+		pr_debug("Created region %d for instance %d: 0x%llx-0x%llx (%llu bytes)\n",
+			 region_num - 1, instance->id,
 			 (unsigned long long)region->res.start,
 			 (unsigned long long)region->res.end,
-			 (unsigned long long)size);
+			 chunk_size);
 	}
 
-	pr_info("Successfully created %d memory regions from pool for instance %d (%s), total %zu bytes\n",
-		instance->region_count, instance->id, instance->name, config->memory_size);
+	pr_info("Transferred 0x%llx bytes from root to instance %d (%s)\n",
+		size, instance->id, instance->name);
+
+	pr_info("Created instance pool %d: %d chunks, total size=%zu bytes\n",
+		instance->id, instance->region_count, instance->pool_size);
+
 	return 0;
 
 cleanup:
-	/* Clean up any regions we managed to allocate */
 	mk_instance_free_memory(instance);
-
-	if (instance->instance_pool) {
-		multikernel_destroy_instance_pool(instance->instance_pool);
-		instance->instance_pool = NULL;
-		instance->pool_size = 0;
-	}
 	return ret;
+}
+
+static int mk_instance_reserve_memory(struct mk_instance *instance,
+				      const struct mk_dt_config *config)
+{
+	return mk_instance_transfer_memory(instance, config->memory_size);
 }
 
 /**

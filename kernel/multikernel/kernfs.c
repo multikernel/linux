@@ -126,16 +126,16 @@ static int status_seq_show(struct seq_file *sf, void *v)
 	return 0;
 }
 
-/* Root-level device_tree attribute - shows merged global DTB */
+/* Root-level device_tree attribute - shows current baseline pool from kernel structures */
 static int root_device_tree_seq_show(struct seq_file *sf, void *v)
 {
 	void *dtb_data = NULL;
 	size_t dtb_size = 0;
 	int ret;
 
-	ret = mk_dt_generate_global_dtb(&dtb_data, &dtb_size);
+	ret = mk_dt_generate_instance_dtb(root_instance, &dtb_data, &dtb_size);
 	if (ret) {
-		pr_err("Failed to generate global DTB: %d\n", ret);
+		pr_err("Failed to generate baseline DTB: %d\n", ret);
 		return ret;
 	}
 
@@ -149,18 +149,26 @@ static ssize_t instance_device_tree_read(struct kernfs_open_file *of,
 					 char *buf, size_t count, loff_t off)
 {
 	struct mk_instance *instance = of->kn->priv;
+	void *dtb_data = NULL;
+	size_t dtb_size = 0;
 	size_t to_read;
+	int ret;
 
-	if (!instance->dtb_data || instance->dtb_size == 0) {
-		pr_debug("Instance '%s': No device tree loaded\n", instance->name);
-		return -ENOENT;
+	ret = mk_dt_generate_instance_dtb(instance, &dtb_data, &dtb_size);
+	if (ret) {
+		pr_err("Instance '%s': Failed to generate device tree: %d\n",
+		       instance->name, ret);
+		return ret;
 	}
 
-	if (off >= instance->dtb_size)
+	if (off >= dtb_size) {
+		kfree(dtb_data);
 		return 0;
+	}
 
-	to_read = min(count, instance->dtb_size - (size_t)off);
-	memcpy(buf, instance->dtb_data + off, to_read);
+	to_read = min(count, dtb_size - (size_t)off);
+	memcpy(buf, dtb_data + off, to_read);
+	kfree(dtb_data);
 
 	return to_read;
 }
@@ -171,7 +179,6 @@ static ssize_t root_device_tree_write(struct kernfs_open_file *of, char *buf, si
 {
 	const void *fdt = buf;
 	int instances_node, instance_node;
-	void *new_dtb;
 	int ret;
 
 	pr_info("Loading host kernel device tree configuration (%zu bytes at offset %lld)\n", count, off);
@@ -203,19 +210,6 @@ static ssize_t root_device_tree_write(struct kernfs_open_file *of, char *buf, si
 		pr_err("Baseline validation and initialization failed: %d\n", ret);
 		return ret;
 	}
-
-	new_dtb = kmalloc(count, GFP_KERNEL);
-	if (!new_dtb) {
-		pr_err("Failed to allocate memory for host kernel DTB\n");
-		return -ENOMEM;
-	}
-	memcpy(new_dtb, buf, count);
-
-	mutex_lock(&mk_host_dtb_mutex);
-	kfree(root_instance->dtb_data);
-	root_instance->dtb_data = new_dtb;
-	root_instance->dtb_size = count;
-	mutex_unlock(&mk_host_dtb_mutex);
 
 	pr_info("Successfully stored host kernel device tree configuration\n");
 	return count;
@@ -270,15 +264,6 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 		goto err_free_cpumask;
 	}
 
-	ret = mk_dt_generate_instance_dtb(name, id, &config, &dtb_copy, &dtb_size);
-	if (ret) {
-		pr_err("Failed to generate DTB for instance '%s': %d\n", name, ret);
-		goto err_free_config;
-	}
-
-	instance->dtb_data = dtb_copy;
-	instance->dtb_size = dtb_size;
-
 	INIT_LIST_HEAD(&instance->memory_regions);
 	INIT_LIST_HEAD(&instance->list);
 	INIT_LIST_HEAD(&instance->pci_devices);
@@ -306,28 +291,34 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 		goto err_remove_dir;
 	}
 
+	ret = mk_dt_generate_instance_dtb(instance, &dtb_copy, &dtb_size);
+	if (ret) {
+		pr_err("Failed to generate DTB for instance '%s': %d\n", name, ret);
+		goto err_free_resources;
+	}
+
+	instance->dtb_data = dtb_copy;
+	instance->dtb_size = dtb_size;
+
 	list_add_tail(&instance->list, &mk_instance_list);
 
 	ret = idr_alloc(&mk_instance_idr, instance, id, id + 1, GFP_KERNEL);
 	if (ret < 0) {
 		pr_err("Failed to register instance '%s' in IDR: %d\n", name, ret);
 		list_del(&instance->list);
-		goto err_free_resources;
+		goto err_free_dtb;
 	}
 
 	kernfs_activate(kn);
 	mk_instance_set_state(instance, MK_STATE_READY);
 	mk_dt_config_free(&config);
 
-	ret = mk_dt_update_global_dtb();
-	if (ret) {
-		pr_warn("Failed to update global DTB after instance creation: %d\n", ret);
-		/* Non-fatal - instance is created, just global view may be stale */
-	}
-
 	pr_info("Successfully created instance '%s' (ID %d)\n", name, id);
 	return 0;
 
+err_free_dtb:
+	kfree(instance->dtb_data);
+	instance->dtb_data = NULL;
 err_free_resources:
 	mk_instance_free_memory(instance);
 err_remove_dir:
@@ -335,7 +326,6 @@ err_remove_dir:
 	mk_instance_put(instance);
 err_free_config:
 	mk_dt_config_free(&config);
-	kfree(instance->dtb_data);
 err_free_cpumask:
 	kfree(instance->cpus);
 err_free_name:
@@ -425,8 +415,6 @@ static int mk_kernfs_rmdir(struct kernfs_node *kn)
  */
 int mk_instance_destroy(struct mk_instance *instance)
 {
-	int ret;
-
 	lockdep_assert_held(&mk_instance_mutex);
 
 	if (!instance) {
@@ -454,12 +442,6 @@ int mk_instance_destroy(struct mk_instance *instance)
 		mk_instance_put(instance);
 	}
 	mk_instance_put(instance);
-
-	ret = mk_dt_update_global_dtb();
-	if (ret) {
-		pr_warn("Failed to update global DTB after instance destruction: %d\n", ret);
-		/* Non-fatal - instance is destroyed, just global view may be stale */
-	}
 
 	return 0;
 }

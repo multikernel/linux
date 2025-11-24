@@ -16,11 +16,8 @@ int mk_instance_destroy(struct mk_instance *instance);
 /* dts.c */
 int mk_dt_parse_resources(const void *fdt, int resources_node,
 			  const char *instance_name, struct mk_dt_config *config);
-int mk_dt_generate_instance_dtb(const char *name, int id,
-				 const struct mk_dt_config *config,
+int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 				 void **out_dtb, size_t *out_size);
-int mk_dt_generate_global_dtb(void **out_dtb, size_t *out_size);
-int mk_dt_update_global_dtb(void);
 
 /* overlay.c */
 extern struct kernfs_node *mk_overlay_root_kn;

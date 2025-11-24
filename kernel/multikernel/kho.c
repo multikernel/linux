@@ -53,6 +53,8 @@ struct mk_instance *root_instance = NULL;
 int mk_kho_preserve_dtb(struct kimage *image, void *fdt, int mk_id)
 {
 	struct mk_instance *instance;
+	void *fresh_dtb = NULL;
+	size_t fresh_dtb_size = 0;
 	int ret = 0;
 
 	pr_info("Preserving multikernel DTB for instance %d\n", mk_id);
@@ -64,11 +66,16 @@ int mk_kho_preserve_dtb(struct kimage *image, void *fdt, int mk_id)
 		return -ENOENT;
 	}
 
-	if (!instance->dtb_data || instance->dtb_size == 0) {
-		pr_err("Target multikernel instance %d has no DTB data - did you write to device_tree file?\n", mk_id);
+	ret = mk_dt_generate_instance_dtb(instance, &fresh_dtb, &fresh_dtb_size);
+	if (ret) {
+		pr_err("Failed to generate fresh DTB for instance %d: %d\n", mk_id, ret);
 		mk_instance_put(instance);
-		return -EINVAL;
+		return ret;
 	}
+
+	kfree(instance->dtb_data);
+	instance->dtb_data = fresh_dtb;
+	instance->dtb_size = fresh_dtb_size;
 
 	ret |= fdt_begin_node(fdt, "multikernel");
 	ret |= fdt_property(fdt, "dtb-data", instance->dtb_data, instance->dtb_size);
@@ -449,7 +456,7 @@ static struct mk_instance * __init mk_kho_restore_host_instance(const void *kho_
 		return NULL;
 	}
 
-	host_instance = alloc_mk_instance(0, "/", false);
+	host_instance = alloc_mk_instance(0, "", false);
 	if (!host_instance)
 		return NULL;
 
@@ -499,7 +506,7 @@ int __init mk_kho_restore_dtbs(void)
 	if (!fdt_phys) {
 		pr_info("No KHO FDT available for multikernel DTB restoration\n");
 
-		instance = alloc_mk_instance(0, "/", true);
+		instance = alloc_mk_instance(0, "", true);
 		if (!instance) {
 			pr_err("Failed to allocate root instance\n");
 			return -ENOMEM;
