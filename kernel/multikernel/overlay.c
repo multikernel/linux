@@ -323,11 +323,11 @@ static int mk_overlay_parse_and_apply(struct mk_overlay_tx *tx,
 		}
 
 		id_prop = fdt_getprop(fdt, op_node, "id", &len);
-		if (!id_prop || len < 4) {
-			pr_err("Overlay tx%d: instance-create requires 'id' property\n", tx->id);
-			return -EINVAL;
+		if (id_prop && len >= 4) {
+			instance_id = fdt32_to_cpu(*id_prop);
+		} else {
+			instance_id = -1;
 		}
-		instance_id = fdt32_to_cpu(*id_prop);
 
 		resources_node = fdt_subnode_offset(fdt, op_node, "resources");
 		if (resources_node < 0) {
@@ -336,14 +336,27 @@ static int mk_overlay_parse_and_apply(struct mk_overlay_tx *tx,
 		}
 
 		mutex_lock(&mk_instance_mutex);
+
 		if (mk_instance_find_by_name(instance_name)) {
 			mutex_unlock(&mk_instance_mutex);
 			pr_err("Overlay tx%d: instance '%s' already exists\n", tx->id, instance_name);
 			return -EEXIST;
 		}
 
-		pr_info("Overlay tx%d: Creating instance '%s' (ID: %u)\n",
-			tx->id, instance_name, instance_id);
+		if (instance_id >= 0 && idr_find(&mk_instance_idr, instance_id)) {
+			mutex_unlock(&mk_instance_mutex);
+			pr_err("Overlay tx%d: instance ID %u is already in use\n", tx->id, instance_id);
+			pr_err("Overlay tx%d: Use a different ID or omit the 'id' property for auto-allocation\n", tx->id);
+			return -EEXIST;
+		}
+
+		if (instance_id >= 0) {
+			pr_info("Overlay tx%d: Creating instance '%s' (ID: %u)\n",
+				tx->id, instance_name, instance_id);
+		} else {
+			pr_info("Overlay tx%d: Creating instance '%s' (ID: auto-allocated)\n",
+				tx->id, instance_name);
+		}
 
 		ret = mk_create_instance_from_dtb(instance_name, instance_id,
 						  fdt, resources_node, tx->dtbo_size);

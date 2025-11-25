@@ -14,36 +14,110 @@
 #include <asm/page.h>
 #include "internal.h"
 
-/**
- * Instance reference counting
- */
+static void mk_instance_return_cpus(struct mk_instance *instance)
+{
+	int phys_cpu;
+	int returned_count = 0;
+
+	if (!instance || !instance->cpus)
+		return;
+
+	if (instance == root_instance || instance->id == 0)
+		return;
+
+	if (!root_instance || !root_instance->cpus) {
+		pr_warn("Cannot return CPUs from instance %d (%s): no root instance\n",
+			instance->id, instance->name);
+		return;
+	}
+
+	for_each_set_bit(phys_cpu, instance->cpus, NR_CPUS) {
+		clear_bit(phys_cpu, instance->cpus);
+		set_bit(phys_cpu, root_instance->cpus);
+		returned_count++;
+	}
+
+	if (returned_count > 0) {
+		pr_info("Returned %d CPUs from instance %d (%s) to root instance: %*pbl\n",
+			returned_count, instance->id, instance->name,
+			NR_CPUS, root_instance->cpus);
+	}
+}
+
+static void mk_instance_return_pci_devices(struct mk_instance *instance)
+{
+	struct mk_pci_device *pci_dev, *pci_tmp;
+	int returned_count = 0;
+
+	if (!instance || !instance->pci_devices_valid)
+		return;
+
+	if (instance == root_instance || instance->id == 0)
+		return;
+
+	if (!root_instance) {
+		pr_warn("Cannot return PCI devices from instance %d (%s): no root instance\n",
+			instance->id, instance->name);
+		goto cleanup;
+	}
+
+	list_for_each_entry_safe(pci_dev, pci_tmp, &instance->pci_devices, list) {
+		struct mk_pci_device *root_dev;
+
+		root_dev = kzalloc(sizeof(*root_dev), GFP_KERNEL);
+		if (!root_dev) {
+			pr_warn("Failed to allocate PCI device entry for root instance\n");
+			continue;
+		}
+
+		*root_dev = *pci_dev;
+		INIT_LIST_HEAD(&root_dev->list);
+
+		list_add_tail(&root_dev->list, &root_instance->pci_devices);
+		root_instance->pci_device_count++;
+		root_instance->pci_devices_valid = true;
+
+		pr_debug("Returned PCI device %04x:%02x:%02x.%d from instance %d to root\n",
+			 root_dev->domain, root_dev->bus, root_dev->slot,
+			 root_dev->func, instance->id);
+
+		returned_count++;
+	}
+
+	if (returned_count > 0) {
+		pr_info("Returned %d PCI devices from instance %d (%s) to root instance\n",
+			returned_count, instance->id, instance->name);
+	}
+
+cleanup:
+	list_for_each_entry_safe(pci_dev, pci_tmp, &instance->pci_devices, list) {
+		list_del(&pci_dev->list);
+		kfree(pci_dev);
+	}
+	instance->pci_device_count = 0;
+	instance->pci_devices_valid = false;
+}
+
 static void mk_instance_release(struct kref *kref)
 {
 	struct mk_instance *instance = container_of(kref, struct mk_instance, refcount);
-	struct mk_pci_device *pci_dev, *pci_tmp;
 
-	pr_debug("Releasing multikernel instance %d (%s)\n", instance->id, instance->name);
+	pr_info("Releasing multikernel instance %d (%s), returning resources to root\n",
+		instance->id, instance->name);
 
+	mk_instance_return_cpus(instance);
+	mk_instance_return_pci_devices(instance);
 	mk_instance_free_memory(instance);
 
-	/* Free CPU bitmap */
 	kfree(instance->cpus);
-
-	/* Free PCI device list */
-	if (instance->pci_devices_valid) {
-		list_for_each_entry_safe(pci_dev, pci_tmp, &instance->pci_devices, list) {
-			list_del(&pci_dev->list);
-			kfree(pci_dev);
-		}
-		instance->pci_device_count = 0;
-		instance->pci_devices_valid = false;
-	}
-
 	kfree(instance->dtb_data);
 	kfree(instance->name);
 	kfree(instance);
 }
 
+/**
+ * Instance reference counting
+ */
 struct mk_instance *mk_instance_get(struct mk_instance *instance)
 {
 	if (instance)
@@ -443,29 +517,43 @@ static int mk_instance_reserve_memory(struct mk_instance *instance,
  *
  * Returns all reserved memory regions back to the multikernel pool
  * and removes them from the resource hierarchy.
+ *
+ * Note: The memory is returned to the global multikernel pool by
+ * multikernel_destroy_instance_pool(), which makes it available for
+ * future instance allocations (including root_instance).
  */
 void mk_instance_free_memory(struct mk_instance *instance)
 {
 	struct mk_memory_region *region, *tmp;
+	u64 total_freed = 0;
 
 	if (!instance)
 		return;
 
 	list_for_each_entry_safe(region, tmp, &instance->memory_regions, list) {
-		pr_debug("Freeing memory region for instance %d (%s): 0x%llx-0x%llx\n",
+		u64 region_size = resource_size(&region->res);
+
+		pr_debug("Freeing memory region for instance %d (%s): 0x%llx-0x%llx (%llu bytes)\n",
 			 instance->id, instance->name,
 			 (unsigned long long)region->res.start,
-			 (unsigned long long)region->res.end);
+			 (unsigned long long)region->res.end,
+			 region_size);
 
 		list_del(&region->list);
 		if (region->res.parent)
 			remove_resource(&region->res);
 		kfree(region->res.name);
 		kfree(region);
+
+		total_freed += region_size;
 	}
 
 	instance->region_count = 0;
 	if (instance->instance_pool) {
+		pr_info("Returning 0x%llx bytes from instance %d (%s) back to multikernel pool\n",
+			total_freed, instance->id, instance->name);
+
+		/* Destroy instance pool - this returns memory to global multikernel pool */
 		multikernel_destroy_instance_pool(instance->instance_pool);
 		instance->instance_pool = NULL;
 		instance->pool_size = 0;

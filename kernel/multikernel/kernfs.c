@@ -218,7 +218,7 @@ static ssize_t root_device_tree_write(struct kernfs_open_file *of, char *buf, si
 /**
  * mk_create_instance_from_dtb() - Create a multikernel instance from DTB resources node
  * @name: Instance name
- * @id: Instance ID
+ * @id: Instance ID (or -1 for auto-allocation)
  * @fdt: Device tree containing the DTB resources node
  * @resources_node: Offset of the resources node in the FDT
  * @dtb_size: Size of the full DTB (for storage)
@@ -226,6 +226,9 @@ static ssize_t root_device_tree_write(struct kernfs_open_file *of, char *buf, si
  * Creates a multikernel instance by parsing resources directly from a resources node.
  * This is used by overlay instance-create operations where the resources are directly
  * available.
+ *
+ * If id is -1, the kernel will automatically allocate the next available ID.
+ * If id is >= 0, the kernel will use that specific ID (caller must ensure it's available).
  *
  * Returns 0 on success, negative error code on failure.
  */
@@ -237,14 +240,13 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 	struct mk_dt_config config;
 	void *dtb_copy;
 	int ret;
-
-	pr_info("Creating instance '%s' (ID %d) from resources node\n", name, id);
+	int allocated_id;
 
 	instance = kzalloc(sizeof(*instance), GFP_KERNEL);
 	if (!instance)
 		return -ENOMEM;
 
-	instance->id = id;
+	instance->id = 0;
 	instance->name = kstrdup(name, GFP_KERNEL);
 	if (!instance->name) {
 		ret = -ENOMEM;
@@ -302,18 +304,31 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 
 	list_add_tail(&instance->list, &mk_instance_list);
 
-	ret = idr_alloc(&mk_instance_idr, instance, id, id + 1, GFP_KERNEL);
-	if (ret < 0) {
-		pr_err("Failed to register instance '%s' in IDR: %d\n", name, ret);
+	if (id == 0) {
+		pr_err("Instance ID 0 is reserved for root instance\n");
 		list_del(&instance->list);
+		ret = -EINVAL;
 		goto err_free_dtb;
 	}
+
+	if (id < 0)
+		allocated_id = idr_alloc(&mk_instance_idr, instance, 1, INT_MAX, GFP_KERNEL);
+	else
+		allocated_id = idr_alloc(&mk_instance_idr, instance, id, id + 1, GFP_KERNEL);
+
+	if (allocated_id < 0) {
+		pr_err("Failed to register instance '%s' in IDR: %d\n", name, allocated_id);
+		list_del(&instance->list);
+		ret = allocated_id;
+		goto err_free_dtb;
+	}
+
+	instance->id = allocated_id;
 
 	kernfs_activate(kn);
 	mk_instance_set_state(instance, MK_STATE_READY);
 	mk_dt_config_free(&config);
 
-	pr_info("Successfully created instance '%s' (ID %d)\n", name, id);
 	return 0;
 
 err_free_dtb:
@@ -409,6 +424,11 @@ static int mk_kernfs_rmdir(struct kernfs_node *kn)
  *
  * Removes the instance from the global list, IDR, and kernfs.
  * The instance must not be active or loading.
+ *
+ * When the instance is released (via mk_instance_put), all resources
+ * (CPUs, memory, PCI devices) are automatically returned to the root
+ * instance pool, making them available for future instance allocations.
+ *
  * Caller must hold mk_instance_mutex.
  *
  * Returns 0 on success, negative error code on failure.
