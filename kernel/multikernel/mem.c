@@ -277,6 +277,126 @@ size_t multikernel_instance_pool_avail(void *pool_handle)
 	return gen_pool_avail(instance_pool);
 }
 
+/**
+ * mk_instance_add_memory_region() - Add a memory region to an instance
+ * @instance: Target instance
+ * @size: Size of the memory region to allocate
+ *
+ * Allocates memory from the main multikernel pool and adds it to the
+ * instance's memory_regions list. Used for non-running instances where
+ * we only need to track memory allocation without performing memory
+ * hotplug operations.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+int mk_instance_add_memory_region(struct mk_instance *instance, size_t size)
+{
+	struct mk_memory_region *region;
+	phys_addr_t phys_addr;
+	int ret;
+
+	phys_addr = multikernel_alloc(size);
+	if (!phys_addr) {
+		pr_err("Failed to allocate %zu bytes from multikernel pool for instance %d\n",
+		       size, instance->id);
+		return -ENOMEM;
+	}
+
+	region = kzalloc(sizeof(*region), GFP_KERNEL);
+	if (!region) {
+		multikernel_free(phys_addr, size);
+		return -ENOMEM;
+	}
+
+	region->res.name = kasprintf(GFP_KERNEL, "mk-instance-%d-%s-region-%d",
+				     instance->id, instance->name, instance->region_count);
+	if (!region->res.name) {
+		kfree(region);
+		multikernel_free(phys_addr, size);
+		return -ENOMEM;
+	}
+
+	region->res.start = phys_addr;
+	region->res.end = phys_addr + size - 1;
+	region->res.flags = IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
+	region->chunk = NULL;  /* For overlay-added regions */
+
+	ret = insert_resource(&multikernel_res, &region->res);
+	if (ret) {
+		pr_err("Failed to insert resource for instance %d region %d: %d\n",
+		       instance->id, instance->region_count, ret);
+		kfree(region->res.name);
+		kfree(region);
+		multikernel_free(phys_addr, size);
+		return ret;
+	}
+
+	INIT_LIST_HEAD(&region->list);
+	list_add_tail(&region->list, &instance->memory_regions);
+	instance->region_count++;
+
+	pr_info("Added memory region 0x%llx-0x%llx (%zu MB) to instance %d (%s)\n",
+		(unsigned long long)phys_addr, (unsigned long long)(phys_addr + size - 1),
+		size >> 20, instance->id, instance->name);
+
+	return 0;
+}
+
+/**
+ * mk_instance_remove_memory_region() - Remove a memory region from an instance
+ * @instance: Target instance
+ * @phys_addr: Physical address of the memory region
+ * @size: Size of the memory region
+ *
+ * Removes a memory region from the instance's memory_regions list and
+ * frees it back to the main multikernel pool. Used for non-running instances
+ * where we only need to track memory deallocation without performing memory
+ * hotplug operations.
+ *
+ * Returns: 0 on success, -ENOENT if region not found
+ */
+int mk_instance_remove_memory_region(struct mk_instance *instance,
+				     phys_addr_t phys_addr, size_t size)
+{
+	struct mk_memory_region *region, *tmp;
+	bool found = false;
+
+	if (!instance)
+		return -EINVAL;
+
+	list_for_each_entry_safe(region, tmp, &instance->memory_regions, list) {
+		if (region->res.start == phys_addr &&
+		    resource_size(&region->res) == size) {
+			list_del(&region->list);
+			if (region->res.parent)
+				remove_resource(&region->res);
+
+			multikernel_free(phys_addr, size);
+
+			kfree(region->res.name);
+			kfree(region);
+			instance->region_count--;
+			found = true;
+
+			pr_info("Removed memory region 0x%llx-0x%llx (%zu MB) from instance %d (%s)\n",
+				(unsigned long long)phys_addr,
+				(unsigned long long)(phys_addr + size - 1),
+				size >> 20, instance->id, instance->name);
+			break;
+		}
+	}
+
+	if (!found) {
+		pr_warn("Memory region 0x%llx-0x%llx not found in instance %d (%s)\n",
+			(unsigned long long)phys_addr,
+			(unsigned long long)(phys_addr + size - 1),
+			instance->id, instance->name);
+		return -ENOENT;
+	}
+
+	return 0;
+}
+
 static int __init mkkernel_pool_setup(char *str)
 {
 	char *cur = str;
