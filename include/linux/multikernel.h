@@ -590,6 +590,15 @@ int mk_instance_reserve_resources(struct mk_instance *instance,
  */
 void mk_instance_free_memory(struct mk_instance *instance);
 
+
+int mk_instance_transfer_cpus(struct mk_instance *instance,
+			       const unsigned long *cpus);
+int mk_instance_return_cpus(struct mk_instance *instance,
+			     const unsigned long *cpus);
+int mk_instance_add_memory_region(struct mk_instance *instance, size_t size);
+int mk_instance_remove_memory_region(struct mk_instance *instance,
+				     phys_addr_t phys_addr, size_t size);
+
 void *mk_instance_alloc(struct mk_instance *instance, size_t size, size_t align);
 void mk_instance_free(struct mk_instance *instance, void *virt_addr, size_t size);
 

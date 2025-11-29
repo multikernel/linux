@@ -663,6 +663,8 @@ void mk_hotplug_cleanup(void)
  *
  * For local instance, executes removal synchronously and returns after completion.
  * For remote instance, sends IPI and waits for ACK response.
+ * For instances that are not yet running (MK_STATE_READY/LOADED), transfers
+ * the CPU back to root instance without sending IPIs.
  *
  * Returns: 0 on success, negative error code on failure or timeout
  */
@@ -675,11 +677,25 @@ int mk_send_cpu_remove(int instance_id, u32 cpu_id)
 		.sender_instance_id = root_instance->id
 	};
 	struct mk_pending_msg *pending;
+	struct mk_instance *target_instance;
 	int ret;
 
 	/* For self-removal, execute directly (we're in process context) */
 	if (instance_id == root_instance->id)
 		return mk_do_cpu_remove(cpu_id);
+
+	target_instance = mk_instance_find(instance_id);
+	if (!target_instance)
+		return -ENODEV;
+
+	/* For non-running instances, return CPU to root using existing API */
+	if (target_instance->state != MK_STATE_ACTIVE) {
+		DECLARE_BITMAP(cpu_mask, NR_CPUS);
+
+		bitmap_zero(cpu_mask, NR_CPUS);
+		set_bit(cpu_id, cpu_mask);
+		return mk_instance_return_cpus(target_instance, cpu_mask);
+	}
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_CPU_REMOVE, cpu_id);
 	if (!pending)
@@ -692,7 +708,14 @@ int mk_send_cpu_remove(int instance_id, u32 cpu_id)
 		return ret;
 	}
 
-	return mk_msg_pending_wait(pending, 10000);
+	ret = mk_msg_pending_wait(pending, 10000);
+	if (ret < 0)
+		return ret;
+
+	clear_bit(cpu_id, target_instance->cpus);
+	set_bit(cpu_id, root_instance->cpus);
+
+	return 0;
 }
 
 /**
@@ -704,6 +727,8 @@ int mk_send_cpu_remove(int instance_id, u32 cpu_id)
  *
  * For local instance, executes addition synchronously and returns after completion.
  * For remote instance, sends IPI and waits for ACK response.
+ * For instances that are not yet running (MK_STATE_READY/LOADED), transfers
+ * the CPU from root instance without sending IPIs.
  *
  * Returns: 0 on success, negative error code on failure or timeout
  */
@@ -716,11 +741,25 @@ int mk_send_cpu_add(int instance_id, u32 cpu_id, u32 numa_node, u32 flags)
 		.sender_instance_id = root_instance->id
 	};
 	struct mk_pending_msg *pending;
+	struct mk_instance *target_instance;
 	int ret;
 
 	/* For self-addition, execute directly (we're in process context) */
 	if (instance_id == root_instance->id)
 		return mk_do_cpu_add(cpu_id, numa_node, flags);
+
+	target_instance = mk_instance_find(instance_id);
+	if (!target_instance)
+		return -ENODEV;
+
+	/* For non-running instances, transfer CPU from root using existing API */
+	if (target_instance->state != MK_STATE_ACTIVE) {
+		DECLARE_BITMAP(cpu_mask, NR_CPUS);
+
+		bitmap_zero(cpu_mask, NR_CPUS);
+		set_bit(cpu_id, cpu_mask);
+		return mk_instance_transfer_cpus(target_instance, cpu_mask);
+	}
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_CPU_ADD, cpu_id);
 	if (!pending)
@@ -733,7 +772,14 @@ int mk_send_cpu_add(int instance_id, u32 cpu_id, u32 numa_node, u32 flags)
 		return ret;
 	}
 
-	return mk_msg_pending_wait(pending, 10000);
+	ret = mk_msg_pending_wait(pending, 10000);
+	if (ret < 0)
+		return ret;
+
+	set_bit(cpu_id, target_instance->cpus);
+	clear_bit(cpu_id, root_instance->cpus);
+
+	return 0;
 }
 
 /**
@@ -746,6 +792,8 @@ int mk_send_cpu_add(int instance_id, u32 cpu_id, u32 numa_node, u32 flags)
  *
  * For local instance, executes addition synchronously.
  * For remote instance, sends IPI and waits for ACK response.
+ * For instances that are not yet running (MK_STATE_READY/LOADED), adds
+ * the memory region to instance's memory_regions list.
  *
  * Returns: 0 on success, negative error code on failure
  */
@@ -760,11 +808,24 @@ int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
 		.sender_instance_id = root_instance->id
 	};
 	struct mk_pending_msg *pending;
+	struct mk_instance *target_instance;
 	int ret;
 
 	/* For self-addition, execute directly (we're in process context) */
 	if (instance_id == root_instance->id)
 		return mk_do_mem_add(start_pfn, nr_pages, numa_node, mem_type);
+
+	target_instance = mk_instance_find(instance_id);
+	if (!target_instance)
+		return -ENODEV;
+
+	/* For non-running instances, allocate memory from pool and add to instance */
+	if (target_instance->state != MK_STATE_ACTIVE) {
+		size_t size;
+
+		size = PFN_PHYS(nr_pages);
+		return mk_instance_add_memory_region(target_instance, size);
+	}
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_MEM_ADD, (u32)start_pfn);
 	if (!pending)
@@ -777,7 +838,11 @@ int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
 		return ret;
 	}
 
-	return mk_msg_pending_wait(pending, 10000);
+	ret = mk_msg_pending_wait(pending, 10000);
+	if (ret < 0)
+		return ret;
+
+	return mk_instance_add_memory_region(target_instance, PFN_PHYS(nr_pages));
 }
 
 /**
@@ -788,6 +853,8 @@ int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
  *
  * For local instance, executes removal synchronously.
  * For remote instance, sends IPI and waits for ACK response.
+ * For instances that are not yet running (MK_STATE_READY/LOADED), removes
+ * the memory region from instance's memory_regions list.
  *
  * Returns: 0 on success, negative error code on failure
  */
@@ -801,11 +868,26 @@ int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages)
 		.sender_instance_id = root_instance->id
 	};
 	struct mk_pending_msg *pending;
+	struct mk_instance *target_instance;
 	int ret;
 
 	/* For self-removal, execute directly (we're in process context) */
 	if (instance_id == root_instance->id)
 		return mk_do_mem_remove(start_pfn, nr_pages);
+
+	target_instance = mk_instance_find(instance_id);
+	if (!target_instance)
+		return -ENODEV;
+
+	/* For non-running instances, just remove the memory region from the instance */
+	if (target_instance->state != MK_STATE_ACTIVE) {
+		phys_addr_t phys_addr;
+		size_t size;
+
+		phys_addr = PFN_PHYS(start_pfn);
+		size = PFN_PHYS(nr_pages);
+		return mk_instance_remove_memory_region(target_instance, phys_addr, size);
+	}
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_MEM_REMOVE, (u32)start_pfn);
 	if (!pending)
@@ -818,5 +900,12 @@ int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages)
 		return ret;
 	}
 
-	return mk_msg_pending_wait(pending, 10000);
+	ret = mk_msg_pending_wait(pending, 10000);
+	if (ret < 0)
+		return ret;
+
+	/* Update root kernel's view of instance memory after successful IPI */
+	return mk_instance_remove_memory_region(target_instance,
+						PFN_PHYS(start_pfn),
+						PFN_PHYS(nr_pages));
 }

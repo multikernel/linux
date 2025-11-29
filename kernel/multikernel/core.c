@@ -14,34 +14,15 @@
 #include <asm/page.h>
 #include "internal.h"
 
-static void mk_instance_return_cpus(struct mk_instance *instance)
+static void mk_instance_return_all_cpus(struct mk_instance *instance)
 {
-	int phys_cpu;
-	int returned_count = 0;
-
 	if (!instance || !instance->cpus)
 		return;
 
 	if (instance == root_instance || instance->id == 0)
 		return;
 
-	if (!root_instance || !root_instance->cpus) {
-		pr_warn("Cannot return CPUs from instance %d (%s): no root instance\n",
-			instance->id, instance->name);
-		return;
-	}
-
-	for_each_set_bit(phys_cpu, instance->cpus, NR_CPUS) {
-		clear_bit(phys_cpu, instance->cpus);
-		set_bit(phys_cpu, root_instance->cpus);
-		returned_count++;
-	}
-
-	if (returned_count > 0) {
-		pr_info("Returned %d CPUs from instance %d (%s) to root instance: %*pbl\n",
-			returned_count, instance->id, instance->name,
-			NR_CPUS, root_instance->cpus);
-	}
+	mk_instance_return_cpus(instance, instance->cpus);
 }
 
 static void mk_instance_return_pci_devices(struct mk_instance *instance)
@@ -105,7 +86,7 @@ static void mk_instance_release(struct kref *kref)
 	pr_info("Releasing multikernel instance %d (%s), returning resources to root\n",
 		instance->id, instance->name);
 
-	mk_instance_return_cpus(instance);
+	mk_instance_return_all_cpus(instance);
 	mk_instance_return_pci_devices(instance);
 	mk_instance_free_memory(instance);
 
@@ -235,8 +216,18 @@ bool multikernel_allow_emergency_restart(void)
  * CPU management functions for instances
  */
 
-static int mk_instance_transfer_cpus(struct mk_instance *instance,
-				     const unsigned long *cpus)
+/**
+ * mk_instance_transfer_cpus() - Transfer CPUs from root to instance
+ * @instance: Target instance
+ * @cpus: Bitmap of CPUs to transfer
+ *
+ * Transfers CPUs from root instance to the target instance.
+ * Validates that CPUs are available in root.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+int mk_instance_transfer_cpus(struct mk_instance *instance,
+			       const unsigned long *cpus)
 {
 	int phys_cpu, logical_cpu;
 	int unavailable = 0;
@@ -267,12 +258,6 @@ static int mk_instance_transfer_cpus(struct mk_instance *instance,
 			unavailable++;
 			continue;
 		}
-
-		if (cpu_online(logical_cpu)) {
-			pr_err("CPU %u (logical %d) is still online - not properly offlined\n",
-			       phys_cpu, logical_cpu);
-			unavailable++;
-		}
 	}
 
 	if (unavailable > 0) {
@@ -289,6 +274,63 @@ static int mk_instance_transfer_cpus(struct mk_instance *instance,
 	pr_info("Transferred %d CPUs from root to instance %d (%s): %*pbl\n",
 		requested_count, instance->id, instance->name,
 		NR_CPUS, instance->cpus);
+
+	return 0;
+}
+
+/**
+ * mk_instance_return_cpus() - Return CPUs from instance back to root
+ * @instance: Source instance
+ * @cpus: Bitmap of CPUs to return
+ *
+ * Transfers CPUs from the instance back to root instance.
+ * Validates that CPUs are assigned to the source instance.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+int mk_instance_return_cpus(struct mk_instance *instance,
+			     const unsigned long *cpus)
+{
+	int phys_cpu;
+	int not_found = 0;
+	int requested_count;
+
+	if (!cpus || !instance->cpus || !root_instance || !root_instance->cpus) {
+		pr_err("Invalid CPU bitmaps for return\n");
+		return -EINVAL;
+	}
+
+	requested_count = bitmap_weight(cpus, NR_CPUS);
+	if (requested_count == 0) {
+		pr_info("No CPUs requested to return from instance %d (%s)\n",
+			instance->id, instance->name);
+		return 0;
+	}
+
+	/* Validate all CPUs are assigned to this instance */
+	for_each_set_bit(phys_cpu, cpus, NR_CPUS) {
+		if (!test_bit(phys_cpu, instance->cpus)) {
+			pr_err("CPU %u not assigned to instance %d (%s)\n",
+			       phys_cpu, instance->id, instance->name);
+			not_found++;
+		}
+	}
+
+	if (not_found > 0) {
+		pr_err("Instance %d (%s): %d CPUs are not assigned to this instance\n",
+		       instance->id, instance->name, not_found);
+		return -EINVAL;
+	}
+
+	/* Transfer: remove from instance, add back to root */
+	for_each_set_bit(phys_cpu, cpus, NR_CPUS) {
+		clear_bit(phys_cpu, instance->cpus);
+		set_bit(phys_cpu, root_instance->cpus);
+	}
+
+	pr_info("Returned %d CPUs from instance %d (%s) to root: %*pbl\n",
+		requested_count, instance->id, instance->name,
+		NR_CPUS, cpus);
 
 	return 0;
 }
