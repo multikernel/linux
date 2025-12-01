@@ -19,6 +19,7 @@
 #include <linux/of.h>
 #include <linux/of_fdt.h>
 #include <linux/libfdt.h>
+#include <linux/pci.h>
 #include <linux/multikernel.h>
 #include "internal.h"
 
@@ -267,7 +268,9 @@ static struct mk_instance *mk_overlay_get_instance_for_operation(
  *   2. memory-add      - Then add memory to destination instance
  *   3. cpu-remove      - Remove CPU from source instance first
  *   4. cpu-add         - Then add CPU to destination instance
- *   5. instance-remove - Remove instance last (after all resources transferred)
+ *   5. device-remove   - Remove PCI device from source instance first
+ *   6. device-add      - Then add PCI device to destination instance
+ *   7. instance-remove - Remove instance last (after all resources transferred)
  *
  * This ordering prevents race conditions where a resource could be owned by
  * two instances simultaneously. The source instance must cleanly release the
@@ -280,7 +283,9 @@ static struct mk_instance *mk_overlay_get_instance_for_operation(
  *     ├── memory-remove { mk,instance = "source"; region@N { reg = <addr size>; }; }
  *     ├── memory-add { mk,instance = "target"; region@N { reg = <addr size>; }; }
  *     ├── cpu-remove { mk,instance = "source"; cpu@N { reg = <cpuid>; }; }
- *     └── cpu-add { mk,instance = "target"; cpu@N { reg = <cpuid>; numa-node = <N>; }; }
+ *     ├── cpu-add { mk,instance = "target"; cpu@N { reg = <cpuid>; numa-node = <N>; }; }
+ *     ├── device-remove { mk,instance = "source"; pci@N { pci-id = "DDDD:BB:SS.F"; }; }
+ *     └── device-add { mk,instance = "target"; pci@N { pci-id = "DDDD:BB:SS.F"; driver = "vfio-pci"; }; }
  *
  * Returns 0 on success, negative error code on failure.
  */
@@ -543,6 +548,102 @@ static int mk_overlay_parse_and_apply(struct mk_overlay_tx *tx,
 		}
 	}
 
+	/* Process device-remove operations */
+	op_node = fdt_subnode_offset(fdt, overlay_node, "device-remove");
+	if (op_node >= 0) {
+		struct mk_instance *remove_instance;
+
+		remove_instance = mk_overlay_get_instance_for_operation(
+			op_node, fdt, "device-remove", tx->id);
+		if (!remove_instance)
+			return -EINVAL;
+
+		fdt_for_each_subnode(item_node, fdt, op_node) {
+			const char *name = fdt_get_name(fdt, item_node, NULL);
+			const char *pci_id_str;
+			unsigned int domain, bus, slot, func;
+
+			if (strncmp(name, "pci@", 4) != 0)
+				continue;
+
+			/* Get PCI ID: pci-id = "DDDD:BB:SS.F" */
+			pci_id_str = fdt_getprop(fdt, item_node, "pci-id", &len);
+			if (!pci_id_str) {
+				pr_err("Invalid pci-id property in %s\n", name);
+				return -EINVAL;
+			}
+
+			if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
+				pr_err("Invalid pci-id format '%s'\n", pci_id_str);
+				return -EINVAL;
+			}
+
+			pr_info("Overlay tx%d: -device %04x:%02x:%02x.%x from %s\n",
+				tx->id, domain, bus, slot, func, remove_instance->name);
+
+			ret = mk_send_device_remove(remove_instance->id, domain, bus,
+						    PCI_DEVFN(slot, func));
+			if (ret < 0) {
+				pr_err("Failed to send device_remove IPI: %d\n", ret);
+				return ret;
+			}
+		}
+	}
+
+	/* Process device-add operations */
+	op_node = fdt_subnode_offset(fdt, overlay_node, "device-add");
+	if (op_node >= 0) {
+		struct mk_instance *add_instance;
+
+		add_instance = mk_overlay_get_instance_for_operation(
+			op_node, fdt, "device-add", tx->id);
+		if (!add_instance)
+			return -EINVAL;
+
+		fdt_for_each_subnode(item_node, fdt, op_node) {
+			const char *name = fdt_get_name(fdt, item_node, NULL);
+			const char *pci_id_str;
+			const char *driver_name = NULL;
+			unsigned int domain, bus, slot, func;
+			u32 flags = 0;
+
+			if (strncmp(name, "pci@", 4) != 0)
+				continue;
+
+			/* Get PCI ID: pci-id = "DDDD:BB:SS.F" */
+			pci_id_str = fdt_getprop(fdt, item_node, "pci-id", &len);
+			if (!pci_id_str) {
+				pr_err("Invalid pci-id property in %s\n", name);
+				return -EINVAL;
+			}
+
+			if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
+				pr_err("Invalid pci-id format '%s'\n", pci_id_str);
+				return -EINVAL;
+			}
+
+			/* Get optional driver override */
+			driver_name = fdt_getprop(fdt, item_node, "driver", &len);
+
+			/* Get optional flags */
+			const fdt32_t *flags_prop = fdt_getprop(fdt, item_node, "flags", &len);
+			if (flags_prop && len >= 4)
+				flags = fdt32_to_cpu(*flags_prop);
+
+			pr_info("Overlay tx%d: +device %04x:%02x:%02x.%x driver=%s -> %s\n",
+				tx->id, domain, bus, slot, func,
+				driver_name ? driver_name : "none",
+				add_instance->name);
+
+			ret = mk_send_device_add(add_instance->id, domain, bus,
+						 PCI_DEVFN(slot, func), driver_name, flags);
+			if (ret < 0) {
+				pr_err("Failed to send device_add IPI: %d\n", ret);
+				return ret;
+			}
+		}
+	}
+
 	/* Process instance-remove operations last (after all resources have been migrated) */
 	op_node = fdt_subnode_offset(fdt, overlay_node, "instance-remove");
 	if (op_node >= 0) {
@@ -594,15 +695,19 @@ static int mk_overlay_parse_and_apply(struct mk_overlay_tx *tx,
  *   2. memory-add to destination
  *   3. cpu-remove from source
  *   4. cpu-add to destination
- *   5. instance-remove - Remove instance
+ *   5. device-remove from source
+ *   6. device-add to destination
+ *   7. instance-remove - Remove instance
  *
  * Rollback order (must be exact reverse - Restore-Add-Modify-Remove-Destroy):
  *   1. instance-remove → re-create instance (undo instance-remove, restore instance)
- *   2. cpu-add → cpu-remove (undo cpu-add, remove from destination)
- *   3. cpu-remove → cpu-add (undo cpu-remove, add back to source)
- *   4. memory-add → memory-remove (undo memory-add, remove from destination)
- *   5. memory-remove → memory-add (undo memory-remove, add back to source)
- *   6. instance-create → destroy instance (undo instance-create, remove instance)
+ *   2. device-add → device-remove (undo device-add, remove from destination)
+ *   3. device-remove → device-add (undo device-remove, add back to source)
+ *   4. cpu-add → cpu-remove (undo cpu-add, remove from destination)
+ *   5. cpu-remove → cpu-add (undo cpu-remove, add back to source)
+ *   6. memory-add → memory-remove (undo memory-add, remove from destination)
+ *   7. memory-remove → memory-add (undo memory-remove, add back to source)
+ *   8. instance-create → destroy instance (undo instance-create, remove instance)
  *
  * This ordering ensures clean resource migration in reverse, preventing
  * race conditions and maintaining the same safety guarantees as the forward path.
@@ -659,7 +764,109 @@ static int mk_overlay_parse_and_rollback(struct mk_overlay_tx *tx,
 	}
 
 	/*
-	 * STEP 2: Rollback cpu-add → send cpu-remove
+	 * STEP 2: Rollback device-add → send device-remove
+	 * (Reverse of sixth operation in apply path)
+	 */
+	op_node = fdt_subnode_offset(fdt, overlay_node, "device-add");
+	if (op_node >= 0) {
+		struct mk_instance *add_instance;
+
+		add_instance = mk_overlay_get_instance_for_operation(
+			op_node, fdt, "device-add", tx->id);
+		if (!add_instance)
+			return -EINVAL;
+
+		fdt_for_each_subnode(item_node, fdt, op_node) {
+			const char *name = fdt_get_name(fdt, item_node, NULL);
+			const char *pci_id_str;
+			unsigned int domain, bus, slot, func;
+
+			if (strncmp(name, "pci@", 4) != 0)
+				continue;
+
+			pci_id_str = fdt_getprop(fdt, item_node, "pci-id", &len);
+			if (!pci_id_str) {
+				pr_err("Invalid pci-id property in %s\n", name);
+				return -EINVAL;
+			}
+
+			if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
+				pr_err("Invalid pci-id format '%s'\n", pci_id_str);
+				return -EINVAL;
+			}
+
+			pr_info("Rollback tx%d: -device %04x:%02x:%02x.%x from %s\n",
+				tx->id, domain, bus, slot, func, add_instance->name);
+
+			/* Send remove for what was added */
+			ret = mk_send_device_remove(add_instance->id, domain, bus,
+						    PCI_DEVFN(slot, func));
+			if (ret < 0) {
+				pr_err("Failed to send device_remove IPI for rollback: %d\n", ret);
+				return ret;
+			}
+		}
+	}
+
+	/*
+	 * STEP 3: Rollback device-remove → send device-add
+	 * (Reverse of fifth operation in apply path)
+	 */
+	op_node = fdt_subnode_offset(fdt, overlay_node, "device-remove");
+	if (op_node >= 0) {
+		struct mk_instance *remove_instance;
+
+		remove_instance = mk_overlay_get_instance_for_operation(
+			op_node, fdt, "device-remove", tx->id);
+		if (!remove_instance)
+			return -EINVAL;
+
+		fdt_for_each_subnode(item_node, fdt, op_node) {
+			const char *name = fdt_get_name(fdt, item_node, NULL);
+			const char *pci_id_str;
+			const char *driver_name = NULL;
+			unsigned int domain, bus, slot, func;
+			u32 flags = 0;
+
+			if (strncmp(name, "pci@", 4) != 0)
+				continue;
+
+			pci_id_str = fdt_getprop(fdt, item_node, "pci-id", &len);
+			if (!pci_id_str) {
+				pr_err("Invalid pci-id property in %s\n", name);
+				return -EINVAL;
+			}
+
+			if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
+				pr_err("Invalid pci-id format '%s'\n", pci_id_str);
+				return -EINVAL;
+			}
+
+			/* Get optional driver override */
+			driver_name = fdt_getprop(fdt, item_node, "driver", &len);
+
+			/* Get optional flags */
+			const fdt32_t *flags_prop = fdt_getprop(fdt, item_node, "flags", &len);
+			if (flags_prop && len >= 4)
+				flags = fdt32_to_cpu(*flags_prop);
+
+			pr_info("Rollback tx%d: +device %04x:%02x:%02x.%x driver=%s to %s\n",
+				tx->id, domain, bus, slot, func,
+				driver_name ? driver_name : "none",
+				remove_instance->name);
+
+			/* Send add for what was removed */
+			ret = mk_send_device_add(remove_instance->id, domain, bus,
+						 PCI_DEVFN(slot, func), driver_name, flags);
+			if (ret < 0) {
+				pr_err("Failed to send device_add IPI for rollback: %d\n", ret);
+				return ret;
+			}
+		}
+	}
+
+	/*
+	 * STEP 4: Rollback cpu-add → send cpu-remove
 	 * (Reverse of fourth operation in apply path)
 	 */
 	op_node = fdt_subnode_offset(fdt, overlay_node, "cpu-add");
@@ -698,7 +905,7 @@ static int mk_overlay_parse_and_rollback(struct mk_overlay_tx *tx,
 	}
 
 	/*
-	 * STEP 3: Rollback cpu-remove → send cpu-add
+	 * STEP 5: Rollback cpu-remove → send cpu-add
 	 * (Reverse of third operation in apply path)
 	 */
 	op_node = fdt_subnode_offset(fdt, overlay_node, "cpu-remove");
@@ -749,7 +956,7 @@ static int mk_overlay_parse_and_rollback(struct mk_overlay_tx *tx,
 	}
 
 	/*
-	 * STEP 4: Rollback memory-add → send memory-remove
+	 * STEP 6: Rollback memory-add → send memory-remove
 	 * (Reverse of second operation in apply path)
 	 */
 	op_node = fdt_subnode_offset(fdt, overlay_node, "memory-add");
@@ -792,7 +999,7 @@ static int mk_overlay_parse_and_rollback(struct mk_overlay_tx *tx,
 	}
 
 	/*
-	 * STEP 5: Rollback memory-remove → send memory-add
+	 * STEP 7: Rollback memory-remove → send memory-add
 	 * (Reverse of first operation in apply path)
 	 */
 	op_node = fdt_subnode_offset(fdt, overlay_node, "memory-remove");
@@ -848,7 +1055,7 @@ static int mk_overlay_parse_and_rollback(struct mk_overlay_tx *tx,
 	}
 
 	/*
-	 * STEP 6: Rollback instance-create → remove the instance
+	 * STEP 8: Rollback instance-create → remove the instance
 	 * (Reverse of zeroth operation in apply path - must be LAST)
 	 */
 	op_node = fdt_subnode_offset(fdt, overlay_node, "instance-create");

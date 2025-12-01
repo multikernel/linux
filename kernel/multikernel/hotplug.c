@@ -22,6 +22,7 @@
 #include <linux/mm.h>
 #include <linux/mmzone.h>
 #include <linux/multikernel.h>
+#include <linux/pci.h>
 #include <asm/apic.h>
 #include "internal.h"
 
@@ -31,7 +32,9 @@ struct mk_hotplug_op {
 		MK_HOTPLUG_CPU_ADD,
 		MK_HOTPLUG_CPU_REMOVE,
 		MK_HOTPLUG_MEM_ADD,
-		MK_HOTPLUG_MEM_REMOVE
+		MK_HOTPLUG_MEM_REMOVE,
+		MK_HOTPLUG_DEVICE_ADD,
+		MK_HOTPLUG_DEVICE_REMOVE
 	} type;
 
 	union {
@@ -46,6 +49,13 @@ struct mk_hotplug_op {
 			u32 numa_node;
 			u64 phys_addr;
 		} mem;
+
+		struct {
+			u16 domain;
+			u8 bus;
+			u8 devfn;
+			char prev_driver[64]; /* Previous driver name */
+		} device;
 	};
 
 	struct list_head list;
@@ -538,13 +548,269 @@ static int mk_handle_mem_remove(struct mk_mem_resource_payload *payload, u32 pay
 }
 
 /*
+ * PCI Device Hotplug Operations
+ */
+
+static int mk_do_device_add(u16 domain, u8 bus, u8 devfn,
+			    const char *driver_override, u32 flags)
+{
+	struct pci_dev *pdev;
+	struct pci_bus *pci_bus;
+	struct device_driver *drv;
+	struct mk_hotplug_op *op;
+	char prev_driver[64] = {0};
+	int ret;
+
+	pr_info("Multikernel hotplug: Adding device %04x:%02x:%02x.%x driver=%s flags=0x%x\n",
+		domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn),
+		driver_override ? driver_override : "none", flags);
+
+	pci_bus = pci_find_bus(domain, bus);
+	if (!pci_bus) {
+		pr_err("Multikernel hotplug: PCI bus %04x:%02x not found\n", domain, bus);
+		return -ENODEV;
+	}
+
+	pdev = pci_get_slot(pci_bus, devfn);
+	if (!pdev) {
+		pr_err("Multikernel hotplug: PCI device %04x:%02x:%02x.%x not found\n",
+		       domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
+		return -ENODEV;
+	}
+
+	if (pdev->dev.driver) {
+		strscpy(prev_driver, pdev->dev.driver->name, sizeof(prev_driver));
+		pr_info("Multikernel hotplug: Device currently bound to %s, unbinding\n",
+			prev_driver);
+		device_release_driver(&pdev->dev);
+	}
+
+	if (driver_override && driver_override[0]) {
+		ret = driver_set_override(&pdev->dev, &pdev->driver_override,
+					  driver_override, strlen(driver_override));
+		if (ret < 0) {
+			pr_err("Multikernel hotplug: Failed to set driver override to %s: %d\n",
+			       driver_override, ret);
+			pci_dev_put(pdev);
+			return ret;
+		}
+
+		drv = driver_find(driver_override, &pci_bus_type);
+		if (!drv) {
+			pr_err("Multikernel hotplug: Driver %s not found\n", driver_override);
+			pci_dev_put(pdev);
+			return -ENOENT;
+		}
+
+		ret = device_driver_attach(drv, &pdev->dev);
+		if (ret < 0) {
+			pr_err("Multikernel hotplug: Failed to bind device to %s: %d\n",
+			       driver_override, ret);
+			pci_dev_put(pdev);
+			return ret;
+		}
+
+		pr_info("Multikernel hotplug: Successfully bound device to %s\n", driver_override);
+	}
+
+	pci_dev_put(pdev);
+
+	op = kzalloc(sizeof(*op), GFP_KERNEL);
+	if (op) {
+		op->type = MK_HOTPLUG_DEVICE_ADD;
+		op->device.domain = domain;
+		op->device.bus = bus;
+		op->device.devfn = devfn;
+		strscpy(op->device.prev_driver, prev_driver, sizeof(op->device.prev_driver));
+
+		mutex_lock(&mk_hotplug_mutex);
+		list_add_tail(&op->list, &mk_hotplug_ops);
+		mutex_unlock(&mk_hotplug_mutex);
+	}
+
+	pr_info("Multikernel hotplug: Successfully configured device %04x:%02x:%02x.%x\n",
+		domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
+
+	return 0;
+}
+
+static int mk_do_device_remove(u16 domain, u8 bus, u8 devfn)
+{
+	struct pci_dev *pdev;
+	struct pci_bus *pci_bus;
+	struct mk_hotplug_op *op;
+	char prev_driver[64] = {0};
+
+	pr_info("Multikernel hotplug: Removing device %04x:%02x:%02x.%x\n",
+		domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
+
+	pci_bus = pci_find_bus(domain, bus);
+	if (!pci_bus) {
+		pr_err("Multikernel hotplug: PCI bus %04x:%02x not found\n", domain, bus);
+		return -ENODEV;
+	}
+
+	pdev = pci_get_slot(pci_bus, devfn);
+	if (!pdev) {
+		pr_err("Multikernel hotplug: PCI device %04x:%02x:%02x.%x not found\n",
+		       domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
+		return -ENODEV;
+	}
+
+	if (pdev->dev.driver) {
+		strscpy(prev_driver, pdev->dev.driver->name, sizeof(prev_driver));
+		pr_info("Multikernel hotplug: Unbinding device from %s\n", prev_driver);
+		device_release_driver(&pdev->dev);
+	}
+
+	pci_dev_put(pdev);
+
+	op = kzalloc(sizeof(*op), GFP_KERNEL);
+	if (op) {
+		op->type = MK_HOTPLUG_DEVICE_REMOVE;
+		op->device.domain = domain;
+		op->device.bus = bus;
+		op->device.devfn = devfn;
+		strscpy(op->device.prev_driver, prev_driver, sizeof(op->device.prev_driver));
+
+		mutex_lock(&mk_hotplug_mutex);
+		list_add_tail(&op->list, &mk_hotplug_ops);
+		mutex_unlock(&mk_hotplug_mutex);
+	}
+
+	pr_info("Multikernel hotplug: Successfully removed device %04x:%02x:%02x.%x\n",
+		domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
+
+	return 0;
+}
+
+struct mk_device_hotplug_work {
+	struct work_struct work;
+	u16 domain;
+	u8 bus;
+	u8 devfn;
+	u32 flags;
+	char driver_override[64];
+	int sender_instance_id;
+	u32 operation;
+};
+
+static void mk_device_add_work_fn(struct work_struct *work)
+{
+	struct mk_device_hotplug_work *hp_work = container_of(work, struct mk_device_hotplug_work, work);
+	struct mk_resource_ack ack;
+	int ret, ack_ret;
+
+	ret = mk_do_device_add(hp_work->domain, hp_work->bus, hp_work->devfn,
+			       hp_work->driver_override, hp_work->flags);
+
+	ack.operation = hp_work->operation;
+	ack.result = ret;
+	ack.resource_id = (hp_work->domain << 16) | (hp_work->bus << 8) | hp_work->devfn;
+	ack.reserved = 0;
+
+	ack_ret = mk_send_message(hp_work->sender_instance_id, MK_MSG_RESOURCE, MK_RES_ACK,
+				  &ack, sizeof(ack));
+	if (ack_ret < 0) {
+		pr_warn("Multikernel hotplug: Failed to send ACK for device %04x:%02x:%02x.%x: %d\n",
+			hp_work->domain, hp_work->bus,
+			PCI_SLOT(hp_work->devfn), PCI_FUNC(hp_work->devfn), ack_ret);
+	}
+
+	kfree(hp_work);
+}
+
+static void mk_device_remove_work_fn(struct work_struct *work)
+{
+	struct mk_device_hotplug_work *hp_work = container_of(work, struct mk_device_hotplug_work, work);
+	struct mk_resource_ack ack;
+	int ret, ack_ret;
+
+	ret = mk_do_device_remove(hp_work->domain, hp_work->bus, hp_work->devfn);
+
+	ack.operation = hp_work->operation;
+	ack.result = ret;
+	ack.resource_id = (hp_work->domain << 16) | (hp_work->bus << 8) | hp_work->devfn;
+	ack.reserved = 0;
+
+	ack_ret = mk_send_message(hp_work->sender_instance_id, MK_MSG_RESOURCE, MK_RES_ACK,
+				  &ack, sizeof(ack));
+	if (ack_ret < 0) {
+		pr_warn("Multikernel hotplug: Failed to send ACK for device %04x:%02x:%02x.%x: %d\n",
+			hp_work->domain, hp_work->bus,
+			PCI_SLOT(hp_work->devfn), PCI_FUNC(hp_work->devfn), ack_ret);
+	}
+
+	kfree(hp_work);
+}
+
+static int mk_handle_device_add(struct mk_device_resource_payload *payload, u32 payload_len)
+{
+	struct mk_device_hotplug_work *hp_work;
+
+	if (payload_len < sizeof(*payload)) {
+		pr_err("Multikernel hotplug: Invalid device add payload size: %u\n", payload_len);
+		return -EINVAL;
+	}
+
+	hp_work = kmalloc(sizeof(*hp_work), GFP_ATOMIC);
+	if (!hp_work) {
+		pr_err("Multikernel hotplug: Failed to allocate work structure for device %04x:%02x:%02x.%x\n",
+		       payload->domain, payload->bus,
+		       PCI_SLOT(payload->devfn), PCI_FUNC(payload->devfn));
+		return -ENOMEM;
+	}
+
+	INIT_WORK(&hp_work->work, mk_device_add_work_fn);
+	hp_work->domain = payload->domain;
+	hp_work->bus = payload->bus;
+	hp_work->devfn = payload->devfn;
+	hp_work->flags = payload->flags;
+	strscpy(hp_work->driver_override, payload->driver_override, sizeof(hp_work->driver_override));
+	hp_work->sender_instance_id = payload->sender_instance_id;
+	hp_work->operation = MK_RES_DEVICE_ADD;
+	schedule_work(&hp_work->work);
+
+	return 0;
+}
+
+static int mk_handle_device_remove(struct mk_device_resource_payload *payload, u32 payload_len)
+{
+	struct mk_device_hotplug_work *hp_work;
+
+	if (payload_len < sizeof(*payload)) {
+		pr_err("Multikernel hotplug: Invalid device remove payload size: %u\n", payload_len);
+		return -EINVAL;
+	}
+
+	hp_work = kmalloc(sizeof(*hp_work), GFP_ATOMIC);
+	if (!hp_work) {
+		pr_err("Multikernel hotplug: Failed to allocate work structure for device %04x:%02x:%02x.%x\n",
+		       payload->domain, payload->bus,
+		       PCI_SLOT(payload->devfn), PCI_FUNC(payload->devfn));
+		return -ENOMEM;
+	}
+
+	INIT_WORK(&hp_work->work, mk_device_remove_work_fn);
+	hp_work->domain = payload->domain;
+	hp_work->bus = payload->bus;
+	hp_work->devfn = payload->devfn;
+	hp_work->flags = payload->flags;
+	hp_work->sender_instance_id = payload->sender_instance_id;
+	hp_work->operation = MK_RES_DEVICE_REMOVE;
+	schedule_work(&hp_work->work);
+
+	return 0;
+}
+
+/*
  * Message Handler - Dispatches to specific handlers based on subtype
  */
 
 /**
  * mk_resource_msg_handler - Handle resource management messages
  * @msg_type: Message type (should be MK_MSG_RESOURCE)
- * @subtype: Message subtype (CPU_ADD, CPU_REMOVE, MEM_ADD, MEM_REMOVE)
+ * @subtype: Message subtype (CPU_ADD, CPU_REMOVE, MEM_ADD, MEM_REMOVE, DEVICE_ADD, DEVICE_REMOVE)
  * @payload: Payload data
  * @payload_len: Payload length
  * @ctx: Context (unused)
@@ -578,6 +844,14 @@ static void mk_resource_msg_handler(u32 msg_type, u32 subtype,
 
 	case MK_RES_MEM_REMOVE:
 		ret = mk_handle_mem_remove((struct mk_mem_resource_payload *)payload, payload_len);
+		break;
+
+	case MK_RES_DEVICE_ADD:
+		ret = mk_handle_device_add((struct mk_device_resource_payload *)payload, payload_len);
+		break;
+
+	case MK_RES_DEVICE_REMOVE:
+		ret = mk_handle_device_remove((struct mk_device_resource_payload *)payload, payload_len);
 		break;
 
 	case MK_RES_ACK:
@@ -908,4 +1182,147 @@ int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages)
 	return mk_instance_remove_memory_region(target_instance,
 						PFN_PHYS(start_pfn),
 						PFN_PHYS(nr_pages));
+}
+
+/**
+ * mk_send_device_add - Add PCI device to instance and wait for completion
+ * @instance_id: Target instance ID
+ * @domain: PCI domain
+ * @bus: PCI bus
+ * @devfn: PCI device and function (combined)
+ * @driver_override: Target driver name for binding (can be NULL)
+ * @flags: Additional flags
+ *
+ * For local instance, executes addition synchronously.
+ * For remote instance, sends IPI and waits for ACK response.
+ * For instances that are not yet running (MK_STATE_READY/LOADED),
+ * adds device to instance's device list.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
+		       const char *driver_override, u32 flags)
+{
+	struct mk_device_resource_payload payload = {
+		.domain = domain,
+		.bus = bus,
+		.devfn = devfn,
+		.flags = flags,
+		.sender_instance_id = root_instance->id
+	};
+	struct mk_pending_msg *pending;
+	struct mk_instance *target_instance;
+	int ret;
+	u32 resource_id;
+
+	if (driver_override)
+		strscpy(payload.driver_override, driver_override, sizeof(payload.driver_override));
+	else
+		payload.driver_override[0] = '\0';
+
+	resource_id = (domain << 16) | (bus << 8) | devfn;
+
+	if (instance_id == root_instance->id)
+		return mk_do_device_add(domain, bus, devfn, driver_override, flags);
+
+	target_instance = mk_instance_find(instance_id);
+	if (!target_instance)
+		return -ENODEV;
+
+	if (target_instance->state != MK_STATE_ACTIVE) {
+		return mk_instance_add_pci_device(target_instance, domain, bus, devfn);
+	}
+
+	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_DEVICE_ADD, resource_id);
+	if (!pending)
+		return -ENOMEM;
+
+	ret = mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_DEVICE_ADD,
+			      &payload, sizeof(payload));
+	if (ret < 0) {
+		mk_msg_pending_wait(pending, 0);
+		return ret;
+	}
+
+	ret = mk_msg_pending_wait(pending, 10000);
+	if (ret < 0)
+		return ret;
+
+	ret = mk_instance_add_pci_device(target_instance, domain, bus, devfn);
+	if (ret < 0) {
+		pr_warn("Device added to target but failed to update tracking: %d\n", ret);
+	}
+
+	pr_info("Multikernel hotplug: Device %04x:%02x:%02x.%x successfully added to instance %d\n",
+		domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn), instance_id);
+
+	return 0;
+}
+
+/**
+ * mk_send_device_remove - Remove PCI device from instance and wait for completion
+ * @instance_id: Target instance ID
+ * @domain: PCI domain
+ * @bus: PCI bus
+ * @devfn: PCI device and function (combined)
+ *
+ * For local instance, executes removal synchronously.
+ * For remote instance, sends IPI and waits for ACK response.
+ * For instances that are not yet running (MK_STATE_READY/LOADED),
+ * removes device from instance's device list.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
+{
+	struct mk_device_resource_payload payload = {
+		.domain = domain,
+		.bus = bus,
+		.devfn = devfn,
+		.flags = 0,
+		.sender_instance_id = root_instance->id
+	};
+	struct mk_pending_msg *pending;
+	struct mk_instance *target_instance;
+	int ret;
+	u32 resource_id;
+
+	payload.driver_override[0] = '\0';
+	resource_id = (domain << 16) | (bus << 8) | devfn;
+
+	if (instance_id == root_instance->id)
+		return mk_do_device_remove(domain, bus, devfn);
+
+	target_instance = mk_instance_find(instance_id);
+	if (!target_instance)
+		return -ENODEV;
+
+	if (target_instance->state != MK_STATE_ACTIVE) {
+		return mk_instance_remove_pci_device(target_instance, domain, bus, devfn);
+	}
+
+	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_DEVICE_REMOVE, resource_id);
+	if (!pending)
+		return -ENOMEM;
+
+	ret = mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_DEVICE_REMOVE,
+			      &payload, sizeof(payload));
+	if (ret < 0) {
+		mk_msg_pending_wait(pending, 0);
+		return ret;
+	}
+
+	ret = mk_msg_pending_wait(pending, 10000);
+	if (ret < 0)
+		return ret;
+
+	ret = mk_instance_remove_pci_device(target_instance, domain, bus, devfn);
+	if (ret < 0) {
+		pr_warn("Device removed from target but failed to update tracking: %d\n", ret);
+	}
+
+	pr_info("Multikernel hotplug: Device %04x:%02x:%02x.%x successfully removed from instance %d\n",
+		domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn), instance_id);
+
+	return 0;
 }

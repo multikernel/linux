@@ -443,6 +443,119 @@ static int mk_instance_reserve_pci_devices(struct mk_instance *instance,
 }
 
 /**
+ * mk_instance_add_pci_device - Add a single PCI device to an instance
+ * @instance: Target instance
+ * @domain: PCI domain
+ * @bus: PCI bus
+ * @devfn: PCI device and function (combined)
+ *
+ * Transfers a single PCI device from root instance to the specified instance.
+ * Used for dynamic PCI device hotplug to non-running instances.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+int mk_instance_add_pci_device(struct mk_instance *instance,
+			       u16 domain, u8 bus, u8 devfn)
+{
+	struct mk_pci_device *root_dev, *tmp;
+	u8 slot = PCI_SLOT(devfn);
+	u8 func = PCI_FUNC(devfn);
+
+	if (!root_instance || !root_instance->pci_devices_valid) {
+		pr_err("No root instance or PCI devices not initialized\n");
+		return -EINVAL;
+	}
+
+	list_for_each_entry_safe(root_dev, tmp, &root_instance->pci_devices, list) {
+		if (root_dev->domain == domain &&
+		    root_dev->bus == bus &&
+		    root_dev->slot == slot &&
+		    root_dev->func == func) {
+
+			list_del(&root_dev->list);
+			list_add_tail(&root_dev->list, &instance->pci_devices);
+			root_instance->pci_device_count--;
+			instance->pci_device_count++;
+			instance->pci_devices_valid = true;
+
+			pr_info("Transferred PCI device %04x:%04x@%04x:%02x:%02x.%x to instance %d\n",
+				root_dev->vendor, root_dev->device, domain, bus, slot, func,
+				instance->id);
+			return 0;
+		}
+	}
+
+	pr_err("PCI device %04x:%02x:%02x.%x not found in root pool\n",
+	       domain, bus, slot, func);
+	return -ENOENT;
+}
+
+/**
+ * mk_instance_remove_pci_device - Remove a single PCI device from an instance
+ * @instance: Target instance
+ * @domain: PCI domain
+ * @bus: PCI bus
+ * @devfn: PCI device and function (combined)
+ *
+ * Returns a single PCI device from the specified instance back to root instance.
+ * Used for dynamic PCI device hotplug from non-running instances.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+int mk_instance_remove_pci_device(struct mk_instance *instance,
+				  u16 domain, u8 bus, u8 devfn)
+{
+	struct mk_pci_device *inst_dev, *tmp;
+	struct mk_pci_device *root_dev;
+	u8 slot = PCI_SLOT(devfn);
+	u8 func = PCI_FUNC(devfn);
+
+	if (!instance->pci_devices_valid) {
+		pr_err("Instance %d PCI devices not initialized\n", instance->id);
+		return -EINVAL;
+	}
+
+	if (!root_instance) {
+		pr_err("Cannot return PCI device: no root instance\n");
+		return -EINVAL;
+	}
+
+	list_for_each_entry_safe(inst_dev, tmp, &instance->pci_devices, list) {
+		if (inst_dev->domain == domain &&
+		    inst_dev->bus == bus &&
+		    inst_dev->slot == slot &&
+		    inst_dev->func == func) {
+
+			root_dev = kzalloc(sizeof(*root_dev), GFP_KERNEL);
+			if (!root_dev) {
+				pr_err("Failed to allocate PCI device entry for root instance\n");
+				return -ENOMEM;
+			}
+
+			*root_dev = *inst_dev;
+			INIT_LIST_HEAD(&root_dev->list);
+
+			list_add_tail(&root_dev->list, &root_instance->pci_devices);
+			root_instance->pci_device_count++;
+			root_instance->pci_devices_valid = true;
+
+			list_del(&inst_dev->list);
+			kfree(inst_dev);
+			instance->pci_device_count--;
+
+			pr_info("Returned PCI device %04x:%04x@%04x:%02x:%02x.%x from instance %d to root\n",
+				root_dev->vendor, root_dev->device, domain, bus, slot, func,
+				instance->id);
+			return 0;
+		}
+	}
+
+	pr_err("PCI device %04x:%02x:%02x.%x not found in instance %d\n",
+	       domain, bus, slot, func, instance->id);
+	return -ENOENT;
+}
+
+/**
  * Memory management functions for instances
  */
 

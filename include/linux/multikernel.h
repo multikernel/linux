@@ -112,6 +112,8 @@ void generic_multikernel_interrupt(void);
 #define MK_RES_MEM_ADD      (MK_MSG_RESOURCE + 3)
 #define MK_RES_MEM_REMOVE   (MK_MSG_RESOURCE + 4)
 #define MK_RES_QUERY        (MK_MSG_RESOURCE + 5)
+#define MK_RES_DEVICE_ADD   (MK_MSG_RESOURCE + 6)
+#define MK_RES_DEVICE_REMOVE (MK_MSG_RESOURCE + 7)
 #define MK_RES_ACK          (MK_MSG_RESOURCE + 0x100)  /* Response/acknowledgment */
 
 /* System management subtypes */
@@ -174,6 +176,20 @@ struct mk_mem_resource_payload {
 #define MK_MEM_DMA              0x02
 #define MK_MEM_DMA32            0x04
 #define MK_MEM_HIGHMEM          0x08
+
+/* PCI device resource operations */
+struct mk_device_resource_payload {
+	u16 domain;             /* PCI domain */
+	u8 bus;                 /* PCI bus */
+	u8 devfn;               /* PCI device and function (combined) */
+	u32 flags;              /* Device flags */
+	char driver_override[64]; /* Target driver name for binding */
+	int sender_instance_id; /* Sender instance ID for ACK */
+};
+
+/* Device flags */
+#define MK_DEVICE_BIND_VFIO     0x01  /* Bind to VFIO driver */
+#define MK_DEVICE_BIND_STUB     0x02  /* Bind to pci-stub driver */
 
 /* Resource operation response/ACK */
 struct mk_resource_ack {
@@ -256,10 +272,14 @@ int mk_send_cpu_add(int instance_id, u32 cpu_id, u32 numa_node, u32 flags);
 int mk_send_cpu_remove(int instance_id, u32 cpu_id);
 
 /* Memory resource management */
-/* Memory hotplug functions */
 int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
 		    u32 numa_node, u32 mem_type);
 int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages);
+
+/* PCI device resource management */
+int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
+		       const char *driver_override, u32 flags);
+int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn);
 
 /* Messaging system functions */
 int __init mk_messaging_init(void);
@@ -598,6 +618,10 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 int mk_instance_add_memory_region(struct mk_instance *instance, size_t size);
 int mk_instance_remove_memory_region(struct mk_instance *instance,
 				     phys_addr_t phys_addr, size_t size);
+int mk_instance_add_pci_device(struct mk_instance *instance,
+			       u16 domain, u8 bus, u8 devfn);
+int mk_instance_remove_pci_device(struct mk_instance *instance,
+				  u16 domain, u8 bus, u8 devfn);
 
 void *mk_instance_alloc(struct mk_instance *instance, size_t size, size_t align);
 void mk_instance_free(struct mk_instance *instance, void *virt_addr, size_t size);
