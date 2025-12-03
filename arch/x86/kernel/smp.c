@@ -316,6 +316,33 @@ DEFINE_IDTENTRY_SYSVEC(sysvec_multikernel)
 	inc_irq_stat(irq_call_count);
 	generic_multikernel_interrupt();
 }
+
+void smp_stop_cpus(const struct cpumask *mask)
+{
+	unsigned int this_cpu = smp_processor_id();
+	unsigned long timeout;
+	int cpu;
+
+	if (cpumask_empty(mask))
+		return;
+
+	cpumask_copy(&cpus_stop_mask, mask);
+	cpumask_clear_cpu(this_cpu, &cpus_stop_mask);
+
+	if (cpumask_empty(&cpus_stop_mask))
+		return;
+
+	atomic_set(&stopping_cpu, this_cpu);
+
+	for_each_cpu(cpu, &cpus_stop_mask)
+		__apic_send_IPI(cpu, REBOOT_VECTOR);
+
+	timeout = USEC_PER_SEC;
+	while (!cpumask_empty(&cpus_stop_mask) && timeout--)
+		udelay(1);
+
+	cpumask_clear(&cpus_stop_mask);
+}
 #endif /* CONFIG_MULTIKERNEL */
 
 static int __init nonmi_ipi_setup(char *str)
