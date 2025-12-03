@@ -119,6 +119,7 @@ void generic_multikernel_interrupt(void);
 /* System management subtypes */
 #define MK_SYS_HEARTBEAT    (MK_MSG_SYSTEM + 1)
 #define MK_SYS_SHUTDOWN     (MK_MSG_SYSTEM + 2)
+#define MK_SYS_SHUTDOWN_ACK (MK_MSG_SYSTEM + 3)
 
 /**
  * Core message structure
@@ -198,6 +199,15 @@ struct mk_resource_ack {
 	u32 resource_id;        /* CPU ID, memory PFN, etc. */
 	u32 reserved;           /* For future use */
 };
+
+/* Shutdown request payload */
+struct mk_shutdown_payload {
+	u32 flags;
+	int sender_instance_id;
+};
+
+#define MK_SHUTDOWN_GRACEFUL  0x01
+#define MK_SHUTDOWN_IMMEDIATE 0x02
 
 /**
  * Message handler callback type
@@ -660,10 +670,15 @@ int mk_instance_set_kexec_active(int mk_id);
 
 #ifdef CONFIG_MULTIKERNEL
 bool multikernel_allow_emergency_restart(void);
+int multikernel_halt_by_id(int mk_id);
 #else
 static inline bool multikernel_allow_emergency_restart(void)
 {
 	return true;
+}
+static inline int multikernel_halt_by_id(int mk_id)
+{
+	return -ENODEV;
 }
 #endif
 

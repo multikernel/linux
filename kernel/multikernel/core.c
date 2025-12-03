@@ -7,11 +7,17 @@
 #include <linux/init.h>
 #include <linux/cpumask.h>
 #include <linux/cpu.h>
+#include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/kexec.h>
 #include <linux/multikernel.h>
 #include <linux/pci.h>
+#include <asm/apic.h>
+#include <asm/cpu.h>
+#include <asm/irq_vectors.h>
 #include <asm/page.h>
+#include <asm/processor.h>
+#include <asm/smp.h>
 #include "internal.h"
 
 static void mk_instance_return_all_cpus(struct mk_instance *instance)
@@ -865,6 +871,143 @@ void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size)
 	mk_instance_free(image->mk_instance, virt_addr, size);
 }
 
+/*
+ * Instance Shutdown
+ */
+
+static void mk_stop_instance_cpus(void)
+{
+	cpumask_var_t instance_cpus;
+	int phys_cpu, logical_cpu;
+
+	if (!root_instance || !root_instance->cpus)
+		return;
+
+	if (!alloc_cpumask_var(&instance_cpus, GFP_KERNEL))
+		return;
+
+	cpumask_clear(instance_cpus);
+	for_each_set_bit(phys_cpu, root_instance->cpus, NR_CPUS) {
+		logical_cpu = arch_cpu_from_physical_id(phys_cpu);
+		if (logical_cpu >= 0 && cpu_online(logical_cpu))
+			cpumask_set_cpu(logical_cpu, instance_cpus);
+	}
+
+	smp_stop_cpus(instance_cpus);
+
+	free_cpumask_var(instance_cpus);
+}
+
+struct mk_shutdown_work {
+	struct work_struct work;
+	u32 flags;
+	int sender_instance_id;
+};
+
+static void mk_shutdown_work_fn(struct work_struct *work)
+{
+	struct mk_shutdown_work *sw = container_of(work, struct mk_shutdown_work, work);
+	struct mk_resource_ack ack;
+
+	ack.operation = MK_SYS_SHUTDOWN;
+	ack.result = 0;
+	ack.resource_id = root_instance->id;
+
+	mk_send_message(sw->sender_instance_id, MK_MSG_SYSTEM, MK_SYS_SHUTDOWN_ACK,
+			&ack, sizeof(ack));
+
+	pr_emerg("Multikernel instance %d shutting down\n", root_instance->id);
+
+	kfree(sw);
+
+	local_irq_disable();
+	mk_stop_instance_cpus();
+	stop_this_cpu(NULL);
+}
+
+static void mk_system_msg_handler(u32 msg_type, u32 subtype,
+				  void *payload, u32 payload_len, void *ctx)
+{
+	if (msg_type != MK_MSG_SYSTEM)
+		return;
+
+	switch (subtype) {
+	case MK_SYS_SHUTDOWN: {
+		struct mk_shutdown_payload *req = payload;
+		struct mk_shutdown_work *sw;
+
+		if (payload_len < sizeof(*req))
+			return;
+
+		pr_emerg("Shutdown requested by instance %d\n", req->sender_instance_id);
+
+		sw = kmalloc(sizeof(*sw), GFP_ATOMIC);
+		if (!sw)
+			return;
+
+		INIT_WORK(&sw->work, mk_shutdown_work_fn);
+		sw->flags = req->flags;
+		sw->sender_instance_id = req->sender_instance_id;
+		schedule_work(&sw->work);
+		break;
+	}
+	case MK_SYS_SHUTDOWN_ACK: {
+		struct mk_resource_ack *ack = payload;
+
+		if (payload_len < sizeof(*ack))
+			return;
+		mk_msg_pending_complete(MK_MSG_SYSTEM, MK_SYS_SHUTDOWN,
+					ack->resource_id, ack->result);
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+int multikernel_halt_by_id(int mk_id)
+{
+	struct mk_instance *instance;
+	struct mk_shutdown_payload payload;
+	struct mk_pending_msg *pending;
+	int ret;
+
+	instance = mk_instance_find(mk_id);
+	if (!instance)
+		return -ENOENT;
+
+	if (instance->state != MK_STATE_ACTIVE) {
+		mk_instance_put(instance);
+		return -EINVAL;
+	}
+
+	payload.flags = MK_SHUTDOWN_GRACEFUL;
+	payload.sender_instance_id = root_instance->id;
+
+	pending = mk_msg_pending_add(MK_MSG_SYSTEM, MK_SYS_SHUTDOWN, mk_id);
+	if (!pending) {
+		mk_instance_put(instance);
+		return -ENOMEM;
+	}
+
+	ret = mk_send_message(mk_id, MK_MSG_SYSTEM, MK_SYS_SHUTDOWN,
+			      &payload, sizeof(payload));
+	if (ret < 0) {
+		mk_msg_pending_wait(pending, 0);
+		mk_instance_put(instance);
+		return ret;
+	}
+
+	ret = mk_msg_pending_wait(pending, 30000);
+	if (ret == 0) {
+		mk_instance_set_state(instance, MK_STATE_LOADED);
+		pr_info("Multikernel instance %d halted\n", mk_id);
+	}
+
+	mk_instance_put(instance);
+	return ret;
+}
+
 static int __init multikernel_init(void)
 {
 	int ret;
@@ -875,9 +1018,17 @@ static int __init multikernel_init(void)
 		return ret;
 	}
 
+	ret = mk_register_msg_handler(MK_MSG_SYSTEM, mk_system_msg_handler, NULL);
+	if (ret < 0) {
+		pr_err("Failed to register system message handler: %d\n", ret);
+		mk_messaging_cleanup();
+		return ret;
+	}
+
 	ret = mk_hotplug_init();
 	if (ret < 0) {
 		pr_err("Failed to initialize multikernel hotplug: %d\n", ret);
+		mk_unregister_msg_handler(MK_MSG_SYSTEM, mk_system_msg_handler);
 		mk_messaging_cleanup();
 		return ret;
 	}
@@ -886,6 +1037,7 @@ static int __init multikernel_init(void)
 	if (ret < 0) {
 		pr_err("Failed to initialize multikernel sysfs interface: %d\n", ret);
 		mk_hotplug_cleanup();
+		mk_unregister_msg_handler(MK_MSG_SYSTEM, mk_system_msg_handler);
 		mk_messaging_cleanup();
 		return ret;
 	}
