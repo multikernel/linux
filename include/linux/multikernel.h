@@ -126,6 +126,14 @@ void generic_multikernel_interrupt(void);
 #define MK_NET_VSOCK_PKT    (MK_MSG_NETWORK + 1)  /* vsock packet */
 #define MK_NET_DATA_READY   (MK_MSG_NETWORK + 2)  /* Data available notification */
 
+/* FUSE multikernel transport (zero-copy DAX) */
+#define MK_MSG_FUSE         0xA000
+#define MK_FUSE_REQ_READY   (MK_MSG_FUSE + 1)     /* FUSE request ready */
+#define MK_FUSE_RESP_READY  (MK_MSG_FUSE + 2)     /* FUSE response ready */
+#define MK_FUSE_MOUNT       (MK_MSG_FUSE + 3)     /* Mount request */
+#define MK_FUSE_MOUNT_ACK   (MK_MSG_FUSE + 4)     /* Mount acknowledgment */
+#define MK_FUSE_UNMOUNT     (MK_MSG_FUSE + 5)     /* Unmount notification */
+
 /**
  * Core message structure
  */

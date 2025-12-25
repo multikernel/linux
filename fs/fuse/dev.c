@@ -2140,6 +2140,7 @@ struct fuse_req *fuse_request_find(struct fuse_pqueue *fpq, u64 unique)
 	}
 	return NULL;
 }
+EXPORT_SYMBOL_GPL(fuse_request_find);
 
 int fuse_copy_out_args(struct fuse_copy_state *cs, struct fuse_args *args,
 		       unsigned nbytes)

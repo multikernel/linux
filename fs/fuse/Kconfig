@@ -41,17 +41,19 @@ config VIRTIO_FS
 	  or M.
 
 config FUSE_DAX
-	bool "Virtio Filesystem Direct Host Memory Access support"
+	bool "FUSE Direct Host Memory Access (DAX) support"
 	default y
 	select INTERVAL_TREE
-	depends on VIRTIO_FS
+	depends on VIRTIO_FS || FUSE_MULTIKERNEL
 	depends on FS_DAX
 	depends on DAX
 	help
 	  This allows bypassing guest page cache and allows mapping host page
 	  cache directly in guest address space.
 
-	  If you want to allow mounting a Virtio Filesystem with the "dax"
+	  Required for virtio-fs DAX mode and multikernel zero-copy filesystem.
+
+	  If you want to allow mounting a FUSE filesystem with the "dax"
 	  option, answer Y.
 
 config FUSE_PASSTHROUGH
@@ -76,3 +78,20 @@ config FUSE_IO_URING
 
 	  If you want to allow fuse server/client communication through io-uring,
 	  answer Y
+
+config FUSE_MULTIKERNEL
+	tristate "FUSE Multikernel Transport"
+	depends on FUSE_FS
+	depends on MULTIKERNEL
+	depends on FS_DAX
+	depends on DAX
+	select INTERVAL_TREE
+	help
+	  This enables a FUSE transport for multikernel that uses shared
+	  memory and IPI for communication between host and spawn kernels.
+	  It leverages DAX for zero-copy file access.
+
+	  When enabled, also enable FUSE_DAX for full DAX support.
+
+	  If you want to share filesystems between multikernel instances
+	  with zero-copy performance, answer Y or M.
