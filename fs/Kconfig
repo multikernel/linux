@@ -319,6 +319,7 @@ source "fs/jffs2/Kconfig"
 # UBIFS File system configuration
 source "fs/ubifs/Kconfig"
 source "fs/cramfs/Kconfig"
+source "fs/daxfs/Kconfig"
 source "fs/squashfs/Kconfig"
 source "fs/freevxfs/Kconfig"
 source "fs/minix/Kconfig"

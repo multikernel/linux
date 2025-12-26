@@ -1,0 +1,12 @@
+config DAXFS
+	tristate "DAX-based filesystem for shared memory"
+	select DMA_SHARED_BUFFER
+	help
+	  A simple read-only filesystem stored in shared physical memory.
+	  It can be backed by any dma-buf (e.g. system heap, CMA heap,
+	  or the multikernel memory pool) or by a raw phys/size region.
+
+	  The host writes a daxfs image into the buffer, then mounts it
+	  by passing the dma-buf fd via fsconfig(FSCONFIG_SET_FD).
+
+	  If unsure, say N.
