@@ -200,6 +200,9 @@ struct boot_params {
  * @X86_SUBARCH_CE4100: Used for Intel CE media processor (CE4100) SoC
  * 	for settop boxes and media devices, the use of a subarch for CE4100
  * 	is more of a hack...
+ * @X86_SUBARCH_MULTIKERNEL: Used for multikernel spawn kernels that boot
+ *	without legacy BIOS resources. These kernels have their own page tables
+ *	and a restricted e820 map containing only assigned memory regions.
  */
 enum x86_hardware_subarch {
 	X86_SUBARCH_PC = 0,
@@ -207,6 +210,7 @@ enum x86_hardware_subarch {
 	X86_SUBARCH_XEN,
 	X86_SUBARCH_INTEL_MID,
 	X86_SUBARCH_CE4100,
+	X86_SUBARCH_MULTIKERNEL,
 	X86_NR_SUBARCHS,
 };
 

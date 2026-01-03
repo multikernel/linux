@@ -1218,6 +1218,26 @@ char *__init e820__memory_setup_default(void)
 }
 
 /*
+ * Multikernel spawn memory setup - accepts any number of e820 entries
+ * without fallback to legacy BIOS memory probing.
+ */
+char *__init e820__memory_setup_multikernel(void)
+{
+	struct boot_e820_entry *entry = boot_params.e820_table;
+	u32 nr_entries = boot_params.e820_entries;
+
+	while (nr_entries) {
+		e820__range_add(entry->addr, entry->size, entry->type);
+		entry++;
+		nr_entries--;
+	}
+
+	e820__update_table(e820_table);
+
+	return "MULTIKERNEL";
+}
+
+/*
  * Calls e820__memory_setup_default() in essence to pick up the firmware/bootloader
  * E820 map - with an optional platform quirk available for virtual platforms
  * to override this method of boot environment processing:

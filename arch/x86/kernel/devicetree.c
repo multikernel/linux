@@ -291,6 +291,10 @@ static void __init x86_dtb_parse_smp_config(void)
 
 void __init x86_flattree_get_config(void)
 {
+	/* Skip device tree processing if no DTB available from bootloader */
+	if (!initial_dtb)
+		return;
+
 #ifdef CONFIG_OF_EARLY_FLATTREE
 	u32 size, map_len;
 	void *dt;

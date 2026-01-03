@@ -1175,6 +1175,8 @@ static inline int pgd_none(pgd_t pgd)
 
 extern int direct_gbpages;
 void init_mem_mapping(void);
+void init_direct_mapping_default(void);
+void init_direct_mapping_sparse(void);
 void early_alloc_pgt_buf(void);
 void __init poking_init(void);
 unsigned long init_memory_mapping(unsigned long start,

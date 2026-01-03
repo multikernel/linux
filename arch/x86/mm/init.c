@@ -756,13 +756,14 @@ static void __init init_trampoline(void)
 #endif
 }
 
-void __init init_mem_mapping(void)
+/*
+ * Default direct mapping for systems with contiguous memory layout.
+ * Maps ISA range, initializes trampoline, then maps remaining memory
+ * using top-down or bottom-up approach.
+ */
+void __init init_direct_mapping_default(void)
 {
 	unsigned long end;
-
-	pti_check_boottime_disable();
-	probe_page_size_mask();
-	setup_pcid();
 
 #ifdef CONFIG_X86_64
 	end = max_pfn << PAGE_SHIFT;
@@ -770,8 +771,13 @@ void __init init_mem_mapping(void)
 	end = max_low_pfn << PAGE_SHIFT;
 #endif
 
-	/* the ISA range is always mapped regardless of memory holes */
-	init_memory_mapping(0, ISA_END_ADDRESS, PAGE_KERNEL);
+	/*
+	 * Map the ISA range (0-1MB) if this platform has legacy BIOS RAM.
+	 * Systems without legacy BIOS (multikernel spawn, some VMs) don't
+	 * have this memory and should not map it.
+	 */
+	if (x86_platform.legacy.map_isa_ram)
+		init_memory_mapping(0, ISA_END_ADDRESS, PAGE_KERNEL);
 
 	/* Init the trampoline, possibly with KASLR memory offset */
 	init_trampoline();
@@ -795,14 +801,38 @@ void __init init_mem_mapping(void)
 	} else {
 		memory_map_top_down(ISA_END_ADDRESS, end);
 	}
+}
+
+/*
+ * Direct mapping for systems with sparse/fragmented memory layout.
+ * Maps each memblock range individually instead of assuming contiguous
+ * memory from ISA_END to max_pfn.
+ */
+void __init init_direct_mapping_sparse(void)
+{
+	unsigned long start_pfn, end_pfn;
+	int i;
+
+	for_each_mem_pfn_range(i, MAX_NUMNODES, &start_pfn, &end_pfn, NULL) {
+		init_memory_mapping(PFN_PHYS(start_pfn), PFN_PHYS(end_pfn),
+				    PAGE_KERNEL);
+	}
+}
+
+void __init init_mem_mapping(void)
+{
+	pti_check_boottime_disable();
+	probe_page_size_mask();
+	setup_pcid();
+
+	/* Platform-specific direct mapping setup */
+	x86_init.paging.init_direct_mapping();
 
 #ifdef CONFIG_X86_64
 	if (max_pfn > max_low_pfn) {
 		/* can we preserve max_low_pfn ?*/
 		max_low_pfn = max_pfn;
 	}
-#else
-	early_ioremap_page_table_range_init();
 #endif
 
 	load_cr3(swapper_pg_dir);

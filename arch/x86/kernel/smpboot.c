@@ -120,6 +120,16 @@ struct mwait_cpu_dead {
  */
 static DEFINE_PER_CPU_ALIGNED(struct mwait_cpu_dead, mwait_cpu_dead);
 
+#ifdef CONFIG_MULTIKERNEL
+static DEFINE_PER_CPU(bool, mk_pool_cpu);
+
+void mk_set_pool_cpu(int cpu, bool is_pool)
+{
+	per_cpu(mk_pool_cpu, cpu) = is_pool;
+}
+EXPORT_SYMBOL_GPL(mk_set_pool_cpu);
+#endif
+
 /* Maximum number of SMT threads on any online core */
 int __read_mostly __max_smt_threads = 1;
 
@@ -900,94 +910,7 @@ int common_cpu_up(unsigned int cpu, struct task_struct *idle)
 	return 0;
 }
 
-extern void __init setup_trampolines_bsp(void);
 extern unsigned long orig_boot_params;
-
-unsigned char *x86_trampoline_bsp_base;
-
-extern const unsigned char trampoline_data_bsp[];
-extern const unsigned char trampoline_status_bsp[];
-extern const unsigned char x86_trampoline_bsp_start [];
-extern const unsigned char x86_trampoline_bsp_end   [];
-extern unsigned long kernel_phys_addr;
-extern unsigned long boot_params_phys_addr;
-
-#define TRAMPOLINE_SYM_BSP(x)                                           \
-        ((void *)(x86_trampoline_bsp_base +                                     \
-                  ((const unsigned char *)(x) - trampoline_data_bsp)))
-
-/* Address of the SMP trampoline */
-static inline unsigned long trampoline_bsp_address(void)
-{
-        return virt_to_phys(TRAMPOLINE_SYM_BSP(trampoline_data_bsp));
-}
-
-// must be locked by cpus_read_lock()
-static int do_multikernel_boot_cpu(u32 apicid, int cpu, unsigned long kernel_start_address)
-{
-	unsigned long start_ip;
-	int ret;
-
-	/* Multikernel -- set physical address where kernel has been copied.
-           Note that this needs to be written to the location where the
-           trampoline was copied, not to the location within the original
-           kernel itself. */
-        unsigned long *kernel_virt_addr = TRAMPOLINE_SYM_BSP(&kernel_phys_addr);
-
-        *kernel_virt_addr = kernel_start_address;
-
-        /* start_ip had better be page-aligned! */
-        start_ip = trampoline_bsp_address();
-
-	pr_info("do_multikernel_boot_cpu(apicid=%u, cpu=%u, kernel_start_address=%lx)\n", apicid, cpu, kernel_start_address);
-
-	/* Skip init_espfix_ap(cpu); */
-
-	/* Skip announce_cpu(cpu, apicid); */
-
-	/*
-	 * This grunge runs the startup process for
-	 * the targeted processor.
-	 */
-	if (x86_platform.legacy.warm_reset) {
-
-		pr_debug("Setting warm reset code and vector.\n");
-
-		smpboot_setup_warm_reset_vector(start_ip);
-		/*
-		 * Be paranoid about clearing APIC errors.
-		*/
-		if (APIC_INTEGRATED(boot_cpu_apic_version)) {
-			apic_write(APIC_ESR, 0);
-			apic_read(APIC_ESR);
-		}
-	}
-
-	smp_mb();
-
-	/*
-	 * Wake up a CPU in difference cases:
-	 * - Use a method from the APIC driver if one defined, with wakeup
-	 *   straight to 64-bit mode preferred over wakeup to RM.
-	 * Otherwise,
-	 * - Use an INIT boot APIC message
-	 */
-	if (apic->wakeup_secondary_cpu_64)
-		ret = apic->wakeup_secondary_cpu_64(apicid, start_ip, cpu);
-	else if (apic->wakeup_secondary_cpu)
-		ret = apic->wakeup_secondary_cpu(apicid, start_ip, cpu);
-	else
-		ret = wakeup_secondary_cpu_via_init(apicid, start_ip, cpu);
-
-	pr_info("do_multikernel_boot_cpu end\n");
-	/* If the wakeup mechanism failed, cleanup the warm reset vector */
-	if (ret)
-		arch_cpuhp_cleanup_kick_cpu(cpu);
-
-        /* mark "stuck" area as not stuck */
-        *(volatile u32 *)TRAMPOLINE_SYM_BSP(trampoline_status_bsp) = 0;
-	return ret;
-}
 /*
  * NOTE - on most systems this is a PHYSICAL apic ID, but on multiquad
  * (ie clustered apic addressing mode), this is a LOGICAL apic ID.
@@ -996,44 +919,32 @@ static int do_multikernel_boot_cpu(u32 apicid, int cpu, unsigned long kernel_sta
  */
 static int do_boot_cpu(u32 apicid, unsigned int cpu, struct task_struct *idle)
 {
-	unsigned long start_ip = real_mode_header->trampoline_start;
+	unsigned long start_ip = 0;
 	int ret;
 
+	/*
+	 * For multikernel spawns without realmode, we use a custom wakeup
+	 * that doesn't need start_ip from the realmode trampoline.
+	 * The custom wakeup sets up the entry point directly.
+	 */
+	if (real_mode_header) {
+		start_ip = real_mode_header->trampoline_start;
 #ifdef CONFIG_X86_64
-	/* If 64-bit wakeup method exists, use the 64-bit mode trampoline IP */
-	if (apic->wakeup_secondary_cpu_64)
-		start_ip = real_mode_header->trampoline_start64;
+		/* If 64-bit wakeup method exists, use the 64-bit mode trampoline IP */
+		if (apic->wakeup_secondary_cpu_64)
+			start_ip = real_mode_header->trampoline_start64;
 #endif
+	} else {
+		/*
+		 * No realmode header - multikernel spawn using custom wakeup.
+		 * The custom wakeup function will provide the entry point.
+		 * Use secondary_startup_64 as a fallback if needed.
+		 */
+		start_ip = (unsigned long)secondary_startup_64;
+	}
+
 	idle->thread.sp = (unsigned long)task_pt_regs(idle);
 	initial_code = (unsigned long)start_secondary;
-
-	/*
-	 * For multikernel, update the shared trampoline to point to this
-	 * kernel's code and page tables. Multiple kernels share the same
-	 * trampoline in the first 1MB, so each must update it before booting
-	 * a CPU to ensure the CPU boots into the correct kernel with the
-	 * correct page tables.
-	 */
-	if (IS_ENABLED(CONFIG_MULTIKERNEL)) {
-		struct trampoline_header *th =
-			(struct trampoline_header *)__va(real_mode_header->trampoline_header);
-		u64 *trampoline_pgd = (u64 *)__va(real_mode_header->trampoline_pgd);
-		u64 efer;
-		int i;
-
-		th->start = (u64)secondary_startup_64;
-		rdmsrq(MSR_EFER, efer);
-		th->efer = efer & ~EFER_LMA;
-		th->cr4 = mmu_cr4_features;
-		th->flags = 0;
-		th->lock = 0;
-
-		extern pgd_t trampoline_pgd_entry;
-		trampoline_pgd[0] = trampoline_pgd_entry.pgd;
-
-		for (i = pgd_index(__PAGE_OFFSET); i < PTRS_PER_PGD; i++)
-			trampoline_pgd[i] = init_top_pgt[i].pgd;
-	}
 
 	if (IS_ENABLED(CONFIG_X86_32)) {
 		early_gdt_descr.address = (unsigned long)get_cpu_gdt_rw(cpu);
@@ -1087,77 +998,6 @@ static int do_boot_cpu(u32 apicid, unsigned int cpu, struct task_struct *idle)
 		arch_cpuhp_cleanup_kick_cpu(cpu);
 	return ret;
 }
-
-// must be locked by cpus_read_lock()
-int multikernel_kick_ap(unsigned int cpu, unsigned long kernel_start_address)
-{
-	u32 apicid = apic->cpu_present_to_apicid(cpu);
-	int err;
-
-	lockdep_assert_irqs_enabled();
-
-	pr_info("++++++++++++++++++++=_---CPU UP  %u\n", cpu);
-
-	if (apicid == BAD_APICID || !apic_id_valid(apicid)) {
-		pr_err("CPU %u has invalid APIC ID %x. Aborting bringup\n", cpu, apicid);
-		return -EINVAL;
-	}
-
-	if (!test_bit(apicid, phys_cpu_present_map)) {
-		pr_err("CPU %u APIC ID %x is not present. Aborting bringup\n", cpu, apicid);
-		return -EINVAL;
-	}
-
-	/*
-	 * Save current MTRR state in case it was changed since early boot
-	 * (e.g. by the ACPI SMI) to initialize new CPUs with MTRRs in sync:
-	 */
-	mtrr_save_state();
-
-	/* the FPU context is blank, nobody can own it */
-	per_cpu(fpu_fpregs_owner_ctx, cpu) = NULL;
-	/* skip common_cpu_up(cpu, tidle); */
-
-	err = do_multikernel_boot_cpu(apicid, cpu, kernel_start_address);
-	if (err)
-		pr_err("do_multikernel_boot_cpu failed(%d) to wakeup CPU#%u\n", err, cpu);
-
-	return err;
-}
-
-void __init setup_trampolines_bsp(void)
-{
-        phys_addr_t mem;
-        size_t size = PAGE_ALIGN(x86_trampoline_bsp_end - x86_trampoline_bsp_start);
-
-        /* Has to be in very low memory so we can execute real-mode AP code. */
-        mem = memblock_phys_alloc_range(size, PAGE_SIZE, 0, 1<<20);
-        if (!mem)
-                panic("Cannot allocate trampoline\n");
-
-        x86_trampoline_bsp_base = __va(mem);
-        memblock_reserve(mem, mem + size);
-
-        printk(KERN_DEBUG "Base memory trampoline BSP at [%p] %llx size %zu\n",
-               x86_trampoline_bsp_base, (unsigned long long)mem, size);
-
-        //if (!mklinux_boot) {
-                memcpy(x86_trampoline_bsp_base, trampoline_data_bsp, size);
-
-        //} else {
-        //        printk("Multikernel boot: BSP trampoline will NOT be copied\n");
-        //}
-}
-
-static int __init configure_trampolines_bsp(void)
-{
-        size_t size = PAGE_ALIGN(x86_trampoline_bsp_end - x86_trampoline_bsp_start);
-
-        set_memory_x((unsigned long)x86_trampoline_bsp_base, size >> PAGE_SHIFT);
-        return 0;
-}
-
-arch_initcall(configure_trampolines_bsp);
 
 int native_kick_ap(unsigned int cpu, struct task_struct *tidle)
 {
@@ -1463,6 +1303,11 @@ int native_cpu_disable(void)
 
 	cpu_disable_common();
 
+#ifdef CONFIG_MULTIKERNEL
+	if (__this_cpu_read(mk_pool_cpu))
+		return 0;
+#endif
+
         /*
          * Disable the local APIC. Otherwise IPI broadcasts will reach
          * it. It still responds normally to INIT, NMI, SMI, and SIPI
@@ -1582,10 +1427,43 @@ void __noreturn hlt_play_dead(void)
 		native_halt();
 }
 
+#ifdef CONFIG_MULTIKERNEL
+/*
+ * multikernel_play_dead - IPI-capable wait loop for multikernel pool CPUs
+ *
+ * Unlike native_play_dead(), this keeps the APIC enabled so the CPU can
+ * receive IPIs. When a spawn is triggered via mk_spawn_cpu(), the IPI
+ * handler executes and jumps to the trampoline.
+ *
+ * This function never returns - either the spawn handler takes over,
+ * or the CPU waits indefinitely.
+ */
+void __noreturn multikernel_play_dead(void)
+{
+	if (cpu_feature_enabled(X86_FEATURE_KERNEL_IBRS))
+		__update_spec_ctrl(0);
+
+	play_dead_common();
+
+	local_irq_enable();
+
+	while (1) {
+		native_safe_halt();
+		mk_check_spawn();
+	}
+}
+#endif
+
 void __noreturn native_play_dead(void)
 {
 	if (cpu_feature_enabled(X86_FEATURE_KERNEL_IBRS))
 		__update_spec_ctrl(0);
+
+#ifdef CONFIG_MULTIKERNEL
+	if (__this_cpu_read(mk_pool_cpu)) {
+		multikernel_play_dead();
+	}
+#endif
 
 	play_dead_common();
 	tboot_shutdown(TB_SHUTDOWN_WFS);

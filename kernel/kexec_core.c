@@ -51,6 +51,9 @@
 
 #include <asm/page.h>
 #include <asm/sections.h>
+#ifdef CONFIG_X86
+#include <asm/bootparam.h>
+#endif
 
 #include <crypto/hash.h>
 #include "kexec_internal.h"
@@ -1010,8 +1013,8 @@ static int kimage_load_multikernel_segment(struct kimage *image, int idx)
 	ubytes = segment->bufsz;
 	mbytes = segment->memsz;
 	maddr = segment->mem;
-	pr_info("Loading multikernel segment: mem=0x%lx, memsz=0x%zu, buf=0x%px, bufsz=0x%zu\n",
-		maddr, mbytes, buf, ubytes);
+	pr_info("Loading multikernel segment: mem=0x%lx, memsz=0x%zx, kbuf=0x%px, buf=0x%px, bufsz=0x%zx, file_mode=%d\n",
+		maddr, mbytes, kbuf, buf, ubytes, image->file_mode);
 	while (mbytes) {
 		char *ptr;
 		size_t uchunk, mchunk;
@@ -1672,6 +1675,11 @@ int multikernel_kexec_by_id(int mk_id)
 {
 	struct kimage *mk_image;
 	struct mk_instance *instance;
+	struct mk_ident_pgtable *ident_pgt = NULL;
+	struct mk_spawn_context *spawn_ctx = NULL;
+	phys_addr_t spawn_ctx_phys;
+	void *trampoline_va = NULL;
+	unsigned long trampoline_phys;
 	int cpu = -1;
 	int rc;
 
@@ -1703,30 +1711,79 @@ int multikernel_kexec_by_id(int mk_id)
 		goto unlock;
 	}
 
-	if (cpu_online(cpu)) {
-		pr_err("CPU %d is currently online and cannot be used for multikernel instance %d\n",
-		       cpu, mk_id);
-		rc = -EBUSY;
-		goto unlock;
-	}
-
 	rc = mk_kexec_finalize(mk_image);
 	if (rc)
 		pr_warn("KHO finalization failed: %d\n", rc);
 	else
 		pr_info("KHO finalized for multikernel instance\n");
 
-	pr_info("Using multikernel image with ID %d (entry point: 0x%lx) on CPU %d\n",
-		mk_image->mk_id, mk_image->start, cpu);
+	ident_pgt = mk_build_identity_pgtable(instance,
+					      mk_image->multikernel_pool_start,
+					      mk_image->multikernel_pool_end);
+	if (IS_ERR(ident_pgt)) {
+		pr_err("Failed to build identity page table: %ld\n", PTR_ERR(ident_pgt));
+		rc = PTR_ERR(ident_pgt);
+		ident_pgt = NULL;
+		goto unlock;
+	}
 
-	cpus_read_lock();
-	rc = multikernel_kick_ap(cpu, mk_image->start);
-	cpus_read_unlock();
+	trampoline_va = mk_setup_trampoline(instance, ident_pgt, &trampoline_phys);
+	if (IS_ERR(trampoline_va)) {
+		pr_err("Failed to set up trampoline: %ld\n", PTR_ERR(trampoline_va));
+		rc = PTR_ERR(trampoline_va);
+		trampoline_va = NULL;
+		goto unlock;
+	}
 
+	/* Allocate and set up spawn context for this instance */
+	spawn_ctx = mk_alloc_spawn_context(instance, &spawn_ctx_phys);
+	if (!spawn_ctx) {
+		pr_err("Failed to allocate spawn context\n");
+		rc = -ENOMEM;
+		goto unlock;
+	}
+
+	/* Copy boot_params into spawn context */
+	{
+		struct boot_params *src_bp;
+		struct boot_params *dst_bp;
+
+		src_bp = memremap(mk_image->mk_boot_params,
+				  sizeof(struct boot_params), MEMREMAP_WB);
+		if (!src_bp) {
+			pr_err("Failed to map boot_params at 0x%lx\n",
+			       mk_image->mk_boot_params);
+			rc = -ENOMEM;
+			goto unlock;
+		}
+		dst_bp = mk_spawn_context_boot_params(spawn_ctx);
+		memcpy(dst_bp, src_bp, sizeof(struct boot_params));
+		memunmap(src_bp);
+	}
+
+	mk_set_spawn_context(spawn_ctx,
+			     mk_get_identity_cr3(ident_pgt),
+			     mk_image->mk_kernel_entry,
+			     (unsigned long)trampoline_va,
+			     trampoline_phys);
+
+	rc = mk_spawn_cpu(cpu, spawn_ctx);
 	if (rc == 0) {
 		rc = mk_instance_set_kexec_active(mk_image->mk_id);
 		if (rc)
 			pr_warn("Failed to set instance %d as active: %d\n", mk_image->mk_id, rc);
+		/*
+		 * On success, the spawn kernel is booting asynchronously and
+		 * needs the identity page table for the CR3 switch. The pages
+		 * are allocated from the instance pool and will be reclaimed
+		 * when the instance is destroyed. Just free the tracking struct.
+		 */
+		mk_free_identity_pgtable_struct(ident_pgt);
+	} else {
+		if (ident_pgt)
+			mk_free_identity_pgtable(ident_pgt);
+		if (trampoline_va)
+			mk_instance_free(instance, trampoline_va, PAGE_SIZE);
 	}
 
 unlock:

@@ -36,6 +36,7 @@ extern void e820__reserve_resources_late(void);
 extern void e820__memory_setup(void);
 extern void e820__memory_setup_extended(u64 phys_addr, u32 data_len);
 extern char *e820__memory_setup_default(void);
+extern char *e820__memory_setup_multikernel(void);
 extern void e820__setup_pci_gap(void);
 
 extern void e820__reallocate_tables(void);

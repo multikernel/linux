@@ -36,5 +36,7 @@ obj-$(CONFIG_KEXEC_FILE) += purgatory/
 
 obj-y += virt/
 
+obj-$(CONFIG_MULTIKERNEL) += multikernel/
+
 # for cleaning
 subdir- += boot tools

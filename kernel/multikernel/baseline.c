@@ -411,10 +411,13 @@ static int mk_baseline_initialize_cpus(const struct mk_instance *instance)
 			continue;
 		}
 
+		mk_set_pool_cpu(logical_cpu, true);
+
 		ret = remove_cpu(logical_cpu);
 		if (ret) {
 			pr_err("Failed to offline CPU %u (logical %d): %d\n",
 			       phys_cpu_id, logical_cpu, ret);
+			mk_set_pool_cpu(logical_cpu, false);
 			failed++;
 		} else {
 			pr_info("Offlined CPU %u (logical %d) for multikernel pool\n",

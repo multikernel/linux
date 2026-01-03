@@ -57,7 +57,7 @@ struct bzimage64_data {
 	void *bootparams_buf;
 };
 
-static int setup_initrd(struct boot_params *params,
+int setup_initrd(struct boot_params *params,
 		unsigned long initrd_load_addr, unsigned long initrd_len)
 {
 	params->hdr.ramdisk_image = initrd_load_addr & 0xffffffffUL;
@@ -69,7 +69,7 @@ static int setup_initrd(struct boot_params *params,
 	return 0;
 }
 
-static int setup_cmdline(struct kimage *image, struct boot_params *params,
+int setup_cmdline(struct kimage *image, struct boot_params *params,
 			 unsigned long bootparams_load_addr,
 			 unsigned long cmdline_offset, char *cmdline,
 			 unsigned long cmdline_len)
@@ -92,6 +92,8 @@ static int setup_cmdline(struct kimage *image, struct boot_params *params,
 	cmdline_ptr[cmdline_len - 1] = '\0';
 
 	kexec_dprintk("Final command line is: %s\n", cmdline_ptr);
+	pr_info("setup_cmdline: cmdline=%s len=%lu offset=%lu\n",
+		cmdline_ptr, cmdline_len, cmdline_offset);
 	cmdline_ptr_phys = bootparams_load_addr + cmdline_offset;
 	cmdline_low_32 = cmdline_ptr_phys & 0xffffffffUL;
 	cmdline_ext_32 = cmdline_ptr_phys >> 32;
@@ -99,6 +101,9 @@ static int setup_cmdline(struct kimage *image, struct boot_params *params,
 	params->hdr.cmd_line_ptr = cmdline_low_32;
 	if (cmdline_ext_32)
 		params->ext_cmd_line_ptr = cmdline_ext_32;
+
+	pr_info("setup_cmdline: cmd_line_ptr=0x%x ext=0x%x (phys=0x%lx)\n",
+		params->hdr.cmd_line_ptr, params->ext_cmd_line_ptr, cmdline_ptr_phys);
 
 	return 0;
 }
@@ -124,38 +129,23 @@ static int setup_e820_entries_multikernel(struct kimage *image, struct boot_para
 	struct mk_instance *instance = image->mk_instance;
 	struct mk_memory_region *region;
 	unsigned int nr_e820_entries = 0;
-	int i;
 
-	/* For multikernel spawn, the spawn kernel needs RAM in the first 1MB to allocate
-	 * its real-mode trampoline (see arch/x86/realmode/init.c reserve_real_mode()).
+	/*
+	 * Don't include first 1MB in e820 for multikernel spawn kernels.
+	 * Multikernel doesn't use real-mode trampoline (init_trampoline is
+	 * skipped), and including unmapped low memory causes sparse_init()
+	 * to fail when trying to populate vmemmap for those sections.
+	 * Only include the assigned memory pool regions.
 	 *
-	 * We use e820_table (the kernel's modified e820 map) rather than
-	 * e820_table_kexec, so we automatically exclude regions the kernel has
-	 * reserved (like 0x0-0xFFF containing IVT/BDA).
+	 * However, we need at least 2 e820 entries or the kernel's
+	 * append_e820_table() will reject our map and fall back to
+	 * creating a fake memory map that includes low memory.
+	 * Add a small reserved region at 0x0 as a dummy entry.
 	 */
-
-	for (i = 0; i < e820_table->nr_entries && nr_e820_entries < E820_MAX_ENTRIES_ZEROPAGE; i++) {
-		struct e820_entry *entry = &e820_table->entries[i];
-		u64 entry_end = entry->addr + entry->size;
-
-		if (entry->addr >= 0x100000)
-			continue;
-
-		if (entry->type != E820_TYPE_RAM)
-			continue;
-
-		params->e820_table[nr_e820_entries].addr = entry->addr;
-		params->e820_table[nr_e820_entries].size = entry->size;
-		params->e820_table[nr_e820_entries].type = entry->type;
-		/* Truncate if it extends beyond 1MB */
-		if (entry_end > 0x100000)
-			params->e820_table[nr_e820_entries].size = 0x100000 - entry->addr;
-
-		nr_e820_entries++;
-	}
-
-	pr_info("Set up multikernel e820 map with %d entries from first 1MB\n",
-		nr_e820_entries);
+	params->e820_table[nr_e820_entries].addr = 0;
+	params->e820_table[nr_e820_entries].size = 0x1000;
+	params->e820_table[nr_e820_entries].type = E820_TYPE_RESERVED;
+	nr_e820_entries++;
 
 	if (instance && !list_empty(&instance->memory_regions)) {
 		list_for_each_entry(region, &instance->memory_regions, list) {
@@ -179,8 +169,14 @@ static int setup_e820_entries_multikernel(struct kimage *image, struct boot_para
 
 	params->e820_entries = nr_e820_entries;
 
-	pr_info("Final multikernel e820 map has %d total entries\n",
+	pr_info("Final multikernel e820 map has %d total entries:\n",
 		nr_e820_entries);
+	for (int i = 0; i < nr_e820_entries; i++) {
+		pr_info("  e820[%d]: 0x%llx-0x%llx type=%d\n", i,
+			params->e820_table[i].addr,
+			params->e820_table[i].addr + params->e820_table[i].size,
+			params->e820_table[i].type);
+	}
 
 	return 0;
 }
@@ -364,7 +360,7 @@ static void setup_kho(const struct kimage *image, struct boot_params *params,
 	params->hdr.setup_data = params_load_addr + setup_data_offset;
 }
 
-static int
+int
 setup_boot_parameters(struct kimage *image, struct boot_params *params,
 		      unsigned long params_load_addr,
 		      unsigned int efi_map_offset, unsigned int efi_map_sz,
@@ -409,9 +405,11 @@ setup_boot_parameters(struct kimage *image, struct boot_params *params,
 	} else
 #endif
 	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
-		ret = setup_e820_entries_multikernel(image, params);
-		if (ret)
-			return ret;
+		/*
+		 * Don't setup e820 here for multikernel - each loader
+		 * (vmlinux, bzImage) has its own setup_e820_entries_multikernel()
+		 * that handles this appropriately after setup_boot_parameters().
+		 */
 	} else {
 		setup_e820_entries(params);
 	}
@@ -759,6 +757,13 @@ static void *bzImage64_load(struct kimage *image, char *kernel,
 				    efi_setup_data_offset);
 	if (ret)
 		goto out_free_params;
+
+	/* For multikernel, setup custom e820 map */
+	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
+		ret = setup_e820_entries_multikernel(image, params);
+		if (ret)
+			goto out_free_params;
+	}
 
 	/* Allocate loader specific data */
 	ldata = kzalloc(sizeof(struct bzimage64_data), GFP_KERNEL);

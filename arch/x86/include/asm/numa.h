@@ -12,6 +12,11 @@
 
 extern int numa_off;
 
+static inline void numa_set_off(void)
+{
+	numa_off = 1;
+}
+
 /*
  * __apicid_to_node[] stores the raw mapping between physical apicid and
  * node and is used to initialize cpu_to_node mapping.
@@ -38,6 +43,10 @@ static inline void set_apicid_to_node(int apicid, s16 node)
 static inline int numa_cpu_node(int cpu)
 {
 	return NUMA_NO_NODE;
+}
+
+static inline void numa_set_off(void)
+{
 }
 #endif	/* CONFIG_NUMA */
 

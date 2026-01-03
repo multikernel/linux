@@ -124,7 +124,6 @@ void native_smp_prepare_cpus(unsigned int max_cpus);
 void native_smp_cpus_done(unsigned int max_cpus);
 int common_cpu_up(unsigned int cpunum, struct task_struct *tidle);
 int native_kick_ap(unsigned int cpu, struct task_struct *tidle);
-int multikernel_kick_ap(unsigned int cpu, unsigned long kernel_start_address);
 int native_cpu_disable(void);
 void __noreturn hlt_play_dead(void);
 void __noreturn native_play_dead(void);
@@ -137,6 +136,15 @@ void wbnoinvd_on_cpus_mask(struct cpumask *cpus);
 
 void smp_kick_mwait_play_dead(void);
 void __noreturn mwait_play_dead(unsigned int eax_hint);
+
+#ifdef CONFIG_MULTIKERNEL
+void mk_set_pool_cpu(int cpu, bool is_pool);
+void __noreturn multikernel_play_dead(void);
+void mk_check_spawn(void);
+int multikernel_restore_ap(unsigned int cpu, unsigned long cr3,
+			   unsigned long gs_base, unsigned long stack,
+			   unsigned long entry);
+#endif
 
 void native_smp_send_reschedule(int cpu);
 void native_send_call_func_ipi(const struct cpumask *mask);

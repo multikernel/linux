@@ -443,6 +443,14 @@ struct kimage {
 
 	/* Multikernel instance cross-reference */
 	struct mk_instance *mk_instance;
+
+#ifdef CONFIG_MULTIKERNEL
+	/* Multikernel spawn parameters */
+	unsigned long mk_kernel_entry;      /* Physical entry point */
+	unsigned long mk_boot_params;       /* Physical boot_params address */
+	unsigned long multikernel_pool_start; /* Pool region start */
+	unsigned long multikernel_pool_end;   /* Pool region end */
+#endif
 };
 
 /* kexec interface functions */

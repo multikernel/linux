@@ -129,6 +129,7 @@ int mk_kho_preserve_host_ipi(struct kimage *image, void *fdt)
 	return 0;
 }
 
+
 /**
  * mk_dt_extract_instance_info() - Extract instance ID and name from DTB
  * @dtb_data: Device tree blob data
@@ -177,10 +178,68 @@ static int mk_dt_extract_instance_info(const void *dtb_data, size_t dtb_size,
 	return 0;
 }
 
+/*
+ * Register CPUs from KHO DTB during SMP config phase.
+ * Called from multikernel_parse_smp_config() before topology is finalized.
+ */
+void __init mk_register_cpus_from_kho(void)
+{
+	phys_addr_t fdt_phys;
+	const void *kho_fdt;
+	int mk_node, resources_node;
+	const fdt32_t *cpus_prop;
+	int cpus_len, i;
+	const void *dtb_data;
+	int dtb_len;
+
+	fdt_phys = kho_get_fdt_phys();
+	if (!fdt_phys)
+		return;
+
+	kho_fdt = early_memremap(fdt_phys, PAGE_SIZE);
+	if (!kho_fdt)
+		return;
+
+	mk_node = fdt_subnode_offset(kho_fdt, 0, "multikernel");
+	if (mk_node < 0)
+		goto out;
+
+	/* Get the embedded DTB */
+	dtb_data = fdt_getprop(kho_fdt, mk_node, "dtb-data", &dtb_len);
+	if (!dtb_data || dtb_len <= 0)
+		goto out;
+
+	/* Find /resources node in the embedded DTB */
+	resources_node = fdt_subnode_offset(dtb_data, 0, "resources");
+	if (resources_node < 0)
+		goto out;
+
+	/* Get the cpus property from resources node */
+	cpus_prop = fdt_getprop(dtb_data, resources_node, "cpus", &cpus_len);
+	if (!cpus_prop || cpus_len < sizeof(fdt32_t))
+		goto out;
+
+	/* Register each CPU from the DTB */
+	for (i = 0; i < cpus_len / sizeof(fdt32_t); i++) {
+		u32 apic_id = fdt32_to_cpu(cpus_prop[i]);
+
+		topology_register_apic(apic_id, CPU_ACPIID_INVALID, true);
+		pr_debug("Registered CPU APIC ID %u from KHO DTB\n", apic_id);
+	}
+
+out:
+	early_memunmap((void *)kho_fdt, PAGE_SIZE);
+}
+
+/*
+ * Restrict CPU masks to only include CPUs assigned to this instance.
+ * CPUs are already registered during multikernel_parse_smp_config() via
+ * topology_register_apic(), so we just need to restrict the present mask.
+ */
 static int __init mk_kho_restore_cpus(struct mk_dt_config *config)
 {
 	int phys_cpu_id;
-	cpumask_var_t new_possible;
+	cpumask_var_t new_present;
 
 	if (!config->cpus || bitmap_empty(config->cpus, NR_CPUS)) {
 		pr_debug("No CPU configuration in DTB\n");
@@ -191,35 +250,27 @@ static int __init mk_kho_restore_cpus(struct mk_dt_config *config)
 		cpumask_pr_args(cpu_possible_mask),
 		cpumask_pr_args(cpu_present_mask));
 
-	if (!alloc_cpumask_var(&new_possible, GFP_KERNEL)) {
+	if (!alloc_cpumask_var(&new_present, GFP_KERNEL)) {
 		pr_err("Failed to allocate CPU mask\n");
 		return -ENOMEM;
 	}
 
-	cpumask_clear(new_possible);
+	cpumask_clear(new_present);
 	for_each_set_bit(phys_cpu_id, config->cpus, NR_CPUS) {
 		int logical_cpu = arch_cpu_from_physical_id(phys_cpu_id);
 
-		if (logical_cpu < 0) {
-			topology_register_apic(phys_cpu_id, CPU_ACPIID_INVALID, false);
-			logical_cpu = arch_cpu_from_physical_id(phys_cpu_id);
-		}
-
 		if (logical_cpu >= 0) {
-			cpumask_set_cpu(logical_cpu, new_possible);
-			pr_debug("Static CPU: physical %d -> logical %d\n",
+			cpumask_set_cpu(logical_cpu, new_present);
+			pr_debug("Instance CPU: physical %d -> logical %d\n",
 				 phys_cpu_id, logical_cpu);
 		} else {
-			pr_warn("Failed to register physical CPU %d\n", phys_cpu_id);
+			pr_warn("Physical CPU %d not found in topology\n", phys_cpu_id);
 		}
 	}
 
-	/* cpu_possible_mask stays large to allow per-CPU data allocation
-	 * Devices will only be registered for present CPUs, but we'll register
-	 * them on-demand during hotplug
-	 */
-	cpumask_and(&__cpu_present_mask, &__cpu_present_mask, new_possible);
-	free_cpumask_var(new_possible);
+	/* Restrict present mask to only CPUs assigned to this instance */
+	cpumask_and(&__cpu_present_mask, &__cpu_present_mask, new_present);
+	free_cpumask_var(new_present);
 
 	pr_info("After restriction: cpu_possible=%*pbl, cpu_present=%*pbl\n",
 		cpumask_pr_args(cpu_possible_mask),
