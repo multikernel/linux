@@ -21,6 +21,8 @@
 #include <asm/i8259.h>
 #include <asm/pc-conf-reg.h>
 #include <asm/pci_x86.h>
+#include <asm/setup.h>
+#include <asm/x86_init.h>
 
 #define PIRQ_SIGNATURE	(('$' << 0) + ('P' << 8) + ('I' << 16) + ('R' << 24))
 #define PIRQ_VERSION 0x0100
@@ -174,6 +176,13 @@ static struct irq_routing_table * __init pirq_find_routing_table(void)
 	u8 * const bios_end = (u8 *)__va(0x100000);
 	u8 *addr;
 	struct irq_routing_table *rt;
+
+	/*
+	 * Skip scanning for PIRQ table if ISA/BIOS memory area is not mapped.
+	 * This applies to multikernel spawn, some paravirt environments, etc.
+	 */
+	if (!x86_platform.legacy.map_isa_ram)
+		return NULL;
 
 	if (pirq_table_addr) {
 		rt = pirq_check_routing_table((u8 *)__va(pirq_table_addr),

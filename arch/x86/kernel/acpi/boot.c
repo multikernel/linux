@@ -1740,6 +1740,13 @@ int __init acpi_mps_check(void)
 	if (xen_pv_domain() && !xen_initial_domain())
 		return 0;
 
+	/*
+	 * If SMP config was found via alternative means (multikernel, etc.),
+	 * APIC is already set up - no need for MPS tables.
+	 */
+	if (smp_found_config)
+		return 0;
+
 	if (acpi_disabled || acpi_noirq) {
 		pr_warn("MPS support code is not built-in, using acpi=off or acpi=noirq or pci=noacpi may have problem\n");
 		return 1;

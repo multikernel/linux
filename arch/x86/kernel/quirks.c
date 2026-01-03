@@ -9,6 +9,7 @@
 #include <asm/hpet.h>
 #include <asm/setup.h>
 #include <asm/mce.h>
+#include <asm/x86_init.h>
 
 #include <linux/platform_data/x86/apple.h>
 
@@ -666,6 +667,13 @@ EXPORT_SYMBOL(x86_apple_machine);
 
 void __init early_platform_quirks(void)
 {
+	/*
+	 * Skip DMI/SMBIOS access if ISA/BIOS memory area is not mapped.
+	 * This applies to multikernel spawn, some paravirt environments, etc.
+	 */
+	if (!x86_platform.legacy.map_isa_ram)
+		return;
+
 	x86_apple_machine = dmi_match(DMI_SYS_VENDOR, "Apple Inc.") ||
 			    dmi_match(DMI_SYS_VENDOR, "Apple Computer, Inc.");
 }

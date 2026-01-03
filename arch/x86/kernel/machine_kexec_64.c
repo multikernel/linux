@@ -91,7 +91,14 @@ static int map_mmio_serial(struct x86_mapping_info *info, pgd_t *level4p)
 }
 
 #ifdef CONFIG_KEXEC_FILE
+#ifdef CONFIG_MULTIKERNEL
+extern const struct kexec_file_ops kexec_vmlinux_ops;
+#endif
+
 const struct kexec_file_ops * const kexec_file_loaders[] = {
+#ifdef CONFIG_MULTIKERNEL
+		&kexec_vmlinux_ops,  /* Try vmlinux first for multikernel ELF loading */
+#endif
 		&kexec_bzImage64_ops,
 		NULL
 };

@@ -550,8 +550,8 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 		struct kexec_segment *ksegment;
 
 		ksegment = &image->segment[i];
-		kexec_dprintk("segment[%d]: buf=0x%p bufsz=0x%zx mem=0x%lx memsz=0x%zx\n",
-			      i, ksegment->buf, ksegment->bufsz, ksegment->mem,
+		kexec_dprintk("segment[%d]: kbuf=0x%px buf=0x%p bufsz=0x%zx mem=0x%lx memsz=0x%zx\n",
+			      i, ksegment->kbuf, ksegment->buf, ksegment->bufsz, ksegment->mem,
 			      ksegment->memsz);
 
 		ret = kimage_load_segment(image, i);
@@ -899,6 +899,19 @@ static int kexec_alloc_multikernel(struct kexec_buf *kbuf)
 
 	kbuf->mem = phys_addr;
 
+	/*
+	 * If kbuf->buffer was already set (e.g., boot_params allocated via
+	 * kvzalloc), copy the data to the pool allocation. Otherwise, the
+	 * caller will populate the buffer later (e.g., ELF segments).
+	 */
+	if (kbuf->buffer && kbuf->bufsz > 0) {
+		memcpy(virt_addr, kbuf->buffer, kbuf->bufsz);
+		pr_info("kexec_alloc_multikernel: copied %zu bytes from %px to %px\n",
+			kbuf->bufsz, kbuf->buffer, virt_addr);
+	}
+
+	kbuf->buffer = virt_addr;
+
 	pr_info("Allocated %lu bytes from multikernel pool at 0x%llx (virt=%px)\n",
 		 kbuf->memsz, (unsigned long long)phys_addr, virt_addr);
 
@@ -1007,6 +1020,9 @@ int kexec_add_buffer(struct kexec_buf *kbuf)
 	ksegment->bufsz = kbuf->bufsz;
 	ksegment->mem = kbuf->mem;
 	ksegment->memsz = kbuf->memsz;
+	pr_info("kexec_add_buffer: segment[%lu] kbuf=0x%px bufsz=0x%zx mem=0x%lx memsz=0x%zx\n",
+		kbuf->image->nr_segments, ksegment->kbuf, ksegment->bufsz,
+		ksegment->mem, ksegment->memsz);
 	kbuf->image->segment_cma[kbuf->image->nr_segments] = kbuf->cma;
 	kbuf->image->nr_segments++;
 	return 0;
@@ -1024,6 +1040,9 @@ static int kexec_calculate_store_digests(struct kimage *image)
 	struct purgatory_info *pi = &image->purgatory_info;
 
 	if (!IS_ENABLED(CONFIG_ARCH_SUPPORTS_KEXEC_PURGATORY))
+		return 0;
+
+	if (image->type == KEXEC_TYPE_MULTIKERNEL)
 		return 0;
 
 	zero_buf = __va(page_to_pfn(ZERO_PAGE(0)) << PAGE_SHIFT);

@@ -765,6 +765,7 @@ int mk_kho_preserve_dtb(struct kimage *image, void *fdt, int mk_id);
  */
 int mk_kho_preserve_host_ipi(struct kimage *image, void *fdt);
 
+
 /**
  * mk_kho_restore_dtbs() - Restore DTBs from KHO shared memory
  *
@@ -774,6 +775,15 @@ int mk_kho_preserve_host_ipi(struct kimage *image, void *fdt);
  * Returns: 0 on success, negative error code on failure
  */
 int __init mk_kho_restore_dtbs(void);
+
+/**
+ * mk_register_cpus_from_kho() - Register CPUs from KHO DTB during SMP config
+ *
+ * Called early during SMP configuration to register CPUs from the KHO DTB.
+ * This must happen before topology_init_possible_cpus() to ensure CPUs are
+ * properly registered in the topology.
+ */
+void __init mk_register_cpus_from_kho(void);
 
 /**
  * PCI Device Enforcement Functions
@@ -812,5 +822,57 @@ bool mk_pci_device_allowed(struct pci_bus *bus, int devfn, u16 vendor, u16 devic
  * Returns: true if device is allowed, false otherwise
  */
 bool mk_platform_device_allowed(const char *name, const char *hid);
+
+/**
+ * Direct 64-bit Spawn Functions
+ *
+ * These functions implement the direct 64-bit to 64-bit spawn mechanism.
+ * Pool CPUs wait in multikernel_play_dead() with APIC enabled, and can be
+ * triggered to execute the spawn trampoline via IPI.
+ *
+ * The spawn context combines boot_params with spawn-specific fields,
+ * allocated once per instance and reused for secondary CPU bringup.
+ */
+
+struct mk_spawn_context;
+struct mk_ident_pgtable;
+
+/* Allocate spawn context (includes boot_params) */
+struct mk_spawn_context *mk_alloc_spawn_context(struct mk_instance *instance,
+						phys_addr_t *phys_out);
+struct boot_params *mk_spawn_context_boot_params(struct mk_spawn_context *ctx);
+
+/* Set up spawn context for kernel boot */
+void mk_set_spawn_context(struct mk_spawn_context *ctx,
+			  unsigned long identity_cr3,
+			  unsigned long kernel_entry,
+			  unsigned long trampoline_virt,
+			  unsigned long trampoline_phys);
+
+/* Trigger spawn on a pool CPU */
+int mk_spawn_cpu(int cpu, struct mk_spawn_context *ctx);
+
+/* Initialize boot context tracking in spawn kernel */
+void mk_init_boot_context(phys_addr_t ctx_phys);
+
+/* Identity page table and trampoline setup */
+struct mk_ident_pgtable *mk_build_identity_pgtable(struct mk_instance *instance,
+						    unsigned long start,
+						    unsigned long end);
+void mk_free_identity_pgtable(struct mk_ident_pgtable *pgt);
+void mk_free_identity_pgtable_struct(struct mk_ident_pgtable *pgt);
+unsigned long mk_get_identity_cr3(struct mk_ident_pgtable *pgt);
+void *mk_setup_trampoline(struct mk_instance *instance,
+			  struct mk_ident_pgtable *pgt,
+			  unsigned long *phys_out);
+
+/* Secondary CPU wakeup for spawn kernels (reuses boot context) */
+int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
+					unsigned int cpu);
+
+/* Restore AP to spawn context (used by hibernation/switch) */
+int multikernel_restore_ap(unsigned int cpu, unsigned long cr3,
+			   unsigned long gs_base, unsigned long stack,
+			   unsigned long entry);
 
 #endif /* _LINUX_MULTIKERNEL_H */

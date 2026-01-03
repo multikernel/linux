@@ -28,6 +28,7 @@
 #include <asm/mach_traps.h>
 #include <asm/irqdomain.h>
 #include <asm/realmode.h>
+#include <asm/pgtable.h>
 
 void x86_init_noop(void) { }
 void __init x86_init_uint_noop(unsigned int unused) { }
@@ -93,6 +94,7 @@ struct x86_init_ops x86_init __initdata = {
 
 	.paging = {
 		.pagetable_init		= native_pagetable_init,
+		.init_direct_mapping	= init_direct_mapping_default,
 	},
 
 	.timers = {

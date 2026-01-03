@@ -112,6 +112,15 @@ ASSERT(__relocate_kernel_end - __relocate_kernel_start <= KEXEC_CONTROL_CODE_MAX
 #else
 #define KEXEC_RELOCATE_KERNEL
 #endif
+
+#if defined(CONFIG_X86_64) && defined(CONFIG_MULTIKERNEL)
+#define MULTIKERNEL_RELOCATE_KERNEL				\
+	. = ALIGN(0x100);					\
+	*(.text..multikernel_relocate);				\
+	*(.data..multikernel_relocate);
+#else
+#define MULTIKERNEL_RELOCATE_KERNEL
+#endif
 PHDRS {
 	text PT_LOAD FLAGS(5);          /* R_E */
 	data PT_LOAD FLAGS(6);          /* RW_ */
@@ -193,6 +202,7 @@ SECTIONS
 		DATA_DATA
 		CONSTRUCTORS
 		KEXEC_RELOCATE_KERNEL
+		MULTIKERNEL_RELOCATE_KERNEL
 
 		/* rarely changed data like cpu maps */
 		READ_MOSTLY_DATA(INTERNODE_CACHE_BYTES)

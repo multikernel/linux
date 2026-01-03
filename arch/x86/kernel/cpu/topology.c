@@ -28,6 +28,7 @@
 
 #include <asm/apic.h>
 #include <asm/hypervisor.h>
+#include <asm/x86_init.h>
 #include <asm/io_apic.h>
 #include <asm/mpspec.h>
 #include <asm/msr.h>
@@ -143,6 +144,17 @@ static __init bool check_for_real_bsp(u32 apic_id)
 	 */
 	if (topo_info.real_bsp_apic_id != BAD_APICID)
 		return false;
+
+	/*
+	 * Some platforms (e.g., multikernel spawns) intentionally boot on
+	 * non-BSP CPUs. The boot CPU won't have the BSP bit set in
+	 * MSR_IA32_APICBASE, and the APIC enumeration order may not match
+	 * the boot CPU. Skip crash kernel detection for these platforms.
+	 */
+	if (x86_platform.legacy.no_bsp_restriction) {
+		topo_info.real_bsp_apic_id = topo_info.boot_cpu_apic_id;
+		return false;
+	}
 
 	/*
 	 * Check whether the enumeration order is broken by evaluating the
