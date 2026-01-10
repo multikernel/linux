@@ -377,8 +377,15 @@ setup_boot_parameters(struct kimage *image, struct boot_params *params,
 	/* Get subarch from existing bootparams */
 	params->hdr.hardware_subarch = boot_params.hdr.hardware_subarch;
 
-	/* Copying screen_info will do? */
-	memcpy(&params->screen_info, &screen_info, sizeof(struct screen_info));
+	/*
+	 * For multikernel spawns, clear screen_info to prevent VGA/framebuffer
+	 * console from trying to access memory that isn't mapped. The spawn
+	 * kernel doesn't have low 1MB and shouldn't use VGA console.
+	 */
+	if (image->type == KEXEC_TYPE_MULTIKERNEL)
+		memset(&params->screen_info, 0, sizeof(struct screen_info));
+	else
+		memcpy(&params->screen_info, &screen_info, sizeof(struct screen_info));
 
 	/* Fill in memsize later */
 	params->screen_info.ext_mem_k = 0;
