@@ -242,23 +242,47 @@ void mk_init_boot_context(phys_addr_t ctx_phys)
 
 /*
  * Add a 2MB executable mapping to a page table.
- * Allocates PUD/PMD levels as needed, reusing existing entries if present.
+ * Allocates P4D/PUD/PMD levels as needed, reusing existing entries if present.
+ * Handles both 4-level and 5-level paging.
  */
 static int mk_add_2mb_mapping(pgd_t *pgd, unsigned long virt, unsigned long phys)
 {
 	int pgd_idx = pgd_index(virt);
+	int p4d_idx = p4d_index(virt);
 	int pud_idx = pud_index(virt);
 	int pmd_idx = pmd_index(virt);
+	p4d_t *p4d;
 	pud_t *pud;
 	pmd_t *pmd;
 
-	if (!(pgd_val(pgd[pgd_idx]) & _PAGE_PRESENT)) {
-		pud = (pud_t *)get_zeroed_page(GFP_KERNEL);
-		if (!pud)
-			return -ENOMEM;
-		pgd[pgd_idx] = __pgd(__pa(pud) | _KERNPG_TABLE);
+	if (pgtable_l5_enabled()) {
+		if (!(pgd_val(pgd[pgd_idx]) & _PAGE_PRESENT)) {
+			p4d = (p4d_t *)get_zeroed_page(GFP_KERNEL);
+			if (!p4d)
+				return -ENOMEM;
+			pgd[pgd_idx] = __pgd(__pa(p4d) | _KERNPG_TABLE);
+		} else {
+			p4d = (p4d_t *)__va(pgd_val(pgd[pgd_idx]) & PTE_PFN_MASK);
+		}
+
+		if (!(p4d_val(p4d[p4d_idx]) & _PAGE_PRESENT)) {
+			pud = (pud_t *)get_zeroed_page(GFP_KERNEL);
+			if (!pud)
+				return -ENOMEM;
+			p4d[p4d_idx] = __p4d(__pa(pud) | _KERNPG_TABLE);
+		} else {
+			pud = (pud_t *)__va(p4d_val(p4d[p4d_idx]) & PTE_PFN_MASK);
+		}
 	} else {
-		pud = (pud_t *)__va(pgd_val(pgd[pgd_idx]) & PTE_PFN_MASK);
+		/* 4-level paging: PGD points directly to PUD */
+		if (!(pgd_val(pgd[pgd_idx]) & _PAGE_PRESENT)) {
+			pud = (pud_t *)get_zeroed_page(GFP_KERNEL);
+			if (!pud)
+				return -ENOMEM;
+			pgd[pgd_idx] = __pgd(__pa(pud) | _KERNPG_TABLE);
+		} else {
+			pud = (pud_t *)__va(pgd_val(pgd[pgd_idx]) & PTE_PFN_MASK);
+		}
 	}
 
 	if (!(pud_val(pud[pud_idx]) & _PAGE_PRESENT)) {
@@ -437,35 +461,75 @@ static int mk_build_ident_pmd(struct mk_ident_pgtable *pgt, unsigned long *pud,
 	return 0;
 }
 
-static int mk_build_ident_pud(struct mk_ident_pgtable *pgt, unsigned long *pgd,
+static int mk_build_ident_pud(struct mk_ident_pgtable *pgt, unsigned long *p4d,
+			      unsigned long start, unsigned long end)
+{
+	unsigned long addr;
+	unsigned long p4d_idx;
+	unsigned long *pud;
+	unsigned long pud_phys;
+	int ret;
+
+	for (addr = start; addr < end; addr = round_down(addr + PUD_SIZE, PUD_SIZE)) {
+		unsigned long chunk_end = min(end, round_down(addr + PUD_SIZE, PUD_SIZE));
+
+		p4d_idx = (addr >> P4D_SHIFT) & (PTRS_PER_P4D - 1);
+
+		if (!(p4d[p4d_idx] & _PAGE_PRESENT)) {
+			pud = mk_alloc_pgtable_page(pgt);
+			if (!pud)
+				return -ENOMEM;
+			pud_phys = __pa(pud);
+			p4d[p4d_idx] = pud_phys | _KERNPG_TABLE;
+		}
+
+		pud_phys = p4d[p4d_idx] & PTE_PFN_MASK;
+		pud = __va(pud_phys);
+
+		ret = mk_build_ident_pmd(pgt, pud, addr, chunk_end);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int mk_build_ident_p4d(struct mk_ident_pgtable *pgt, unsigned long *pgd,
 			      unsigned long start, unsigned long end)
 {
 	unsigned long addr;
 	unsigned long pgd_idx;
-	unsigned long *pud;
-	unsigned long pud_phys;
+	unsigned long *p4d;
+	unsigned long p4d_phys;
 	int ret;
 
 	start = round_down(start, PMD_SIZE);
 	end = round_up(end, PMD_SIZE);
 
-	for (addr = start; addr < end; addr = round_down(addr + PUD_SIZE, PUD_SIZE)) {
-		unsigned long chunk_end = min(end, round_down(addr + PUD_SIZE, PUD_SIZE));
+	if (pgtable_l5_enabled()) {
+		for (addr = start; addr < end; addr = round_down(addr + P4D_SIZE, P4D_SIZE)) {
+			unsigned long chunk_end = min(end, round_down(addr + P4D_SIZE, P4D_SIZE));
 
-		pgd_idx = (addr >> PGDIR_SHIFT) & (PTRS_PER_PGD - 1);
+			pgd_idx = (addr >> PGDIR_SHIFT) & (PTRS_PER_PGD - 1);
 
-		if (!(pgd[pgd_idx] & _PAGE_PRESENT)) {
-			pud = mk_alloc_pgtable_page(pgt);
-			if (!pud)
-				return -ENOMEM;
-			pud_phys = __pa(pud);
-			pgd[pgd_idx] = pud_phys | _KERNPG_TABLE;
+			if (!(pgd[pgd_idx] & _PAGE_PRESENT)) {
+				p4d = mk_alloc_pgtable_page(pgt);
+				if (!p4d)
+					return -ENOMEM;
+				p4d_phys = __pa(p4d);
+				pgd[pgd_idx] = p4d_phys | _KERNPG_TABLE;
+			}
+
+			p4d_phys = pgd[pgd_idx] & PTE_PFN_MASK;
+			p4d = __va(p4d_phys);
+
+			ret = mk_build_ident_pud(pgt, p4d, addr, chunk_end);
+			if (ret)
+				return ret;
 		}
-
-		pud_phys = pgd[pgd_idx] & PTE_PFN_MASK;
-		pud = __va(pud_phys);
-
-		ret = mk_build_ident_pmd(pgt, pud, addr, chunk_end);
+	} else {
+		/* 4-level paging: PGD is effectively P4D */
+		ret = mk_build_ident_pud(pgt, pgd, start, end);
 		if (ret)
 			return ret;
 	}
@@ -495,7 +559,7 @@ struct mk_ident_pgtable *mk_build_identity_pgtable(struct mk_instance *instance,
 
 	pgt->pgd_phys = virt_to_phys(pgd);
 
-	ret = mk_build_ident_pud(pgt, pgd, start, end);
+	ret = mk_build_ident_p4d(pgt, pgd, start, end);
 	if (ret) {
 		mk_free_identity_pgtable(pgt);
 		return ERR_PTR(ret);
@@ -507,23 +571,47 @@ static int mk_add_trampoline_mapping(struct mk_ident_pgtable *pgt,
 				     unsigned long virt, unsigned long phys)
 {
 	unsigned long *pgd = __va(pgt->pgd_phys);
-	unsigned long pgd_idx, pud_idx, pmd_idx;
-	unsigned long *pud, *pmd;
-	unsigned long pud_phys, pmd_phys;
+	unsigned long pgd_idx, p4d_idx, pud_idx, pmd_idx;
+	unsigned long *p4d, *pud, *pmd;
+	unsigned long p4d_phys, pud_phys, pmd_phys;
 
 	pgd_idx = (virt >> PGDIR_SHIFT) & (PTRS_PER_PGD - 1);
+	p4d_idx = (virt >> P4D_SHIFT) & (PTRS_PER_P4D - 1);
 	pud_idx = (virt >> PUD_SHIFT) & (PTRS_PER_PUD - 1);
 	pmd_idx = (virt >> PMD_SHIFT) & (PTRS_PER_PMD - 1);
 
-	if (!(pgd[pgd_idx] & _PAGE_PRESENT)) {
-		pud = mk_alloc_pgtable_page(pgt);
-		if (!pud)
-			return -ENOMEM;
-		pud_phys = __pa(pud);
-		pgd[pgd_idx] = pud_phys | _KERNPG_TABLE;
+	if (pgtable_l5_enabled()) {
+		if (!(pgd[pgd_idx] & _PAGE_PRESENT)) {
+			p4d = mk_alloc_pgtable_page(pgt);
+			if (!p4d)
+				return -ENOMEM;
+			p4d_phys = __pa(p4d);
+			pgd[pgd_idx] = p4d_phys | _KERNPG_TABLE;
+		}
+		p4d_phys = pgd[pgd_idx] & PTE_PFN_MASK;
+		p4d = __va(p4d_phys);
+
+		if (!(p4d[p4d_idx] & _PAGE_PRESENT)) {
+			pud = mk_alloc_pgtable_page(pgt);
+			if (!pud)
+				return -ENOMEM;
+			pud_phys = __pa(pud);
+			p4d[p4d_idx] = pud_phys | _KERNPG_TABLE;
+		}
+		pud_phys = p4d[p4d_idx] & PTE_PFN_MASK;
+		pud = __va(pud_phys);
+	} else {
+		/* 4-level paging: PGD points directly to PUD */
+		if (!(pgd[pgd_idx] & _PAGE_PRESENT)) {
+			pud = mk_alloc_pgtable_page(pgt);
+			if (!pud)
+				return -ENOMEM;
+			pud_phys = __pa(pud);
+			pgd[pgd_idx] = pud_phys | _KERNPG_TABLE;
+		}
+		pud_phys = pgd[pgd_idx] & PTE_PFN_MASK;
+		pud = __va(pud_phys);
 	}
-	pud_phys = pgd[pgd_idx] & PTE_PFN_MASK;
-	pud = __va(pud_phys);
 
 	if (!(pud[pud_idx] & _PAGE_PRESENT)) {
 		pmd = mk_alloc_pgtable_page(pgt);
