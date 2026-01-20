@@ -4,6 +4,7 @@
 #include <linux/pnp.h>
 #include <linux/acpi.h>
 #include <linux/multikernel.h>
+#include <linux/nmi.h>
 
 #include <asm/acpi.h>
 #include <asm/setup.h>
@@ -138,6 +139,15 @@ void __init x86_early_init_platform_quirks(void)
 		 */
 		smp_found_config = 1;
 		disable_acpi();
+		/*
+		 * Disable NMI watchdog for spawn kernels. The watchdog uses
+		 * performance counters and generates NMIs that can interfere
+		 * with the host kernel, causing system freezes.
+		 */
+		hardlockup_detector_disable();
+#ifdef CONFIG_LOCKUP_DETECTOR
+		watchdog_user_enabled = 0;
+#endif
 		x86_init.resources.memory_setup = e820__memory_setup_multikernel;
 		x86_init.paging.init_direct_mapping = init_direct_mapping_sparse;
 #ifdef CONFIG_X86_64
