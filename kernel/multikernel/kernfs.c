@@ -281,16 +281,36 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 	instance->kn = kn;
 	mk_instance_get(instance);
 
+	/* Allocate instance ID early so resource reservation logs show correct ID */
+	if (id == 0) {
+		pr_err("Instance ID 0 is reserved for root instance\n");
+		ret = -ENOMEM;
+		goto err_remove_dir;
+	}
+
+	if (id < 0)
+		allocated_id = idr_alloc(&mk_instance_idr, instance, 1, INT_MAX, GFP_KERNEL);
+	else
+		allocated_id = idr_alloc(&mk_instance_idr, instance, id, id + 1, GFP_KERNEL);
+
+	if (allocated_id < 0) {
+		pr_err("Failed to register instance '%s' in IDR: %d\n", name, allocated_id);
+		ret = allocated_id;
+		goto err_remove_dir;
+	}
+
+	instance->id = allocated_id;
+
 	ret = mk_create_instance_files(instance);
 	if (ret) {
 		pr_err("Failed to create files for instance '%s': %d\n", name, ret);
-		goto err_remove_dir;
+		goto err_free_idr;
 	}
 
 	ret = mk_instance_reserve_resources(instance, &config);
 	if (ret) {
 		pr_err("Failed to reserve resources for instance '%s': %d\n", name, ret);
-		goto err_remove_dir;
+		goto err_free_resources;
 	}
 
 	ret = mk_dt_generate_instance_dtb(instance, &dtb_copy, &dtb_size);
@@ -304,38 +324,18 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 
 	list_add_tail(&instance->list, &mk_instance_list);
 
-	if (id == 0) {
-		pr_err("Instance ID 0 is reserved for root instance\n");
-		list_del(&instance->list);
-		ret = -EINVAL;
-		goto err_free_dtb;
-	}
-
-	if (id < 0)
-		allocated_id = idr_alloc(&mk_instance_idr, instance, 1, INT_MAX, GFP_KERNEL);
-	else
-		allocated_id = idr_alloc(&mk_instance_idr, instance, id, id + 1, GFP_KERNEL);
-
-	if (allocated_id < 0) {
-		pr_err("Failed to register instance '%s' in IDR: %d\n", name, allocated_id);
-		list_del(&instance->list);
-		ret = allocated_id;
-		goto err_free_dtb;
-	}
-
-	instance->id = allocated_id;
-
 	kernfs_activate(kn);
 	mk_instance_set_state(instance, MK_STATE_READY);
 	mk_dt_config_free(&config);
 
 	return 0;
 
-err_free_dtb:
 	kfree(instance->dtb_data);
 	instance->dtb_data = NULL;
 err_free_resources:
 	mk_instance_free_memory(instance);
+err_free_idr:
+	idr_remove(&mk_instance_idr, instance->id);
 err_remove_dir:
 	kernfs_remove(kn);
 	mk_instance_put(instance);
