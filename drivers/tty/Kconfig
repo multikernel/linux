@@ -424,6 +424,17 @@ config RPMSG_TTY
 	  To compile this driver as a module, choose M here: the module will be
 	  called rpmsg_tty.
 
+config MKTTY
+	bool "Multikernel TTY driver"
+	depends on MULTIKERNEL
+	help
+	  TTY driver for multikernel console communication using IPI.
+
+	  Host kernel: /dev/mkttyX where X is spawn instance ID (1, 2, 3...)
+	  Spawn kernel: /dev/mktty0 as main console
+
+	  Boot spawn with: console=mktty0
+
 endif # TTY
 
 source "drivers/tty/serdev/Kconfig"
