@@ -732,7 +732,18 @@ cleanup_fdt:
 /* Run at early_initcall to enforce CPU restrictions before per-CPU allocations */
 early_initcall(mk_kho_restore_dtbs);
 
-bool mk_pci_device_allowed(struct pci_bus *bus, int devfn, u16 vendor, u16 device)
+/**
+ * mk_pci_should_probe - Check if PCI probing should occur at all
+ * @bus: PCI bus
+ * @devfn: device/function number
+ *
+ * Called BEFORE any PCI config space reads to determine if probing
+ * should proceed. This prevents config space accesses to devices
+ * that are not in the whitelist.
+ *
+ * Returns: true if probing should proceed, false to skip entirely
+ */
+bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
 {
 	struct mk_pci_device *pci_dev;
 	u16 domain = pci_domain_nr(bus);
@@ -740,35 +751,55 @@ bool mk_pci_device_allowed(struct pci_bus *bus, int devfn, u16 vendor, u16 devic
 	u8 slot = PCI_SLOT(devfn);
 	u8 func = PCI_FUNC(devfn);
 	u8 hdr_type;
-	bool is_bridge = false;
 
 	if (!root_instance)
 		return true;
 
-	if (!root_instance->pci_devices_valid || root_instance->pci_device_count == 0)
+	if (!root_instance->dtb_data)
 		return true;
 
-	/* Check if this exact device is whitelisted */
+	if (!root_instance->pci_devices_valid || root_instance->pci_device_count == 0)
+		return false;
+
 	list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
-		if (pci_dev->vendor == vendor &&
-		    pci_dev->device == device &&
-		    pci_dev->domain == domain &&
-		    pci_dev->bus == bus_num &&
+		if (pci_dev->domain != domain)
+			continue;
+
+		/* Exact location match - always allow */
+		if (pci_dev->bus == bus_num &&
 		    pci_dev->slot == slot &&
 		    pci_dev->func == func)
 			return true;
 	}
 
-	if (pci_bus_read_config_byte(bus, devfn, PCI_HEADER_TYPE, &hdr_type) == 0) {
-		u8 secondary_bus = 0, subordinate_bus = 0;
+	/*
+	 * Check if any whitelisted device is on a downstream bus.
+	 * If so, this might be a bridge in the path to that device.
+	 */
+	list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
+		if (pci_dev->domain == domain && pci_dev->bus > bus_num)
+			goto check_bridge;
+	}
+	return false;
 
-		is_bridge = ((hdr_type & PCI_HEADER_TYPE_MASK) == PCI_HEADER_TYPE_BRIDGE);
+check_bridge:
+	/*
+	 * There's a whitelisted device on a downstream bus. Check if this
+	 * is a bridge that serves it.
+	 */
+	if (pci_bus_read_config_byte(bus, devfn, PCI_HEADER_TYPE, &hdr_type) == 0) {
+		bool is_bridge = ((hdr_type & PCI_HEADER_TYPE_MASK) == PCI_HEADER_TYPE_BRIDGE);
+
 		if (is_bridge) {
+			u8 secondary_bus = 0, subordinate_bus = 0;
+
 			pci_bus_read_config_byte(bus, devfn, PCI_SECONDARY_BUS, &secondary_bus);
 			pci_bus_read_config_byte(bus, devfn, PCI_SUBORDINATE_BUS, &subordinate_bus);
 
-			/* Allow bridge if there's a whitelisted device on any bus
-			 * between secondary and subordinate (inclusive) */
+			/*
+			 * Allow bridge if there's a whitelisted device on any bus
+			 * between secondary and subordinate (inclusive).
+			 */
 			if (secondary_bus > 0 && subordinate_bus >= secondary_bus) {
 				list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
 					if (pci_dev->domain == domain &&
@@ -780,12 +811,9 @@ bool mk_pci_device_allowed(struct pci_bus *bus, int devfn, u16 vendor, u16 devic
 		}
 	}
 
-	pr_debug("PCI %s %04x:%04x@%04x:%02x:%02x.%x not allowed by DTB\n",
-		is_bridge ? "bridge" : "device",
-		vendor, device, domain, bus_num, slot, func);
 	return false;
 }
-EXPORT_SYMBOL_GPL(mk_pci_device_allowed);
+EXPORT_SYMBOL_GPL(mk_pci_should_probe);
 
 bool mk_platform_device_allowed(const char *name, const char *hid)
 {
@@ -828,11 +856,11 @@ int __init mk_kho_restore_dtbs(void)
 	return 0;
 }
 
-bool mk_pci_device_allowed(u16 vendor, u16 device, u16 domain, u8 bus, u8 devfn, bool is_bridge)
+bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
 {
 	return true;
 }
-EXPORT_SYMBOL_GPL(mk_pci_device_allowed);
+EXPORT_SYMBOL_GPL(mk_pci_should_probe);
 
 bool mk_platform_device_allowed(const char *name, const char *hid)
 {

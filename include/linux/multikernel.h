@@ -795,23 +795,17 @@ void __init mk_register_cpus_from_kho(void);
  */
 
 /**
- * mk_pci_device_allowed() - Check if a PCI device is allowed
- * @bus: PCI bus the device is on
+ * mk_pci_should_probe() - Check if PCI probing should occur at a location
+ * @bus: PCI bus
  * @devfn: PCI device/function number
- * @vendor: PCI vendor ID
- * @device: PCI device ID
  *
- * Checks if the specified PCI device is allowed according to the DTB
- * configuration in the root instance. For bridges, automatically reads
- * the secondary/subordinate bus numbers and checks if the bridge is on
- * the path to any allowed devices.
+ * Called BEFORE any PCI config space reads to determine if probing
+ * should proceed. This prevents config space accesses to devices
+ * that are not in the whitelist, avoiding hardware conflicts on bare metal.
  *
- * This function encapsulates all multikernel-specific PCI logic including
- * reading config space to determine bridge topology.
- *
- * Returns: true if device is allowed, false otherwise
+ * Returns: true if probing should proceed, false to skip entirely
  */
-bool mk_pci_device_allowed(struct pci_bus *bus, int devfn, u16 vendor, u16 device);
+bool mk_pci_should_probe(struct pci_bus *bus, int devfn);
 
 /**
  * mk_platform_device_allowed() - Check if a platform device is allowed by DTB allowlist
