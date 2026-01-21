@@ -183,10 +183,13 @@ static int mk_do_cpu_remove(u32 cpu_id)
 		return -EINVAL;
 	}
 
+	mk_set_pool_cpu(logical_cpu, true);
+
 	ret = remove_cpu(logical_cpu);
 	if (ret < 0) {
 		pr_err("Multikernel hotplug: Failed to remove CPU %d (phys %u): %d\n",
 		       logical_cpu, cpu_id, ret);
+		mk_set_pool_cpu(logical_cpu, false);
 		return ret;
 	}
 

@@ -61,6 +61,7 @@
 #include <linux/cpuhotplug.h>
 #include <linux/mc146818rtc.h>
 #include <linux/acpi.h>
+#include <linux/multikernel.h>
 
 #include <asm/acpi.h>
 #include <asm/cacheinfo.h>
@@ -128,6 +129,12 @@ void mk_set_pool_cpu(int cpu, bool is_pool)
 	per_cpu(mk_pool_cpu, cpu) = is_pool;
 }
 EXPORT_SYMBOL_GPL(mk_set_pool_cpu);
+
+bool cpu_is_multikernel_pool(unsigned int cpu)
+{
+	return per_cpu(mk_pool_cpu, cpu);
+}
+EXPORT_SYMBOL_GPL(cpu_is_multikernel_pool);
 #endif
 
 /* Maximum number of SMT threads on any online core */

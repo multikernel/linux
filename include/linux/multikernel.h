@@ -691,6 +691,7 @@ int mk_instance_set_kexec_active(int mk_id);
 #ifdef CONFIG_MULTIKERNEL
 bool multikernel_allow_emergency_restart(void);
 int multikernel_halt_by_id(int mk_id);
+bool cpu_is_multikernel_pool(unsigned int cpu);
 #else
 static inline bool multikernel_allow_emergency_restart(void)
 {
@@ -699,6 +700,10 @@ static inline bool multikernel_allow_emergency_restart(void)
 static inline int multikernel_halt_by_id(int mk_id)
 {
 	return -ENODEV;
+}
+static inline bool cpu_is_multikernel_pool(unsigned int cpu)
+{
+	return false;
 }
 #endif
 
