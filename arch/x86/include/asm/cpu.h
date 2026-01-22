@@ -68,7 +68,8 @@ int intel_microcode_sanity_check(void *mc, bool print_err, int hdr_type);
 extern struct cpumask cpus_stop_mask;
 
 #ifdef CONFIG_MULTIKERNEL
-void smp_stop_cpus(const struct cpumask *mask);
+int mk_register_stop_nmi_handler(void);
+void mk_force_stop_cpu(int phys_cpu);
 #endif
 
 #endif /* _ASM_X86_CPU_H */

@@ -274,3 +274,47 @@ void generic_multikernel_interrupt(void)
 {
 	multikernel_interrupt_handler();
 }
+
+/**
+ * mk_has_pending_shutdown - Check if there's a pending shutdown message
+ *
+ * Peeks at the IPI ring buffer to check for a MK_SYS_SHUTDOWN message
+ * with MK_SHUTDOWN_IMMEDIATE flag. Used by NMI handler for force halt.
+ *
+ * Safe to call from NMI context (no locks, read-only peek).
+ *
+ * Returns: true if shutdown requested, false otherwise
+ */
+bool mk_has_pending_shutdown(void)
+{
+	struct mk_ipi_data *slot;
+	struct mk_message *msg;
+	struct mk_shutdown_payload *payload;
+	unsigned int head, tail, idx;
+
+	if (!root_instance || !root_instance->ipi_data)
+		return false;
+
+	tail = atomic_read(&root_instance->ipi_data->ring.tail);
+	head = atomic_read(&root_instance->ipi_data->ring.head);
+
+	/* Scan all pending messages (without consuming) */
+	for (idx = tail; idx != head; idx = (idx + 1) % MK_IPI_RING_SIZE) {
+		slot = &root_instance->ipi_data->ring.entries[idx];
+
+		if (slot->data_size < sizeof(struct mk_message))
+			continue;
+
+		msg = (struct mk_message *)slot->buffer;
+		if (msg->msg_type != MK_MSG_SYSTEM || msg->msg_subtype != MK_SYS_SHUTDOWN)
+			continue;
+
+		if (msg->payload_len >= sizeof(struct mk_shutdown_payload)) {
+			payload = (struct mk_shutdown_payload *)msg->payload;
+			if (payload->flags & MK_SHUTDOWN_IMMEDIATE)
+				return true;
+		}
+	}
+
+	return false;
+}
