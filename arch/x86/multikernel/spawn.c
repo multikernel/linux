@@ -691,15 +691,6 @@ void mk_free_identity_pgtable(struct mk_ident_pgtable *pgt)
 	kfree(pgt);
 }
 
-/*
- * Free only the tracking struct, not the page table pages.
- * Used on success when the spawn kernel needs the pages for the CR3 switch.
- * The pages will be reclaimed when the instance is destroyed.
- */
-void mk_free_identity_pgtable_struct(struct mk_ident_pgtable *pgt)
-{
-	kfree(pgt);
-}
 
 unsigned long mk_get_identity_cr3(struct mk_ident_pgtable *pgt)
 {

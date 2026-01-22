@@ -1717,25 +1717,34 @@ int multikernel_kexec_by_id(int mk_id)
 	else
 		pr_info("KHO finalized for multikernel instance\n");
 
-	ident_pgt = mk_build_identity_pgtable(instance,
-					      mk_image->multikernel_pool_start,
-					      mk_image->multikernel_pool_end);
-	if (IS_ERR(ident_pgt)) {
-		pr_err("Failed to build identity page table: %ld\n", PTR_ERR(ident_pgt));
-		rc = PTR_ERR(ident_pgt);
-		ident_pgt = NULL;
-		goto unlock;
+	/* Reuse spawn resources if already allocated (re-spawn case) */
+	if (instance->ident_pgt) {
+		ident_pgt = instance->ident_pgt;
+	} else {
+		ident_pgt = mk_build_identity_pgtable(instance,
+						      mk_image->multikernel_pool_start,
+						      mk_image->multikernel_pool_end);
+		if (IS_ERR(ident_pgt)) {
+			pr_err("Failed to build identity page table: %ld\n", PTR_ERR(ident_pgt));
+			rc = PTR_ERR(ident_pgt);
+			ident_pgt = NULL;
+			goto unlock;
+		}
 	}
 
-	trampoline_va = mk_setup_trampoline(instance, ident_pgt, &trampoline_phys);
-	if (IS_ERR(trampoline_va)) {
-		pr_err("Failed to set up trampoline: %ld\n", PTR_ERR(trampoline_va));
-		rc = PTR_ERR(trampoline_va);
-		trampoline_va = NULL;
-		goto unlock;
+	if (instance->trampoline_va) {
+		trampoline_va = instance->trampoline_va;
+		trampoline_phys = virt_to_phys(trampoline_va);
+	} else {
+		trampoline_va = mk_setup_trampoline(instance, ident_pgt, &trampoline_phys);
+		if (IS_ERR(trampoline_va)) {
+			pr_err("Failed to set up trampoline: %ld\n", PTR_ERR(trampoline_va));
+			rc = PTR_ERR(trampoline_va);
+			trampoline_va = NULL;
+			goto unlock;
+		}
 	}
 
-	/* Reuse spawn context if already allocated (re-spawn case) */
 	if (instance->spawn_ctx) {
 		spawn_ctx = instance->spawn_ctx;
 		spawn_ctx_phys = instance->spawn_ctx_phys;
@@ -1746,8 +1755,6 @@ int multikernel_kexec_by_id(int mk_id)
 			rc = -ENOMEM;
 			goto unlock;
 		}
-		instance->spawn_ctx = spawn_ctx;
-		instance->spawn_ctx_phys = spawn_ctx_phys;
 	}
 
 	/* Copy boot_params into spawn context */
@@ -1779,21 +1786,19 @@ int multikernel_kexec_by_id(int mk_id)
 		rc = mk_instance_set_kexec_active(mk_image->mk_id);
 		if (rc)
 			pr_warn("Failed to set instance %d as active: %d\n", mk_image->mk_id, rc);
-		/*
-		 * On success, the spawn kernel is booting asynchronously and
-		 * needs the identity page table for the CR3 switch. The pages
-		 * are allocated from the instance pool and will be reclaimed
-		 * when the instance is destroyed. Just free the tracking struct.
-		 */
-		mk_free_identity_pgtable_struct(ident_pgt);
-	} else {
-		if (ident_pgt)
-			mk_free_identity_pgtable(ident_pgt);
-		if (trampoline_va)
-			mk_instance_free(instance, trampoline_va, PAGE_SIZE);
+		instance->spawn_ctx = spawn_ctx;
+		instance->spawn_ctx_phys = spawn_ctx_phys;
+		instance->ident_pgt = ident_pgt;
+		instance->trampoline_va = trampoline_va;
 	}
 
 unlock:
+	if (rc) {
+		if (ident_pgt && !instance->ident_pgt)
+			mk_free_identity_pgtable(ident_pgt);
+		if (trampoline_va && !instance->trampoline_va)
+			mk_instance_free(instance, trampoline_va, PAGE_SIZE);
+	}
 	kexec_unlock();
 	return rc;
 }
