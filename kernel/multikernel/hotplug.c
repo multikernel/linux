@@ -26,6 +26,8 @@
 #include <asm/apic.h>
 #include "internal.h"
 
+static const char mk_mem_resource_name[] = "System RAM (multikernel)";
+
 /* Resource operation tracking for rollback support */
 struct mk_hotplug_op {
 	enum {
@@ -352,14 +354,27 @@ int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_le
  * Memory Hotplug Operations
  */
 
+static int mk_online_memory_block_movable(struct memory_block *mem, void *arg)
+{
+	int ret;
+
+	/* Handle blocks that were auto-onlined to wrong zone */
+	if (mem->state == MEM_ONLINE) {
+		ret = device_offline(&mem->dev);
+		if (ret < 0)
+			return ret;
+	}
+
+	mem->online_type = MMOP_ONLINE_MOVABLE;
+	return device_online(&mem->dev);
+}
+
 static int mk_do_mem_add(u64 start_pfn, u64 nr_pages, u32 numa_node, u32 mem_type)
 {
 	int ret;
 	int nid;
 	u64 phys_addr;
 	u64 size;
-	struct zone *zone = NULL;
-	mhp_t mhp_flags = MHP_NONE;
 	struct mk_hotplug_op *op;
 
 	phys_addr = PFN_PHYS(start_pfn);
@@ -392,29 +407,22 @@ static int mk_do_mem_add(u64 start_pfn, u64 nr_pages, u32 numa_node, u32 mem_typ
 		}
 	}
 
-	ret = add_memory(nid, phys_addr, size, mhp_flags);
+	ret = add_memory_driver_managed(nid, phys_addr, size,
+					mk_mem_resource_name,
+					MHP_MEMMAP_ON_MEMORY);
 	if (ret < 0) {
 		pr_err("Multikernel hotplug: Failed to add memory at 0x%llx: %d\n",
 		       phys_addr, ret);
 		return ret;
 	}
 
-	zone = zone_for_pfn_range(mhp_get_default_online_type(), nid,
-				  NULL, start_pfn, nr_pages);
-	if (!zone) {
-		pr_warn("Multikernel hotplug: Could not determine zone, memory added but not onlined\n");
-	} else {
-		get_online_mems();
-		mem_hotplug_begin();
-		ret = online_pages(start_pfn, nr_pages, zone, NULL);
-		mem_hotplug_done();
-		put_online_mems();
-
-		if (ret < 0) {
-			pr_err("Multikernel hotplug: Failed to online memory at 0x%llx: %d\n",
-			       phys_addr, ret);
-			/* Memory is added but not online - not a fatal error */
-		}
+	ret = walk_memory_blocks(phys_addr, size, NULL,
+				 mk_online_memory_block_movable);
+	if (ret < 0) {
+		pr_err("Multikernel hotplug: Failed to online memory at 0x%llx: %d\n",
+		       phys_addr, ret);
+		offline_and_remove_memory(phys_addr, size);
+		return ret;
 	}
 
 	/* Track the operation for potential rollback */
@@ -441,7 +449,6 @@ static int mk_do_mem_remove(u64 start_pfn, u64 nr_pages)
 	int ret;
 	u64 phys_addr;
 	u64 size;
-	struct zone *zone;
 	struct mk_hotplug_op *op;
 
 	phys_addr = PFN_PHYS(start_pfn);
@@ -462,23 +469,7 @@ static int mk_do_mem_remove(u64 start_pfn, u64 nr_pages)
 		return -EINVAL;
 	}
 
-	/* Determine the zone for this memory range */
-	zone = page_zone(pfn_to_page(start_pfn));
-
-	get_online_mems();
-	mem_hotplug_begin();
-	ret = offline_pages(start_pfn, nr_pages, zone, NULL);
-	mem_hotplug_done();
-	put_online_mems();
-
-	if (ret < 0) {
-		pr_err("Multikernel hotplug: Failed to offline memory at 0x%llx: %d\n",
-		       phys_addr, ret);
-		pr_err("This usually means the memory is in use and cannot be migrated\n");
-		return ret;
-	}
-
-	ret = remove_memory(phys_addr, size);
+	ret = offline_and_remove_memory(phys_addr, size);
 	if (ret < 0) {
 		pr_err("Multikernel hotplug: Failed to remove memory at 0x%llx: %d\n",
 		       phys_addr, ret);
@@ -503,57 +494,115 @@ static int mk_do_mem_remove(u64 start_pfn, u64 nr_pages)
 	return 0;
 }
 
-static int mk_handle_mem_add(struct mk_mem_resource_payload *payload, u32 payload_len)
+struct mk_mem_hotplug_work {
+	struct work_struct work;
+	u64 start_pfn;
+	u64 nr_pages;
+	u32 numa_node;
+	u32 mem_type;
+	int sender_instance_id;
+	u32 operation;
+};
+
+static void mk_mem_add_work_fn(struct work_struct *work)
 {
+	struct mk_mem_hotplug_work *hp_work = container_of(work, struct mk_mem_hotplug_work, work);
 	struct mk_resource_ack ack;
 	int ret, ack_ret;
+
+	ret = mk_do_mem_add(hp_work->start_pfn, hp_work->nr_pages,
+			    hp_work->numa_node, hp_work->mem_type);
+
+	ack.operation = hp_work->operation;
+	ack.result = ret;
+	ack.resource_id = (u32)hp_work->start_pfn;
+	ack.reserved = 0;
+
+	ack_ret = mk_send_message(hp_work->sender_instance_id, MK_MSG_RESOURCE, MK_RES_ACK,
+				  &ack, sizeof(ack));
+	if (ack_ret < 0) {
+		pr_warn("Multikernel hotplug: Failed to send ACK for mem add at 0x%llx: %d\n",
+			(u64)hp_work->start_pfn, ack_ret);
+	}
+
+	kfree(hp_work);
+}
+
+static void mk_mem_remove_work_fn(struct work_struct *work)
+{
+	struct mk_mem_hotplug_work *hp_work = container_of(work, struct mk_mem_hotplug_work, work);
+	struct mk_resource_ack ack;
+	int ret, ack_ret;
+
+	ret = mk_do_mem_remove(hp_work->start_pfn, hp_work->nr_pages);
+
+	ack.operation = hp_work->operation;
+	ack.result = ret;
+	ack.resource_id = (u32)hp_work->start_pfn;
+	ack.reserved = 0;
+
+	ack_ret = mk_send_message(hp_work->sender_instance_id, MK_MSG_RESOURCE, MK_RES_ACK,
+				  &ack, sizeof(ack));
+	if (ack_ret < 0) {
+		pr_warn("Multikernel hotplug: Failed to send ACK for mem remove at 0x%llx: %d\n",
+			(u64)hp_work->start_pfn, ack_ret);
+	}
+
+	kfree(hp_work);
+}
+
+static int mk_handle_mem_add(struct mk_mem_resource_payload *payload, u32 payload_len)
+{
+	struct mk_mem_hotplug_work *hp_work;
 
 	if (payload_len < sizeof(*payload)) {
 		pr_err("Multikernel hotplug: Invalid memory add payload size: %u\n", payload_len);
 		return -EINVAL;
 	}
 
-	ret = mk_do_mem_add(payload->start_pfn, payload->nr_pages,
-			    payload->numa_node, payload->mem_type);
-
-	ack.operation = MK_RES_MEM_ADD;
-	ack.result = ret;
-	ack.resource_id = (u32)payload->start_pfn;
-	ack.reserved = 0;
-	ack_ret = mk_send_message(payload->sender_instance_id, MK_MSG_RESOURCE, MK_RES_ACK,
-				  &ack, sizeof(ack));
-	if (ack_ret < 0) {
-		pr_warn("Multikernel hotplug: Failed to send ACK for mem add at 0x%llx: %d\n",
-			payload->start_pfn, ack_ret);
+	hp_work = kmalloc(sizeof(*hp_work), GFP_ATOMIC);
+	if (!hp_work) {
+		pr_err("Multikernel hotplug: Failed to allocate work for mem add at 0x%llx\n",
+		       (u64)payload->start_pfn);
+		return -ENOMEM;
 	}
 
-	return ret;
+	INIT_WORK(&hp_work->work, mk_mem_add_work_fn);
+	hp_work->start_pfn = payload->start_pfn;
+	hp_work->nr_pages = payload->nr_pages;
+	hp_work->numa_node = payload->numa_node;
+	hp_work->mem_type = payload->mem_type;
+	hp_work->sender_instance_id = payload->sender_instance_id;
+	hp_work->operation = MK_RES_MEM_ADD;
+	schedule_work(&hp_work->work);
+
+	return 0;
 }
 
 static int mk_handle_mem_remove(struct mk_mem_resource_payload *payload, u32 payload_len)
 {
-	struct mk_resource_ack ack;
-	int ret, ack_ret;
+	struct mk_mem_hotplug_work *hp_work;
 
 	if (payload_len < sizeof(*payload)) {
 		pr_err("Multikernel hotplug: Invalid memory remove payload size: %u\n", payload_len);
 		return -EINVAL;
 	}
 
-	ret = mk_do_mem_remove(payload->start_pfn, payload->nr_pages);
-
-	ack.operation = MK_RES_MEM_REMOVE;
-	ack.result = ret;
-	ack.resource_id = (u32)payload->start_pfn;
-	ack.reserved = 0;
-	ack_ret = mk_send_message(payload->sender_instance_id, MK_MSG_RESOURCE, MK_RES_ACK,
-				  &ack, sizeof(ack));
-	if (ack_ret < 0) {
-		pr_warn("Multikernel hotplug: Failed to send ACK for mem remove at 0x%llx: %d\n",
-			payload->start_pfn, ack_ret);
+	hp_work = kmalloc(sizeof(*hp_work), GFP_ATOMIC);
+	if (!hp_work) {
+		pr_err("Multikernel hotplug: Failed to allocate work for mem remove at 0x%llx\n",
+		       (u64)payload->start_pfn);
+		return -ENOMEM;
 	}
 
-	return ret;
+	INIT_WORK(&hp_work->work, mk_mem_remove_work_fn);
+	hp_work->start_pfn = payload->start_pfn;
+	hp_work->nr_pages = payload->nr_pages;
+	hp_work->sender_instance_id = payload->sender_instance_id;
+	hp_work->operation = MK_RES_MEM_REMOVE;
+	schedule_work(&hp_work->work);
+
+	return 0;
 }
 
 /*
