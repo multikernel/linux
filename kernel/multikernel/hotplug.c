@@ -196,6 +196,12 @@ static int mk_do_cpu_remove(u32 cpu_id)
 	if (root_instance->cpus)
 		clear_bit(cpu_id, root_instance->cpus);
 
+	/*
+	 * Clear CPU from present mask to prevent host kernel from trying
+	 * to interact with it after spawn kernel takes over.
+	 */
+	set_cpu_present(logical_cpu, false);
+
 	/* Track the operation for potential rollback */
 	op = kzalloc(sizeof(*op), GFP_KERNEL);
 	if (op) {

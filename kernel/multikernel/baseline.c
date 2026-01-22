@@ -433,6 +433,13 @@ static int mk_baseline_initialize_cpus(const struct mk_instance *instance)
 	}
 
 	pr_info("Successfully offlined %d CPUs for multikernel pool\n", offlined);
+
+	for_each_set_bit(phys_cpu_id, instance->cpus, NR_CPUS) {
+		logical_cpu = arch_cpu_from_physical_id(phys_cpu_id);
+		if (logical_cpu > 0 && !cpu_online(logical_cpu))
+			set_cpu_present(logical_cpu, false);
+	}
+
 	return 0;
 }
 
