@@ -320,9 +320,10 @@ DEFINE_IDTENTRY_SYSVEC(sysvec_multikernel)
 /*
  * NMI handler for multikernel forcible shutdown.
  *
- * When the host needs to stop a spawn kernel's CPUs via NMI, it queues
- * a shutdown message in the IPI ring buffer and sends NMI. This handler
- * checks for the pending message and stops if found.
+ * We enter a pool state (HLT loop) rather than calling stop_this_cpu(),
+ * because stop_this_cpu() disables the APIC - preventing re-spawn, and
+ * leaving CPUs vulnerable to triple faults if a subsequent kexec load
+ * overwrites their IDT handlers while NMIs can still arrive.
  */
 static int mk_stop_nmi_callback(unsigned int val, struct pt_regs *regs)
 {
@@ -333,7 +334,14 @@ static int mk_stop_nmi_callback(unsigned int val, struct pt_regs *regs)
 		 smp_processor_id(), root_instance ? root_instance->id : -1);
 
 	cpu_emergency_disable_virtualization();
-	stop_this_cpu(NULL);
+
+	/* Keep interrupts disabled to avoid running potentially overwritten handlers */
+	local_irq_disable();
+	while (1) {
+		native_safe_halt();
+		local_irq_disable();
+		mk_check_spawn();
+	}
 
 	return NMI_HANDLED;
 }
