@@ -255,7 +255,7 @@ bool multikernel_allow_emergency_restart(void)
 
 		if (instance->state == MK_STATE_ACTIVE ||
 		    instance->state == MK_STATE_LOADED) {
-			pr_emerg("Found active spawn instance %d (%s) in state %d\n",
+			pr_info("Found active spawn instance %d (%s) in state %d\n",
 				 instance->id, instance->name, instance->state);
 			has_active_spawn = true;
 			break;
@@ -264,9 +264,9 @@ bool multikernel_allow_emergency_restart(void)
 	mutex_unlock(&mk_instance_mutex);
 
 	if (has_active_spawn) {
-		pr_emerg("emergency_restart() BLOCKED: spawn kernel instance(s) active\n");
+		pr_info("emergency_restart() BLOCKED: spawn kernel instance(s) active\n");
 	} else {
-		pr_emerg("emergency_restart() ALLOWED: no active spawn instances\n");
+		pr_info("emergency_restart() ALLOWED: no active spawn instances\n");
 	}
 
 	return !has_active_spawn;
@@ -1017,30 +1017,21 @@ void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size)
 
 /*
  * Instance Shutdown
+ *
+ * Two shutdown methods are provided:
+ *
+ * 1. Graceful shutdown (MK_SYS_SHUTDOWN via MULTIKERNEL_VECTOR):
+ *    - Host sends shutdown message to spawn kernel
+ *    - Spawn kernel receives message, sends ACK while still able to communicate
+ *    - Spawn kernel uses native_stop_other_cpus() to stop all its CPUs
+ *    - Works when spawn kernel is responsive
+ *
+ * 2. Forcible shutdown (NMI-based, multikernel_force_halt_by_id):
+ *    - Host sets shutdown flag in shared memory for target CPUs
+ *    - Host sends NMI directly to spawn CPUs
+ *    - NMI handler checks shared memory marker and stops if flagged
+ *    - Works when spawn kernel is stuck or crashed
  */
-
-static void mk_stop_instance_cpus(void)
-{
-	cpumask_var_t instance_cpus;
-	int phys_cpu, logical_cpu;
-
-	if (!root_instance || !root_instance->cpus)
-		return;
-
-	if (!alloc_cpumask_var(&instance_cpus, GFP_KERNEL))
-		return;
-
-	cpumask_clear(instance_cpus);
-	for_each_set_bit(phys_cpu, root_instance->cpus, NR_CPUS) {
-		logical_cpu = arch_cpu_from_physical_id(phys_cpu);
-		if (logical_cpu >= 0 && cpu_online(logical_cpu))
-			cpumask_set_cpu(logical_cpu, instance_cpus);
-	}
-
-	smp_stop_cpus(instance_cpus);
-
-	free_cpumask_var(instance_cpus);
-}
 
 struct mk_shutdown_work {
 	struct work_struct work;
@@ -1053,6 +1044,10 @@ static void mk_shutdown_work_fn(struct work_struct *work)
 	struct mk_shutdown_work *sw = container_of(work, struct mk_shutdown_work, work);
 	struct mk_resource_ack ack;
 
+	/*
+	 * Send ACK first while we can still send messages.
+	 * After this point, we disable interrupts and stop CPUs.
+	 */
 	ack.operation = MK_SYS_SHUTDOWN;
 	ack.result = 0;
 	ack.resource_id = root_instance->id;
@@ -1060,12 +1055,25 @@ static void mk_shutdown_work_fn(struct work_struct *work)
 	mk_send_message(sw->sender_instance_id, MK_MSG_SYSTEM, MK_SYS_SHUTDOWN_ACK,
 			&ack, sizeof(ack));
 
-	pr_emerg("Multikernel instance %d shutting down\n", root_instance->id);
+	pr_info("Multikernel instance %d shutting down (graceful)\n", root_instance->id);
 
 	kfree(sw);
 
+	/*
+	 * Use native stop mechanism - this kernel stops its own CPUs.
+	 * All CPUs belong to the same kernel instance, so stopping_cpu
+	 * coordination works correctly (no cross-instance race condition).
+	 */
 	local_irq_disable();
-	mk_stop_instance_cpus();
+
+	/*
+	 * Stop all other CPUs in this instance using native mechanism.
+	 * The 0 parameter means don't wait indefinitely - timeout is fine
+	 * since we're shutting down anyway.
+	 */
+	smp_ops.stop_other_cpus(0);
+
+	/* Stop this CPU last */
 	stop_this_cpu(NULL);
 }
 
@@ -1083,7 +1091,7 @@ static void mk_system_msg_handler(u32 msg_type, u32 subtype,
 		if (payload_len < sizeof(*req))
 			return;
 
-		pr_emerg("Shutdown requested by instance %d\n", req->sender_instance_id);
+		pr_info("Shutdown requested by instance %d\n", req->sender_instance_id);
 
 		sw = kmalloc(sizeof(*sw), GFP_ATOMIC);
 		if (!sw)
@@ -1109,6 +1117,17 @@ static void mk_system_msg_handler(u32 msg_type, u32 subtype,
 	}
 }
 
+/**
+ * multikernel_halt_by_id - Graceful shutdown of a multikernel instance
+ * @mk_id: Instance ID to halt
+ *
+ * Sends a shutdown message to the spawn kernel and waits for acknowledgment.
+ * The spawn kernel will stop its own CPUs using native mechanisms.
+ *
+ * Use when: The spawn kernel is responsive and able to process messages.
+ *
+ * Returns: 0 on success, negative error code on failure or timeout
+ */
 int multikernel_halt_by_id(int mk_id)
 {
 	struct mk_instance *instance;
@@ -1145,16 +1164,84 @@ int multikernel_halt_by_id(int mk_id)
 	ret = mk_msg_pending_wait(pending, 30000);
 	if (ret == 0) {
 		mk_instance_set_state(instance, MK_STATE_LOADED);
-		pr_info("Multikernel instance %d halted\n", mk_id);
+		pr_info("Multikernel instance %d halted (graceful)\n", mk_id);
 	}
 
 	mk_instance_put(instance);
 	return ret;
 }
 
+/**
+ * multikernel_force_halt_by_id - Forcible shutdown of a multikernel instance via NMI
+ * @mk_id: Instance ID to halt
+ *
+ * Forces a spawn kernel's CPUs to stop by queuing a shutdown message in the
+ * IPI ring buffer and sending NMIs directly to each CPU. The NMI handler
+ * checks for the pending shutdown message and stops if found.
+ *
+ * Use when: The spawn kernel is stuck/crashed and not responding to graceful
+ * shutdown, or when graceful shutdown has failed.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+int multikernel_force_halt_by_id(int mk_id)
+{
+	struct mk_instance *instance;
+	struct mk_shutdown_payload payload;
+	int phys_cpu;
+	int cpu_count = 0;
+	int ret;
+
+	instance = mk_instance_find(mk_id);
+	if (!instance)
+		return -ENOENT;
+
+	if (instance->state != MK_STATE_ACTIVE) {
+		pr_err("Instance %d not active (state=%d), nothing to force halt\n",
+			mk_id, instance->state);
+		mk_instance_put(instance);
+		return -EINVAL;
+	}
+
+	if (!instance->cpus) {
+		pr_err("Instance %d has no CPUs assigned\n", mk_id);
+		mk_instance_put(instance);
+		return -EINVAL;
+	}
+
+	pr_info("Force halting multikernel instance %d via NMI\n", mk_id);
+
+	/* Queue shutdown message - NMI handler will check for this */
+	payload.flags = MK_SHUTDOWN_IMMEDIATE;
+	payload.sender_instance_id = root_instance->id;
+	ret = mk_send_message(mk_id, MK_MSG_SYSTEM, MK_SYS_SHUTDOWN,
+			      &payload, sizeof(payload));
+	if (ret < 0)
+		pr_err("Failed to queue shutdown message: %d (sending NMI anyway)\n", ret);
+
+	/* Send NMI to each CPU in the instance */
+	for_each_set_bit(phys_cpu, instance->cpus, NR_CPUS) {
+		mk_force_stop_cpu(phys_cpu);
+		cpu_count++;
+	}
+
+	pr_info("Sent NMI to %d CPUs in instance %d\n", cpu_count, mk_id);
+
+	mk_instance_set_state(instance, MK_STATE_LOADED);
+	mk_instance_put(instance);
+	return 0;
+}
+
 static int __init multikernel_init(void)
 {
 	int ret;
+
+	/* Register NMI handler for forcible shutdown */
+	ret = mk_register_stop_nmi_handler();
+	if (ret < 0) {
+		pr_warn("Failed to register NMI stop handler: %d (force halt unavailable)\n", ret);
+		/* Continue anyway - graceful shutdown still works */
+	}
 
 	ret = mk_messaging_init();
 	if (ret < 0) {

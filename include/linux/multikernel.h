@@ -691,13 +691,19 @@ int mk_instance_set_kexec_active(int mk_id);
 #ifdef CONFIG_MULTIKERNEL
 bool multikernel_allow_emergency_restart(void);
 int multikernel_halt_by_id(int mk_id);
+int multikernel_force_halt_by_id(int mk_id);
 bool cpu_is_multikernel_pool(unsigned int cpu);
+bool mk_has_pending_shutdown(void);
 #else
 static inline bool multikernel_allow_emergency_restart(void)
 {
 	return true;
 }
 static inline int multikernel_halt_by_id(int mk_id)
+{
+	return -ENODEV;
+}
+static inline int multikernel_force_halt_by_id(int mk_id)
 {
 	return -ENODEV;
 }

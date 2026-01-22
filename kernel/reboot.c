@@ -815,6 +815,11 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 			return -EFAULT;
 		ret = multikernel_halt_by_id(boot_args.mk_id);
 		break;
+	case LINUX_REBOOT_CMD_MULTIKERNEL_HALT_FORCE:
+		if (copy_from_user(&boot_args, arg, sizeof(boot_args)))
+			return -EFAULT;
+		ret = multikernel_force_halt_by_id(boot_args.mk_id);
+		break;
 #endif
 
 #ifdef CONFIG_HIBERNATION

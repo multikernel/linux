@@ -317,32 +317,69 @@ DEFINE_IDTENTRY_SYSVEC(sysvec_multikernel)
 	generic_multikernel_interrupt();
 }
 
-void smp_stop_cpus(const struct cpumask *mask)
+/*
+ * NMI handler for multikernel forcible shutdown.
+ *
+ * When the host needs to stop a spawn kernel's CPUs via NMI, it queues
+ * a shutdown message in the IPI ring buffer and sends NMI. This handler
+ * checks for the pending message and stops if found.
+ */
+static int mk_stop_nmi_callback(unsigned int val, struct pt_regs *regs)
 {
-	unsigned int this_cpu = smp_processor_id();
-	unsigned long timeout;
-	int cpu;
+	if (!mk_has_pending_shutdown())
+		return NMI_DONE;
 
-	if (cpumask_empty(mask))
-		return;
+	pr_emerg("CPU %d: Forcible shutdown via NMI (instance %d)\n",
+		 smp_processor_id(), root_instance ? root_instance->id : -1);
 
-	cpumask_copy(&cpus_stop_mask, mask);
-	cpumask_clear_cpu(this_cpu, &cpus_stop_mask);
+	cpu_emergency_disable_virtualization();
+	stop_this_cpu(NULL);
 
-	if (cpumask_empty(&cpus_stop_mask))
-		return;
-
-	atomic_set(&stopping_cpu, this_cpu);
-
-	for_each_cpu(cpu, &cpus_stop_mask)
-		__apic_send_IPI(cpu, REBOOT_VECTOR);
-
-	timeout = USEC_PER_SEC;
-	while (!cpumask_empty(&cpus_stop_mask) && timeout--)
-		udelay(1);
-
-	cpumask_clear(&cpus_stop_mask);
+	return NMI_HANDLED;
 }
+
+static bool mk_nmi_handler_registered;
+
+/**
+ * mk_register_stop_nmi_handler - Register the multikernel NMI stop handler
+ *
+ * Called during multikernel initialization to register the NMI handler
+ * that enables forcible shutdown of spawn kernels.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+int mk_register_stop_nmi_handler(void)
+{
+	int ret;
+
+	if (mk_nmi_handler_registered)
+		return 0;
+
+	ret = register_nmi_handler(NMI_LOCAL, mk_stop_nmi_callback,
+				   NMI_FLAG_FIRST, "mk_stop");
+	if (ret) {
+		pr_err("Failed to register multikernel NMI stop handler: %d\n", ret);
+		return ret;
+	}
+
+	mk_nmi_handler_registered = true;
+	pr_info("Multikernel NMI stop handler registered\n");
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mk_register_stop_nmi_handler);
+
+/**
+ * mk_force_stop_cpu - Send NMI to a specific CPU to force it to stop
+ * @phys_cpu: Physical CPU ID to stop
+ */
+void mk_force_stop_cpu(int phys_cpu)
+{
+	int logical_cpu = arch_cpu_from_physical_id(phys_cpu);
+
+	if (logical_cpu >= 0)
+		__apic_send_IPI(logical_cpu, NMI_VECTOR);
+}
+EXPORT_SYMBOL_GPL(mk_force_stop_cpu);
 #endif /* CONFIG_MULTIKERNEL */
 
 static int __init nonmi_ipi_setup(char *str)
