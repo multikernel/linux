@@ -465,9 +465,11 @@ struct mk_instance {
 	/* Kexec integration */
 	struct kimage *kimage;          /* Associated kimage object */
 
-	/* Spawn context - reused across re-spawns so mk_boot_context stays valid */
-	struct mk_spawn_context *spawn_ctx;  /* Virtual address of spawn context */
-	phys_addr_t spawn_ctx_phys;          /* Physical address (shared memory) */
+	/* Spawn resources - reused across re-spawns, freed on pool destroy */
+	struct mk_spawn_context *spawn_ctx;
+	phys_addr_t spawn_ctx_phys;
+	struct mk_ident_pgtable *ident_pgt;
+	void *trampoline_va;
 
 	/* Sysfs representation */
 	struct kernfs_node *kn;            /* Kernfs node for this instance */
@@ -869,7 +871,6 @@ struct mk_ident_pgtable *mk_build_identity_pgtable(struct mk_instance *instance,
 						    unsigned long start,
 						    unsigned long end);
 void mk_free_identity_pgtable(struct mk_ident_pgtable *pgt);
-void mk_free_identity_pgtable_struct(struct mk_ident_pgtable *pgt);
 unsigned long mk_get_identity_cr3(struct mk_ident_pgtable *pgt);
 void *mk_setup_trampoline(struct mk_instance *instance,
 			  struct mk_ident_pgtable *pgt,

@@ -850,6 +850,15 @@ void mk_instance_free_memory(struct mk_instance *instance)
 		pr_info("Returning 0x%llx bytes from instance %d (%s) back to multikernel pool\n",
 			total_freed, instance->id, instance->name);
 
+		/* Free all tracked pool allocations before destroying the pool */
+		if (instance->trampoline_va) {
+			mk_instance_free(instance, instance->trampoline_va, PAGE_SIZE);
+			instance->trampoline_va = NULL;
+		}
+		if (instance->ident_pgt) {
+			mk_free_identity_pgtable(instance->ident_pgt);
+			instance->ident_pgt = NULL;
+		}
 		if (instance->spawn_ctx) {
 			mk_instance_free(instance, instance->spawn_ctx,
 					 sizeof(struct mk_spawn_context));
