@@ -13,6 +13,7 @@
 #include <linux/multikernel.h>
 #include <linux/pci.h>
 #include <asm/apic.h>
+#include <asm/multikernel.h>
 #include <asm/cpu.h>
 #include <asm/irq_vectors.h>
 #include <asm/page.h>
@@ -849,7 +850,13 @@ void mk_instance_free_memory(struct mk_instance *instance)
 		pr_info("Returning 0x%llx bytes from instance %d (%s) back to multikernel pool\n",
 			total_freed, instance->id, instance->name);
 
-		/* Destroy instance pool - this returns memory to global multikernel pool */
+		if (instance->spawn_ctx) {
+			mk_instance_free(instance, instance->spawn_ctx,
+					 sizeof(struct mk_spawn_context));
+			instance->spawn_ctx = NULL;
+			instance->spawn_ctx_phys = 0;
+		}
+
 		multikernel_destroy_instance_pool(instance->instance_pool);
 		instance->instance_pool = NULL;
 		instance->pool_size = 0;
@@ -1039,6 +1046,17 @@ struct mk_shutdown_work {
 	int sender_instance_id;
 };
 
+static void __noreturn mk_enter_pool_state(void *info)
+{
+	local_irq_disable();
+
+	while (1) {
+		native_safe_halt();  /* sti; hlt - wakes on next interrupt */
+		local_irq_disable();
+		mk_check_spawn();
+	}
+}
+
 static void mk_shutdown_work_fn(struct work_struct *work)
 {
 	struct mk_shutdown_work *sw = container_of(work, struct mk_shutdown_work, work);
@@ -1046,7 +1064,7 @@ static void mk_shutdown_work_fn(struct work_struct *work)
 
 	/*
 	 * Send ACK first while we can still send messages.
-	 * After this point, we disable interrupts and stop CPUs.
+	 * After this point, CPUs enter pool state and stop processing.
 	 */
 	ack.operation = MK_SYS_SHUTDOWN;
 	ack.result = 0;
@@ -1060,21 +1078,13 @@ static void mk_shutdown_work_fn(struct work_struct *work)
 	kfree(sw);
 
 	/*
-	 * Use native stop mechanism - this kernel stops its own CPUs.
-	 * All CPUs belong to the same kernel instance, so stopping_cpu
-	 * coordination works correctly (no cross-instance race condition).
+	 * Enter pool state: CPUs wait in HLT with APIC enabled, checking
+	 * for spawn signals. This allows CPUs to be re-spawned later.
+	 *
+	 * Use wait=0 since mk_enter_pool_state() never returns.
 	 */
-	local_irq_disable();
-
-	/*
-	 * Stop all other CPUs in this instance using native mechanism.
-	 * The 0 parameter means don't wait indefinitely - timeout is fine
-	 * since we're shutting down anyway.
-	 */
-	smp_ops.stop_other_cpus(0);
-
-	/* Stop this CPU last */
-	stop_this_cpu(NULL);
+	smp_call_function(mk_enter_pool_state, NULL, 0);
+	mk_enter_pool_state(NULL);
 }
 
 static void mk_system_msg_handler(u32 msg_type, u32 subtype,

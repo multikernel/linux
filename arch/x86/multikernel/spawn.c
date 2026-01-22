@@ -155,6 +155,7 @@ void mk_check_spawn(void)
 		 * then jumps to identity-mapped physical address after CR3 switch.
 		 */
 		secondary_trampoline_phys = ctx->secondary_trampoline_phys;
+		set_memory_x((unsigned long)__va(secondary_trampoline_phys) & PAGE_MASK, 1);
 		secondary_trampoline = (mk_secondary_trampoline_fn)
 			__va(secondary_trampoline_phys);
 		secondary_trampoline(ctx->identity_cr3, ctx->kernel_entry,
@@ -163,7 +164,11 @@ void mk_check_spawn(void)
 	} else {
 		/*
 		 * Initial spawn boot - use full trampoline with identity mapping.
+		 * Mark trampoline page executable in current page tables.
+		 * On re-spawn, the direct map has NX set and set_memory_x()
+		 * was only called in the HOST kernel's page tables.
 		 */
+		set_memory_x(ctx->trampoline_virt & PAGE_MASK, 1);
 		trampoline = (mk_trampoline_fn)ctx->trampoline_virt;
 		trampoline(ctx->identity_cr3, virt_to_phys(&ctx->bp),
 			   ctx->kernel_entry, ctx->trampoline_phys);
@@ -202,6 +207,7 @@ void mk_set_spawn_context(struct mk_spawn_context *ctx,
 	ctx->trampoline_phys = trampoline_phys;
 	ctx->gs_base = 0;
 	ctx->stack = 0;
+	ctx->flags = 0;
 	ctx->ready = 0;
 }
 

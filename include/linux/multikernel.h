@@ -465,6 +465,10 @@ struct mk_instance {
 	/* Kexec integration */
 	struct kimage *kimage;          /* Associated kimage object */
 
+	/* Spawn context - reused across re-spawns so mk_boot_context stays valid */
+	struct mk_spawn_context *spawn_ctx;  /* Virtual address of spawn context */
+	phys_addr_t spawn_ctx_phys;          /* Physical address (shared memory) */
+
 	/* Sysfs representation */
 	struct kernfs_node *kn;            /* Kernfs node for this instance */
 

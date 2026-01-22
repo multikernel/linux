@@ -1735,12 +1735,19 @@ int multikernel_kexec_by_id(int mk_id)
 		goto unlock;
 	}
 
-	/* Allocate and set up spawn context for this instance */
-	spawn_ctx = mk_alloc_spawn_context(instance, &spawn_ctx_phys);
-	if (!spawn_ctx) {
-		pr_err("Failed to allocate spawn context\n");
-		rc = -ENOMEM;
-		goto unlock;
+	/* Reuse spawn context if already allocated (re-spawn case) */
+	if (instance->spawn_ctx) {
+		spawn_ctx = instance->spawn_ctx;
+		spawn_ctx_phys = instance->spawn_ctx_phys;
+	} else {
+		spawn_ctx = mk_alloc_spawn_context(instance, &spawn_ctx_phys);
+		if (!spawn_ctx) {
+			pr_err("Failed to allocate spawn context\n");
+			rc = -ENOMEM;
+			goto unlock;
+		}
+		instance->spawn_ctx = spawn_ctx;
+		instance->spawn_ctx_phys = spawn_ctx_phys;
 	}
 
 	/* Copy boot_params into spawn context */
