@@ -12,7 +12,6 @@
 #include <linux/kexec.h>
 #include <linux/multikernel.h>
 #include <linux/pci.h>
-#include <asm/apic.h>
 #include <asm/multikernel.h>
 #include <asm/cpu.h>
 #include <asm/irq_vectors.h>
@@ -1055,16 +1054,6 @@ struct mk_shutdown_work {
 	int sender_instance_id;
 };
 
-static void __noreturn mk_enter_pool_state(void *info)
-{
-	local_irq_disable();
-
-	while (1) {
-		native_safe_halt();  /* sti; hlt - wakes on next interrupt */
-		local_irq_disable();
-		mk_check_spawn();
-	}
-}
 
 static void mk_shutdown_work_fn(struct work_struct *work)
 {

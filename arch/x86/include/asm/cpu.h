@@ -70,6 +70,7 @@ extern struct cpumask cpus_stop_mask;
 #ifdef CONFIG_MULTIKERNEL
 int mk_register_stop_nmi_handler(void);
 void mk_force_stop_cpu(int phys_cpu);
+void mk_enter_pool_state(void *info);
 #endif
 
 #endif /* _ASM_X86_CPU_H */

@@ -318,12 +318,36 @@ DEFINE_IDTENTRY_SYSVEC(sysvec_multikernel)
 }
 
 /*
+ * Enter pool state: mask all local APIC LVT entries to prevent timer,
+ * thermal, performance counter, and other local interrupts from firing
+ * into dead/corrupted handlers (which causes triple fault -> system reset
+ * on bare metal). Keep the APIC itself enabled for IPI delivery so that
+ * re-spawn wakeup works. Then loop in HLT waiting for spawn signals.
+ */
+void mk_enter_pool_state(void *info)
+{
+	apic_write(APIC_LVTT, APIC_LVT_MASKED);
+	apic_write(APIC_LVTTHMR, APIC_LVT_MASKED);
+	apic_write(APIC_LVTPC, APIC_LVT_MASKED);
+	apic_write(APIC_LVT0, APIC_LVT_MASKED);
+	apic_write(APIC_LVT1, APIC_LVT_MASKED);
+	apic_write(APIC_LVTERR, APIC_LVT_MASKED);
+
+	local_irq_disable();
+
+	while (1) {
+		native_safe_halt();  /* sti; hlt - wakes on IPI only */
+		local_irq_disable();
+		mk_check_spawn();
+	}
+}
+EXPORT_SYMBOL_GPL(mk_enter_pool_state);
+
+/*
  * NMI handler for multikernel forcible shutdown.
  *
  * We enter a pool state (HLT loop) rather than calling stop_this_cpu(),
- * because stop_this_cpu() disables the APIC - preventing re-spawn, and
- * leaving CPUs vulnerable to triple faults if a subsequent kexec load
- * overwrites their IDT handlers while NMIs can still arrive.
+ * because stop_this_cpu() disables the APIC - preventing re-spawn.
  */
 static int mk_stop_nmi_callback(unsigned int val, struct pt_regs *regs)
 {
@@ -334,16 +358,8 @@ static int mk_stop_nmi_callback(unsigned int val, struct pt_regs *regs)
 		 smp_processor_id(), root_instance ? root_instance->id : -1);
 
 	cpu_emergency_disable_virtualization();
-
-	/* Keep interrupts disabled to avoid running potentially overwritten handlers */
-	local_irq_disable();
-	while (1) {
-		native_safe_halt();
-		local_irq_disable();
-		mk_check_spawn();
-	}
-
-	return NMI_HANDLED;
+	mk_enter_pool_state(NULL);
+	return NMI_HANDLED; /* unreachable */
 }
 
 static bool mk_nmi_handler_registered;
