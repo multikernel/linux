@@ -18,6 +18,10 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/iomap.h>
+#ifdef CONFIG_EROFS_FS_MEMORY
+#include <linux/dma-buf.h>
+#include <linux/iosys-map.h>
+#endif
 #include "erofs_fs.h"
 
 __printf(2, 3) void _erofs_printk(struct super_block *sb, const char *fmt, ...);
@@ -38,6 +42,17 @@ __printf(2, 3) void _erofs_printk(struct super_block *sb, const char *fmt, ...);
 typedef u64 erofs_nid_t;
 typedef u64 erofs_off_t;
 typedef u64 erofs_blk_t;
+
+#ifdef CONFIG_EROFS_FS_MEMORY
+/* Memory backing structure for direct memory access */
+struct erofs_mem_backing {
+	void *mem;              /* Kernel virtual address */
+	phys_addr_t phys_addr;  /* Physical address (0 if dma-buf) */
+	size_t size;            /* Total memory region size */
+	struct dma_buf *dmabuf; /* dma-buf ref (NULL if phys mode) */
+	struct iosys_map dma_map;
+};
+#endif
 
 struct erofs_device_info {
 	char *path;
@@ -167,6 +182,12 @@ struct erofs_sb_info {
 	struct erofs_domain *domain;
 	char *fsid;
 	char *domain_id;
+#ifdef CONFIG_EROFS_FS_MEMORY
+	struct erofs_mem_backing *mem_backing;
+	phys_addr_t mem_phys_addr;      /* Mount option: physical address */
+	size_t mem_size;                /* Mount option: memory size */
+	struct file *mem_dmabuf_file;   /* Mount option: dma-buf file */
+#endif
 };
 
 #define EROFS_SB(sb) ((struct erofs_sb_info *)(sb)->s_fs_info)
@@ -194,6 +215,30 @@ static inline bool erofs_is_fscache_mode(struct super_block *sb)
 			!erofs_is_fileio_mode(EROFS_SB(sb)) && !sb->s_bdev;
 }
 
+#ifdef CONFIG_EROFS_FS_MEMORY
+static inline bool erofs_is_memory_mode(struct erofs_sb_info *sbi)
+{
+	return sbi->mem_backing != NULL;
+}
+
+static inline void *erofs_mem_ptr(struct erofs_sb_info *sbi, erofs_off_t offset)
+{
+	if (!sbi->mem_backing || offset >= sbi->mem_backing->size)
+		return NULL;
+	return sbi->mem_backing->mem + offset;
+}
+#else
+static inline bool erofs_is_memory_mode(struct erofs_sb_info *sbi)
+{
+	return false;
+}
+
+static inline void *erofs_mem_ptr(struct erofs_sb_info *sbi, erofs_off_t offset)
+{
+	return NULL;
+}
+#endif
+
 enum {
 	EROFS_ZIP_CACHE_DISABLED,
 	EROFS_ZIP_CACHE_READAHEAD,
@@ -206,6 +251,9 @@ struct erofs_buf {
 	u64 off;
 	struct page *page;
 	void *base;
+#ifdef CONFIG_EROFS_FS_MEMORY
+	struct erofs_sb_info *sbi;  /* For direct memory access */
+#endif
 };
 #define __EROFS_BUF_INITIALIZER	((struct erofs_buf){ .page = NULL })
 
@@ -540,6 +588,25 @@ static inline void erofs_fscache_submit_bio(struct bio *bio) {}
 long erofs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 long erofs_compat_ioctl(struct file *filp, unsigned int cmd,
 			unsigned long arg);
+
+#ifdef CONFIG_EROFS_FS_MEMORY
+int erofs_mem_init_phys(struct erofs_sb_info *sbi, phys_addr_t phys_addr,
+			size_t size);
+int erofs_mem_init_dmabuf(struct erofs_sb_info *sbi, struct file *dmabuf_file);
+void erofs_mem_exit(struct erofs_sb_info *sbi);
+#else
+static inline int erofs_mem_init_phys(struct erofs_sb_info *sbi,
+				      phys_addr_t phys_addr, size_t size)
+{
+	return -EOPNOTSUPP;
+}
+static inline int erofs_mem_init_dmabuf(struct erofs_sb_info *sbi,
+					struct file *dmabuf_file)
+{
+	return -EOPNOTSUPP;
+}
+static inline void erofs_mem_exit(struct erofs_sb_info *sbi) {}
+#endif
 
 #define EFSCORRUPTED    EUCLEAN         /* Filesystem is corrupted */
 

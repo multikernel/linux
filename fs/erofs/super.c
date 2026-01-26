@@ -386,6 +386,9 @@ static void erofs_default_options(struct erofs_sb_info *sbi)
 enum {
 	Opt_user_xattr, Opt_acl, Opt_cache_strategy, Opt_dax, Opt_dax_enum,
 	Opt_device, Opt_fsid, Opt_domain_id, Opt_directio, Opt_fsoffset,
+#ifdef CONFIG_EROFS_FS_MEMORY
+	Opt_phys, Opt_memsize, Opt_dmabuf,
+#endif
 };
 
 static const struct constant_table erofs_param_cache_strategy[] = {
@@ -413,6 +416,11 @@ static const struct fs_parameter_spec erofs_fs_parameters[] = {
 	fsparam_string("domain_id",	Opt_domain_id),
 	fsparam_flag_no("directio",	Opt_directio),
 	fsparam_u64("fsoffset",		Opt_fsoffset),
+#ifdef CONFIG_EROFS_FS_MEMORY
+	fsparam_u64("phys",		Opt_phys),
+	fsparam_u64("memsize",		Opt_memsize),
+	fsparam_fd("dmabuf",		Opt_dmabuf),
+#endif
 	{}
 };
 
@@ -539,6 +547,21 @@ static int erofs_fc_parse_param(struct fs_context *fc,
 	case Opt_fsoffset:
 		sbi->dif0.fsoff = result.uint_64;
 		break;
+#ifdef CONFIG_EROFS_FS_MEMORY
+	case Opt_phys:
+		sbi->mem_phys_addr = result.uint_64;
+		break;
+	case Opt_memsize:
+		sbi->mem_size = result.uint_64;
+		break;
+	case Opt_dmabuf:
+		if (sbi->mem_dmabuf_file)
+			fput(sbi->mem_dmabuf_file);
+		sbi->mem_dmabuf_file = fget(result.uint_32);
+		if (!sbi->mem_dmabuf_file)
+			return -EBADF;
+		break;
+#endif
 	}
 	return 0;
 }
@@ -638,7 +661,30 @@ static int erofs_fc_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_op = &erofs_sops;
 
 	sbi->blkszbits = PAGE_SHIFT;
-	if (!sb->s_bdev) {
+
+#ifdef CONFIG_EROFS_FS_MEMORY
+	/* Initialize memory backing early, before reading superblock */
+	if (sbi->mem_dmabuf_file) {
+		err = erofs_mem_init_dmabuf(sbi, sbi->mem_dmabuf_file);
+		if (err)
+			return err;
+	} else if (sbi->mem_phys_addr && sbi->mem_size) {
+		err = erofs_mem_init_phys(sbi, sbi->mem_phys_addr, sbi->mem_size);
+		if (err)
+			return err;
+	}
+	if (erofs_is_memory_mode(sbi)) {
+		sb->s_blocksize = PAGE_SIZE;
+		sb->s_blocksize_bits = PAGE_SHIFT;
+		err = super_setup_bdi(sb);
+		if (err) {
+			erofs_mem_exit(sbi);
+			return err;
+		}
+	}
+#endif
+
+	if (!sb->s_bdev && !erofs_is_memory_mode(sbi)) {
 		/*
 		 * (File-backed mounts) EROFS claims it's safe to nest other
 		 * fs contexts (including its own) due to self-controlled RO
@@ -673,7 +719,7 @@ static int erofs_fc_fill_super(struct super_block *sb, struct fs_context *fc)
 		err = super_setup_bdi(sb);
 		if (err)
 			return err;
-	} else {
+	} else if (sb->s_bdev) {
 		if (!sb_set_blocksize(sb, PAGE_SIZE)) {
 			errorfc(fc, "failed to set initial blksize");
 			return -EINVAL;
@@ -682,6 +728,7 @@ static int erofs_fc_fill_super(struct super_block *sb, struct fs_context *fc)
 		sbi->dif0.dax_dev = fs_dax_get_by_bdev(sb->s_bdev,
 				&sbi->dif0.dax_part_off, NULL, NULL);
 	}
+	/* Memory mode: blocksize and bdi already set up above */
 
 	err = erofs_read_superblock(sb);
 	if (err)
@@ -693,7 +740,7 @@ static int erofs_fc_fill_super(struct super_block *sb, struct fs_context *fc)
 			return -EINVAL;
 		}
 
-		if (erofs_is_fileio_mode(sbi)) {
+		if (erofs_is_fileio_mode(sbi) || erofs_is_memory_mode(sbi)) {
 			sb->s_blocksize = 1 << sbi->blkszbits;
 			sb->s_blocksize_bits = sbi->blkszbits;
 		} else if (!sb_set_blocksize(sb, 1 << sbi->blkszbits)) {
@@ -778,6 +825,11 @@ static int erofs_fc_get_tree(struct fs_context *fc)
 	if (IS_ENABLED(CONFIG_EROFS_FS_ONDEMAND) && sbi->fsid)
 		return get_tree_nodev(fc, erofs_fc_fill_super);
 
+#ifdef CONFIG_EROFS_FS_MEMORY
+	if (sbi->mem_phys_addr || sbi->mem_dmabuf_file)
+		return get_tree_nodev(fc, erofs_fc_fill_super);
+#endif
+
 	ret = get_tree_bdev_flags(fc, erofs_fc_fill_super,
 		IS_ENABLED(CONFIG_EROFS_FS_BACKED_BY_FILE) ?
 			GET_TREE_BDEV_QUIET_LOOKUP : 0);
@@ -852,6 +904,11 @@ static void erofs_sb_free(struct erofs_sb_info *sbi)
 	kfree(sbi->domain_id);
 	if (sbi->dif0.file)
 		fput(sbi->dif0.file);
+#ifdef CONFIG_EROFS_FS_MEMORY
+	erofs_mem_exit(sbi);
+	if (sbi->mem_dmabuf_file)
+		fput(sbi->mem_dmabuf_file);
+#endif
 	kfree(sbi->volume_name);
 	kfree(sbi);
 }
@@ -910,7 +967,7 @@ static void erofs_kill_sb(struct super_block *sb)
 	struct erofs_sb_info *sbi = EROFS_SB(sb);
 
 	if ((IS_ENABLED(CONFIG_EROFS_FS_ONDEMAND) && sbi->fsid) ||
-	    sbi->dif0.file)
+	    erofs_is_memory_mode(sbi) || sbi->dif0.file)
 		kill_anon_super(sb);
 	else
 		kill_block_super(sb);
@@ -1046,6 +1103,17 @@ static int erofs_show_options(struct seq_file *seq, struct dentry *root)
 #endif
 	if (sbi->dif0.fsoff)
 		seq_printf(seq, ",fsoffset=%llu", sbi->dif0.fsoff);
+#ifdef CONFIG_EROFS_FS_MEMORY
+	if (erofs_is_memory_mode(sbi)) {
+		if (sbi->mem_backing->phys_addr) {
+			seq_printf(seq, ",phys=0x%llx",
+				   (unsigned long long)sbi->mem_backing->phys_addr);
+			seq_printf(seq, ",memsize=%zu", sbi->mem_backing->size);
+		} else if (sbi->mem_backing->dmabuf) {
+			seq_puts(seq, ",dmabuf");
+		}
+	}
+#endif
 	return 0;
 }
 

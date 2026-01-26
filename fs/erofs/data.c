@@ -6,18 +6,33 @@
  */
 #include "internal.h"
 #include <linux/sched/mm.h>
+#include <linux/uio.h>
 #include <trace/events/erofs.h>
 
 void erofs_unmap_metabuf(struct erofs_buf *buf)
 {
 	if (!buf->base)
 		return;
+#ifdef CONFIG_EROFS_FS_MEMORY
+	/* Memory mode: no kmap to undo */
+	if (buf->sbi && erofs_is_memory_mode(buf->sbi)) {
+		buf->base = NULL;
+		return;
+	}
+#endif
 	kunmap_local(buf->base);
 	buf->base = NULL;
 }
 
 void erofs_put_metabuf(struct erofs_buf *buf)
 {
+#ifdef CONFIG_EROFS_FS_MEMORY
+	/* Memory mode: nothing to release */
+	if (buf->sbi && erofs_is_memory_mode(buf->sbi)) {
+		buf->base = NULL;
+		return;
+	}
+#endif
 	if (!buf->page)
 		return;
 	erofs_unmap_metabuf(buf);
@@ -29,6 +44,14 @@ void *erofs_bread(struct erofs_buf *buf, erofs_off_t offset, bool need_kmap)
 {
 	pgoff_t index = (buf->off + offset) >> PAGE_SHIFT;
 	struct folio *folio = NULL;
+
+#ifdef CONFIG_EROFS_FS_MEMORY
+	/* Memory mode: direct pointer access, no page cache */
+	if (buf->sbi && erofs_is_memory_mode(buf->sbi)) {
+		buf->base = erofs_mem_ptr(buf->sbi, buf->off + offset);
+		return buf->base ? buf->base : ERR_PTR(-EFAULT);
+	}
+#endif
 
 	if (buf->page) {
 		folio = page_folio(buf->page);
@@ -55,6 +78,14 @@ int erofs_init_metabuf(struct erofs_buf *buf, struct super_block *sb,
 	struct erofs_sb_info *sbi = EROFS_SB(sb);
 
 	buf->file = NULL;
+#ifdef CONFIG_EROFS_FS_MEMORY
+	buf->sbi = sbi;
+	if (erofs_is_memory_mode(sbi)) {
+		buf->mapping = NULL;  /* Signal: memory mode */
+		buf->off = sbi->dif0.fsoff;
+		return 0;
+	}
+#endif
 	if (in_metabox) {
 		if (unlikely(!sbi->metabox_inode))
 			return -EFSCORRUPTED;
@@ -388,6 +419,65 @@ static sector_t erofs_bmap(struct address_space *mapping, sector_t block)
 	return iomap_bmap(mapping, block, &erofs_iomap_ops);
 }
 
+#ifdef CONFIG_EROFS_FS_MEMORY
+static ssize_t erofs_memory_read_iter(struct kiocb *iocb, struct iov_iter *to)
+{
+	struct inode *inode = file_inode(iocb->ki_filp);
+	struct erofs_sb_info *sbi = EROFS_I_SB(inode);
+	loff_t pos = iocb->ki_pos;
+	size_t count = iov_iter_count(to);
+	ssize_t total = 0;
+
+	if (pos >= inode->i_size)
+		return 0;
+	if (pos + count > inode->i_size)
+		count = inode->i_size - pos;
+
+	while (count > 0) {
+		struct erofs_map_blocks map = { .m_la = pos };
+		void *src;
+		size_t len, data_off;
+		int err;
+
+		err = erofs_map_blocks(inode, &map);
+		if (err)
+			return total ? total : err;
+
+		if (!(map.m_flags & EROFS_MAP_MAPPED)) {
+			/* Hole - zero fill */
+			len = min_t(size_t, count, map.m_llen - (pos - map.m_la));
+			if (iov_iter_zero(len, to) != len)
+				return total ? total : -EFAULT;
+		} else if (map.m_flags & EROFS_MAP_META) {
+			/* Inline data in metadata area */
+			src = erofs_mem_ptr(sbi, sbi->dif0.fsoff + map.m_pa);
+			if (!src)
+				return total ? total : -EFAULT;
+
+			data_off = pos - map.m_la;
+			len = min_t(size_t, count, map.m_plen - data_off);
+			if (copy_to_iter(src + data_off, len, to) != len)
+				return total ? total : -EFAULT;
+		} else {
+			/* Direct pointer access - same as DAXFS */
+			data_off = pos - map.m_la;
+			src = erofs_mem_ptr(sbi, sbi->dif0.fsoff + map.m_pa + data_off);
+			if (!src)
+				return total ? total : -EFAULT;
+
+			len = min_t(size_t, count, map.m_plen - data_off);
+			if (copy_to_iter(src, len, to) != len)
+				return total ? total : -EFAULT;
+		}
+		pos += len;
+		count -= len;
+		total += len;
+	}
+	iocb->ki_pos = pos;
+	return total;
+}
+#endif
+
 static ssize_t erofs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 {
 	struct inode *inode = file_inode(iocb->ki_filp);
@@ -395,6 +485,12 @@ static ssize_t erofs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
 	/* no need taking (shared) inode lock since it's a ro filesystem */
 	if (!iov_iter_count(to))
 		return 0;
+
+#ifdef CONFIG_EROFS_FS_MEMORY
+	/* Memory mode: direct pointer path, bypass iomap entirely */
+	if (erofs_is_memory_mode(EROFS_I_SB(inode)))
+		return erofs_memory_read_iter(iocb, to);
+#endif
 
 #ifdef CONFIG_FS_DAX
 	if (IS_DAX(inode))

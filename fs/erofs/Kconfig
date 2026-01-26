@@ -194,3 +194,15 @@ config EROFS_FS_PCPU_KTHREAD_HIPRI
 	  at higher priority.
 
 	  If unsure, say N.
+
+config EROFS_FS_MEMORY
+	bool "EROFS memory-backed filesystem support"
+	depends on EROFS_FS
+	select DMA_SHARED_BUFFER
+	help
+	  Allows EROFS to use direct memory regions as backing store,
+	  via physical address (memremap) or dma-buf file descriptors.
+	  Useful for multi-kernel shared memory, CXL memory pooling,
+	  and container rootfs sharing with GPU/accelerators.
+
+	  If unsure, say N.
