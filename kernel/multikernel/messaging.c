@@ -82,7 +82,7 @@ static void mk_message_type_ipi_callback(struct mk_ipi_data *data, void *ctx)
 	payload = msg->payload_len > 0 ? msg->payload : NULL;
 	payload_len = msg->payload_len;
 
-	pr_debug("Multikernel message received: type=0x%x, subtype=0x%x, len=%u from CPU %d\n",
+	pr_debug("[EO] Multikernel message received: type=0x%x, subtype=0x%x, len=%u from CPU %d\n",
 		 msg_type, msg_subtype, payload_len, data->sender_cpu);
 
 	/* Call the registered handler for this message type */
