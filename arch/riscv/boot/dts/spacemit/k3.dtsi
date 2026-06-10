@@ -1099,6 +1099,19 @@
 			#clock-cells = <1>;
 		};
 
+		sdhci0: mmc@d4280000 {
+			compatible = "spacemit,k3-sdhci";
+			reg = <0x0 0xd4280000 0x0 0x200>;
+			clocks = <&syscon_apmu CLK_APMU_SDH_AXI>,
+				 <&syscon_apmu CLK_APMU_SDH0>;
+			clock-names = "core", "io";
+			resets = <&syscon_apmu RESET_APMU_SDH_AXI>,
+				 <&syscon_apmu RESET_APMU_SDH0>;
+			reset-names = "axi", "sdh";
+			interrupts = <99 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
 		syscon_apmu: system-controller@d4282800 {
 			compatible = "spacemit,k3-syscon-apmu";
 			reg = <0x0 0xd4282800 0x0 0x400>;
