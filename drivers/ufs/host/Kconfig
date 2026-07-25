@@ -132,6 +132,18 @@ config SCSI_UFS_VARIABLE_SG_ENTRY_SIZE
 	bool
 	default y if SCSI_UFS_EXYNOS && SCSI_UFS_CRYPTO
 
+config SCSI_UFS_SPACEMIT
+	tristate "SpacemiT UFS controller driver"
+	depends on SCSI_UFSHCD_PLATFORM && (ARCH_SPACEMIT || COMPILE_TEST)
+	help
+	  This selects the SpacemiT specific additions to UFSHCD platform driver.
+	  UFS host on SpacemiT needs some vendor specific configuration before
+	  accessing the hardware which includes PHY configuration and vendor
+	  specific registers.
+
+	  Select this if you have UFS controller on SpacemiT chipset.
+	  If unsure, say N.
+
 config SCSI_UFS_SPRD
 	tristate "Unisoc specific hooks to UFS controller platform driver"
 	depends on SCSI_UFSHCD_PLATFORM && (ARCH_SPRD || COMPILE_TEST)
