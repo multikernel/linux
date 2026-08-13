@@ -47,6 +47,7 @@ Phase 1: Instance Creation (Automatic from DTB)
                   resources {
                       cpus = <1>;
                       memory-bytes = <0x20000000>;   // 512MB
+                      llc-way-mask = <0x0000ffff>;  // Lower half of LLC ways
                   };
               };
 
@@ -142,6 +143,7 @@ The multikernel device tree uses the ``/instances`` structure with ``multikernel
                 resources {
                     cpus = <1>;                      // CPU ID 1
                     memory-bytes = <0x20000000>;     // 512MB
+                    llc-way-mask = <0x0000ffff>;     // resctrl L3 CBM
                 };
             };
 
@@ -178,6 +180,7 @@ When viewing an instance's ``device_tree_source``, it appears in per-instance fo
         resources {
             cpus = <1>;
             memory-bytes = <0x20000000>; // 512 MB
+            llc-way-mask = <0x0000ffff>;
         };
     };
 
@@ -186,12 +189,51 @@ Resource Properties
 
 - **cpus**: Array of CPU IDs to assign to this instance
 - **memory-bytes**: Memory size in bytes (must be page-aligned)
+- **llc-way-mask**: Optional 32-bit resctrl L3 capacity bitmask. The baseline
+  value defines the LLC ways available to the multikernel pool; every instance
+  value must be a non-zero, non-overlapping subset of that pool.
 - **id**: Unique instance identifier used for kexec operations
+
+LLC Way Isolation
+-----------------
+
+``llc-way-mask`` uses the same bit numbering as the L3 CBM in a resctrl
+``schemata`` file.  Mount resctrl before applying a baseline that contains an
+LLC mask, and keep it mounted while any LLC-partitioned instance exists.  For
+example::
+
+    mkdir -p /dev/resctrl
+    mount -t resctrl none /dev/resctrl
+
+The baseline mask is the pool reserved for spawn kernels.  Multikernel assigns
+the complementary supported mask to the host's default resctrl group.  For a
+16-way LLC, this reserves the upper half for multikernel and leaves the lower
+half to the host::
+
+    /dts-v1/;
+    / {
+        compatible = "multikernel-v1";
+        resources {
+            cpus = <0x0 0x1>;
+            memory-base = /bits/ 64 <0x100000000>;
+            memory-bytes = /bits/ 64 <0x40000000>;
+            llc-way-mask = <0xff00>;
+        };
+    };
+
+An instance then requests a non-overlapping subset of ``0xff00``.  The host
+allocates a resctrl CLOSID, programs the mask on every L3 domain, and records
+the CLOSID in the generated instance DTB.  ``linux,resctrl-closid`` is internal
+host-generated metadata and must not be supplied in an input DTB.  A spawn
+kernel inherits that CLOSID and does not reset the package-wide CAT registers.
+Mounting resctrl inside a spawn kernel is rejected because those registers are
+shared with its parent.
 
 The system validates that:
 
 - CPU IDs are valid and available
 - Memory requests don't exceed available multikernel pool
+- LLC way masks stay within the baseline pool and don't overlap another instance
 - Instance IDs are unique
 - All values are properly aligned
 

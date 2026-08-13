@@ -16,6 +16,7 @@
 #include <linux/debugfs.h>
 #include <linux/fs.h>
 #include <linux/fs_parser.h>
+#include <linux/multikernel.h>
 #include <linux/sysfs.h>
 #include <linux/kernfs.h>
 #include <linux/once.h>
@@ -2788,6 +2789,10 @@ static int rdt_get_tree(struct fs_context *fc)
 	struct rdt_resource *r;
 	int ret;
 
+	/* A child kernel shares package-wide control MSRs with its parent. */
+	if (multikernel_is_spawn_kernel())
+		return -EBUSY;
+
 	DO_ONCE_SLEEPABLE(resctrl_arch_pre_mount);
 
 	cpus_read_lock();
@@ -4094,6 +4099,218 @@ out:
 	return ret;
 }
 
+/*
+ * Multikernel uses resctrl as a kernel-side allocator.  Keeping this here,
+ * next to the normal mkdir/schemata/rmdir paths, lets both users share the
+ * same CLOSID allocator and locking instead of having multikernel program
+ * architecture MSRs behind resctrl's back.
+ */
+static bool multikernel_cbm_valid(u32 cbm, struct rdt_resource *r)
+{
+	unsigned int len = r->cache.cbm_len;
+	unsigned long first, zero, value = cbm;
+	u32 supported;
+
+	if (!len || len > 32)
+		return false;
+
+	supported = len == 32 ? U32_MAX : BIT(len) - 1;
+	if (!cbm || (cbm & ~supported))
+		return false;
+
+	first = find_first_bit(&value, len);
+	zero = find_next_zero_bit(&value, len, first);
+	if (!r->cache.arch_has_sparse_bitmasks &&
+	    find_next_bit(&value, len, zero) < len)
+		return false;
+
+	return bitmap_weight(&value, len) >= r->cache.min_cbm_bits;
+}
+
+static int multikernel_set_l3_mask(struct rdtgroup *rdtgrp, u32 mask)
+{
+	struct resctrl_staged_config *cfg;
+	struct rdt_ctrl_domain *d;
+	struct resctrl_schema *s;
+	struct rdt_resource *r;
+	bool found = false;
+	int ret = 0;
+
+	lockdep_assert_cpus_held();
+	lockdep_assert_held(&rdtgroup_mutex);
+	rdt_staged_configs_clear();
+
+	list_for_each_entry(s, &resctrl_schema_all, list) {
+		r = s->res;
+		if (r->rid != RDT_RESOURCE_L3)
+			continue;
+		found = true;
+
+		if (rdtgrp->closid >= s->num_closid ||
+		    !multikernel_cbm_valid(mask, r)) {
+			ret = -EINVAL;
+			goto out;
+		}
+
+		list_for_each_entry(d, &r->ctrl_domains, hdr.list) {
+			if (rdtgroup_cbm_overlaps(s, d, mask, rdtgrp->closid,
+						  true)) {
+				ret = -EBUSY;
+				goto out;
+			}
+
+			cfg = &d->staged_config[s->conf_type];
+			cfg->new_ctrl = mask;
+			cfg->have_new_ctrl = true;
+		}
+
+		ret = resctrl_arch_update_domains(r, rdtgrp->closid);
+		if (ret)
+			goto out;
+	}
+
+	if (!found)
+		ret = -EOPNOTSUPP;
+out:
+	rdt_staged_configs_clear();
+	return ret;
+}
+
+int resctrl_multikernel_set_pool_mask(u32 pool_mask)
+{
+	struct rdt_resource *l3;
+	struct rdtgroup *rdtgrp;
+	u32 supported, host_mask;
+	int ret;
+
+	if (!resctrl_mounted)
+		return -ENODEV;
+
+	l3 = resctrl_arch_get_resource(RDT_RESOURCE_L3);
+	if (!l3 || !l3->alloc_capable || !l3->cache.cbm_len ||
+	    l3->cache.cbm_len > 32)
+		return -EOPNOTSUPP;
+
+	supported = l3->cache.cbm_len == 32 ? U32_MAX :
+		    BIT(l3->cache.cbm_len) - 1;
+	if (!pool_mask || (pool_mask & ~supported))
+		return -EINVAL;
+
+	host_mask = supported & ~pool_mask;
+	if (!multikernel_cbm_valid(pool_mask, l3) ||
+	    !multikernel_cbm_valid(host_mask, l3))
+		return -EINVAL;
+
+	rdtgrp = rdtgroup_kn_lock_live(rdtgroup_default.kn);
+	if (!rdtgrp)
+		return -ENODEV;
+	ret = multikernel_set_l3_mask(rdtgrp, host_mask);
+	rdtgroup_kn_unlock(rdtgroup_default.kn);
+
+	return ret;
+}
+
+int resctrl_multikernel_create_group(const char *name, u32 l3_mask,
+				     u32 *closid)
+{
+	struct rdtgroup *rdtgrp = NULL;
+	struct kernfs_node *kn;
+	bool found = false;
+	int ret;
+
+	if (!name || !closid || !name[0] || strchr(name, '/') ||
+	    strchr(name, '\n'))
+		return -EINVAL;
+	if (!resctrl_mounted)
+		return -ENODEV;
+
+	ret = rdtgroup_mkdir_ctrl_mon(rdtgroup_default.kn, name, 0755);
+	if (ret)
+		return ret;
+
+	/* The mkdir path inserted the group while holding rdtgroup_mutex. */
+	rdtgrp = rdtgroup_kn_lock_live(rdtgroup_default.kn);
+	if (!rdtgrp) {
+		ret = -ENODEV;
+		goto out_find;
+	}
+	list_for_each_entry(rdtgrp, &rdt_all_groups, rdtgroup_list) {
+		if (rdtgrp != &rdtgroup_default &&
+		    !strcmp(rdt_kn_name(rdtgrp->kn), name)) {
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
+		rdtgroup_kn_unlock(rdtgroup_default.kn);
+		ret = -ENOENT;
+		goto out_find;
+	}
+	kn = rdtgrp->kn;
+	kernfs_get(kn);
+	rdtgroup_kn_unlock(rdtgroup_default.kn);
+
+	rdtgrp = rdtgroup_kn_lock_live(kn);
+	if (!rdtgrp) {
+		ret = -ENOENT;
+		goto out_put;
+	}
+	ret = multikernel_set_l3_mask(rdtgrp, l3_mask);
+	if (!ret && rdtgroup_mode_test_exclusive(rdtgrp))
+		rdtgrp->mode = RDT_MODE_EXCLUSIVE;
+	else if (!ret)
+		ret = -EBUSY;
+	if (!ret)
+		*closid = rdtgrp->closid;
+	rdtgroup_kn_unlock(kn);
+	if (ret)
+		rdtgroup_rmdir(kn);
+out_put:
+	kernfs_put(kn);
+	return ret;
+
+out_find:
+	kn = kernfs_find_and_get(rdtgroup_default.kn, name);
+	if (kn) {
+		rdtgroup_rmdir(kn);
+		kernfs_put(kn);
+	}
+	return ret;
+}
+
+int resctrl_multikernel_remove_group(u32 closid)
+{
+	struct rdtgroup *rdtgrp;
+	struct kernfs_node *kn = NULL;
+	int ret;
+
+	if (!resctrl_mounted)
+		return -ENODEV;
+
+	rdtgrp = rdtgroup_kn_lock_live(rdtgroup_default.kn);
+	if (!rdtgrp)
+		return -ENODEV;
+	list_for_each_entry(rdtgrp, &rdt_all_groups, rdtgroup_list) {
+		if (rdtgrp != &rdtgroup_default && rdtgrp->closid == closid) {
+			kn = rdtgrp->kn;
+			kernfs_get(kn);
+			break;
+		}
+	}
+	rdtgroup_kn_unlock(rdtgroup_default.kn);
+	if (!kn)
+		return -ENOENT;
+
+	ret = rdtgroup_rmdir(kn);
+	kernfs_put(kn);
+	return ret;
+}
+
+bool resctrl_multikernel_l3_cdp_enabled(void)
+{
+	return resctrl_arch_get_cdp_enabled(RDT_RESOURCE_L3);
+}
+
 /**
  * mongrp_reparent() - replace parent CTRL_MON group of a MON group
  * @rdtgrp:		the MON group whose parent should be replaced
@@ -4274,7 +4491,7 @@ static void rdtgroup_setup_default(void)
 {
 	mutex_lock(&rdtgroup_mutex);
 
-	rdtgroup_default.closid = RESCTRL_RESERVED_CLOSID;
+	rdtgroup_default.closid = multikernel_resctrl_closid();
 	rdtgroup_default.mon.rmid = RESCTRL_RESERVED_RMID;
 	rdtgroup_default.type = RDTCTRL_GROUP;
 	INIT_LIST_HEAD(&rdtgroup_default.mon.crdtgrp_list);

@@ -90,6 +90,9 @@ struct mk_spawn_context {
 	u32 target_apic_id;		/* Target CPU's APIC ID */
 	u32 flags;			/* MK_SPAWN_F_* flags */
 	u32 ready;			/* Signal flag */
+	u32 resctrl_closid;		/* CLOSID to install before dispatch */
+	u32 resctrl_l3_mask;		/* L3 CBM to install before dispatch */
+	u32 resctrl_l3_cdp;		/* L3 CDP uses two CBM registers */
 	u32 reserved;			/* Padding for alignment */
 	/* Variable-size struct last - size depends on kernel config */
 	struct boot_params bp;		/* Standard x86 boot params */

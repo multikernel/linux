@@ -12,6 +12,7 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 				      int resources_node, size_t dtb_size);
 struct mk_instance *mk_instance_find_by_name(const char *name);
 int mk_instance_destroy(struct mk_instance *instance);
+void mk_instance_release_llc_ways(struct mk_instance *instance);
 
 /* dts.c */
 int mk_dt_parse_resources(const void *fdt, int resources_node,

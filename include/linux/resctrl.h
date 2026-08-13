@@ -18,6 +18,34 @@
 
 #define RESCTRL_PICK_ANY_CPU		-1
 
+#ifdef CONFIG_RESCTRL_FS
+int resctrl_multikernel_set_pool_mask(u32 pool_mask);
+int resctrl_multikernel_create_group(const char *name, u32 l3_mask,
+				     u32 *closid);
+int resctrl_multikernel_remove_group(u32 closid);
+bool resctrl_multikernel_l3_cdp_enabled(void);
+#else
+static inline int resctrl_multikernel_set_pool_mask(u32 pool_mask)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int resctrl_multikernel_create_group(const char *name, u32 l3_mask, u32 *closid)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int resctrl_multikernel_remove_group(u32 closid)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline bool resctrl_multikernel_l3_cdp_enabled(void)
+{
+	return false;
+}
+#endif
+
 #ifdef CONFIG_PROC_CPU_RESCTRL
 
 int proc_resctrl_show(struct seq_file *m,

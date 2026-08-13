@@ -449,6 +449,12 @@ struct mk_dt_config {
 	/* CPU resources */
 	struct mk_cpu_set *cpus;         /* Set of physical CPU IDs */
 
+	/* Last-level cache allocation (resctrl CAT capacity bitmask) */
+	u32 llc_way_mask;
+	bool llc_way_mask_valid;
+	u32 resctrl_closid;              /* Host-assigned resctrl CLOSID */
+	bool resctrl_closid_valid;
+
 	/* PCI device resources */
 	struct list_head pci_devices;    /* List of struct mk_pci_device */
 	int pci_device_count;            /* Number of PCI devices */
@@ -460,7 +466,7 @@ struct mk_dt_config {
 	bool platform_devices_valid;         /* Whether platform device list is valid */
 
 	/* Extensibility: Reserved fields for future use */
-	u32 reserved[7];                 /* Reduced due to added fields */
+	u32 reserved[5];
 
 	/* Raw device tree data */
 	void *dtb_data;
@@ -487,6 +493,12 @@ struct mk_instance {
 
 	/* CPU resources */
 	struct mk_cpu_set *cpus;         /* Set of assigned physical CPU IDs */
+
+	/* Last-level cache allocation (resctrl CAT capacity bitmask) */
+	u32 llc_way_mask;
+	bool llc_way_mask_valid;
+	u32 resctrl_closid;              /* Host-assigned resctrl CLOSID */
+	bool resctrl_closid_valid;
 
 	/* PCI device resources */
 	struct list_head pci_devices;    /* List of struct mk_pci_device */
@@ -748,6 +760,9 @@ struct pci_bus;
 
 #ifdef CONFIG_MULTIKERNEL
 bool multikernel_allow_emergency_restart(void);
+bool multikernel_is_spawn_kernel(void);
+u32 multikernel_resctrl_closid(void);
+u32 multikernel_resctrl_l3_mask(void);
 int multikernel_halt_by_id(int mk_id);
 int multikernel_force_halt_by_id(int mk_id);
 bool cpu_is_multikernel_pool(unsigned int cpu);
@@ -781,6 +796,22 @@ static inline bool multikernel_allow_emergency_restart(void)
 {
 	return true;
 }
+
+static inline bool multikernel_is_spawn_kernel(void)
+{
+	return false;
+}
+
+static inline u32 multikernel_resctrl_closid(void)
+{
+	return 0;
+}
+
+static inline u32 multikernel_resctrl_l3_mask(void)
+{
+	return 0;
+}
+
 static inline int multikernel_halt_by_id(int mk_id)
 {
 	return -ENODEV;
@@ -844,11 +875,15 @@ static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
  */
 #define MK_DT_RESOURCE_MEMORY   "memory-bytes"
 #define MK_DT_RESOURCE_CPUS     "cpus"
+#define MK_DT_RESOURCE_LLC_WAYS "llc-way-mask"
+#define MK_DT_RESOURCE_CLOSID   "linux,resctrl-closid"
 #define MK_DT_RESOURCE_DEVICES  "devices"
 
 static const char * const mk_resource_properties[] = {
 	MK_DT_RESOURCE_MEMORY,
 	MK_DT_RESOURCE_CPUS,
+	MK_DT_RESOURCE_LLC_WAYS,
+	MK_DT_RESOURCE_CLOSID,
 	MK_DT_RESOURCE_DEVICES,
 	NULL  /* Sentinel */
 };

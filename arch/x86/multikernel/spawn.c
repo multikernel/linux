@@ -31,6 +31,7 @@
 #include <linux/memblock.h>
 #include <linux/multikernel.h>
 #include <linux/percpu.h>
+#include <linux/resctrl.h>
 #include <linux/set_memory.h>
 #include <linux/sched.h>
 
@@ -328,6 +329,9 @@ int mk_spawn_cpu(struct mk_instance *instance, int cpu,
 	slot->kernel_entry = ctx->kernel_entry;
 	slot->trampoline_phys = ctx->trampoline_phys;
 	slot->self_phys = virt_to_phys(ctx);
+	slot->resctrl_closid = ctx->resctrl_closid;
+	slot->resctrl_l3_mask = ctx->resctrl_l3_mask;
+	slot->resctrl_l3_cdp = ctx->resctrl_l3_cdp;
 	slot->flags = 0;
 	ret = mk_slot_wake(slot, apic_id, "first spawn boot cpu");
 	if (!ret) {
@@ -447,6 +451,12 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 			     (unsigned long)instance->trampoline_va,
 			     virt_to_phys(instance->trampoline_va),
 			     virt_to_phys(instance->park_va));
+	instance->spawn_ctx->resctrl_closid = instance->resctrl_closid_valid ?
+		instance->resctrl_closid : 0;
+	instance->spawn_ctx->resctrl_l3_mask = instance->llc_way_mask_valid ?
+		instance->llc_way_mask : 0;
+	instance->spawn_ctx->resctrl_l3_cdp =
+		resctrl_multikernel_l3_cdp_enabled();
 
 	return mk_spawn_cpu(instance, cpu, instance->spawn_ctx);
 }
