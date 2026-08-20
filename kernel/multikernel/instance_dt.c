@@ -755,6 +755,11 @@ int __init mk_instance_restore_from_manifest(void)
 		goto cleanup_instance_name;
 	}
 
+	instance->llc_way_mask = config.llc_way_mask;
+	instance->llc_way_mask_valid = config.llc_way_mask_valid;
+	instance->resctrl_closid = config.resctrl_closid;
+	instance->resctrl_closid_valid = config.resctrl_closid_valid;
+
 	instance->dtb_data = kmalloc(dtb_len, GFP_KERNEL);
 	if (!instance->dtb_data) {
 		pr_err("Failed to allocate memory for DTB restoration\n");

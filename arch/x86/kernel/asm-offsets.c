@@ -64,6 +64,9 @@ static void __used common(void)
 	OFFSET(MK_CTX_target_apic_id, mk_spawn_context, target_apic_id);
 	OFFSET(MK_CTX_flags, mk_spawn_context, flags);
 	OFFSET(MK_CTX_ready, mk_spawn_context, ready);
+	OFFSET(MK_CTX_resctrl_closid, mk_spawn_context, resctrl_closid);
+	OFFSET(MK_CTX_resctrl_l3_mask, mk_spawn_context, resctrl_l3_mask);
+	OFFSET(MK_CTX_resctrl_l3_cdp, mk_spawn_context, resctrl_l3_cdp);
 	OFFSET(MK_CTX_bp, mk_spawn_context, bp);
 #endif
 

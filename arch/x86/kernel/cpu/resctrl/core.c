@@ -20,6 +20,7 @@
 #include <linux/slab.h>
 #include <linux/err.h>
 #include <linux/cpuhotplug.h>
+#include <linux/multikernel.h>
 
 #include <asm/cpu_device_id.h>
 #include <asm/msr.h>
@@ -409,13 +410,48 @@ static int domain_setup_ctrlval(struct rdt_resource *r, struct rdt_ctrl_domain *
 		return -ENOMEM;
 
 	hw_dom->ctrl_val = dc;
-	setup_default_ctrlval(r, dc);
+	if (multikernel_is_spawn_kernel()) {
+		u32 closid = multikernel_resctrl_closid();
+		u32 mask = multikernel_resctrl_l3_mask();
+		int i;
 
-	m.res = r;
-	m.dom = d;
-	m.low = 0;
-	m.high = hw_res->num_closid;
-	hw_res->msr_update(&m);
+		/* Import the package-wide controls programmed by the parent. */
+		for (i = 0; i < hw_res->num_closid; i++)
+			rdmsrq(hw_res->msr_base + i, dc[i]);
+
+		/*
+		 * A parent may have no online CPU in this LLC domain after
+		 * donating the whole domain.  Program our own slot locally as
+		 * the first CPU in the domain comes online.
+		 */
+		if (r->rid == RDT_RESOURCE_L3 && mask) {
+			m.res = r;
+			m.dom = d;
+			if (resctrl_arch_get_cdp_enabled(RDT_RESOURCE_L3)) {
+				m.low = resctrl_get_config_index(closid, CDP_DATA);
+				m.high = m.low + 2;
+				if (m.high > hw_res->num_closid)
+					return -ERANGE;
+				dc[m.low] = mask;
+				dc[m.low + 1] = mask;
+			} else {
+				if (closid >= hw_res->num_closid)
+					return -ERANGE;
+				m.low = closid;
+				m.high = closid + 1;
+				dc[closid] = mask;
+			}
+			hw_res->msr_update(&m);
+		}
+	} else {
+		setup_default_ctrlval(r, dc);
+
+		m.res = r;
+		m.dom = d;
+		m.low = 0;
+		m.high = hw_res->num_closid;
+		hw_res->msr_update(&m);
+	}
 	return 0;
 }
 
@@ -724,13 +760,13 @@ static void domain_remove_cpu(int cpu, struct rdt_resource *r)
 static void clear_closid_rmid(int cpu)
 {
 	struct resctrl_pqr_state *state = this_cpu_ptr(&pqr_state);
+	u32 closid = multikernel_resctrl_closid();
 
-	state->default_closid = RESCTRL_RESERVED_CLOSID;
+	state->default_closid = closid;
 	state->default_rmid = RESCTRL_RESERVED_RMID;
-	state->cur_closid = RESCTRL_RESERVED_CLOSID;
+	state->cur_closid = closid;
 	state->cur_rmid = RESCTRL_RESERVED_RMID;
-	wrmsr(MSR_IA32_PQR_ASSOC, RESCTRL_RESERVED_RMID,
-	      RESCTRL_RESERVED_CLOSID);
+	wrmsr(MSR_IA32_PQR_ASSOC, RESCTRL_RESERVED_RMID, closid);
 }
 
 static int resctrl_arch_online_cpu(unsigned int cpu)

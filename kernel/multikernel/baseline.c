@@ -17,6 +17,7 @@
 #include <linux/multikernel.h>
 #include <linux/ioport.h>
 #include <linux/pci.h>
+#include <linux/resctrl.h>
 
 #include "internal.h"
 
@@ -28,6 +29,38 @@
  * owns".
  */
 struct mk_cpu_set *mk_cpu_pool;
+
+static int mk_baseline_parse_llc_ways(const void *fdt, int resources_node,
+				      struct mk_instance *instance)
+{
+	const fdt32_t *prop;
+	u32 mask;
+	int len;
+
+	prop = fdt_getprop(fdt, resources_node, MK_DT_RESOURCE_LLC_WAYS,
+			   &len);
+	if (!prop)
+		return 0;
+
+	if (len != sizeof(*prop)) {
+		pr_err("Invalid '%s' length: %d (must be one 32-bit cell)\n",
+		       MK_DT_RESOURCE_LLC_WAYS, len);
+		return -EINVAL;
+	}
+
+	mask = fdt32_to_cpu(*prop);
+	if (!mask) {
+		pr_err("Invalid zero '%s' in baseline\n",
+		       MK_DT_RESOURCE_LLC_WAYS);
+		return -EINVAL;
+	}
+
+	instance->llc_way_mask = mask;
+	instance->llc_way_mask_valid = true;
+	pr_info("Baseline LLC way pool: 0x%08x\n", mask);
+
+	return 0;
+}
 
 static int mk_baseline_parse_cpus(const void *fdt, int resources_node)
 {
@@ -190,6 +223,8 @@ static void mk_baseline_clear_resources(struct mk_instance *instance)
 	}
 	instance->platform_device_count = 0;
 	instance->platform_devices_valid = false;
+	instance->llc_way_mask = 0;
+	instance->llc_way_mask_valid = false;
 }
 
 static int mk_baseline_validate_cpus(void)
@@ -605,6 +640,12 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 		return ret;
 	}
 
+	ret = mk_baseline_parse_llc_ways(fdt, resources_node, root_instance);
+	if (ret) {
+		pr_err("Failed to parse baseline LLC ways: %d\n", ret);
+		return ret;
+	}
+
 	ret = mk_baseline_parse_devices(fdt, resources_node, root_instance);
 	if (ret) {
 		pr_err("Failed to parse baseline devices: %d\n", ret);
@@ -633,6 +674,15 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 	if (ret) {
 		pr_err("Baseline memory validation failed: %d\n", ret);
 		return ret;
+	}
+
+	if (root_instance->llc_way_mask_valid) {
+		ret = resctrl_multikernel_set_pool_mask(root_instance->llc_way_mask);
+		if (ret) {
+			pr_err("Failed to reserve baseline LLC way pool 0x%08x through resctrl: %d\n",
+			       root_instance->llc_way_mask, ret);
+			return ret;
+		}
 	}
 
 	ret = mk_baseline_initialize_cpus();

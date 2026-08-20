@@ -351,6 +351,34 @@ SYM_CODE_START_LOCAL_NOALIGN(mk_park_identity)
 	cmpl	%r13d, %eax
 	jne	.Lpark_relax
 
+	/* Program this LLC domain and select it before kernel code executes. */
+	movl	MK_CTX_resctrl_closid(%r12), %r10d
+	testl	%r10d, %r10d
+	jz	.Lpark_closid_done
+	movl	MK_CTX_resctrl_l3_mask(%r12), %eax
+	testl	%eax, %eax
+	jz	.Lpark_select_closid
+	movl	%r10d, %ecx
+	cmpl	$0, MK_CTX_resctrl_l3_cdp(%r12)
+	je	.Lpark_write_l3
+	shll	$1, %ecx
+	addl	$MSR_IA32_L3_CBM_BASE, %ecx
+	xorl	%edx, %edx
+	wrmsr
+	incl	%ecx
+	wrmsr
+	jmp	.Lpark_select_closid
+.Lpark_write_l3:
+	addl	$MSR_IA32_L3_CBM_BASE, %ecx
+	xorl	%edx, %edx
+	wrmsr
+.Lpark_select_closid:
+	movl	$MSR_IA32_PQR_ASSOC, %ecx
+	rdmsr
+	movl	%r10d, %edx
+	wrmsr
+.Lpark_closid_done:
+
 	/*
 	 * Copy the publication into registers BEFORE claiming: once the
 	 * claim clears ready, the publisher may reuse the slot for the

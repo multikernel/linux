@@ -12,8 +12,35 @@
 #include <linux/kexec.h>
 #include <linux/multikernel.h>
 #include <linux/pci.h>
+#include <linux/resctrl.h>
 #include <linux/vmalloc.h>
 #include "internal.h"
+
+bool multikernel_is_spawn_kernel(void)
+{
+	return root_instance && root_instance->id != 0;
+}
+EXPORT_SYMBOL_GPL(multikernel_is_spawn_kernel);
+
+u32 multikernel_resctrl_closid(void)
+{
+	if (!multikernel_is_spawn_kernel() ||
+	    !root_instance->resctrl_closid_valid)
+		return RESCTRL_RESERVED_CLOSID;
+
+	return root_instance->resctrl_closid;
+}
+EXPORT_SYMBOL_GPL(multikernel_resctrl_closid);
+
+u32 multikernel_resctrl_l3_mask(void)
+{
+	if (!multikernel_is_spawn_kernel() ||
+	    !root_instance->llc_way_mask_valid)
+		return 0;
+
+	return root_instance->llc_way_mask;
+}
+EXPORT_SYMBOL_GPL(multikernel_resctrl_l3_mask);
 
 static void mk_instance_return_all_cpus(struct mk_instance *instance)
 {
@@ -24,6 +51,94 @@ static void mk_instance_return_all_cpus(struct mk_instance *instance)
 		return;
 
 	mk_instance_return_cpus(instance, instance->cpus);
+}
+
+static int mk_instance_reserve_llc_ways(struct mk_instance *instance,
+					const struct mk_dt_config *config)
+{
+	struct mk_instance *other;
+	char group_name[32];
+	u32 outside_pool;
+	int ret;
+
+	instance->llc_way_mask = 0;
+	instance->llc_way_mask_valid = false;
+	instance->resctrl_closid = 0;
+	instance->resctrl_closid_valid = false;
+
+	if (!config->llc_way_mask_valid)
+		return 0;
+
+	if (!config->llc_way_mask)
+		return -EINVAL;
+
+	if (!root_instance || !root_instance->llc_way_mask_valid) {
+		pr_err("Instance %d (%s): LLC mask requires a baseline llc-way-mask pool\n",
+		       instance->id, instance->name);
+		return -EINVAL;
+	}
+
+	if (root_instance->llc_way_mask_valid) {
+		outside_pool = config->llc_way_mask &
+			       ~root_instance->llc_way_mask;
+		if (outside_pool) {
+			pr_err("Instance %d (%s): LLC mask 0x%08x uses ways outside baseline pool 0x%08x\n",
+			       instance->id, instance->name,
+			       config->llc_way_mask,
+			       root_instance->llc_way_mask);
+			return -ERANGE;
+		}
+	}
+
+	list_for_each_entry(other, &mk_instance_list, list) {
+		if (other == instance || other == root_instance ||
+		    !other->llc_way_mask_valid)
+			continue;
+
+		if (config->llc_way_mask & other->llc_way_mask) {
+			pr_err("Instance %d (%s): LLC mask 0x%08x overlaps instance %d (%s) mask 0x%08x\n",
+			       instance->id, instance->name,
+			       config->llc_way_mask, other->id, other->name,
+			       other->llc_way_mask);
+			return -EBUSY;
+		}
+	}
+
+	instance->llc_way_mask = config->llc_way_mask;
+	instance->llc_way_mask_valid = true;
+	snprintf(group_name, sizeof(group_name), "multikernel-%d", instance->id);
+	ret = resctrl_multikernel_create_group(group_name,
+					       instance->llc_way_mask,
+					       &instance->resctrl_closid);
+	if (ret) {
+		pr_err("Instance %d (%s): failed to create resctrl group: %d\n",
+		       instance->id, instance->name, ret);
+		instance->llc_way_mask = 0;
+		instance->llc_way_mask_valid = false;
+		return ret;
+	}
+	instance->resctrl_closid_valid = true;
+
+	return 0;
+}
+
+void mk_instance_release_llc_ways(struct mk_instance *instance)
+{
+	int ret;
+
+	if (!instance || !instance->resctrl_closid_valid)
+		return;
+
+	ret = resctrl_multikernel_remove_group(instance->resctrl_closid);
+	if (ret && ret != -ENOENT && ret != -ENODEV)
+		pr_warn("Instance %d (%s): failed to remove resctrl CLOSID %u: %d\n",
+			instance->id, instance->name, instance->resctrl_closid,
+			ret);
+
+	instance->resctrl_closid = 0;
+	instance->resctrl_closid_valid = false;
+	instance->llc_way_mask = 0;
+	instance->llc_way_mask_valid = false;
 }
 
 static void mk_instance_return_pci_devices(struct mk_instance *instance)
@@ -141,6 +256,7 @@ static void mk_instance_release(struct kref *kref)
 		instance->id, instance->name);
 
 	mk_instance_return_all_cpus(instance);
+	mk_instance_release_llc_ways(instance);
 	mk_instance_return_pci_devices(instance);
 	mk_instance_return_platform_devices(instance);
 	mk_instance_free_memory(instance);
@@ -967,6 +1083,12 @@ int mk_instance_reserve_resources(struct mk_instance *instance,
 	if (ret) {
 		pr_err("Failed to reserve memory regions for instance %d (%s): %d\n",
 		       instance->id, instance->name, ret);
+		return ret;
+	}
+
+	ret = mk_instance_reserve_llc_ways(instance, config);
+	if (ret) {
+		mk_instance_free_memory(instance);
 		return ret;
 	}
 

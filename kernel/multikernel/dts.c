@@ -20,6 +20,7 @@
 #include <linux/sizes.h>
 #include <linux/cpumask.h>
 #include <linux/multikernel.h>
+#include <linux/resctrl.h>
 
 #include "internal.h"
 
@@ -104,6 +105,10 @@ static int mk_dt_parse_memory(const void *fdt, int chosen_node,
 			      struct mk_dt_config *config);
 static int mk_dt_parse_cpus(const void *fdt, int chosen_node,
 			    struct mk_dt_config *config);
+static int mk_dt_parse_llc_ways(const void *fdt, int resources_node,
+				struct mk_dt_config *config);
+static int mk_dt_parse_closid(const void *fdt, int resources_node,
+			      struct mk_dt_config *config);
 static int mk_dt_parse_devices(const void *fdt, int chosen_node,
 			       struct mk_dt_config *config);
 static int mk_dt_validate_memory(const struct mk_dt_config *config);
@@ -199,6 +204,70 @@ static int mk_dt_parse_cpus(const void *fdt, int chosen_node,
 
 	mk_cpu_set_format(buf, sizeof(buf), config->cpus);
 	pr_info("Successfully parsed %d physical CPUs: %s\n", cpu_count, buf);
+	return 0;
+}
+
+/**
+ * mk_dt_parse_llc_ways() - Parse an optional resctrl LLC capacity mask
+ *
+ * The mask uses the same least-significant-bit-first representation as the
+ * L3 CBM in resctrl's schemata file.  A baseline mask describes the ways
+ * available to the multikernel pool; an instance mask must be a non-overlapping
+ * subset of that pool mask.
+ */
+static int mk_dt_parse_llc_ways(const void *fdt, int resources_node,
+				struct mk_dt_config *config)
+{
+	const fdt32_t *prop;
+	int len;
+	u32 mask;
+
+	prop = fdt_getprop(fdt, resources_node, MK_DT_RESOURCE_LLC_WAYS,
+			   &len);
+	if (!prop)
+		return 0;
+
+	if (len != sizeof(*prop)) {
+		pr_err("Invalid %s property length: %d (must be one 32-bit cell)\n",
+		       MK_DT_RESOURCE_LLC_WAYS, len);
+		return -EINVAL;
+	}
+
+	mask = fdt32_to_cpu(*prop);
+	if (!mask) {
+		pr_err("Invalid zero %s\n", MK_DT_RESOURCE_LLC_WAYS);
+		return -EINVAL;
+	}
+
+	config->llc_way_mask = mask;
+	config->llc_way_mask_valid = true;
+	pr_info("Successfully parsed LLC way mask: 0x%08x\n", mask);
+
+	return 0;
+}
+
+/* Host-generated metadata consumed only from a per-instance manifest DTB. */
+static int mk_dt_parse_closid(const void *fdt, int resources_node,
+			      struct mk_dt_config *config)
+{
+	const fdt32_t *prop;
+	int len;
+
+	prop = fdt_getprop(fdt, resources_node, MK_DT_RESOURCE_CLOSID, &len);
+	if (!prop)
+		return 0;
+	if (len != sizeof(*prop)) {
+		pr_err("Invalid %s property length: %d\n",
+		       MK_DT_RESOURCE_CLOSID, len);
+		return -EINVAL;
+	}
+
+	config->resctrl_closid = fdt32_to_cpu(*prop);
+	if (config->resctrl_closid == RESCTRL_RESERVED_CLOSID) {
+		pr_err("Invalid reserved CLOSID in %s\n", MK_DT_RESOURCE_CLOSID);
+		return -EINVAL;
+	}
+	config->resctrl_closid_valid = true;
 	return 0;
 }
 
@@ -557,6 +626,26 @@ int mk_dt_parse(const void *dtb_data, size_t dtb_size,
 		return ret;
 	}
 
+	ret = mk_dt_parse_llc_ways(fdt, resources_node, config);
+	if (ret) {
+		pr_err("Failed to parse LLC way resources: %d\n", ret);
+		mk_dt_config_free(config);
+		return ret;
+	}
+
+	ret = mk_dt_parse_closid(fdt, resources_node, config);
+	if (ret) {
+		pr_err("Failed to parse resctrl CLOSID: %d\n", ret);
+		mk_dt_config_free(config);
+		return ret;
+	}
+	if (config->resctrl_closid_valid && !config->llc_way_mask_valid) {
+		pr_err("%s requires %s\n", MK_DT_RESOURCE_CLOSID,
+		       MK_DT_RESOURCE_LLC_WAYS);
+		mk_dt_config_free(config);
+		return -EINVAL;
+	}
+
 	ret = mk_dt_parse_devices(fdt, resources_node, config);
 	if (ret) {
 		pr_err("Failed to parse device resources: %d\n", ret);
@@ -603,6 +692,14 @@ int mk_dt_parse_resources(const void *fdt, int resources_node,
 	ret = mk_dt_parse_cpus(fdt, resources_node, config);
 	if (ret) {
 		pr_err("Failed to parse CPU resources for '%s': %d\n", instance_name, ret);
+		mk_dt_config_free(config);
+		return ret;
+	}
+
+	ret = mk_dt_parse_llc_ways(fdt, resources_node, config);
+	if (ret) {
+		pr_err("Failed to parse LLC way resources for '%s': %d\n",
+		       instance_name, ret);
 		mk_dt_config_free(config);
 		return ret;
 	}
@@ -846,6 +943,13 @@ void mk_dt_print_config(const struct mk_dt_config *config)
 		pr_info("  CPU assignment: unavailable (allocation failed)\n");
 	}
 
+	if (config->llc_way_mask_valid)
+		pr_info("  LLC way mask: 0x%08x\n", config->llc_way_mask);
+	else
+		pr_info("  LLC way mask: none specified\n");
+	if (config->resctrl_closid_valid)
+		pr_info("  resctrl CLOSID: %u\n", config->resctrl_closid);
+
 	if (config->pci_devices_valid) {
 		if (config->pci_device_count == 0) {
 			pr_info("  PCI devices: none specified\n");
@@ -981,6 +1085,20 @@ int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 				   cpu_count * sizeof(*cpu_array));
 		kfree(cpu_array);
 		if (ret) goto err_free;
+	}
+
+	if (instance->llc_way_mask_valid) {
+		ret = fdt_property_u32(fdt, MK_DT_RESOURCE_LLC_WAYS,
+				       instance->llc_way_mask);
+		if (ret)
+			goto err_free;
+	}
+
+	if (instance->resctrl_closid_valid) {
+		ret = fdt_property_u32(fdt, MK_DT_RESOURCE_CLOSID,
+				       instance->resctrl_closid);
+		if (ret)
+			goto err_free;
 	}
 
 	if ((instance->pci_devices_valid && instance->pci_device_count > 0) ||
