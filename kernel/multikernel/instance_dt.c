@@ -458,12 +458,8 @@ static int __init mk_copy_pci_devices(const struct mk_dt_config *config,
 			return -ENOMEM;
 		}
 
-		dst_dev->vendor = src_dev->vendor;
-		dst_dev->device = src_dev->device;
-		dst_dev->domain = src_dev->domain;
-		dst_dev->bus = src_dev->bus;
-		dst_dev->slot = src_dev->slot;
-		dst_dev->func = src_dev->func;
+		*dst_dev = *src_dev;
+		INIT_LIST_HEAD(&dst_dev->list);
 
 		list_add_tail(&dst_dev->list, &instance->pci_devices);
 		instance->pci_device_count++;

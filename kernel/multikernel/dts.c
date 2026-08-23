@@ -1200,6 +1200,38 @@ static int mk_dt_emit_devices(struct mk_instance *instance, void *fdt)
 	return fdt_end_node(fdt);
 }
 
+static int mk_dt_emit_aliases(struct mk_instance *instance, void *fdt)
+{
+	struct mk_pci_device *pci_dev;
+	bool open = false;
+	int ret;
+
+	if (!instance->pci_devices_valid)
+		return 0;
+
+	list_for_each_entry(pci_dev, &instance->pci_devices, list) {
+		char node_name[32], path[64];
+
+		if (!pci_dev->alias[0])
+			continue;
+
+		if (!open) {
+			ret = fdt_begin_node(fdt, "aliases");
+			if (ret)
+				return ret;
+			open = true;
+		}
+
+		mk_dt_pci_node_name(pci_dev, node_name, sizeof(node_name));
+		snprintf(path, sizeof(path), "/resources/devices/%s", node_name);
+		ret = fdt_property_string(fdt, pci_dev->alias, path);
+		if (ret)
+			return ret;
+	}
+
+	return open ? fdt_end_node(fdt) : 0;
+}
+
 /**
  * mk_dt_emit_instance() - Write one instance device tree into @fdt
  * @instance: Instance to describe
@@ -1256,6 +1288,8 @@ static int mk_dt_emit_instance(struct mk_instance *instance, void *fdt,
 	ret = mk_dt_emit_devices(instance, fdt);
 	if (!ret)
 		ret = fdt_end_node(fdt);	/* /resources */
+	if (!ret)
+		ret = mk_dt_emit_aliases(instance, fdt);
 	if (!ret)
 		ret = fdt_end_node(fdt);	/* root */
 	if (!ret)
