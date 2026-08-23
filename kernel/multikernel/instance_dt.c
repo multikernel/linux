@@ -15,6 +15,7 @@
 #include <linux/multikernel.h>
 #include <linux/io.h>
 #include <linux/pci.h>
+#include <linux/netdevice.h>
 #include <linux/libfdt.h>
 #include <linux/sizes.h>
 #include "internal.h"
@@ -906,6 +907,77 @@ check_bridge:
 	return false;
 }
 EXPORT_SYMBOL_GPL(mk_pci_should_probe);
+
+/**
+ * mk_pci_alias - The /aliases name of a PCI device this kernel was given
+ * @pdev: The PCI device being probed
+ *
+ * The host lists only pool devices it no longer drives, so its own
+ * naming is never affected; a spawn kernel lists exactly the devices it
+ * was given, so their aliases decide its names.
+ *
+ * Returns: the alias, valid while the device stays listed, or NULL
+ */
+const char *mk_pci_alias(struct pci_dev *pdev)
+{
+	struct mk_pci_device *pci_dev;
+	u16 domain = pci_domain_nr(pdev->bus);
+
+	if (!root_instance || !root_instance->pci_devices_valid)
+		return NULL;
+
+	list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
+		if (pci_dev->alias[0] &&
+		    pci_dev->domain == domain &&
+		    pci_dev->bus == pdev->bus->number &&
+		    pci_dev->slot == PCI_SLOT(pdev->devfn) &&
+		    pci_dev->func == PCI_FUNC(pdev->devfn))
+			return pci_dev->alias;
+	}
+
+	return NULL;
+}
+EXPORT_SYMBOL_GPL(mk_pci_alias);
+
+/*
+ * A netdev's alias is its interface name, the one the device had in the
+ * kernel that gave it away, so rename it once it is registered through
+ * the same path as a rename from userspace. netif_change_name() rejects
+ * a name that is too long or already in use, and the driver's name then
+ * stands.
+ */
+static int mk_netdev_alias_event(struct notifier_block *nb,
+				 unsigned long event, void *ptr)
+{
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+	const char *alias;
+	int ret;
+
+	if (event != NETDEV_REGISTER || !dev->dev.parent ||
+	    !dev_is_pci(dev->dev.parent))
+		return NOTIFY_DONE;
+
+	alias = mk_pci_alias(to_pci_dev(dev->dev.parent));
+	if (!alias)
+		return NOTIFY_DONE;
+
+	ret = netif_change_name(dev, alias);
+	if (ret)
+		netdev_warn(dev, "alias %s not applied: %d\n", alias, ret);
+
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block mk_netdev_alias_nb = {
+	.notifier_call = mk_netdev_alias_event,
+};
+
+static int __init mk_netdev_alias_init(void)
+{
+	return register_netdevice_notifier(&mk_netdev_alias_nb);
+}
+/* Before device_initcall, where the drivers that register netdevs run */
+subsys_initcall(mk_netdev_alias_init);
 
 bool mk_platform_device_allowed(const char *name, const char *hid)
 {

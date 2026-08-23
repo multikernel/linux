@@ -831,6 +831,7 @@ int mk_instance_set_kexec_active(int mk_id);
  */
 struct kimage;
 struct pci_bus;
+struct pci_dev;
 
 #ifdef CONFIG_MULTIKERNEL
 bool multikernel_allow_emergency_restart(void);
@@ -853,6 +854,9 @@ void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size);
 /* Device probe filtering against the instance's allowlist */
 bool mk_pci_should_probe(struct pci_bus *bus, int devfn);
 bool mk_platform_device_allowed(const char *name, const char *hid);
+
+/* Stable device names from the instance's /aliases */
+const char *mk_pci_alias(struct pci_dev *pdev);
 
 /* Early CPU registration from the manifest (spawn kernels) */
 void mk_register_cpus_from_manifest(void);
@@ -906,6 +910,10 @@ static inline bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
 static inline bool mk_platform_device_allowed(const char *name, const char *hid)
 {
 	return true;
+}
+static inline const char *mk_pci_alias(struct pci_dev *pdev)
+{
+	return NULL;
 }
 static inline void mk_register_cpus_from_manifest(void)
 {
