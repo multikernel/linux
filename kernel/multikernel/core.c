@@ -823,12 +823,13 @@ bool mk_root_has_pci_device(u16 domain, u8 bus, u8 devfn)
  * @domain: PCI domain
  * @bus: PCI bus
  * @devfn: PCI device and function (combined)
+ * @alias: Stable name for the device tree /aliases node, NULL or "" for none
  *
  * Returns: 0 on success, -EINVAL if there is no root instance, -EEXIST if
  * already listed, -ENODEV if the device does not exist, -ENOMEM on allocation
  * failure
  */
-int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn)
+int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn, const char *alias)
 {
 	struct mk_pci_device *root_dev;
 	struct pci_dev *pdev;
@@ -855,8 +856,8 @@ int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn)
 	root_dev->func = PCI_FUNC(devfn);
 	root_dev->vendor = pdev->vendor;
 	root_dev->device = pdev->device;
-	snprintf(root_dev->name, sizeof(root_dev->name), "pci_%04x_%02x_%02x_%x",
-		 domain, bus, root_dev->slot, root_dev->func);
+	if (alias)
+		strscpy(root_dev->alias, alias, sizeof(root_dev->alias));
 	INIT_LIST_HEAD(&root_dev->list);
 	pci_dev_put(pdev);
 

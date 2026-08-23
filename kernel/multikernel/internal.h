@@ -48,13 +48,13 @@ int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_le
  */
 int mk_pool_cpu_add(mk_phys_cpu_t cpu_id);
 int mk_pool_cpu_remove(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags);
-int mk_pool_device_add(u16 domain, u8 bus, u8 devfn);
+int mk_pool_device_add(u16 domain, u8 bus, u8 devfn, const char *alias);
 int mk_pool_device_remove(u16 domain, u8 bus, u8 devfn,
 			  const char *driver_override, u32 flags);
 
 /* Root pool bookkeeping for PCI devices, see core.c */
 bool mk_root_has_pci_device(u16 domain, u8 bus, u8 devfn);
-int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn);
+int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn, const char *alias);
 int mk_root_del_pci_device(u16 domain, u8 bus, u8 devfn);
 
 /* contig.c */
@@ -63,6 +63,9 @@ void mk_free_contig_pages(struct page *pages, unsigned long nr_pages);
 
 /* baseline.c */
 int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size);
+
+/* dts.c */
+const char *mk_dt_node_alias(const void *fdt, int node);
 /*
  * Parked CPUs this kernel can assign to child instances. Created when a
  * baseline is applied to this kernel; NULL until then. Managing a pool

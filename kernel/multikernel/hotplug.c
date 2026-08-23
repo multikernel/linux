@@ -1133,10 +1133,11 @@ int mk_pool_cpu_remove(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
  * @domain: PCI domain
  * @bus: PCI bus
  * @devfn: PCI device and function (combined)
+ * @alias: Stable name for the device tree /aliases node, NULL for none
  *
  * Returns: 0 on success, negative error code on failure
  */
-int mk_pool_device_add(u16 domain, u8 bus, u8 devfn)
+int mk_pool_device_add(u16 domain, u8 bus, u8 devfn, const char *alias)
 {
 	int ret;
 
@@ -1144,7 +1145,7 @@ int mk_pool_device_add(u16 domain, u8 bus, u8 devfn)
 	if (ret)
 		return ret;
 
-	ret = mk_root_add_pci_device(domain, bus, devfn);
+	ret = mk_root_add_pci_device(domain, bus, devfn, alias);
 	if (ret && ret != -EEXIST) {
 		/* Untracked, the device would belong to neither side */
 		pr_err("Multikernel hotplug: device %04x:%02x:%02x.%x not tracked in pool: %d\n",
@@ -1669,7 +1670,7 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 
 	if (instance_id == root_instance->id) {
 		if (mk_cpu_pool)
-			return mk_pool_device_add(domain, bus, devfn);
+			return mk_pool_device_add(domain, bus, devfn, NULL);
 		return mk_do_device_remove(domain, bus, devfn);
 	}
 

@@ -39,6 +39,83 @@ static const void *mk_dt_get_base_fdt(void)
 	return root_instance->dtb_data;
 }
 
+static void mk_dt_pci_node_name(const struct mk_pci_device *pci_dev, char *buf,
+				size_t size)
+{
+	snprintf(buf, size, "pci_%04x_%02x_%02x_%x", pci_dev->domain,
+		 pci_dev->bus, pci_dev->slot, pci_dev->func);
+}
+
+/**
+ * mk_dt_node_alias() - Find the /aliases entry naming a node
+ * @fdt: Device tree blob
+ * @node: Offset of the node
+ *
+ * Returns: the alias name, valid as long as @fdt is, or NULL if none
+ */
+const char *mk_dt_node_alias(const void *fdt, int node)
+{
+	int aliases, prop;
+
+	aliases = fdt_path_offset(fdt, "/aliases");
+	if (aliases < 0)
+		return NULL;
+
+	fdt_for_each_property_offset(prop, fdt, aliases) {
+		const char *name, *path;
+
+		path = fdt_getprop_by_offset(fdt, prop, &name, NULL);
+		if (path && path[0] == '/' && fdt_path_offset(fdt, path) == node)
+			return name;
+	}
+
+	return NULL;
+}
+
+/**
+ * mk_dt_find_device() - Resolve a device reference to its node
+ * @fdt: Device tree blob holding /resources/devices
+ * @ref: An alias, a node name, a pci-id ("DDDD:BB:SS.F") or the node
+ *       name derived from one ("pci_DDDD_BB_SS_F")
+ *
+ * Returns: the node offset, or a negative libfdt error
+ */
+static int mk_dt_find_device(const void *fdt, const char *ref)
+{
+	unsigned int domain, bus, slot, func;
+	char path[128];
+	int devices, node;
+
+	node = fdt_path_offset(fdt, ref);
+	if (node >= 0)
+		return node;
+
+	snprintf(path, sizeof(path), "/resources/devices/%s", ref);
+	node = fdt_path_offset(fdt, path);
+	if (node >= 0)
+		return node;
+
+	if (sscanf(ref, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4 &&
+	    sscanf(ref, "pci_%x_%x_%x_%x", &domain, &bus, &slot, &func) != 4)
+		return -FDT_ERR_NOTFOUND;
+
+	devices = fdt_path_offset(fdt, "/resources/devices");
+	if (devices < 0)
+		return devices;
+
+	fdt_for_each_subnode(node, fdt, devices) {
+		unsigned int d, b, sl, f;
+		const char *pci_id;
+
+		pci_id = fdt_getprop(fdt, node, "pci-id", NULL);
+		if (pci_id && sscanf(pci_id, "%x:%x:%x.%x", &d, &b, &sl, &f) == 4 &&
+		    d == domain && b == bus && sl == slot && f == func)
+			return node;
+	}
+
+	return -FDT_ERR_NOTFOUND;
+}
+
 /**
  * Configuration initialization and cleanup
  */
@@ -250,7 +327,7 @@ static int mk_dt_parse_single_pci_device(const void *source_fdt, int dev_node,
 	const fdt32_t *vendor_prop, *device_prop;
 	struct mk_pci_device *pci_dev;
 	unsigned int domain, bus, slot, func;
-	const char *node_name;
+	const char *node_name, *alias;
 	int len;
 
 	node_name = fdt_get_name(source_fdt, dev_node, NULL);
@@ -294,6 +371,9 @@ static int mk_dt_parse_single_pci_device(const void *source_fdt, int dev_node,
 	pci_dev->bus = (u8)bus;
 	pci_dev->slot = (u8)slot;
 	pci_dev->func = (u8)func;
+	alias = mk_dt_node_alias(source_fdt, dev_node);
+	if (alias)
+		strscpy(pci_dev->alias, alias, sizeof(pci_dev->alias));
 
 	list_add_tail(&pci_dev->list, &config->pci_devices);
 	config->pci_device_count++;
@@ -404,17 +484,19 @@ static int mk_dt_parse_embedded_devices(const void *fdt, int resources_node,
  *
  * Format: device-names = "dev1", "dev2", ...;
  *
- * This approach:
- * - Uses simple string names instead of phandles
- * - No need for dtc -@ compilation
- * - No __symbols__ or __fixups__ complexity
- * - Just looks up /resources/devices/{name} in base DTB
- * - Reads device-type property first to dispatch to correct parser
+ * A PCI device is identified by its address, never by a name: names
+ * differ between kernels while the BDF is fixed by the fabric. Each
+ * entry is resolved against the base DTB as an /aliases name, a node
+ * name under /resources/devices, a pci-id or the node name derived
+ * from one, and the device-type property of the node found dispatches
+ * to the right parser. Aliases follow the devicetree specification and
+ * name a device as the kernel that owns it does, so a spawn kernel names
+ * its devices from them (nvme0, enp9s0) instead of by probe order.
  *
  * Example base DTB:
  *   resources {
  *       devices {
- *           enp9s0_dev {
+ *           pci_0000_09_00_0 {
  *               device-type = "pci";
  *               pci-id = "0000:09:00.0";
  *               vendor-id = <0x1af4>;
@@ -430,10 +512,15 @@ static int mk_dt_parse_embedded_devices(const void *fdt, int resources_node,
  *           };
  *       };
  *   };
+ *   aliases {
+ *       enp9s0 = "/resources/devices/pci_0000_09_00_0";
+ *   };
  *
- * Example overlay:
+ * Example overlay, any of the three PCI spellings is accepted:
  *   resources {
- *       device-names = "enp9s0_dev", "serial_console", "keyboard";
+ *       device-names = "enp9s0", "serial_console", "keyboard";
+ *       device-names = "0000:09:00.0", "serial_console", "keyboard";
+ *       device-names = "pci_0000_09_00_0", "serial_console", "keyboard";
  *   };
  */
 static int mk_dt_parse_devices(const void *fdt, int chosen_node,
@@ -443,7 +530,6 @@ static int mk_dt_parse_devices(const void *fdt, int chosen_node,
 	const char *prop_data;
 	const char *device_name;
 	const char *device_type;
-	char device_path[256];
 	int len, offset, dev_node, ret;
 	int device_count = 0;
 
@@ -473,13 +559,9 @@ static int mk_dt_parse_devices(const void *fdt, int chosen_node,
 
 		device_count++;
 
-		snprintf(device_path, sizeof(device_path),
-			 "/resources/devices/%s", device_name);
-
-		dev_node = fdt_path_offset(base_fdt, device_path);
+		dev_node = mk_dt_find_device(base_fdt, device_name);
 		if (dev_node < 0) {
-			pr_err("Device '%s' not found in base DTB at path '%s'\n",
-			       device_name, device_path);
+			pr_err("Device '%s' not found in base DTB\n", device_name);
 			return -ENOENT;
 		}
 
@@ -1071,14 +1153,15 @@ static int mk_dt_emit_devices(struct mk_instance *instance, void *fdt)
 
 	if (has_pci) {
 		list_for_each_entry(pci_dev, &instance->pci_devices, list) {
-			char pci_id_str[32];
+			char pci_id_str[32], node_name[32];
 
 			snprintf(pci_id_str, sizeof(pci_id_str),
 				 "%04x:%02x:%02x.%x", pci_dev->domain,
 				 pci_dev->bus, pci_dev->slot, pci_dev->func);
+			mk_dt_pci_node_name(pci_dev, node_name,
+					    sizeof(node_name));
 
-			ret = fdt_begin_node(fdt, pci_dev->name[0] ?
-					     pci_dev->name : "unnamed_pci");
+			ret = fdt_begin_node(fdt, node_name);
 			if (!ret)
 				ret = fdt_property_string(fdt, "device-type",
 							  "pci");

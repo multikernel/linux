@@ -164,6 +164,8 @@ Operation Sections
     Subnodes are ``pci@N`` items:
 
       - ``pci-id``: "DDDD:BB:SS.F" (string)
+      - ``alias``: stable name for the device tree ``/aliases`` node, such
+        as "nvme0" (string, optional, ``device-add`` to the pool only)
       - ``driver``: driver to bind (string, optional, ``device-add`` to an
         instance only)
       - ``flags``: device flags (u32, optional)

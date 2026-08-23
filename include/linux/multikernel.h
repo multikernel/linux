@@ -486,8 +486,10 @@ struct mk_memory_region {
  * Represents a single PCI device that should be accessible to an instance.
  * Format: vendor:device@domain:bus:slot.func
  */
+#define MK_PCI_ALIAS_LEN 32	/* Devicetree spec: alias names are at most 31 chars */
+
 struct mk_pci_device {
-	char name[64];     /* Device name from DTB (e.g., "enp9s0_dev") */
+	char alias[MK_PCI_ALIAS_LEN];	/* Stable name from /aliases, "" if none */
 	u16 vendor;        /* PCI vendor ID */
 	u16 device;        /* PCI device ID */
 	u16 domain;        /* PCI domain number */
