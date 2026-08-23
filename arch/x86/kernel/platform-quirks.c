@@ -14,8 +14,10 @@
 #include <asm/e820/api.h>
 #include <asm/apic.h>
 #include <asm/apicdef.h>
+#include <linux/cpufeature.h>
 #include <asm/mpspec.h>
 #include <asm/numa.h>
+#include <asm/page.h>
 #include <linux/pgtable.h>
 #include <asm/pgtable.h>
 #include <asm/pgtable_64_types.h>
@@ -28,6 +30,35 @@ extern pmd_t *populate_extra_pmd(unsigned long vaddr);
 extern unsigned long orig_boot_params;
 
 #ifdef CONFIG_MULTIKERNEL
+static unsigned long multikernel_cpu_khz;
+static unsigned long multikernel_tsc_khz;
+
+static unsigned long multikernel_calibrate_cpu(void)
+{
+	return multikernel_cpu_khz;
+}
+
+static unsigned long multikernel_calibrate_tsc(void)
+{
+	return multikernel_tsc_khz;
+}
+
+static void __init multikernel_setup_calibration(void)
+{
+	phys_addr_t ctx_phys = orig_boot_params -
+		offsetof(struct mk_spawn_context, bp);
+	struct mk_spawn_context *ctx = mk_validate_boot_context(ctx_phys);
+
+	if (!ctx || !ctx->boot_tsc_khz)
+		return;
+
+	multikernel_tsc_khz = ctx->boot_tsc_khz;
+	multikernel_cpu_khz = ctx->boot_cpu_khz ?: ctx->boot_tsc_khz;
+	x86_platform.calibrate_cpu = multikernel_calibrate_cpu;
+	x86_platform.calibrate_tsc = multikernel_calibrate_tsc;
+	setup_force_cpu_cap(X86_FEATURE_TSC_KNOWN_FREQ);
+}
+
 /*
  * Custom wakeup for multikernel spawn kernels.
  * Uses shared spawn table instead of realmode trampoline.
@@ -105,6 +136,10 @@ static void __init multikernel_parse_smp_config(void)
 	 */
 	apic_update_callback(wakeup_secondary_cpu_64, multikernel_wakeup_cpu);
 }
+#else
+static inline void multikernel_setup_calibration(void)
+{
+}
 #endif /* CONFIG_MULTIKERNEL */
 
 void __init x86_early_init_platform_quirks(void)
@@ -135,6 +170,8 @@ void __init x86_early_init_platform_quirks(void)
 		x86_platform.legacy.i8042 = X86_LEGACY_I8042_PLATFORM_ABSENT;
 		break;
 	case X86_SUBARCH_MULTIKERNEL:
+		multikernel_setup_calibration();
+		x86_multikernel_pci_platform_init();
 		x86_platform.legacy.devices.pnpbios = 0;
 		x86_platform.legacy.i8042 = X86_LEGACY_I8042_PLATFORM_ABSENT;
 		x86_platform.legacy.rtc = 0;
@@ -175,7 +212,9 @@ void __init x86_early_init_platform_quirks(void)
 		 * the PIT - which belongs to the host - and then request
 		 * legacy IRQ0, which can never reach an instance CPU that
 		 * has neither a PIC nor an IO-APIC. Ticks come from the
-		 * local APIC timer via setup_percpu_clockev() instead.
+		 * local APIC timer initialized by setup_percpu_clockev().
+		 * Keeping global_clock_event unset bypasses LAPIC timer
+		 * verification, whose fallback path requires legacy IRQ0.
 		 */
 		x86_init.timers.timer_init = x86_init_noop;
 		x86_init.timers.wallclock_init = x86_init_noop;

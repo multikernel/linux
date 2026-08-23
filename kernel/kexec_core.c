@@ -595,6 +595,7 @@ void kimage_free(struct kimage *image)
 {
 	kimage_entry_t *ptr, entry;
 	kimage_entry_t ind = 0;
+	struct mk_instance *route_instance = NULL;
 
 	if (!image)
 		return;
@@ -608,6 +609,10 @@ void kimage_free(struct kimage *image)
 
 	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
 		unsigned long i;
+
+		route_instance = image->mk_instance;
+		if (route_instance)
+			down_write(&route_instance->control_route_sem);
 
 		for (i = 0; i < image->nr_segments; i++) {
 			void *virt_addr = phys_to_virt(image->segment[i].mem);
@@ -629,7 +634,6 @@ void kimage_free(struct kimage *image)
 			image->mk_instance->ipi_phys = 0;
 			image->mk_instance->kimage = NULL;
 			mk_instance_set_state(image->mk_instance, MK_STATE_READY);
-			mk_instance_put(image->mk_instance);
 			image->mk_instance = NULL;
 		}
 
@@ -643,6 +647,10 @@ void kimage_free(struct kimage *image)
 			unsigned int order = get_order(ipi_buffer_size);
 			__free_pages(phys_to_page(image->mk_ipi), order);
 			image->mk_ipi = 0;
+		}
+		if (route_instance) {
+			up_write(&route_instance->control_route_sem);
+			mk_instance_put(route_instance);
 		}
 	}
 #ifdef CONFIG_CRASH_DUMP
@@ -1688,6 +1696,8 @@ int multikernel_kexec_by_id(int mk_id)
 {
 	struct kimage *mk_image;
 	struct mk_instance *instance;
+	bool transaction_locked = false;
+	bool route_locked = false;
 	int cpu = -1;
 	int i, rc;
 
@@ -1702,9 +1712,22 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	instance = mk_image->mk_instance;
+	if (instance->state != MK_STATE_LOADED) {
+		pr_err("Multikernel instance %d is not loadable (state=%d)\n",
+		       mk_id, instance->state);
+		rc = -EINVAL;
+		goto unlock;
+	}
+	mk_cpu_transaction_lock();
+	transaction_locked = true;
+	down_write(&instance->control_route_sem);
+	route_locked = true;
 	if (!mk_cpu_set_empty(instance->cpus)) {
 		mk_phys_cpu_t phys_cpu = mk_cpu_set_first(instance->cpus);
 
+		if (!mk_cpu_set_contains(instance->cpus,
+					 mk_instance_irq_route_load(instance)))
+			mk_instance_irq_route_store(instance, phys_cpu);
 		cpu = arch_cpu_from_physical_id(phys_cpu);
 		if (cpu < 0) {
 			pr_err("Physical CPU %llu not found in logical CPU map\n", phys_cpu);
@@ -1734,6 +1757,18 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	/*
+	 * Stop and reset every leased VF before rewriting instance memory. A
+	 * force-halted kernel may have left bus mastering enabled and DMA in
+	 * flight into the image that is about to be reused.
+	 */
+	rc = mk_pci_prepare_instance_start(instance);
+	if (rc) {
+		pr_err("Failed to prepare PCI assignments for instance %d restart: %d\n",
+		       mk_id, rc);
+		goto unlock;
+	}
+
+	/*
 	 * Booting consumes the image: the spawn kernel writes its .data and
 	 * patches its own text, so the copy in instance memory is spent once
 	 * it has run. Re-copy it from the source buffers kept at load time,
@@ -1756,10 +1791,11 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	rc = mk_manifest_finalize(mk_image);
-	if (rc)
-		pr_warn("Manifest finalization failed: %d\n", rc);
-	else
-		pr_info("Manifest finalized for multikernel instance\n");
+	if (rc) {
+		pr_err("Manifest finalization failed: %d\n", rc);
+		goto unlock;
+	}
+	pr_info("Manifest finalized for multikernel instance\n");
 
 	/*
 	 * Point at the ring this image actually carries. Every load
@@ -1775,32 +1811,75 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	/*
-	 * Start the instance with an empty ring. It outlives the kernel
-	 * that was using it, so a new instance would otherwise inherit that
-	 * kernel's indices and any slot it left half written - which stalls
-	 * the reader, since an unpublished slot means "the sender is still
-	 * filling this one". Anything left in there was addressed to a
-	 * kernel that is gone.
+	 * Start the instance with an empty downlink after its CPUs have been
+	 * confirmed parked. The host is the only producer for this ring, so no
+	 * publisher can race the reset once the old receiver is quiesced.
 	 */
-	if (instance->ipi_data)
-		memset(instance->ipi_data, 0, sizeof(*instance->ipi_data));
+	if (instance->ipi_data) {
+		rc = mk_ipi_shared_reset_downlink(instance->ipi_data, mk_id);
+		if (rc) {
+			pr_err("Failed to reset instance %d IPI downlink: %d\n",
+			       mk_id, rc);
+			goto unlock;
+		}
+	}
+	rc = mk_arch_spawn_instance(mk_image, instance, cpu);
+	if (rc)
+		goto unlock;
 
 	/*
-	 * Same for the other direction: whatever the halted instance left
-	 * queued for us is addressed from a kernel that no longer exists,
-	 * and a slot it claimed but never published stalls our ring for
-	 * good.
+	 * The instance is running once its CPUs leave the park loop. Publish that
+	 * state before dropping the global kexec lock so another exec cannot race
+	 * this boot while the readiness handshake is pending.
 	 */
-	mk_ipi_ring_drop_pending();
+	rc = mk_instance_set_kexec_active(mk_image->mk_id);
+	if (rc) {
+		int abort_ret;
 
-	rc = mk_arch_spawn_instance(mk_image, instance, cpu);
-	if (rc == 0) {
-		rc = mk_instance_set_kexec_active(mk_image->mk_id);
-		if (rc)
-			pr_warn("Failed to set instance %d as active: %d\n", mk_image->mk_id, rc);
+		mutex_lock(&instance->resource_mutex);
+		mk_instance_set_state(instance, MK_STATE_FAILED);
+		mutex_unlock(&instance->resource_mutex);
+		up_write(&instance->control_route_sem);
+		route_locked = false;
+		mk_cpu_transaction_unlock();
+		transaction_locked = false;
+		abort_ret = mk_instance_abort_spawn(instance);
+		if (abort_ret)
+			pr_crit("Instance %d activation abort failed: %d\n",
+				mk_id, abort_ret);
+		goto unlock;
 	}
 
+	/* The launch no longer needs the CPU route or transaction pinned. */
+	up_write(&instance->control_route_sem);
+	route_locked = false;
+	mk_cpu_transaction_unlock();
+	transaction_locked = false;
+
+	/* Do not block crash kexec while a spawn completes its boot handshake. */
+	kexec_unlock();
+	rc = mk_ipi_shared_wait_ready(instance->ipi_data, mk_id,
+				      MK_IPI_READY_TIMEOUT_MS);
+	if (rc) {
+		int abort_ret;
+
+		pr_err("Instance %d did not acknowledge IPI ABI %u: %d\n",
+		       mk_id, MK_IPI_ABI_VERSION, rc);
+		mutex_lock(&instance->resource_mutex);
+		mk_instance_set_state(instance, MK_STATE_FAILED);
+		mutex_unlock(&instance->resource_mutex);
+		abort_ret = mk_instance_abort_spawn(instance);
+		if (abort_ret)
+			pr_crit("Instance %d IPI ABI timeout abort failed: %d\n",
+				mk_id, abort_ret);
+	}
+	return rc;
+
 unlock:
+	if (route_locked)
+		up_write(&instance->control_route_sem);
+	if (transaction_locked)
+		mk_cpu_transaction_unlock();
 	kexec_unlock();
 	return rc;
 }

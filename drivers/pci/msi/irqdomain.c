@@ -4,6 +4,7 @@
  */
 #include <linux/acpi_iort.h>
 #include <linux/irqdomain.h>
+#include <linux/multikernel.h>
 #include <linux/of_irq.h>
 
 #include "msi.h"
@@ -11,17 +12,37 @@
 int pci_msi_setup_msi_irqs(struct pci_dev *dev, int nvec, int type)
 {
 	struct irq_domain *domain;
+	bool controlled = mk_pci_msi_controlled(dev);
+	int ret;
+
+	if (controlled) {
+		ret = mk_pci_msi_prepare(dev, nvec, type);
+		if (ret)
+			return ret;
+	}
 
 	domain = dev_get_msi_domain(&dev->dev);
 	if (domain && irq_domain_is_hierarchy(domain))
-		return msi_domain_alloc_irqs_all_locked(&dev->dev, MSI_DEFAULT_DOMAIN, nvec);
+		ret = msi_domain_alloc_irqs_all_locked(&dev->dev,
+						       MSI_DEFAULT_DOMAIN, nvec);
+	else
+		ret = pci_msi_legacy_setup_msi_irqs(dev, nvec, type);
+	if (!ret && controlled)
+		ret = mk_pci_msi_activate(dev);
 
-	return pci_msi_legacy_setup_msi_irqs(dev, nvec, type);
+	if (ret && controlled && mk_pci_msi_teardown(dev))
+		pr_err("Failed to roll back host-owned MSI setup for %s\n",
+		       pci_name(dev));
+	return ret;
 }
 
 void pci_msi_teardown_msi_irqs(struct pci_dev *dev)
 {
 	struct irq_domain *domain;
+
+	if (mk_pci_msi_controlled(dev) && mk_pci_msi_teardown(dev))
+		pr_err("Failed to tear down host-owned MSI vectors for %s\n",
+		       pci_name(dev));
 
 	domain = dev_get_msi_domain(&dev->dev);
 	if (domain && irq_domain_is_hierarchy(domain)) {

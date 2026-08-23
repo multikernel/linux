@@ -554,6 +554,11 @@ static void *bzImage64_load(struct kimage *image, char *kernel,
 				  .buf_max = ULONG_MAX, .top_down = true };
 
 	header = (struct setup_header *)(kernel + setup_hdr_offset);
+	if (image->type == KEXEC_TYPE_MULTIKERNEL &&
+	    !(header->xloadflags & XLF_MULTIKERNEL_IPI)) {
+		pr_err("Loaded kernel lacks the required shared transport layout\n");
+		return ERR_PTR(-EPROTONOSUPPORT);
+	}
 	setup_sects = header->setup_sects;
 	if (setup_sects == 0)
 		setup_sects = 4;

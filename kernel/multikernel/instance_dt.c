@@ -17,6 +17,7 @@
 #include <linux/pci.h>
 #include <linux/libfdt.h>
 #include <linux/sizes.h>
+#include <linux/smp.h>
 #include "internal.h"
 
 #define PROP_SUB_FDT "fdt"
@@ -33,6 +34,23 @@
  */
 struct mk_instance *root_instance = NULL;
 EXPORT_SYMBOL_GPL(root_instance);
+
+static void __init __noreturn mk_manifest_reject_and_park(int error)
+{
+	int ret;
+
+	ret = mk_arch_prepare_park();
+	if (ret || !mk_arch_park_ready())
+		panic("multikernel: rejected manifest before park path became ready");
+	ret = mk_register_stop_nmi_handler();
+	if (ret)
+		pr_emerg("multikernel: stop-NMI registration failed while rejecting manifest: %d\n",
+			 ret);
+	pr_emerg("multikernel: parking CPUs after rejecting supplied manifest: %d\n",
+		 error);
+	smp_call_function(mk_enter_pool_state, NULL, 0);
+	mk_enter_pool_state(NULL);
+}
 
 /*
  * Collect every CPU the instance might receive through hotplug later:
@@ -168,6 +186,7 @@ int mk_manifest_add_instance_dtb(struct kimage *image, void *fdt, int mk_id)
  */
 int mk_manifest_add_host_ipi(struct kimage *image, void *fdt)
 {
+	mk_phys_cpu_t target_cpu = arch_cpu_physical_id(0);
 	int ret = 0;
 
 	if (!root_instance->ipi_data) {
@@ -175,12 +194,15 @@ int mk_manifest_add_host_ipi(struct kimage *image, void *fdt)
 		return 0;
 	}
 
-	pr_info("Preserving host IPI buffer: phys=0x%llx, pages=%u\n",
-		(unsigned long long)root_instance->ipi_phys, root_instance->ipi_pages);
+	pr_info("Preserving host IPI buffer: phys=0x%llx, pages=%u, target CPU=%llu\n",
+		(unsigned long long)root_instance->ipi_phys,
+		root_instance->ipi_pages,
+		(unsigned long long)target_cpu);
 
 	ret |= fdt_begin_node(fdt, "host-ipi-buffer");
 	ret |= fdt_property_u64(fdt, "phys-addr", root_instance->ipi_phys);
 	ret |= fdt_property_u32(fdt, "pages", root_instance->ipi_pages);
+	ret |= fdt_property_u64(fdt, "target-cpu", target_cpu);
 	ret |= fdt_end_node(fdt);
 
 	if (ret) {
@@ -386,6 +408,7 @@ static struct mk_instance * __init alloc_mk_instance(int instance_id, const char
 			pr_err("Failed to allocate IPI buffer for instance %d\n", instance_id);
 			goto err_free_name;
 		}
+		mk_shared_data_reset(instance->ipi_data);
 		instance->ipi_phys = virt_to_phys(instance->ipi_data);
 		instance->ipi_pages = (sizeof(struct mk_shared_data) + PAGE_SIZE - 1) / PAGE_SIZE;
 
@@ -399,10 +422,13 @@ static struct mk_instance * __init alloc_mk_instance(int instance_id, const char
 		goto err_free_ipi;
 
 	instance->state = MK_STATE_READY;
+	init_rwsem(&instance->control_route_sem);
+	instance->irq_route_cpu = MK_PHYS_CPU_INVALID;
 	INIT_LIST_HEAD(&instance->memory_regions);
 	INIT_LIST_HEAD(&instance->list);
 	kref_init(&instance->refcount);
 	INIT_LIST_HEAD(&instance->pci_devices);
+	mk_pci_lease_instance_init(instance);
 	instance->pci_devices_valid = false;
 	instance->pci_device_count = 0;
 	INIT_LIST_HEAD(&instance->platform_devices);
@@ -452,19 +478,13 @@ static int __init mk_copy_pci_devices(const struct mk_dt_config *config,
 	instance->pci_devices_valid = true;
 
 	list_for_each_entry(src_dev, &config->pci_devices, list) {
-		dst_dev = kzalloc(sizeof(*dst_dev), GFP_KERNEL);
+		dst_dev = kmemdup(src_dev, sizeof(*dst_dev), GFP_KERNEL);
 		if (!dst_dev) {
 			pr_err("Failed to allocate PCI device entry\n");
 			return -ENOMEM;
 		}
 
-		dst_dev->vendor = src_dev->vendor;
-		dst_dev->device = src_dev->device;
-		dst_dev->domain = src_dev->domain;
-		dst_dev->bus = src_dev->bus;
-		dst_dev->slot = src_dev->slot;
-		dst_dev->func = src_dev->func;
-
+		INIT_LIST_HEAD(&dst_dev->list);
 		list_add_tail(&dst_dev->list, &instance->pci_devices);
 		instance->pci_device_count++;
 	}
@@ -543,6 +563,12 @@ static int __init mk_restore_instance_ipi(const void *manifest, struct mk_instan
 			 (unsigned long long)ipi_phys, ipi_pages);
 		return 0;
 	}
+	if (ipi_size < sizeof(struct mk_shared_data)) {
+		pr_err("IPI buffer is too small for ABI %u: %zu < %zu\n",
+		       MK_IPI_ABI_VERSION, ipi_size,
+		       sizeof(struct mk_shared_data));
+		return -EPROTO;
+	}
 
 	instance->ipi_data = memremap(ipi_phys, ipi_size, MEMREMAP_WB);
 	if (!instance->ipi_data) {
@@ -564,8 +590,10 @@ static struct mk_instance * __init mk_restore_host_instance(const void *manifest
 	struct mk_instance *host_instance;
 	int host_ipi_node;
 	const fdt64_t *phys_prop;
+	const fdt64_t *cpu_prop;
 	const fdt32_t *pages_prop;
 	phys_addr_t host_ipi_phys = 0;
+	mk_phys_cpu_t host_ipi_cpu = MK_PHYS_CPU_INVALID;
 	u32 host_ipi_pages = 0;
 	size_t host_ipi_size = 0;
 	int len;
@@ -585,10 +613,21 @@ static struct mk_instance * __init mk_restore_host_instance(const void *manifest
 		host_ipi_pages = fdt32_to_cpu(*pages_prop);
 		host_ipi_size = (size_t)host_ipi_pages << PAGE_SHIFT;
 	}
+	cpu_prop = fdt_getprop(manifest, host_ipi_node, "target-cpu", &len);
+	if (cpu_prop && len == sizeof(*cpu_prop))
+		host_ipi_cpu = fdt64_to_cpu(*cpu_prop);
 
-	if (!host_ipi_phys || !host_ipi_pages) {
-		pr_warn("Incomplete host IPI buffer info (phys=0x%llx, pages=%u)\n",
-			(unsigned long long)host_ipi_phys, host_ipi_pages);
+	if (!host_ipi_phys || !host_ipi_pages ||
+	    host_ipi_cpu == MK_PHYS_CPU_INVALID) {
+		pr_warn("Incomplete host IPI buffer info (phys=0x%llx, pages=%u, target CPU=%llu)\n",
+			(unsigned long long)host_ipi_phys, host_ipi_pages,
+			(unsigned long long)host_ipi_cpu);
+		return NULL;
+	}
+	if (host_ipi_size < sizeof(struct mk_shared_data)) {
+		pr_err("Host IPI buffer is too small for ABI %u: %zu < %zu\n",
+		       MK_IPI_ABI_VERSION, host_ipi_size,
+		       sizeof(struct mk_shared_data));
 		return NULL;
 	}
 
@@ -596,8 +635,7 @@ static struct mk_instance * __init mk_restore_host_instance(const void *manifest
 	if (!host_instance)
 		return NULL;
 
-	/* Set physical CPU 0 as default target for host IPIs */
-	if (mk_cpu_set_add(host_instance->cpus, 0)) {
+	if (mk_cpu_set_add(host_instance->cpus, host_ipi_cpu)) {
 		kfree(host_instance->name);
 		mk_cpu_set_free(host_instance->cpus);
 		kfree(host_instance);
@@ -615,9 +653,9 @@ static struct mk_instance * __init mk_restore_host_instance(const void *manifest
 	}
 	host_instance->ipi_phys = host_ipi_phys;
 	host_instance->ipi_pages = host_ipi_pages;
-	pr_info("Restored host IPI buffer: phys=0x%llx, virt=%px, pages=%u\n",
+	pr_info("Restored host IPI buffer: phys=0x%llx, virt=%p, pages=%u, target CPU=%llu\n",
 		(unsigned long long)host_ipi_phys, host_instance->ipi_data,
-		host_ipi_pages);
+		host_ipi_pages, (unsigned long long)host_ipi_cpu);
 	pr_info("Registered host instance (ID 0) for spawn→host communication\n");
 
 	return host_instance;
@@ -644,6 +682,9 @@ int __init mk_instance_restore_from_manifest(void)
 	const char *instance_name;
 	const void *manifest = NULL;
 	phys_addr_t fdt_phys;
+
+	if (mk_manifest_rejected())
+		mk_manifest_reject_and_park(-EPROTO);
 
 	fdt_phys = mk_manifest_phys();
 	if (!fdt_phys) {
@@ -682,15 +723,15 @@ int __init mk_instance_restore_from_manifest(void)
 
 	int mk_node = fdt_subnode_offset(manifest, 0, "multikernel");
 	if (mk_node < 0) {
-		pr_info("No multikernel node found in manifest\n");
-		ret = 0;
+		pr_err("No multikernel node found in supplied manifest\n");
+		ret = -EINVAL;
 		goto cleanup_fdt;
 	}
 
 	const void *dtb_data = fdt_getprop(manifest, mk_node, "dtb-data", &dtb_len);
 	if (!dtb_data || dtb_len <= 0) {
-		pr_info("No dtb-data property found in multikernel node\n");
-		ret = 0;
+		pr_err("No dtb-data property found in multikernel node\n");
+		ret = -EINVAL;
 		goto cleanup_fdt;
 	}
 
@@ -787,8 +828,26 @@ int __init mk_instance_restore_from_manifest(void)
 
 	host_instance = mk_restore_host_instance(manifest);
 	if (!host_instance)
-		pr_warn("Failed to restore host instance (spawn→host communication unavailable)\n");
+		mk_manifest_reject_and_park(-ENODEV);
 
+	ret = mk_ipi_shared_validate(instance->ipi_data);
+	if (ret)
+		mk_manifest_reject_and_park(ret);
+	ret = mk_ipi_shared_validate(host_instance->ipi_data);
+	if (ret)
+		mk_manifest_reject_and_park(ret);
+	if (!atomic_read_acquire(&host_instance->ipi_data->ready) ||
+	    READ_ONCE(host_instance->ipi_data->ready_instance_id) !=
+		    host_instance->id)
+		mk_manifest_reject_and_park(-EHOSTDOWN);
+	ret = mk_arch_prepare_park();
+	if (ret)
+		mk_manifest_reject_and_park(ret);
+	if (!mk_arch_park_ready())
+		mk_manifest_reject_and_park(-EIO);
+	ret = mk_register_stop_nmi_handler();
+	if (ret)
+		mk_manifest_reject_and_park(ret);
 	pr_info("Successfully restored multikernel root instance %d ('%s') from manifest (%d bytes)\n",
 		instance_id, instance_name, dtb_len);
 	mk_dt_config_free(&config);
@@ -822,94 +881,13 @@ cleanup_dtb:
 	kfree(dtb_virt);
 cleanup_fdt:
 	early_memunmap((void *)manifest, PAGE_SIZE);
+	if (ret)
+		mk_manifest_reject_and_park(ret);
 	return ret;
 }
 
 /* Run at early_initcall to enforce CPU restrictions before per-CPU allocations */
 early_initcall(mk_instance_restore_from_manifest);
-
-/**
- * mk_pci_should_probe - Check if PCI probing should occur at all
- * @bus: PCI bus
- * @devfn: device/function number
- *
- * Called BEFORE any PCI config space reads to determine if probing
- * should proceed. This prevents config space accesses to devices
- * that are not in the whitelist.
- *
- * Returns: true if probing should proceed, false to skip entirely
- */
-bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
-{
-	struct mk_pci_device *pci_dev;
-	u16 domain = pci_domain_nr(bus);
-	u8 bus_num = bus->number;
-	u8 slot = PCI_SLOT(devfn);
-	u8 func = PCI_FUNC(devfn);
-	u8 hdr_type;
-
-	if (!root_instance)
-		return true;
-
-	if (!root_instance->dtb_data)
-		return true;
-
-	if (!root_instance->pci_devices_valid || root_instance->pci_device_count == 0)
-		return false;
-
-	list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
-		if (pci_dev->domain != domain)
-			continue;
-
-		/* Exact location match - always allow */
-		if (pci_dev->bus == bus_num &&
-		    pci_dev->slot == slot &&
-		    pci_dev->func == func)
-			return true;
-	}
-
-	/*
-	 * Check if any whitelisted device is on a downstream bus.
-	 * If so, this might be a bridge in the path to that device.
-	 */
-	list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
-		if (pci_dev->domain == domain && pci_dev->bus > bus_num)
-			goto check_bridge;
-	}
-	return false;
-
-check_bridge:
-	/*
-	 * There's a whitelisted device on a downstream bus. Check if this
-	 * is a bridge that serves it.
-	 */
-	if (pci_bus_read_config_byte(bus, devfn, PCI_HEADER_TYPE, &hdr_type) == 0) {
-		bool is_bridge = ((hdr_type & PCI_HEADER_TYPE_MASK) == PCI_HEADER_TYPE_BRIDGE);
-
-		if (is_bridge) {
-			u8 secondary_bus = 0, subordinate_bus = 0;
-
-			pci_bus_read_config_byte(bus, devfn, PCI_SECONDARY_BUS, &secondary_bus);
-			pci_bus_read_config_byte(bus, devfn, PCI_SUBORDINATE_BUS, &subordinate_bus);
-
-			/*
-			 * Allow bridge if there's a whitelisted device on any bus
-			 * between secondary and subordinate (inclusive).
-			 */
-			if (secondary_bus > 0 && subordinate_bus >= secondary_bus) {
-				list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
-					if (pci_dev->domain == domain &&
-					    pci_dev->bus >= secondary_bus &&
-					    pci_dev->bus <= subordinate_bus)
-						return true;
-				}
-			}
-		}
-	}
-
-	return false;
-}
-EXPORT_SYMBOL_GPL(mk_pci_should_probe);
 
 bool mk_platform_device_allowed(const char *name, const char *hid)
 {

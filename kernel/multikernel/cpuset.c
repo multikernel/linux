@@ -13,9 +13,37 @@
 #include <linux/string.h>
 #include <linux/multikernel.h>
 
+static void mk_cpu_set_lock(const struct mk_cpu_set *set, unsigned long *flags)
+{
+	raw_spin_lock_irqsave((raw_spinlock_t *)&set->lock, *flags);
+}
+
+static void mk_cpu_set_unlock(const struct mk_cpu_set *set, unsigned long flags)
+{
+	raw_spin_unlock_irqrestore((raw_spinlock_t *)&set->lock, flags);
+}
+
+static int mk_cpu_set_index_locked(const struct mk_cpu_set *set,
+				   mk_phys_cpu_t id)
+{
+	unsigned int i;
+
+	for (i = 0; i < set->nr; i++) {
+		if (set->ids[i] == id)
+			return i;
+	}
+
+	return -1;
+}
+
 struct mk_cpu_set *mk_cpu_set_alloc(void)
 {
-	return kzalloc(sizeof(struct mk_cpu_set), GFP_KERNEL);
+	struct mk_cpu_set *set;
+
+	set = kzalloc_obj(*set, GFP_KERNEL);
+	if (set)
+		raw_spin_lock_init(&set->lock);
+	return set;
 }
 
 void mk_cpu_set_free(struct mk_cpu_set *set)
@@ -29,25 +57,14 @@ void mk_cpu_set_free(struct mk_cpu_set *set)
 
 void mk_cpu_set_clear(struct mk_cpu_set *set)
 {
-	if (set)
-		set->nr = 0;
-}
+	unsigned long flags;
 
-static int mk_cpu_set_index(const struct mk_cpu_set *set, mk_phys_cpu_t id)
-{
-	unsigned int i;
+	if (!set)
+		return;
 
-	for (i = 0; set && i < set->nr; i++) {
-		if (set->ids[i] == id)
-			return i;
-	}
-
-	return -1;
-}
-
-bool mk_cpu_set_contains(const struct mk_cpu_set *set, mk_phys_cpu_t id)
-{
-	return mk_cpu_set_index(set, id) >= 0;
+	mk_cpu_set_lock(set, &flags);
+	set->nr = 0;
+	mk_cpu_set_unlock(set, flags);
 }
 
 /**
@@ -61,64 +78,195 @@ bool mk_cpu_set_contains(const struct mk_cpu_set *set, mk_phys_cpu_t id)
  */
 int mk_cpu_set_reserve(struct mk_cpu_set *set, unsigned int extra)
 {
-	unsigned int cap = set->nr + extra;
-	mk_phys_cpu_t *ids;
+	mk_phys_cpu_t *ids = NULL;
+	mk_phys_cpu_t *old_ids;
+	unsigned int cap;
+	unsigned long flags;
 
-	if (cap <= set->cap)
+	if (!set)
+		return -EINVAL;
+
+	for (;;) {
+		mk_cpu_set_lock(set, &flags);
+		cap = set->nr + extra;
+		if (cap <= set->cap) {
+			mk_cpu_set_unlock(set, flags);
+			kfree(ids);
+			return 0;
+		}
+		mk_cpu_set_unlock(set, flags);
+
+		cap = max_t(unsigned int, cap, 8);
+		kfree(ids);
+		ids = kcalloc(cap, sizeof(*ids), GFP_KERNEL);
+		if (!ids)
+			return -ENOMEM;
+
+		mk_cpu_set_lock(set, &flags);
+		if (set->nr + extra > cap) {
+			mk_cpu_set_unlock(set, flags);
+			continue;
+		}
+		if (cap <= set->cap) {
+			mk_cpu_set_unlock(set, flags);
+			kfree(ids);
+			return 0;
+		}
+
+		memcpy(ids, set->ids, set->nr * sizeof(*ids));
+		old_ids = set->ids;
+		set->ids = ids;
+		set->cap = cap;
+		mk_cpu_set_unlock(set, flags);
+		kfree(old_ids);
 		return 0;
-
-	cap = max_t(unsigned int, cap, 8);
-	ids = krealloc_array(set->ids, cap, sizeof(*ids), GFP_KERNEL);
-	if (!ids)
-		return -ENOMEM;
-
-	set->ids = ids;
-	set->cap = cap;
-	return 0;
+	}
 }
 
 /* Idempotent: adding an ID already in the set succeeds without effect */
 int mk_cpu_set_add(struct mk_cpu_set *set, mk_phys_cpu_t id)
 {
+	unsigned long flags;
 	int ret;
 
-	if (mk_cpu_set_contains(set, id))
-		return 0;
+	if (!set)
+		return -EINVAL;
 
-	ret = mk_cpu_set_reserve(set, 1);
-	if (ret)
-		return ret;
+	for (;;) {
+		mk_cpu_set_lock(set, &flags);
+		if (mk_cpu_set_index_locked(set, id) >= 0) {
+			mk_cpu_set_unlock(set, flags);
+			return 0;
+		}
+		if (set->nr < set->cap) {
+			set->ids[set->nr++] = id;
+			mk_cpu_set_unlock(set, flags);
+			return 0;
+		}
+		mk_cpu_set_unlock(set, flags);
 
-	set->ids[set->nr++] = id;
-	return 0;
+		ret = mk_cpu_set_reserve(set, 1);
+		if (ret)
+			return ret;
+	}
 }
 
 bool mk_cpu_set_del(struct mk_cpu_set *set, mk_phys_cpu_t id)
 {
-	int idx = mk_cpu_set_index(set, id);
+	unsigned long flags;
+	int idx;
 
-	if (idx < 0)
+	if (!set)
 		return false;
+
+	mk_cpu_set_lock(set, &flags);
+	idx = mk_cpu_set_index_locked(set, id);
+	if (idx < 0) {
+		mk_cpu_set_unlock(set, flags);
+		return false;
+	}
 
 	memmove(&set->ids[idx], &set->ids[idx + 1],
 		(set->nr - idx - 1) * sizeof(set->ids[0]));
 	set->nr--;
+	mk_cpu_set_unlock(set, flags);
 	return true;
+}
+
+bool mk_cpu_set_contains(const struct mk_cpu_set *set, mk_phys_cpu_t id)
+{
+	unsigned long flags;
+	bool found;
+
+	if (!set)
+		return false;
+
+	mk_cpu_set_lock(set, &flags);
+	found = mk_cpu_set_index_locked(set, id) >= 0;
+	mk_cpu_set_unlock(set, flags);
+	return found;
+}
+
+unsigned int mk_cpu_set_count(const struct mk_cpu_set *set)
+{
+	unsigned long flags;
+	unsigned int nr;
+
+	if (!set)
+		return 0;
+
+	mk_cpu_set_lock(set, &flags);
+	nr = set->nr;
+	mk_cpu_set_unlock(set, flags);
+	return nr;
+}
+
+bool mk_cpu_set_empty(const struct mk_cpu_set *set)
+{
+	return mk_cpu_set_count(set) == 0;
+}
+
+mk_phys_cpu_t mk_cpu_set_first(const struct mk_cpu_set *set)
+{
+	unsigned long flags;
+	mk_phys_cpu_t id;
+
+	if (!set)
+		return MK_PHYS_CPU_INVALID;
+
+	mk_cpu_set_lock(set, &flags);
+	id = set->nr ? set->ids[0] : MK_PHYS_CPU_INVALID;
+	mk_cpu_set_unlock(set, flags);
+	return id;
+}
+
+bool mk_cpu_set_get(const struct mk_cpu_set *set, unsigned int index,
+		    mk_phys_cpu_t *id)
+{
+	unsigned long flags;
+	bool found = false;
+
+	if (!set || !id)
+		return false;
+
+	mk_cpu_set_lock(set, &flags);
+	if (index < set->nr) {
+		*id = set->ids[index];
+		found = true;
+	}
+	mk_cpu_set_unlock(set, flags);
+	return found;
 }
 
 int mk_cpu_set_copy(struct mk_cpu_set *dst, const struct mk_cpu_set *src)
 {
-	unsigned int nr = mk_cpu_set_count(src);
+	unsigned long src_flags;
+	unsigned long dst_flags;
+	unsigned int nr;
 	int ret;
 
-	dst->nr = 0;
-	ret = mk_cpu_set_reserve(dst, nr);
-	if (ret)
-		return ret;
+	if (!dst || !src)
+		return -EINVAL;
 
-	memcpy(dst->ids, src->ids, nr * sizeof(dst->ids[0]));
-	dst->nr = nr;
-	return 0;
+	for (;;) {
+		nr = mk_cpu_set_count(src);
+		ret = mk_cpu_set_reserve(dst, nr);
+		if (ret)
+			return ret;
+
+		mk_cpu_set_lock(src, &src_flags);
+		if (src->nr > dst->cap) {
+			mk_cpu_set_unlock(src, src_flags);
+			continue;
+		}
+
+		mk_cpu_set_lock(dst, &dst_flags);
+		memcpy(dst->ids, src->ids, src->nr * sizeof(dst->ids[0]));
+		dst->nr = src->nr;
+		mk_cpu_set_unlock(dst, dst_flags);
+		mk_cpu_set_unlock(src, src_flags);
+		return 0;
+	}
 }
 
 /**
@@ -127,22 +275,31 @@ int mk_cpu_set_copy(struct mk_cpu_set *dst, const struct mk_cpu_set *src)
  * @size: Buffer size
  * @set: Set to format
  *
- * Writes "none" for an empty set, a comma-separated list of physical
+ * Writes none for an empty set, a comma-separated list of physical
  * IDs otherwise. Output is truncated to @size. Returns the number of
  * characters written.
  */
 int mk_cpu_set_format(char *buf, size_t size, const struct mk_cpu_set *set)
 {
+	unsigned long flags;
 	unsigned int i;
 	int len = 0;
 
-	if (mk_cpu_set_empty(set))
+	if (!buf || !size)
+		return 0;
+	if (!set)
 		return scnprintf(buf, size, "none");
 
-	for (i = 0; i < set->nr; i++) {
+	mk_cpu_set_lock(set, &flags);
+	if (!set->nr) {
+		mk_cpu_set_unlock(set, flags);
+		return scnprintf(buf, size, "none");
+	}
+
+	for (i = 0; i < set->nr && len < size; i++) {
 		len += scnprintf(buf + len, size - len, "%s%llu",
 				 i ? "," : "", set->ids[i]);
 	}
-
+	mk_cpu_set_unlock(set, flags);
 	return len;
 }

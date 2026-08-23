@@ -1,0 +1,91 @@
+What:		/sys/fs/multikernel/instances/<name>/stats
+Date:		August 2026
+Contact:	Nikolay Nikolaev <nicknickolaev@gmail.com>
+Description:
+		Read-only reliability snapshot for one multikernel instance.  The
+		format is one ``key value`` pair per line.  The first line is always
+		``stats_version 1``.  Versioned formats are append-only; readers must
+		ignore unknown keys.
+
+		The snapshot is observational, not atomic with concurrent producers.
+		Cumulative transport counters are unsigned 32-bit event counts and
+		wrap modulo 2^32.  They reset when the shared buffer is initialized
+		for a new ``spawn_epoch`` and cannot be reset through this file.
+		Compare deltas only between samples with the same nonzero epoch.
+		Gauges are unsigned point-in-time counts and have no reset operation.
+
+		Metadata keys (class; unit; meaning):
+
+		``stats_version`` (metadata; version; this file format, currently 1),
+		``abi_version`` (metadata; version; exact shared transport ABI),
+		``snapshot_atomic`` (metadata; boolean; always 0),
+		``transport_counter_bits`` (metadata; bits; always 32),
+		``transport_available`` (gauge; boolean; shared buffer is mapped), and
+		``spawn_epoch`` (metadata; launch identifier; changes on each start).
+
+		``abi_version`` identifies the exact private kernel-to-kernel transport
+		contract used by the running instance.  Exposing it here supports
+		diagnostics; it is not a stable userspace ABI or a compatibility promise
+		between transport versions.
+
+		Ordered IPI keys (class; unit; increment or sampled condition; reset):
+
+		``ipi.producer_contention`` (counter; sends; producer gate observed
+		busy or recursively owned; new epoch), ``ipi.full_failures`` (counter;
+		sends; head slot prevented publication; new epoch),
+		``ipi.invalid_state`` (counter; observations; impossible slot/cursor
+		state; new epoch), ``ipi.cancelled_writes`` (counter; writes; parked
+		producer recovered as CANCELLED; new epoch), ``ipi.gate_busy`` (gauge;
+		gates; producer gate nonzero; sampled), ``ipi.slot_writing`` (gauge;
+		slots; WRITING; sampled), ``ipi.slot_ready`` (gauge; slots; READY;
+		sampled), ``ipi.slot_consuming`` (gauge; slots; CONSUMING; sampled),
+		and ``ipi.slot_cancelled`` (gauge; slots; CANCELLED; sampled).
+
+		Direct reply keys (class; unit; increment or sampled condition; reset):
+
+		``reply.late_replies`` (counter; replies; stale exact-token claim or
+		completion was rejected; new epoch), ``reply.cancelled_slots``
+		(counter; slots; timeout
+		cancelled RESERVED/WRITING; new epoch), ``reply.atomic_timeouts``
+		(counter; waits; bounded atomic wait expired in cancellable
+		RESERVED/WRITING or indeterminate EXECUTING state; new epoch),
+		``reply.indeterminate_timeouts`` (counter; waits; subset where
+		EXECUTING won and changed to COMMITTED; new epoch),
+		``reply.occupied_failures`` (counter;
+		reservations; no FREE slot; new epoch), ``reply.slot_busy`` (gauge;
+		slots; state is not FREE; sampled), ``reply.slot_reserved`` (gauge;
+		slots; RESERVED; sampled), ``reply.slot_writing`` (gauge; slots;
+		WRITING; sampled), ``reply.slot_executing`` (gauge; slots; EXECUTING;
+		sampled), ``reply.slot_committed`` (gauge; slots; COMMITTED; sampled),
+		``reply.slot_ready`` (gauge; slots; READY; sampled), and
+		``reply.slot_abandoned`` (gauge; slots; ABANDONED; sampled).
+
+		Pending IRQ keys (class; unit; increment or sampled condition; reset):
+
+		``irq.recorded`` (counter; IRQs; pending count recorded; new epoch),
+		``irq.coalesced`` (counter; IRQs; recorded onto an already-pending
+		slot; new epoch), ``irq.masked_deferred`` (counter; IRQs; delivery
+		deferred while logically masked; new epoch), ``irq.stale`` (counter;
+		observations; epoch/generation/route validation rejected work; new
+		epoch), ``irq.dispatch_failed`` (counter; IRQs; validated local dispatch
+		failed; new epoch), ``irq.saturated`` (counter; IRQs; pending count hit
+		its representable limit; new epoch), ``irq.slot_active`` (gauge; slots;
+		nonzero generation; sampled), ``irq.slot_pending`` (gauge; slots;
+		nonzero pending count; sampled), ``irq.slot_masked`` (gauge; slots;
+		MASKED set; sampled), ``irq.slot_consuming`` (gauge; slots; CONSUMING
+		set; sampled), and ``irq.pending_total`` (gauge; IRQs; sum of pending
+		counts across active slots; sampled).
+
+		PCI control-plane keys (class; unit; meaning; reset):
+
+		``pci.config_requests`` (counter; requests; successful spawn-to-host
+		configuration transactions; new epoch), ``pci.config_total_ns``
+		(counter; nanoseconds; cumulative round-trip time of those requests;
+		new epoch), ``pci.config_average_ns`` (gauge; nanoseconds; total divided
+		by requests in this snapshot; derived), ``pci.config_max_ns`` (gauge;
+		nanoseconds; longest successful round trip; new epoch), and
+		``pci.control_pool_exhausted`` (counter; allocation failures; host-wide
+		PCI control-work mempool exhaustion since boot).  The host-wide counter
+		is repeated in every instance snapshot because exhaustion happens before
+		the hardirq handler can safely acquire an instance reference.
+Users:		multikernel management and diagnostic tools

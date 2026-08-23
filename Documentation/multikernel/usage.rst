@@ -93,6 +93,19 @@ Phase 1: Instance Creation (Automatic from DTB)
       cat /sys/fs/multikernel/instances/web-server/status
       # Output: ready
 
+      cat /sys/fs/multikernel/instances/web-server/stats
+
+   ``stats`` is a read-only, append-only key/value interface.  Version 1
+   starts with ``stats_version 1`` and reports the shared ordered-IPI, direct
+   reply, and pending-IRQ transport counters for the instance.  New keys may
+   be appended; readers must ignore keys they do not understand.
+
+   The output is an observational snapshot rather than an atomic transaction.
+   Shared transport counters are unsigned 32-bit values and may wrap.  They
+   are reinitialized for a new ``spawn_epoch``, are not writable or resettable
+   through this interface, and must only be compared as modulo-32-bit deltas
+   between samples carrying the same nonzero epoch.
+
       # View instance device tree
       cat /sys/fs/multikernel/instances/web-server/device_tree_source
       # Output: DTS format showing the instance configuration
@@ -121,6 +134,23 @@ Phase 2: Kernel Loading (Kexec Integration)
    - Detect multikernel KHO data during early boot
    - Restore the instance's DTB and recreate the instance structure
    - Re-reserve the same memory and CPU resources
+
+SR-IOV Assignment Boundary
+==========================
+
+SR-IOV assignment is intended for cooperative spawned kernels.  Filtering
+configuration-space access and enumerating only assigned BDFs prevents
+accidental access by those kernels; it is not a security boundary against a
+privileged kernel that deliberately issues configuration cycles or maps host
+physical windows.  The host-owned IOMMU domain is the boundary that constrains
+device-initiated DMA.
+
+The host fails assignment closed unless it can establish the complete device
+lifecycle: the device is an SR-IOV VF in a singleton IOMMU group, reset is
+available, MSI or MSI-X programming remains isolated and host-owned, and one
+coherent host-owned IOMMU domain covers the assigned memory.  Reset, interrupt,
+or DMA teardown uncertainty leaves the instance failed rather than returning
+the VF to use.
 
 Device Tree Format
 ==================
@@ -213,3 +243,6 @@ The new kernfs interface has the following restrictions:
 - **No direct DTB upload to instances**: Instances don't have writable ``device_tree`` files
 - **Centralized DTB management**: All instances must be created via the root ``device_tree`` file
 - **Read-only instance files**: All instance attributes are read-only for consistency
+- **Host control CPU**: Logical CPU 0 is the PCI forwarding and control CPU and
+  must remain online while assigned devices are active. Selecting another
+  control CPU is a future policy extension.

@@ -556,9 +556,9 @@ static int mk_overlay_parse_pci_id(const void *fdt, int item_node,
 				   const char *name, u16 *domain, u8 *bus,
 				   u8 *devfn)
 {
-	unsigned int d, b, slot, func;
 	const char *pci_id_str;
-	int len;
+	u8 slot, func;
+	int len, ret;
 
 	pci_id_str = fdt_getprop(fdt, item_node, "pci-id", &len);
 	if (!pci_id_str || len <= 0 || pci_id_str[len - 1] != '\0') {
@@ -566,13 +566,12 @@ static int mk_overlay_parse_pci_id(const void *fdt, int item_node,
 		return -EINVAL;
 	}
 
-	if (sscanf(pci_id_str, "%x:%x:%x.%x", &d, &b, &slot, &func) != 4) {
-		pr_err("Invalid pci-id format '%s'\n", pci_id_str);
-		return -EINVAL;
+	ret = mk_pci_parse_bdf(pci_id_str, len, domain, bus, &slot, &func);
+	if (ret) {
+		pr_err("Invalid or out-of-range pci-id '%s'\n", pci_id_str);
+		return ret;
 	}
 
-	*domain = (u16)d;
-	*bus = (u8)b;
 	*devfn = PCI_DEVFN(slot, func);
 	return 0;
 }

@@ -15,6 +15,89 @@
 #include <linux/vmalloc.h>
 #include "internal.h"
 
+/*
+ * CPU moves take transaction, then the affected instance's route write side,
+ * then ownership while inspecting or publishing paired CPU sets. PCI request
+ * work takes the route read side, validates under ownership, drops ownership
+ * before sleeping, and retains the route pin through reply publication.
+ */
+static DEFINE_MUTEX(mk_cpu_transaction_mutex);
+static DEFINE_MUTEX(mk_cpu_ownership_mutex);
+
+void mk_cpu_transaction_lock(void)
+{
+	mutex_lock(&mk_cpu_transaction_mutex);
+}
+
+void mk_cpu_transaction_unlock(void)
+{
+	mutex_unlock(&mk_cpu_transaction_mutex);
+}
+
+void mk_cpu_ownership_lock(void)
+{
+	mutex_lock(&mk_cpu_ownership_mutex);
+}
+
+void mk_cpu_ownership_unlock(void)
+{
+	mutex_unlock(&mk_cpu_ownership_mutex);
+}
+
+void mk_cpu_ownership_assert_held(void)
+{
+	lockdep_assert_held(&mk_cpu_ownership_mutex);
+}
+
+static int __mk_instance_migrate_irq_route(struct mk_instance *instance,
+					   const struct mk_cpu_set *removing)
+{
+	mk_phys_cpu_t replacement = MK_PHYS_CPU_INVALID;
+	mk_phys_cpu_t route_cpu;
+	mk_phys_cpu_t phys_cpu;
+	unsigned int i;
+
+	lockdep_assert_held_write(&instance->control_route_sem);
+	route_cpu = mk_instance_irq_route_load(instance);
+	if (route_cpu == MK_PHYS_CPU_INVALID ||
+	    !mk_cpu_set_contains(removing, route_cpu))
+		return 0;
+
+	mk_cpu_ownership_lock();
+	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
+		if (!mk_cpu_set_contains(removing, phys_cpu)) {
+			replacement = phys_cpu;
+			break;
+		}
+	}
+	mk_cpu_ownership_unlock();
+	if (replacement == MK_PHYS_CPU_INVALID &&
+	    READ_ONCE(instance->state) == MK_STATE_ACTIVE)
+		return -EBUSY;
+
+	mutex_lock(&instance->resource_mutex);
+	if (replacement != MK_PHYS_CPU_INVALID)
+		mk_instance_irq_route_store(instance, replacement);
+	mk_pci_sync_instance_irq_route(instance);
+	if (replacement == MK_PHYS_CPU_INVALID)
+		mk_instance_irq_route_store(instance, MK_PHYS_CPU_INVALID);
+	mutex_unlock(&instance->resource_mutex);
+	return 0;
+}
+
+int mk_instance_migrate_irq_route(struct mk_instance *instance,
+				  const struct mk_cpu_set *removing)
+{
+	int ret;
+
+	if (!instance || !removing)
+		return -EINVAL;
+	down_write(&instance->control_route_sem);
+	ret = __mk_instance_migrate_irq_route(instance, removing);
+	up_write(&instance->control_route_sem);
+	return ret;
+}
+
 static void mk_instance_return_all_cpus(struct mk_instance *instance)
 {
 	if (!instance || mk_cpu_set_empty(instance->cpus))
@@ -26,16 +109,20 @@ static void mk_instance_return_all_cpus(struct mk_instance *instance)
 	mk_instance_return_cpus(instance, instance->cpus);
 }
 
-static void mk_instance_return_pci_devices(struct mk_instance *instance)
+static int mk_instance_return_pci_devices(struct mk_instance *instance)
 {
 	struct mk_pci_device *pci_dev, *pci_tmp;
 	int returned_count = 0;
+	int ret;
 
-	if (!instance || !instance->pci_devices_valid)
-		return;
+	if (!instance || instance == root_instance || instance->id == 0)
+		return 0;
 
-	if (instance == root_instance || instance->id == 0)
-		return;
+	ret = mk_pci_release_assignments(instance);
+	if (ret)
+		return ret;
+	if (!instance->pci_devices_valid)
+		return 0;
 
 	if (!root_instance) {
 		pr_warn("Cannot return PCI devices from instance %d (%s): no root instance\n",
@@ -43,52 +130,37 @@ static void mk_instance_return_pci_devices(struct mk_instance *instance)
 		goto cleanup;
 	}
 
-	list_for_each_entry_safe(pci_dev, pci_tmp, &instance->pci_devices, list) {
-		struct mk_pci_device *root_dev;
-
-		root_dev = kzalloc(sizeof(*root_dev), GFP_KERNEL);
-		if (!root_dev) {
-			pr_warn("Failed to allocate PCI device entry for root instance\n");
-			continue;
-		}
-
-		*root_dev = *pci_dev;
-		INIT_LIST_HEAD(&root_dev->list);
-
-		list_add_tail(&root_dev->list, &root_instance->pci_devices);
+	list_for_each_entry_safe(pci_dev, pci_tmp, &instance->pci_devices,
+				 list) {
+		list_move_tail(&pci_dev->list, &root_instance->pci_devices);
 		root_instance->pci_device_count++;
 		root_instance->pci_devices_valid = true;
-
-		pr_debug("Returned PCI device %04x:%02x:%02x.%d from instance %d to root\n",
-			 root_dev->domain, root_dev->bus, root_dev->slot,
-			 root_dev->func, instance->id);
-
 		returned_count++;
 	}
 
-	if (returned_count > 0) {
+	if (returned_count)
 		pr_info("Returned %d PCI devices from instance %d (%s) to root instance\n",
 			returned_count, instance->id, instance->name);
-	}
 
 cleanup:
-	list_for_each_entry_safe(pci_dev, pci_tmp, &instance->pci_devices, list) {
+	list_for_each_entry_safe(pci_dev, pci_tmp, &instance->pci_devices,
+				 list) {
 		list_del(&pci_dev->list);
 		kfree(pci_dev);
 	}
 	instance->pci_device_count = 0;
 	instance->pci_devices_valid = false;
+	return 0;
 }
-
 static void mk_instance_return_platform_devices(struct mk_instance *instance)
 {
-	struct mk_platform_device *plat_dev, *plat_tmp;
-	int returned_count = 0;
+	struct mk_platform_device *device, *tmp;
+	int returned = 0;
 
-	if (!instance || !instance->platform_devices_valid)
+	if (!instance || instance == root_instance || instance->id == 0)
 		return;
-
-	if (instance == root_instance || instance->id == 0)
+	if (!instance->platform_devices_valid &&
+	    list_empty(&instance->platform_devices))
 		return;
 
 	if (!root_instance) {
@@ -97,68 +169,83 @@ static void mk_instance_return_platform_devices(struct mk_instance *instance)
 		goto cleanup;
 	}
 
-	list_for_each_entry_safe(plat_dev, plat_tmp, &instance->platform_devices, list) {
-		struct mk_platform_device *root_dev;
-
-		root_dev = kzalloc(sizeof(*root_dev), GFP_KERNEL);
-		if (!root_dev) {
-			pr_warn("Failed to allocate platform device entry for root instance\n");
-			continue;
-		}
-
-		*root_dev = *plat_dev;
-		INIT_LIST_HEAD(&root_dev->list);
-
-		list_add_tail(&root_dev->list, &root_instance->platform_devices);
+	list_for_each_entry_safe(device, tmp, &instance->platform_devices,
+				 list) {
+		list_move_tail(&device->list,
+			       &root_instance->platform_devices);
 		root_instance->platform_device_count++;
 		root_instance->platform_devices_valid = true;
-
-		pr_debug("Returned platform device '%s' from instance %d to root\n",
-			 root_dev->name, instance->id);
-
-		returned_count++;
+		returned++;
 	}
 
-	if (returned_count > 0) {
+	if (returned)
 		pr_info("Returned %d platform devices from instance %d (%s) to root instance\n",
-			returned_count, instance->id, instance->name);
-	}
+			returned, instance->id, instance->name);
 
 cleanup:
-	list_for_each_entry_safe(plat_dev, plat_tmp, &instance->platform_devices, list) {
-		list_del(&plat_dev->list);
-		kfree(plat_dev);
+	list_for_each_entry_safe(device, tmp, &instance->platform_devices,
+				 list) {
+		list_del(&device->list);
+		kfree(device);
 	}
 	instance->platform_device_count = 0;
 	instance->platform_devices_valid = false;
 }
 
+int mk_instance_release_resources(struct mk_instance *instance)
+{
+	int ret;
+
+	if (!instance || instance == root_instance || instance->id == 0)
+		return 0;
+
+	ret = mk_instance_return_pci_devices(instance);
+	if (ret)
+		return ret;
+	mk_instance_return_platform_devices(instance);
+	mk_instance_return_all_cpus(instance);
+	mk_instance_free_memory(instance);
+	return 0;
+}
+
 static void mk_instance_release(struct kref *kref)
 {
-	struct mk_instance *instance = container_of(kref, struct mk_instance, refcount);
+	struct mk_instance *instance =
+		container_of(kref, struct mk_instance, refcount);
+	int ret;
 
 	pr_info("Releasing multikernel instance %d (%s), returning resources to root\n",
 		instance->id, instance->name);
-
-	mk_instance_return_all_cpus(instance);
-	mk_instance_return_pci_devices(instance);
-	mk_instance_return_platform_devices(instance);
-	mk_instance_free_memory(instance);
-
+	ret = mk_instance_release_resources(instance);
+	if (WARN_ON_ONCE(ret)) {
+		/*
+		 * The release callback runs after kref_put() reaches zero.  A
+		 * failed PCI release can leave assignments linked to this instance,
+		 * so restore an owning reference before retaining the object.  This
+		 * keeps a still-published instance findable and prevents a later
+		 * lookup from trying to resurrect a zero reference.
+		 *
+		 * Normal removal releases resources before unlinking the instance,
+		 * so this is only the last-resort fail-safe for an unsafe teardown.
+		 */
+		kref_init(&instance->refcount);
+		pr_crit("Retaining multikernel instance %d (%s) after resource release failed: %d\n",
+			instance->id, instance->name, ret);
+		return;
+	}
 	mk_cpu_set_free(instance->cpus);
 	kfree(instance->dtb_data);
 	kfree(instance->name);
 	kfree(instance);
 }
-
 /**
  * Instance reference counting
  */
 struct mk_instance *mk_instance_get(struct mk_instance *instance)
 {
-	if (instance)
-		kref_get(&instance->refcount);
-	return instance;
+	if (instance && kref_get_unless_zero(&instance->refcount))
+		return instance;
+	return NULL;
 }
 
 void mk_instance_put(struct mk_instance *instance)
@@ -190,6 +277,37 @@ void mk_instance_set_state(struct mk_instance *instance,
 	 */
 }
 
+void mk_instance_mark_failed(struct mk_instance *instance)
+{
+	mk_cpu_transaction_lock();
+	down_write(&instance->control_route_sem);
+	mutex_lock(&instance->resource_mutex);
+	mk_instance_set_state(instance, MK_STATE_FAILED);
+	mutex_unlock(&instance->resource_mutex);
+	up_write(&instance->control_route_sem);
+	mk_cpu_transaction_unlock();
+}
+
+static int mk_instance_finish_halt(struct mk_instance *instance,
+				   bool transaction_held)
+{
+	int ret;
+
+	if (!transaction_held)
+		mk_cpu_transaction_lock();
+	down_write(&instance->control_route_sem);
+	mutex_lock(&instance->resource_mutex);
+	/* Every caller has confirmed that all spawn CPUs are parked. */
+	ret = mk_pci_quiesce_instance_irqs(instance, true);
+	mk_instance_irq_route_store(instance, MK_PHYS_CPU_INVALID);
+	mk_instance_set_state(instance, ret ? MK_STATE_FAILED : MK_STATE_LOADED);
+	mutex_unlock(&instance->resource_mutex);
+	up_write(&instance->control_route_sem);
+	if (!transaction_held)
+		mk_cpu_transaction_unlock();
+	return ret;
+}
+
 struct mk_instance *mk_instance_find_by_name(const char *name)
 {
 	struct mk_instance *instance;
@@ -214,7 +332,7 @@ struct mk_instance *mk_instance_find(int mk_id)
 	mutex_lock(&mk_instance_mutex);
 	instance = idr_find(&mk_instance_idr, mk_id);
 	if (instance)
-		mk_instance_get(instance);
+		instance = mk_instance_get(instance);
 	mutex_unlock(&mk_instance_mutex);
 
 	return instance;
@@ -286,6 +404,7 @@ bool multikernel_allow_emergency_restart(void)
  */
 int mk_instance_confirm_parked(struct mk_instance *instance)
 {
+	struct mk_cpu_set *snapshot;
 	mk_phys_cpu_t phys_cpu;
 	unsigned int i;
 	int ret, failed = 0;
@@ -293,8 +412,22 @@ int mk_instance_confirm_parked(struct mk_instance *instance)
 	/* Never started, so nothing of it is running */
 	if (!instance->spawn_ctx)
 		return 0;
+	if (!instance->cpus_on_slot) {
+		pr_err("Instance %d (%s): missing parked-CPU tracking for a started instance\n",
+		       instance->id, instance->name);
+		return -EINVAL;
+	}
 
-	mk_cpu_set_for_each(i, phys_cpu, instance->cpus_on_slot) {
+	snapshot = mk_cpu_set_alloc();
+	if (!snapshot)
+		return -ENOMEM;
+	ret = mk_cpu_set_copy(snapshot, instance->cpus_on_slot);
+	if (ret) {
+		mk_cpu_set_free(snapshot);
+		return ret;
+	}
+
+	mk_cpu_set_for_each(i, phys_cpu, snapshot) {
 		ret = mk_arch_confirm_parked(instance, phys_cpu);
 		if (ret) {
 			pr_err("Instance %d (%s): CPU %llu is not parked: %d\n",
@@ -302,7 +435,16 @@ int mk_instance_confirm_parked(struct mk_instance *instance)
 			failed++;
 		}
 	}
+	if (!failed) {
+		ret = mk_ipi_ring_recover_halted(snapshot);
+		if (ret) {
+			pr_err("Instance %d (%s): failed to recover halted IPI producer: %d\n",
+			       instance->id, instance->name, ret);
+			failed++;
+		}
+	}
 
+	mk_cpu_set_free(snapshot);
 	return failed ? -EBUSY : 0;
 }
 
@@ -319,8 +461,10 @@ int mk_instance_confirm_parked(struct mk_instance *instance)
 int mk_instance_transfer_cpus(struct mk_instance *instance,
 			       const struct mk_cpu_set *cpus)
 {
+	struct mk_cpu_set *snapshot;
 	unsigned int i, requested_count;
 	mk_phys_cpu_t phys_cpu;
+	int logical_cpu;
 	int unavailable = 0;
 	char buf[256];
 	int ret;
@@ -330,14 +474,26 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 		return -EINVAL;
 	}
 
-	requested_count = mk_cpu_set_count(cpus);
+	snapshot = mk_cpu_set_alloc();
+	if (!snapshot)
+		return -ENOMEM;
+
+	mk_cpu_transaction_lock();
+	down_write(&instance->control_route_sem);
+	mk_cpu_ownership_lock();
+	ret = mk_cpu_set_copy(snapshot, cpus);
+	if (ret)
+		goto unlock;
+
+	requested_count = mk_cpu_set_count(snapshot);
 	if (requested_count == 0) {
 		pr_info("No CPUs requested for instance %d (%s)\n",
 			instance->id, instance->name);
-		return 0;
+		ret = 0;
+		goto unlock;
 	}
 
-	mk_cpu_set_for_each(i, phys_cpu, cpus) {
+	mk_cpu_set_for_each(i, phys_cpu, snapshot) {
 		if (!mk_cpu_set_contains(mk_cpu_pool, phys_cpu)) {
 			pr_err("CPU %llu not available in the pool\n",
 			       phys_cpu);
@@ -345,8 +501,13 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 			continue;
 		}
 
-		if (arch_cpu_from_physical_id(phys_cpu) < 0) {
+		logical_cpu = arch_cpu_from_physical_id(phys_cpu);
+		if (logical_cpu < 0) {
 			pr_err("Physical CPU %llu not found in logical CPU map\n",
+			       phys_cpu);
+			unavailable++;
+		} else if (logical_cpu == 0) {
+			pr_err("Physical CPU %llu is reserved for host control\n",
 			       phys_cpu);
 			unavailable++;
 		}
@@ -355,23 +516,32 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 	if (unavailable > 0) {
 		pr_err("Instance %d (%s): %d CPUs are not available\n",
 		       instance->id, instance->name, unavailable);
-		return -EBUSY;
+		ret = -EBUSY;
+		goto unlock;
 	}
 
 	ret = mk_cpu_set_reserve(instance->cpus, requested_count);
 	if (ret)
-		return ret;
+		goto unlock;
 
-	mk_cpu_set_for_each(i, phys_cpu, cpus) {
+	mk_cpu_set_for_each(i, phys_cpu, snapshot) {
 		mk_cpu_set_del(mk_cpu_pool, phys_cpu);
 		mk_cpu_set_add(instance->cpus, phys_cpu);
 	}
+	if (mk_instance_irq_route_load(instance) == MK_PHYS_CPU_INVALID)
+		mk_instance_irq_route_store(instance,
+					    mk_cpu_set_first(instance->cpus));
 
 	mk_cpu_set_format(buf, sizeof(buf), instance->cpus);
 	pr_info("Transferred %u CPUs from pool to instance %d (%s): %s\n",
 		requested_count, instance->id, instance->name, buf);
 
-	return 0;
+unlock:
+	mk_cpu_ownership_unlock();
+	up_write(&instance->control_route_sem);
+	mk_cpu_transaction_unlock();
+	mk_cpu_set_free(snapshot);
+	return ret;
 }
 
 /**
@@ -387,6 +557,7 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 int mk_instance_return_cpus(struct mk_instance *instance,
 			     const struct mk_cpu_set *cpus)
 {
+	struct mk_cpu_set *snapshot;
 	unsigned int i, requested_count;
 	mk_phys_cpu_t phys_cpu;
 	int not_found = 0;
@@ -398,15 +569,27 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 		return -EINVAL;
 	}
 
-	requested_count = mk_cpu_set_count(cpus);
+	snapshot = mk_cpu_set_alloc();
+	if (!snapshot)
+		return -ENOMEM;
+
+	mk_cpu_transaction_lock();
+	down_write(&instance->control_route_sem);
+	mk_cpu_ownership_lock();
+	ret = mk_cpu_set_copy(snapshot, cpus);
+	if (ret)
+		goto unlock;
+
+	requested_count = mk_cpu_set_count(snapshot);
 	if (requested_count == 0) {
 		pr_info("No CPUs requested to return from instance %d (%s)\n",
 			instance->id, instance->name);
-		return 0;
+		ret = 0;
+		goto unlock;
 	}
 
 	/* Validate all CPUs are assigned to this instance */
-	mk_cpu_set_for_each(i, phys_cpu, cpus) {
+	mk_cpu_set_for_each(i, phys_cpu, snapshot) {
 		if (!mk_cpu_set_contains(instance->cpus, phys_cpu)) {
 			pr_err("CPU %llu not assigned to instance %d (%s)\n",
 			       phys_cpu, instance->id, instance->name);
@@ -417,22 +600,22 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 	if (not_found > 0) {
 		pr_err("Instance %d (%s): %d CPUs are not assigned to this instance\n",
 		       instance->id, instance->name, not_found);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto unlock;
 	}
 
 	ret = mk_cpu_set_reserve(mk_cpu_pool, requested_count);
 	if (ret)
-		return ret;
+		goto unlock;
 
-	mk_cpu_set_format(buf, sizeof(buf), cpus);
+	mk_cpu_set_format(buf, sizeof(buf), snapshot);
+	mk_cpu_ownership_unlock();
+	ret = __mk_instance_migrate_irq_route(instance, snapshot);
+	if (ret)
+		goto unlock_route;
+	mk_cpu_ownership_lock();
 
-	/*
-	 * @cpus may alias instance->cpus (returning everything on
-	 * teardown), so walk it back-to-front: a deletion then never
-	 * shifts entries the walk has yet to visit.
-	 */
-	for (i = requested_count; i-- > 0; ) {
-		phys_cpu = cpus->ids[i];
+	mk_cpu_set_for_each(i, phys_cpu, snapshot) {
 		mk_cpu_set_add(mk_cpu_pool, phys_cpu);
 		mk_cpu_set_del(instance->cpus, phys_cpu);
 	}
@@ -440,7 +623,13 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 	pr_info("Returned %u CPUs from instance %d (%s) to the pool: %s\n",
 		requested_count, instance->id, instance->name, buf);
 
-	return 0;
+unlock:
+	mk_cpu_ownership_unlock();
+unlock_route:
+	up_write(&instance->control_route_sem);
+	mk_cpu_transaction_unlock();
+	mk_cpu_set_free(snapshot);
+	return ret;
 }
 
 /**
@@ -481,9 +670,9 @@ static int mk_instance_reserve_cpus(struct mk_instance *instance,
 				    const struct mk_dt_config *config)
 {
 	if (!config->cpus) {
-		pr_warn("No CPU configuration for instance %d (%s)\n",
-			instance->id, instance->name);
-		return 0;
+		pr_err("No CPU configuration for instance %d (%s)\n",
+		       instance->id, instance->name);
+		return -ENOMEM;
 	}
 
 	return mk_instance_transfer_cpus(instance, config->cpus);
@@ -493,91 +682,43 @@ static int mk_instance_transfer_pci_devices(struct mk_instance *instance,
 					     const struct list_head *requested_devices,
 					     int requested_count)
 {
-	struct mk_pci_device *req_dev, *root_dev, *tmp;
-	int transferred = 0;
-	int not_found = 0;
-	bool found;
-
 	if (!root_instance || !root_instance->pci_devices_valid) {
 		pr_err("No root instance or PCI devices not initialized\n");
 		return -EINVAL;
 	}
 
-	if (requested_count == 0 || list_empty(requested_devices)) {
+	if (!requested_count || list_empty(requested_devices)) {
 		pr_info("No PCI devices requested for instance %d (%s)\n",
 			instance->id, instance->name);
 		instance->pci_devices_valid = true;
 		return 0;
 	}
 
-	list_for_each_entry(req_dev, requested_devices, list) {
-		found = false;
-		list_for_each_entry(root_dev, &root_instance->pci_devices, list) {
-			if (root_dev->vendor == req_dev->vendor &&
-			    root_dev->device == req_dev->device &&
-			    root_dev->domain == req_dev->domain &&
-			    root_dev->bus == req_dev->bus &&
-			    root_dev->slot == req_dev->slot &&
-			    root_dev->func == req_dev->func) {
-				found = true;
-				break;
-			}
-		}
-		if (!found) {
-			pr_err("PCI device %04x:%04x@%04x:%02x:%02x.%x not available in root pool\n",
-			       req_dev->vendor, req_dev->device, req_dev->domain,
-			       req_dev->bus, req_dev->slot, req_dev->func);
-			not_found++;
-		}
-	}
-
-	if (not_found > 0) {
-		pr_err("Instance %d (%s): %d PCI devices not available\n",
-		       instance->id, instance->name, not_found);
-		return -ENOENT;
-	}
-
-	list_for_each_entry(req_dev, requested_devices, list) {
-		list_for_each_entry_safe(root_dev, tmp, &root_instance->pci_devices, list) {
-			if (root_dev->vendor == req_dev->vendor &&
-			    root_dev->device == req_dev->device &&
-			    root_dev->domain == req_dev->domain &&
-			    root_dev->bus == req_dev->bus &&
-			    root_dev->slot == req_dev->slot &&
-			    root_dev->func == req_dev->func) {
-
-				list_del(&root_dev->list);
-				list_add_tail(&root_dev->list, &instance->pci_devices);
-				root_instance->pci_device_count--;
-				instance->pci_device_count++;
-				transferred++;
-
-				pr_debug("Transferred PCI device %04x:%04x@%04x:%02x:%02x.%x to instance %d\n",
-					 root_dev->vendor, root_dev->device, root_dev->domain,
-					 root_dev->bus, root_dev->slot, root_dev->func,
-					 instance->id);
-				break;
-			}
-		}
-	}
-
-	instance->pci_devices_valid = true;
-	pr_info("Transferred %d PCI devices from root to instance %d (%s), root pool remaining: %d devices\n",
-		transferred, instance->id, instance->name, root_instance->pci_device_count);
-
-	return 0;
+	return mk_pci_assign_devices(instance, requested_devices,
+				     requested_count);
 }
-
 static int mk_instance_reserve_pci_devices(struct mk_instance *instance,
 					   const struct mk_dt_config *config)
 {
-	if (!config->pci_devices_valid || config->pci_device_count == 0) {
+	if (!config->pci_devices_valid) {
+		if (config->pci_device_count ||
+		    !list_empty(&config->pci_devices))
+			return -EINVAL;
+		instance->pci_devices_valid = true;
+		return 0;
+	}
+
+	if (!config->pci_device_count) {
+		if (!list_empty(&config->pci_devices))
+			return -EINVAL;
 		instance->pci_devices_valid = true;
 		instance->pci_device_count = 0;
 		pr_debug("No PCI devices to reserve for instance %d (%s)\n",
 			 instance->id, instance->name);
 		return 0;
 	}
+	if (list_empty(&config->pci_devices))
+		return -EINVAL;
 
 	return mk_instance_transfer_pci_devices(instance,
 						&config->pci_devices,
@@ -585,86 +726,111 @@ static int mk_instance_reserve_pci_devices(struct mk_instance *instance,
 }
 
 static int mk_instance_transfer_platform_devices(struct mk_instance *instance,
-						 const struct list_head *requested_devices,
-						 int requested_count)
+				 const struct list_head *requested_devices,
+				 int requested_count)
 {
-	struct mk_platform_device *req_dev, *root_dev, *tmp;
+	struct mk_platform_device *requested, *other, *root_device;
+	int actual_count = 0;
 	int transferred = 0;
-	int not_found = 0;
-	bool found;
 
 	if (!root_instance || !root_instance->platform_devices_valid) {
 		pr_err("No root instance or platform devices not initialized\n");
 		return -EINVAL;
 	}
+	if (requested_count <= 0 || list_empty(requested_devices))
+		return -EINVAL;
 
-	if (requested_count == 0 || list_empty(requested_devices)) {
-		pr_info("No platform devices requested for instance %d (%s)\n",
-			instance->id, instance->name);
+	list_for_each_entry(requested, requested_devices, list) {
+		actual_count++;
+		list_for_each_entry(other, requested_devices, list) {
+			if (other == requested)
+				break;
+			if (!strcmp(other->name, requested->name)) {
+				pr_err("Platform device %s is requested more than once\n",
+				       requested->name);
+				return -EINVAL;
+			}
+		}
+
+		root_device = NULL;
+		list_for_each_entry(other, &root_instance->platform_devices,
+				    list) {
+			if (!strcmp(other->name, requested->name)) {
+				root_device = other;
+				break;
+			}
+		}
+		if (!root_device) {
+			pr_err("Platform device %s not available in root pool\n",
+			       requested->name);
+			return -ENOENT;
+		}
+	}
+
+	if (actual_count != requested_count) {
+		pr_err("Platform device count mismatch: metadata=%d list=%d\n",
+		       requested_count, actual_count);
+		return -EINVAL;
+	}
+
+	list_for_each_entry(requested, requested_devices, list) {
+		root_device = NULL;
+		list_for_each_entry(other, &root_instance->platform_devices,
+				    list) {
+			if (!strcmp(other->name, requested->name)) {
+				root_device = other;
+				break;
+			}
+		}
+		if (!root_device)
+			goto rollback;
+
+		list_move_tail(&root_device->list,
+			       &instance->platform_devices);
+		root_instance->platform_device_count--;
+		instance->platform_device_count++;
+		transferred++;
+	}
+
+	instance->platform_devices_valid = true;
+	pr_info("Transferred %d platform devices from root to instance %d (%s)\n",
+		transferred, instance->id, instance->name);
+	return 0;
+
+rollback:
+	pr_err("Platform inventory changed during reservation for instance %d\n",
+	       instance->id);
+	mk_instance_return_platform_devices(instance);
+	return -EIO;
+}
+
+static int mk_instance_reserve_platform_devices(struct mk_instance *instance,
+				 const struct mk_dt_config *config)
+{
+	if (!config->platform_devices_valid) {
+		if (config->platform_device_count ||
+		    !list_empty(&config->platform_devices))
+			return -EINVAL;
 		instance->platform_devices_valid = true;
 		return 0;
 	}
 
-	list_for_each_entry(req_dev, requested_devices, list) {
-		found = false;
-		list_for_each_entry(root_dev, &root_instance->platform_devices, list) {
-			if (strcmp(root_dev->name, req_dev->name) == 0) {
-				found = true;
-				break;
-			}
-		}
-		if (!found) {
-			pr_err("Platform device '%s' not available in root pool\n",
-			       req_dev->name);
-			not_found++;
-		}
-	}
-
-	if (not_found > 0) {
-		pr_err("Instance %d (%s): %d platform devices not available\n",
-		       instance->id, instance->name, not_found);
-		return -ENOENT;
-	}
-
-	list_for_each_entry(req_dev, requested_devices, list) {
-		list_for_each_entry_safe(root_dev, tmp, &root_instance->platform_devices, list) {
-			if (strcmp(root_dev->name, req_dev->name) == 0) {
-				list_del(&root_dev->list);
-				list_add_tail(&root_dev->list, &instance->platform_devices);
-				root_instance->platform_device_count--;
-				instance->platform_device_count++;
-				transferred++;
-
-				pr_debug("Transferred platform device '%s' to instance %d\n",
-					 root_dev->name, instance->id);
-				break;
-			}
-		}
-	}
-
-	instance->platform_devices_valid = true;
-	pr_info("Transferred %d platform devices from root to instance %d (%s), root pool remaining: %d devices\n",
-		transferred, instance->id, instance->name, root_instance->platform_device_count);
-
-	return 0;
-}
-
-static int mk_instance_reserve_platform_devices(struct mk_instance *instance,
-						const struct mk_dt_config *config)
-{
-	if (!config->platform_devices_valid || config->platform_device_count == 0) {
+	if (!config->platform_device_count) {
+		if (!list_empty(&config->platform_devices))
+			return -EINVAL;
 		instance->platform_devices_valid = true;
 		instance->platform_device_count = 0;
 		pr_debug("No platform devices to reserve for instance %d (%s)\n",
 			 instance->id, instance->name);
 		return 0;
 	}
+	if (list_empty(&config->platform_devices))
+		return -EINVAL;
 
 	return mk_instance_transfer_platform_devices(instance,
 						     &config->platform_devices,
 						     config->platform_device_count);
 }
-
 /**
  * mk_instance_add_pci_device - Add a single PCI device to an instance
  * @instance: Target instance
@@ -680,37 +846,14 @@ static int mk_instance_reserve_platform_devices(struct mk_instance *instance,
 int mk_instance_add_pci_device(struct mk_instance *instance,
 			       u16 domain, u8 bus, u8 devfn)
 {
-	struct mk_pci_device *root_dev, *tmp;
-	u8 slot = PCI_SLOT(devfn);
-	u8 func = PCI_FUNC(devfn);
+	int ret;
 
-	if (!root_instance || !root_instance->pci_devices_valid) {
-		pr_err("No root instance or PCI devices not initialized\n");
-		return -EINVAL;
-	}
-
-	list_for_each_entry_safe(root_dev, tmp, &root_instance->pci_devices, list) {
-		if (root_dev->domain == domain &&
-		    root_dev->bus == bus &&
-		    root_dev->slot == slot &&
-		    root_dev->func == func) {
-
-			list_del(&root_dev->list);
-			list_add_tail(&root_dev->list, &instance->pci_devices);
-			root_instance->pci_device_count--;
-			instance->pci_device_count++;
-			instance->pci_devices_valid = true;
-
-			pr_info("Transferred PCI device %04x:%04x@%04x:%02x:%02x.%x to instance %d\n",
-				root_dev->vendor, root_dev->device, domain, bus, slot, func,
-				instance->id);
-			return 0;
-		}
-	}
-
-	pr_err("PCI device %04x:%02x:%02x.%x not found in root pool\n",
-	       domain, bus, slot, func);
-	return -ENOENT;
+	ret = mk_pci_assign_device(instance, domain, bus, devfn);
+	if (!ret)
+		pr_info("Leased PCI VF %04x:%02x:%02x.%x to instance %d\n",
+			domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn),
+			instance->id);
+	return ret;
 }
 
 /**
@@ -721,63 +864,22 @@ int mk_instance_add_pci_device(struct mk_instance *instance,
  * @devfn: PCI device and function (combined)
  *
  * Returns a single PCI device from the specified instance back to root instance.
- * Used for dynamic PCI device hotplug from non-running instances.
+ * Dynamic assignment changes are accepted only while the instance is ready.
  *
  * Returns: 0 on success, negative error code on failure
  */
 int mk_instance_remove_pci_device(struct mk_instance *instance,
 				  u16 domain, u8 bus, u8 devfn)
 {
-	struct mk_pci_device *inst_dev, *tmp;
-	struct mk_pci_device *root_dev;
-	u8 slot = PCI_SLOT(devfn);
-	u8 func = PCI_FUNC(devfn);
+	int ret;
 
-	if (!instance->pci_devices_valid) {
-		pr_err("Instance %d PCI devices not initialized\n", instance->id);
-		return -EINVAL;
-	}
-
-	if (!root_instance) {
-		pr_err("Cannot return PCI device: no root instance\n");
-		return -EINVAL;
-	}
-
-	list_for_each_entry_safe(inst_dev, tmp, &instance->pci_devices, list) {
-		if (inst_dev->domain == domain &&
-		    inst_dev->bus == bus &&
-		    inst_dev->slot == slot &&
-		    inst_dev->func == func) {
-
-			root_dev = kzalloc(sizeof(*root_dev), GFP_KERNEL);
-			if (!root_dev) {
-				pr_err("Failed to allocate PCI device entry for root instance\n");
-				return -ENOMEM;
-			}
-
-			*root_dev = *inst_dev;
-			INIT_LIST_HEAD(&root_dev->list);
-
-			list_add_tail(&root_dev->list, &root_instance->pci_devices);
-			root_instance->pci_device_count++;
-			root_instance->pci_devices_valid = true;
-
-			list_del(&inst_dev->list);
-			kfree(inst_dev);
-			instance->pci_device_count--;
-
-			pr_info("Returned PCI device %04x:%04x@%04x:%02x:%02x.%x from instance %d to root\n",
-				root_dev->vendor, root_dev->device, domain, bus, slot, func,
-				instance->id);
-			return 0;
-		}
-	}
-
-	pr_err("PCI device %04x:%02x:%02x.%x not found in instance %d\n",
-	       domain, bus, slot, func, instance->id);
-	return -ENOENT;
+	ret = mk_pci_unassign_device(instance, domain, bus, devfn);
+	if (!ret)
+		pr_info("Released PCI VF %04x:%02x:%02x.%x from instance %d\n",
+			domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn),
+			instance->id);
+	return ret;
 }
-
 /**
  * mk_root_has_pci_device - Test whether a PCI device is free in the root pool
  * @domain: PCI domain
@@ -1086,67 +1188,76 @@ void mk_instance_free_memory(struct mk_instance *instance)
 		 instance->id, instance->name);
 }
 
+static bool mk_instance_resources_empty(const struct mk_instance *instance)
+{
+	return list_empty(&instance->memory_regions) &&
+	       !instance->instance_pool && !instance->region_count &&
+	       mk_cpu_set_empty(instance->cpus) &&
+	       list_empty(&instance->pci_devices) &&
+	       list_empty(&instance->pci_assignments) &&
+	       !instance->pci_device_count &&
+	       list_empty(&instance->platform_devices) &&
+	       !instance->platform_device_count;
+}
+
 /**
- * mk_instance_reserve_resources() - Reserve memory and CPU resources for an instance
+ * mk_instance_reserve_resources() - Atomically reserve instance resources
  * @instance: Instance to reserve resources for
- * @config: Device tree configuration with memory regions and CPU assignment
+ * @config: Parsed resource configuration
  *
- * Reserves all memory regions specified in the device tree configuration,
- * makes them children of their pool chunks, and copies CPU assignment.
+ * Each resource class is acquired in sequence. Any error returns every
+ * acquired resource in reverse order, so callers never observe a partially
+ * populated instance.
  *
- * Returns 0 on success, negative error code on failure.
+ * Returns: 0 on success, negative error code on failure
  */
 int mk_instance_reserve_resources(struct mk_instance *instance,
 			       const struct mk_dt_config *config)
 {
+	const char *failed_resource;
+	int release_ret;
 	int ret;
 
-	if (!config || !instance) {
+	if (!config || !instance || !instance->cpus) {
 		pr_err("Invalid parameters to mk_instance_reserve_resources\n");
 		return -EINVAL;
 	}
+	if (!mk_instance_resources_empty(instance)) {
+		pr_err("Instance %d (%s) already owns resources\n",
+		       instance->id, instance->name);
+		return -EBUSY;
+	}
 
-	/* Free any existing memory regions first */
-	mk_instance_free_memory(instance);
-
-	/* Reserve memory regions */
+	failed_resource = "memory";
 	ret = mk_instance_reserve_memory(instance, config);
-	if (ret) {
-		pr_err("Failed to reserve memory regions for instance %d (%s): %d\n",
-		       instance->id, instance->name, ret);
-		return ret;
-	}
+	if (ret)
+		goto rollback;
 
-	/* Reserve CPU resources */
+	failed_resource = "CPU";
 	ret = mk_instance_reserve_cpus(instance, config);
-	if (ret) {
-		pr_err("Failed to reserve CPU resources for instance %d (%s): %d\n",
-		       instance->id, instance->name, ret);
-		/* Don't fail the whole operation for CPU reservation failure */
-		pr_warn("Continuing without CPU assignment\n");
-	}
+	if (ret)
+		goto rollback;
 
-	/* Reserve PCI device resources */
-	ret = mk_instance_reserve_pci_devices(instance, config);
-	if (ret) {
-		pr_err("Failed to reserve PCI device resources for instance %d (%s): %d\n",
-		       instance->id, instance->name, ret);
-		/* Don't fail the whole operation for PCI reservation failure */
-		pr_warn("Continuing without PCI device assignment\n");
-	}
-
-	/* Reserve platform device resources */
+	failed_resource = "platform device";
 	ret = mk_instance_reserve_platform_devices(instance, config);
-	if (ret) {
-		pr_err("Failed to reserve platform device resources for instance %d (%s): %d\n",
-		       instance->id, instance->name, ret);
-		/* Don't fail the whole operation for platform reservation failure */
-		pr_warn("Continuing without platform device assignment\n");
-	}
+	if (ret)
+		goto rollback;
+
+	failed_resource = "PCI device";
+	ret = mk_instance_reserve_pci_devices(instance, config);
+	if (ret)
+		goto rollback;
 
 	return 0;
-}
 
+rollback:
+	pr_err("Failed to reserve %s resources for instance %d (%s): %d\n",
+	       failed_resource, instance->id, instance->name, ret);
+	release_ret = mk_instance_release_resources(instance);
+	if (release_ret)
+		return release_ret;
+	return ret;
+}
 /**
  * Per-instance memory pool management
  */
@@ -1371,17 +1482,37 @@ static void mk_shutdown_work_fn(struct work_struct *work)
 }
 
 /*
- * Mark a halted instance re-spawnable. No wakeups are published here:
- * the instance's CPUs may still be on their way to the park loop, and
- * poking its context while its (old or next) kernel also publishes on
- * it corrupts the single-producer mailbox. The kexec path confirms the
- * CPUs are parked before it rewrites the image.
+ * Mark a halted instance re-spawnable only after every CPU is parked. This
+ * proof permits recovery of a mailbox consumer interrupted by shutdown and
+ * prevents the next image from racing the old kernel in shared memory.
  */
-static void mk_instance_settle_halted(struct mk_instance *instance)
+static int mk_instance_settle_halted(struct mk_instance *instance,
+				     bool transaction_held,
+				     bool parked_confirmed)
 {
+	int ret;
+
 	pr_info("Instance %d (%s) halted, CPUs parking in pool\n",
 		instance->id, instance->name);
-	mk_instance_set_state(instance, MK_STATE_LOADED);
+	if (!transaction_held)
+		mk_cpu_transaction_lock();
+	if (!parked_confirmed) {
+		ret = mk_instance_confirm_parked(instance);
+		if (ret) {
+			down_write(&instance->control_route_sem);
+			mutex_lock(&instance->resource_mutex);
+			mk_instance_set_state(instance, MK_STATE_FAILED);
+			mutex_unlock(&instance->resource_mutex);
+			up_write(&instance->control_route_sem);
+			if (!transaction_held)
+				mk_cpu_transaction_unlock();
+			return ret;
+		}
+	}
+	ret = mk_instance_finish_halt(instance, true);
+	if (!transaction_held)
+		mk_cpu_transaction_unlock();
+	return ret;
 }
 
 struct mk_halted_work {
@@ -1397,7 +1528,9 @@ static void mk_halted_work_fn(struct work_struct *work)
 
 	instance = mk_instance_find(aw->instance_id);
 	if (instance) {
-		mk_instance_settle_halted(instance);
+		if (mk_instance_settle_halted(instance, false, false))
+			pr_err("Instance %d halted but could not be made reusable\n",
+			       instance->id);
 		mk_instance_put(instance);
 	} else {
 		pr_warn("Shutdown ACK from unknown instance %d\n",
@@ -1408,7 +1541,8 @@ static void mk_halted_work_fn(struct work_struct *work)
 }
 
 static void mk_system_msg_handler(u32 msg_type, u32 subtype,
-				  void *payload, u32 payload_len, void *ctx)
+				  void *payload, u32 payload_len,
+				  mk_phys_cpu_t sender_cpu, void *ctx)
 {
 	if (msg_type != MK_MSG_SYSTEM)
 		return;
@@ -1521,12 +1655,10 @@ int multikernel_halt_by_id(int mk_id)
 
 	ret = mk_msg_pending_wait(pending, 30000);
 	if (ret == 0) {
-		if (mk_instance_confirm_parked(instance))
-			pr_warn("Multikernel instance %d halted with CPUs unaccounted for\n",
+		ret = mk_instance_settle_halted(instance, false, false);
+		if (!ret)
+			pr_info("Multikernel instance %d halted (graceful)\n",
 				mk_id);
-
-		mk_instance_set_state(instance, MK_STATE_LOADED);
-		pr_info("Multikernel instance %d halted (graceful)\n", mk_id);
 	}
 
 	mk_instance_put(instance);
@@ -1534,85 +1666,128 @@ int multikernel_halt_by_id(int mk_id)
 }
 
 /**
- * multikernel_force_halt_by_id - Forcible shutdown of a multikernel instance via NMI
- * @mk_id: Instance ID to halt
+ * mk_instance_force_halt - Forcibly stop an instance via NMI
+ * @instance: Instance to stop
  *
- * Forces a spawn kernel's CPUs to stop by arming the force-halt marker
- * in the instance's shared IPI area and sending NMIs directly to each
- * CPU. The NMI handler tests the marker and parks the CPU in the pool.
- *
- * No message is queued and no doorbell is rung: a ring message is
- * consumed by the instance's ordinary interrupt path, which on a
- * responsive kernel races the NMIs for it and can leave them with
- * nothing to act on. The marker is host-owned and survives until the
- * instance is re-executed, so the NMIs act on it regardless of timing.
+ * Forces a spawn kernel's CPUs to stop by arming the persistent force-halt
+ * marker and sending NMIs directly to each CPU. The NMI handler checks the
+ * marker and parks the CPU if it is set.
  *
  * Use when: The spawn kernel is stuck/crashed and not responding to graceful
- * shutdown, or when graceful shutdown has failed. May be repeated: an
- * already-halted instance absorbs the NMIs in the park loop, so a rerun
- * only rescues CPUs an earlier halt missed.
+ * shutdown, or when graceful shutdown has failed.
  *
  * Returns: 0 on success, negative error code on failure
  */
-int multikernel_force_halt_by_id(int mk_id)
+static int __mk_instance_force_halt(struct mk_instance *instance,
+				    bool allow_loaded)
 {
-	struct mk_instance *instance;
+	struct mk_cpu_set *snapshot;
 	mk_phys_cpu_t phys_cpu;
 	unsigned int i;
 	int cpu_count = 0;
 	int ret;
 
-	instance = mk_instance_find(mk_id);
 	if (!instance)
-		return -ENOENT;
-
-	/*
-	 * LOADED is allowed for the retry case: a previous halt already
-	 * settled the state, but a CPU that missed its NMI is still
-	 * running the old image and kexec refuses to reload it. Without
-	 * a rerun the instance is stuck for good.
-	 */
+		return -EINVAL;
 	if (instance->state != MK_STATE_ACTIVE &&
-	    instance->state != MK_STATE_LOADED) {
-		pr_err("Instance %d not running (state=%d), nothing to force halt\n",
-			mk_id, instance->state);
-		mk_instance_put(instance);
+	    (!allow_loaded ||
+	     (instance->state != MK_STATE_LOADED &&
+	      instance->state != MK_STATE_FAILED))) {
+		pr_err("Instance %d not active (state=%d), nothing to force halt\n",
+			instance->id, instance->state);
 		return -EINVAL;
 	}
 
-	if (mk_cpu_set_empty(instance->cpus)) {
-		pr_err("Instance %d has no CPUs assigned\n", mk_id);
-		mk_instance_put(instance);
+	snapshot = mk_cpu_set_alloc();
+	if (!snapshot)
+		return -ENOMEM;
+	mk_cpu_transaction_lock();
+	mk_cpu_ownership_lock();
+	ret = mk_cpu_set_copy(snapshot, instance->cpus);
+	mk_cpu_ownership_unlock();
+	if (ret) {
+		mk_cpu_transaction_unlock();
+		mk_cpu_set_free(snapshot);
+		return ret;
+	}
+
+	if (mk_cpu_set_empty(snapshot)) {
+		pr_err("Instance %d has no CPUs assigned\n", instance->id);
+		mk_cpu_transaction_unlock();
+		mk_cpu_set_free(snapshot);
 		return -EINVAL;
 	}
 
-	pr_info("Force halting multikernel instance %d via NMI\n", mk_id);
-
+	pr_info("Force halting multikernel instance %d via NMI\n", instance->id);
 	ret = mk_arm_force_halt(instance);
 	if (ret)
-		pr_err("Failed to arm force-halt marker: %d (sending NMI anyway)\n", ret);
+		pr_err("Failed to arm force-halt marker: %d (sending NMI anyway)\n",
+		       ret);
 
 	/* Send NMI to each CPU in the instance */
-	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
+	mk_cpu_set_for_each(i, phys_cpu, snapshot) {
 		mk_force_stop_cpu(phys_cpu);
 		cpu_count++;
 	}
 
-	pr_info("Sent NMI to %d CPUs in instance %d\n", cpu_count, mk_id);
-
-	/*
-	 * The NMI handler parks each CPU on the instance's context. Wait
-	 * for them to arrive before reporting the instance re-spawnable,
-	 * exactly as the graceful path does after its shutdown ACK.
-	 */
-	mk_instance_settle_halted(instance);
-	mk_instance_put(instance);
-	return 0;
+	pr_info("Sent NMI to %d CPUs in instance %d\n",
+		cpu_count, instance->id);
+	ret = mk_instance_confirm_parked(instance);
+	if (ret) {
+		pr_err("Instance %d CPUs did not park after force halt: %d\n",
+		       instance->id, ret);
+		mk_cpu_set_free(snapshot);
+		mk_cpu_transaction_unlock();
+		return ret;
+	}
+	mk_cpu_set_free(snapshot);
+	/* Quiesce host-owned resources before making the instance reusable. */
+	ret = mk_instance_settle_halted(instance, true, true);
+	mk_cpu_transaction_unlock();
+	return ret;
 }
 
+int mk_instance_force_halt(struct mk_instance *instance)
+{
+	return __mk_instance_force_halt(instance, false);
+}
+
+int mk_instance_abort_spawn(struct mk_instance *instance)
+{
+	int ret;
+
+	ret = __mk_instance_force_halt(instance, true);
+	if (ret && instance)
+		mk_instance_mark_failed(instance);
+	return ret;
+}
+
+int multikernel_force_halt_by_id(int mk_id)
+{
+	struct mk_instance *instance;
+	int ret;
+
+	instance = mk_instance_find(mk_id);
+	if (!instance)
+		return -ENOENT;
+	ret = mk_instance_force_halt(instance);
+	mk_instance_put(instance);
+	return ret;
+}
 static int __init multikernel_init(void)
 {
 	int ret;
+
+	if (!root_instance) {
+		pr_err("Multikernel root instance is unavailable\n");
+		return -ENODEV;
+	}
+
+	ret = mk_pci_lease_system_init();
+	if (ret) {
+		pr_err("Failed to initialize PCI assignment leases: %d\n", ret);
+		return ret;
+	}
 
 	/* Register NMI handler for forcible shutdown */
 	ret = mk_register_stop_nmi_handler();
@@ -1624,6 +1799,7 @@ static int __init multikernel_init(void)
 	ret = mk_messaging_init();
 	if (ret < 0) {
 		pr_err("Failed to initialize multikernel messaging: %d\n", ret);
+		mk_pci_lease_system_cleanup();
 		return ret;
 	}
 
@@ -1631,6 +1807,7 @@ static int __init multikernel_init(void)
 	if (ret < 0) {
 		pr_err("Failed to register system message handler: %d\n", ret);
 		mk_messaging_cleanup();
+		mk_pci_lease_system_cleanup();
 		return ret;
 	}
 
@@ -1639,6 +1816,7 @@ static int __init multikernel_init(void)
 		pr_err("Failed to initialize multikernel hotplug: %d\n", ret);
 		mk_unregister_msg_handler(MK_MSG_SYSTEM, mk_system_msg_handler);
 		mk_messaging_cleanup();
+		mk_pci_lease_system_cleanup();
 		return ret;
 	}
 
@@ -1648,6 +1826,19 @@ static int __init multikernel_init(void)
 		mk_hotplug_cleanup();
 		mk_unregister_msg_handler(MK_MSG_SYSTEM, mk_system_msg_handler);
 		mk_messaging_cleanup();
+		mk_pci_lease_system_cleanup();
+		return ret;
+	}
+
+	ret = mk_ipi_shared_mark_ready(root_instance->ipi_data,
+				       root_instance->id);
+	if (ret < 0) {
+		pr_err("Failed to publish multikernel IPI readiness: %d\n", ret);
+		mk_kernfs_cleanup();
+		mk_hotplug_cleanup();
+		mk_unregister_msg_handler(MK_MSG_SYSTEM, mk_system_msg_handler);
+		mk_messaging_cleanup();
+		mk_pci_lease_system_cleanup();
 		return ret;
 	}
 

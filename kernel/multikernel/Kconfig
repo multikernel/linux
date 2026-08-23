@@ -24,4 +24,7 @@ config MULTIKERNEL
 	  - A manifest handed to each spawn kernel on multikernel's own
 	    boot channel, describing its resources and message rings
 
+	  SR-IOV VF assignment additionally requires PCI_IOV and an active
+	  hardware IOMMU with isolated interrupt delivery. Assignment fails
+	  closed when those isolation facilities are unavailable.
 	  If unsure, say N.

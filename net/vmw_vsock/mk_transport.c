@@ -279,7 +279,8 @@ static void mk_vsock_rx_work(struct work_struct *work)
 }
 
 static void mk_vsock_ipi_handler(u32 msg_type, u32 subtype,
-				 void *payload, u32 payload_len, void *ctx)
+				 void *payload, u32 payload_len,
+				 mk_phys_cpu_t sender_cpu, void *ctx)
 {
 	struct sk_buff *skb;
 	struct virtio_vsock_hdr *hdr;

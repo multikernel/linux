@@ -126,6 +126,180 @@ static int status_seq_show(struct seq_file *sf, void *v)
 	return 0;
 }
 
+/*
+ * This is an observational snapshot, not a transaction: producers may update
+ * fields while the file is read.  Shared transport counters are u32 values
+ * and restart with a new spawn_epoch, so consumers compare modulo-u32 deltas
+ * only between samples from the same epoch.
+ */
+static int stats_seq_show(struct seq_file *sf, void *v)
+{
+	struct kernfs_open_file *of = sf->private;
+	struct mk_instance *instance = of->kn->priv;
+	struct mk_shared_data *shared;
+	struct {
+		u64 spawn_epoch;
+		u64 irq_pending_total;
+		u64 pci_config_requests;
+		u64 pci_config_total_ns;
+		u64 pci_config_max_ns;
+		u64 pci_control_pool_exhausted;
+		u32 ipi_producer_contention;
+		u32 ipi_full_failures;
+		u32 ipi_invalid_state;
+		u32 ipi_cancelled_writes;
+		u32 reply_late_replies;
+		u32 reply_cancelled_slots;
+		u32 reply_atomic_timeouts;
+		u32 reply_indeterminate_timeouts;
+		u32 reply_occupied_failures;
+		u32 irq_recorded;
+		u32 irq_coalesced;
+		u32 irq_masked_deferred;
+		u32 irq_stale;
+		u32 irq_dispatch_failed;
+		u32 irq_saturated;
+		u32 ipi_slots[4];
+		u32 reply_states[MK_REPLY_ABANDONED + 1];
+		u32 irq_active;
+		u32 irq_pending;
+		u32 irq_masked;
+		u32 irq_consuming;
+		u32 reply_busy;
+		u32 ipi_gate_busy;
+		bool available;
+	} stats = {};
+	unsigned int i;
+
+	stats.pci_control_pool_exhausted =
+		mk_pci_control_pool_exhausted_read();
+	down_read(&instance->control_route_sem);
+	shared = READ_ONCE(instance->ipi_data);
+	if (!shared)
+		goto unlock;
+	stats.available = true;
+	stats.spawn_epoch = READ_ONCE(shared->spawn_epoch);
+	stats.ipi_producer_contention =
+		atomic_read(&shared->ring.producer_contention);
+	stats.ipi_full_failures = atomic_read(&shared->ring.full_failures);
+	stats.ipi_invalid_state = atomic_read(&shared->ring.invalid_state);
+	stats.ipi_cancelled_writes = atomic_read(&shared->ring.cancelled_writes);
+	stats.ipi_gate_busy = !!atomic64_read_acquire(&shared->ring.producer_gate);
+	stats.reply_late_replies = atomic_read(&shared->replies.late_replies);
+	stats.reply_cancelled_slots = atomic_read(&shared->replies.cancelled_slots);
+	stats.reply_atomic_timeouts = atomic_read(&shared->replies.atomic_timeouts);
+	stats.reply_indeterminate_timeouts =
+		atomic_read(&shared->replies.indeterminate_timeouts);
+	stats.reply_occupied_failures =
+		atomic_read(&shared->replies.occupied_failures);
+	stats.irq_recorded = atomic_read(&shared->irq_mailbox.recorded);
+	stats.irq_coalesced = atomic_read(&shared->irq_mailbox.coalesced);
+	stats.irq_masked_deferred =
+		atomic_read(&shared->irq_mailbox.masked_deferred);
+	stats.irq_stale = atomic_read(&shared->irq_mailbox.stale);
+	stats.irq_dispatch_failed =
+		atomic_read(&shared->irq_mailbox.dispatch_failed);
+	stats.irq_saturated = atomic_read(&shared->irq_mailbox.saturated);
+	stats.pci_config_requests =
+		atomic64_read(&shared->pci_stats.config_requests);
+	stats.pci_config_total_ns =
+		atomic64_read(&shared->pci_stats.config_total_ns);
+	stats.pci_config_max_ns =
+		atomic64_read(&shared->pci_stats.config_max_ns);
+	for (i = 0; i < MK_IPI_RING_SIZE; i++) {
+		u32 state = atomic_read_acquire(&shared->ring.entries[i].state);
+
+		if (state >= MK_IPI_SLOT_WRITING && state <= MK_IPI_SLOT_CANCELLED)
+			stats.ipi_slots[state - MK_IPI_SLOT_WRITING]++;
+	}
+	for (i = 0; i < MK_REPLY_SLOTS; i++) {
+		struct mk_reply_slot *slot = &shared->replies.slots[i];
+		u64 token = atomic64_read_acquire(&slot->state_generation);
+		u32 state = token & (BIT(MK_REPLY_STATE_BITS) - 1);
+
+		if (state <= MK_REPLY_ABANDONED)
+			stats.reply_states[state]++;
+		if (state != MK_REPLY_FREE)
+			stats.reply_busy++;
+	}
+	for (i = 0; i < MK_IRQ_MAILBOX_SLOTS; i++) {
+		struct mk_irq_mailbox_entry *entry =
+			&shared->irq_mailbox.entries[i];
+		u64 token = atomic64_read_acquire(&entry->pending_generation);
+
+		if (!mk_irq_mailbox_generation(token))
+			continue;
+		stats.irq_active++;
+		if (mk_irq_mailbox_pending(token)) {
+			stats.irq_pending++;
+			stats.irq_pending_total += mk_irq_mailbox_pending(token);
+		}
+		if (mk_irq_mailbox_masked(token))
+			stats.irq_masked++;
+		if (mk_irq_mailbox_consuming(token))
+			stats.irq_consuming++;
+	}
+unlock:
+	up_read(&instance->control_route_sem);
+
+	seq_puts(sf, "stats_version 1\n");
+	seq_printf(sf, "abi_version %u\n", MK_IPI_ABI_VERSION);
+	seq_puts(sf, "snapshot_atomic 0\n");
+	seq_puts(sf, "transport_counter_bits 32\n");
+	seq_printf(sf, "transport_available %u\n", stats.available);
+	seq_printf(sf, "spawn_epoch %llu\n",
+		   (unsigned long long)stats.spawn_epoch);
+#define MK_STATS_VALUE(name, value) seq_printf(sf, name " %u\n", value)
+	MK_STATS_VALUE("ipi.producer_contention", stats.ipi_producer_contention);
+	MK_STATS_VALUE("ipi.full_failures", stats.ipi_full_failures);
+	MK_STATS_VALUE("ipi.invalid_state", stats.ipi_invalid_state);
+	MK_STATS_VALUE("ipi.cancelled_writes", stats.ipi_cancelled_writes);
+	MK_STATS_VALUE("ipi.gate_busy", stats.ipi_gate_busy);
+	MK_STATS_VALUE("ipi.slot_writing", stats.ipi_slots[0]);
+	MK_STATS_VALUE("ipi.slot_ready", stats.ipi_slots[1]);
+	MK_STATS_VALUE("ipi.slot_consuming", stats.ipi_slots[2]);
+	MK_STATS_VALUE("ipi.slot_cancelled", stats.ipi_slots[3]);
+	MK_STATS_VALUE("reply.late_replies", stats.reply_late_replies);
+	MK_STATS_VALUE("reply.cancelled_slots", stats.reply_cancelled_slots);
+	MK_STATS_VALUE("reply.atomic_timeouts", stats.reply_atomic_timeouts);
+	MK_STATS_VALUE("reply.indeterminate_timeouts",
+		       stats.reply_indeterminate_timeouts);
+	MK_STATS_VALUE("reply.occupied_failures", stats.reply_occupied_failures);
+	MK_STATS_VALUE("reply.slot_busy", stats.reply_busy);
+	MK_STATS_VALUE("reply.slot_reserved", stats.reply_states[MK_REPLY_RESERVED]);
+	MK_STATS_VALUE("reply.slot_writing", stats.reply_states[MK_REPLY_WRITING]);
+	MK_STATS_VALUE("reply.slot_executing", stats.reply_states[MK_REPLY_EXECUTING]);
+	MK_STATS_VALUE("reply.slot_committed", stats.reply_states[MK_REPLY_COMMITTED]);
+	MK_STATS_VALUE("reply.slot_ready", stats.reply_states[MK_REPLY_READY]);
+	MK_STATS_VALUE("reply.slot_abandoned", stats.reply_states[MK_REPLY_ABANDONED]);
+	MK_STATS_VALUE("irq.recorded", stats.irq_recorded);
+	MK_STATS_VALUE("irq.coalesced", stats.irq_coalesced);
+	MK_STATS_VALUE("irq.masked_deferred", stats.irq_masked_deferred);
+	MK_STATS_VALUE("irq.stale", stats.irq_stale);
+	MK_STATS_VALUE("irq.dispatch_failed", stats.irq_dispatch_failed);
+	MK_STATS_VALUE("irq.saturated", stats.irq_saturated);
+	MK_STATS_VALUE("irq.slot_active", stats.irq_active);
+	MK_STATS_VALUE("irq.slot_pending", stats.irq_pending);
+	MK_STATS_VALUE("irq.slot_masked", stats.irq_masked);
+	MK_STATS_VALUE("irq.slot_consuming", stats.irq_consuming);
+#undef MK_STATS_VALUE
+	seq_printf(sf, "irq.pending_total %llu\n",
+		   (unsigned long long)stats.irq_pending_total);
+	seq_printf(sf, "pci.config_requests %llu\n",
+		   (unsigned long long)stats.pci_config_requests);
+	seq_printf(sf, "pci.config_total_ns %llu\n",
+		   (unsigned long long)stats.pci_config_total_ns);
+	seq_printf(sf, "pci.config_average_ns %llu\n",
+		   stats.pci_config_requests ?
+		   (unsigned long long)(stats.pci_config_total_ns /
+					stats.pci_config_requests) : 0);
+	seq_printf(sf, "pci.config_max_ns %llu\n",
+		   (unsigned long long)stats.pci_config_max_ns);
+	seq_printf(sf, "pci.control_pool_exhausted %llu\n",
+		   (unsigned long long)stats.pci_control_pool_exhausted);
+	return 0;
+}
+
 /* Root-level device_tree attribute - shows current baseline pool from kernel structures */
 static int root_device_tree_seq_show(struct seq_file *sf, void *v)
 {
@@ -242,6 +416,7 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 	struct kernfs_node *kn;
 	struct mk_dt_config config;
 	void *dtb_copy;
+	int release_ret;
 	int ret;
 	int allocated_id;
 
@@ -271,7 +446,10 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 
 	INIT_LIST_HEAD(&instance->memory_regions);
 	INIT_LIST_HEAD(&instance->list);
+	init_rwsem(&instance->control_route_sem);
+	instance->irq_route_cpu = MK_PHYS_CPU_INVALID;
 	INIT_LIST_HEAD(&instance->pci_devices);
+	mk_pci_lease_instance_init(instance);
 	INIT_LIST_HEAD(&instance->platform_devices);
 	kref_init(&instance->refcount);
 
@@ -336,7 +514,16 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 	kfree(instance->dtb_data);
 	instance->dtb_data = NULL;
 err_free_resources:
-	mk_instance_free_memory(instance);
+	release_ret = mk_instance_release_resources(instance);
+	if (release_ret) {
+		pr_crit("Retaining failed instance '%s' because PCI cleanup failed: %d\n",
+			name, release_ret);
+		list_add_tail(&instance->list, &mk_instance_list);
+		kernfs_activate(kn);
+		mk_instance_set_state(instance, MK_STATE_FAILED);
+		mk_dt_config_free(&config);
+		return release_ret;
+	}
 err_free_idr:
 	idr_remove(&mk_instance_idr, instance->id);
 err_remove_dir:
@@ -361,6 +548,10 @@ static const struct kernfs_ops mk_id_ops = {
 
 static const struct kernfs_ops mk_status_ops = {
 	.seq_show = status_seq_show,
+};
+
+static const struct kernfs_ops mk_stats_ops = {
+	.seq_show = stats_seq_show,
 };
 
 /* Root-level device_tree operations */
@@ -395,6 +586,13 @@ static int mk_create_instance_files(struct mk_instance *instance)
 				  &mk_status_ops, instance, NULL, NULL);
 	if (IS_ERR(kn)) {
 		pr_err("Failed to create status file for instance %s\n", instance->name);
+		return PTR_ERR(kn);
+	}
+	kn = __kernfs_create_file(instance->kn, "stats", 0444,
+				  GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, 0,
+				  &mk_stats_ops, instance, NULL, NULL);
+	if (IS_ERR(kn)) {
+		pr_err("Failed to create stats file for instance %s\n", instance->name);
 		return PTR_ERR(kn);
 	}
 
@@ -438,6 +636,8 @@ static int mk_kernfs_rmdir(struct kernfs_node *kn)
  */
 int mk_instance_destroy(struct mk_instance *instance)
 {
+	int ret;
+
 	lockdep_assert_held(&mk_instance_mutex);
 
 	if (!instance) {
@@ -455,6 +655,14 @@ int mk_instance_destroy(struct mk_instance *instance)
 		pr_err("Cannot remove instance '%s' (ID: %d) with loaded kernel. Unload it first.\n",
 		       instance->name, instance->id);
 		return -EBUSY;
+	}
+
+	ret = mk_instance_release_resources(instance);
+	if (ret) {
+		pr_crit("Cannot remove instance '%s' while PCI cleanup is unsafe: %d\n",
+			instance->name, ret);
+		mk_instance_set_state(instance, MK_STATE_FAILED);
+		return ret;
 	}
 
 	list_del(&instance->list);

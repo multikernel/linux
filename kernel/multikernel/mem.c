@@ -421,17 +421,30 @@ int mk_instance_add_memory_region(struct mk_instance *instance, size_t size,
 	phys_addr_t phys_addr;
 	int ret;
 
+	if (!instance)
+		return -EINVAL;
+
+	mutex_lock(&instance->resource_mutex);
+	if (mk_pci_iommu_lease_active_locked(instance)) {
+		pr_err("Cannot add memory to instance %d while an IOMMU lease is active\n",
+		       instance->id);
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+
 	phys_addr = multikernel_alloc(size, node);
 	if (!phys_addr) {
 		pr_err("Failed to allocate %zu bytes from multikernel pool for instance %d\n",
 		       size, instance->id);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto out_unlock;
 	}
 
 	region = kzalloc(sizeof(*region), GFP_KERNEL);
 	if (!region) {
 		multikernel_free(phys_addr, size);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto out_unlock;
 	}
 
 	region->res.name = kasprintf(GFP_KERNEL, "mk-instance-%d-%s-region-%d",
@@ -439,7 +452,8 @@ int mk_instance_add_memory_region(struct mk_instance *instance, size_t size,
 	if (!region->res.name) {
 		kfree(region);
 		multikernel_free(phys_addr, size);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto out_unlock;
 	}
 
 	region->res.start = phys_addr;
@@ -455,7 +469,7 @@ int mk_instance_add_memory_region(struct mk_instance *instance, size_t size,
 		kfree(region->res.name);
 		kfree(region);
 		multikernel_free(phys_addr, size);
-		return ret;
+		goto out_unlock;
 	}
 
 	INIT_LIST_HEAD(&region->list);
@@ -466,7 +480,10 @@ int mk_instance_add_memory_region(struct mk_instance *instance, size_t size,
 		(unsigned long long)phys_addr, (unsigned long long)(phys_addr + size - 1),
 		size >> 20, instance->id, instance->name);
 
-	return 0;
+	ret = 0;
+out_unlock:
+	mutex_unlock(&instance->resource_mutex);
+	return ret;
 }
 
 /* Does [phys_addr, phys_addr+size) back a segment of the loaded image? */
@@ -508,16 +525,26 @@ int mk_instance_remove_memory_region(struct mk_instance *instance,
 {
 	struct mk_memory_region *region, *tmp;
 	bool found = false;
+	int ret;
 
 	if (!instance)
 		return -EINVAL;
 
+	mutex_lock(&instance->resource_mutex);
 	if (mk_range_backs_kimage(instance, phys_addr, size)) {
 		pr_err("Refusing to remove 0x%llx-0x%llx from instance %d (%s): the loaded kernel image lives there\n",
 		       (unsigned long long)phys_addr,
 		       (unsigned long long)(phys_addr + size - 1),
 		       instance->id, instance->name);
-		return -EBUSY;
+		ret = -EBUSY;
+		goto out_unlock;
+	}
+
+	if (mk_pci_iommu_lease_active_locked(instance)) {
+		pr_err("Cannot remove memory from instance %d while an IOMMU lease is active\n",
+		       instance->id);
+		ret = -EBUSY;
+		goto out_unlock;
 	}
 
 	list_for_each_entry_safe(region, tmp, &instance->memory_regions, list) {
@@ -547,10 +574,14 @@ int mk_instance_remove_memory_region(struct mk_instance *instance,
 			(unsigned long long)phys_addr,
 			(unsigned long long)(phys_addr + size - 1),
 			instance->id, instance->name);
-		return -ENOENT;
+		ret = -ENOENT;
+	} else {
+		ret = 0;
 	}
 
-	return 0;
+out_unlock:
+	mutex_unlock(&instance->resource_mutex);
+	return ret;
 }
 
 /**
