@@ -135,6 +135,13 @@ int __init pci_multikernel_init(void)
 		if (!mk_pci_scan_bridge(bridge))
 			scanned++;
 
-	/* Nothing described: legacy probing of bus 0 is all there is */
-	return scanned ? 0 : 1;
+	if (!scanned)
+		pr_info("PCI: no host bridges described, no PCI for this instance\n");
+
+	/*
+	 * The instance device tree is the sole source of PCI topology:
+	 * never fall back to probing bus 0, which would register a
+	 * phantom root bus with fabricated windows.
+	 */
+	return 0;
 }
