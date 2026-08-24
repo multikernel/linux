@@ -488,6 +488,32 @@ struct mk_memory_region {
  */
 #define MK_PCI_ALIAS_LEN 32	/* Devicetree spec: alias names are at most 31 chars */
 
+/*
+ * A PCI host bridge as the instance device tree describes it: the
+ * kernel that spawned this one knows the platform topology exactly and
+ * writes down each root bus an assigned device sits under, so a spawn
+ * kernel creates its root buses instead of probing for them. Window
+ * flags use the devicetree PCI encoding: bits 25:24 are the space
+ * (1 IO, 2 MEM32, 3 MEM64) and bit 30 marks prefetchable.
+ */
+#define MK_PCI_BRIDGE_MAX_WINDOWS 16
+
+struct mk_pci_bridge_window {
+	u32 flags;
+	u64 pci_addr;
+	u64 cpu_addr;
+	u64 size;
+};
+
+struct mk_pci_host_bridge {
+	struct list_head list;
+	u32 domain;
+	u32 bus_start;
+	u32 bus_end;
+	int nr_windows;
+	struct mk_pci_bridge_window windows[MK_PCI_BRIDGE_MAX_WINDOWS];
+};
+
 struct mk_pci_device {
 	char alias[MK_PCI_ALIAS_LEN];	/* Stable name from /aliases, "" if none */
 	u16 vendor;        /* PCI vendor ID */
@@ -854,6 +880,9 @@ void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size);
 /* Device probe filtering against the instance's allowlist */
 bool mk_pci_should_probe(struct pci_bus *bus, int devfn);
 bool mk_platform_device_allowed(const char *name, const char *hid);
+
+/* PCI host bridges described by the instance device tree */
+extern struct list_head mk_pci_host_bridges;
 
 /* Stable device names from the instance's /aliases */
 const char *mk_pci_alias(struct pci_dev *pdev);

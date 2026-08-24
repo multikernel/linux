@@ -16,6 +16,8 @@ obj-$(CONFIG_X86_INTEL_MID)	+= intel_mid.o
 
 obj-$(CONFIG_X86_NUMACHIP)	+= numachip.o
 
+obj-$(CONFIG_MULTIKERNEL)	+= multikernel.o
+
 obj-y				+= common.o early.o
 obj-y				+= bus_numa.o
 

@@ -18,6 +18,7 @@
 #include <linux/string.h>
 #include <linux/ioport.h>
 #include <linux/sizes.h>
+#include <linux/pci.h>
 #include <linux/cpumask.h>
 #include <linux/numa.h>
 #include <linux/multikernel.h>
@@ -1232,6 +1233,244 @@ static int mk_dt_emit_aliases(struct mk_instance *instance, void *fdt)
 	return open ? fdt_end_node(fdt) : 0;
 }
 
+#ifdef CONFIG_PCI
+static u32 mk_dt_window_flags(const struct resource *res)
+{
+	u32 hi;
+
+	if (res->flags & IORESOURCE_IO)
+		hi = 0x01000000;
+	else if ((res->flags & IORESOURCE_MEM_64) || res->end > U32_MAX)
+		hi = 0x03000000;
+	else
+		hi = 0x02000000;
+
+	if (res->flags & IORESOURCE_PREFETCH)
+		hi |= 0x40000000;
+
+	return hi;
+}
+
+static struct pci_bus *mk_dt_root_bus_of(u32 domain, u32 busn)
+{
+	struct pci_bus *bus;
+
+	list_for_each_entry(bus, &pci_root_buses, node) {
+		if (pci_domain_nr(bus) == domain &&
+		    bus->busn_res.start <= busn && busn <= bus->busn_res.end)
+			return bus;
+	}
+
+	return NULL;
+}
+
+static int mk_dt_emit_one_host_bridge(struct pci_bus *root, void *fdt)
+{
+	struct pci_host_bridge *bridge = pci_find_host_bridge(root);
+	fdt32_t ranges[MK_PCI_BRIDGE_MAX_WINDOWS * 7];
+	fdt32_t bus_range[2];
+	struct resource_entry *entry;
+	char name[16];
+	int cells = 0;
+	int ret;
+
+	snprintf(name, sizeof(name), "pci@%llx",
+		 (unsigned long long)root->busn_res.start);
+
+	ret = fdt_begin_node(fdt, name);
+	if (!ret)
+		ret = fdt_property_string(fdt, "compatible",
+					  "multikernel,pci-host-bridge");
+	if (!ret)
+		ret = fdt_property_string(fdt, "device_type", "pci");
+	if (!ret)
+		ret = fdt_property_u32(fdt, "#address-cells", 3);
+	if (!ret)
+		ret = fdt_property_u32(fdt, "#size-cells", 2);
+	if (!ret)
+		ret = fdt_property_u32(fdt, "linux,pci-domain",
+				       pci_domain_nr(root));
+	if (ret)
+		return ret;
+
+	bus_range[0] = cpu_to_fdt32(root->busn_res.start);
+	bus_range[1] = cpu_to_fdt32(root->busn_res.end);
+	ret = fdt_property(fdt, "bus-range", bus_range, sizeof(bus_range));
+	if (ret)
+		return ret;
+
+	resource_list_for_each_entry(entry, &bridge->windows) {
+		const struct resource *res = entry->res;
+		u64 pci_addr, size;
+
+		if (resource_type(res) != IORESOURCE_IO &&
+		    resource_type(res) != IORESOURCE_MEM)
+			continue;
+
+		if (cells + 7 > ARRAY_SIZE(ranges)) {
+			pr_warn("Host bridge %s has more than %d windows, rest not described\n",
+				name, MK_PCI_BRIDGE_MAX_WINDOWS);
+			break;
+		}
+
+		pci_addr = res->start - entry->offset;
+		size = resource_size(res);
+		ranges[cells++] = cpu_to_fdt32(mk_dt_window_flags(res));
+		ranges[cells++] = cpu_to_fdt32(upper_32_bits(pci_addr));
+		ranges[cells++] = cpu_to_fdt32(lower_32_bits(pci_addr));
+		ranges[cells++] = cpu_to_fdt32(upper_32_bits(res->start));
+		ranges[cells++] = cpu_to_fdt32(lower_32_bits(res->start));
+		ranges[cells++] = cpu_to_fdt32(upper_32_bits(size));
+		ranges[cells++] = cpu_to_fdt32(lower_32_bits(size));
+	}
+
+	if (cells) {
+		ret = fdt_property(fdt, "ranges", ranges,
+				   cells * sizeof(fdt32_t));
+		if (ret)
+			return ret;
+	}
+
+	return fdt_end_node(fdt);
+}
+
+/*
+ * mk_dt_emit_host_bridges() - Describe the root buses under an instance's devices
+ *
+ * A spawn kernel boots without ACPI, so nothing tells it where its PCI
+ * root buses are or which windows they decode; this kernel knows both
+ * exactly. One node per distinct root bus:
+ *
+ *   pci@4f {
+ *       compatible = "multikernel,pci-host-bridge";
+ *       device_type = "pci";
+ *       #address-cells = <3>;
+ *       #size-cells = <2>;
+ *       linux,pci-domain = <0>;
+ *       bus-range = <0x4f 0x50>;
+ *       ranges = <flags pci.hi pci.lo cpu.hi cpu.lo size.hi size.lo ...>;
+ *   };
+ *
+ * The ranges cells follow the devicetree PCI encoding so the format
+ * stays mechanical to migrate to the OF core later.
+ */
+static int mk_dt_emit_host_bridges(struct mk_instance *instance, void *fdt)
+{
+	struct pci_bus *roots[8];
+	struct mk_pci_device *pci_dev;
+	int nr = 0, i, ret;
+
+	if (instance == root_instance || !instance->pci_devices_valid)
+		return 0;
+
+	list_for_each_entry(pci_dev, &instance->pci_devices, list) {
+		struct pci_bus *root;
+
+		root = mk_dt_root_bus_of(pci_dev->domain, pci_dev->bus);
+		if (!root) {
+			pr_warn("No root bus covers %04x:%02x, device %04x:%02x:%02x.%x not reachable in the instance\n",
+				pci_dev->domain, pci_dev->bus, pci_dev->domain,
+				pci_dev->bus, pci_dev->slot, pci_dev->func);
+			continue;
+		}
+
+		for (i = 0; i < nr; i++)
+			if (roots[i] == root)
+				break;
+		if (i < nr)
+			continue;
+		if (nr == ARRAY_SIZE(roots)) {
+			pr_warn("Instance %s spans more than %zu root buses, rest not described\n",
+				instance->name, ARRAY_SIZE(roots));
+			break;
+		}
+		roots[nr++] = root;
+	}
+
+	for (i = 0; i < nr; i++) {
+		ret = mk_dt_emit_one_host_bridge(roots[i], fdt);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+#else /* !CONFIG_PCI */
+static int mk_dt_emit_host_bridges(struct mk_instance *instance, void *fdt)
+{
+	return 0;
+}
+#endif
+
+/*
+ * The parsed counterpart, filled on a spawn kernel from its own device
+ * tree so PCI initialization can create the described root buses.
+ */
+LIST_HEAD(mk_pci_host_bridges);
+
+int __init mk_dt_parse_host_bridges(const void *fdt)
+{
+	int node;
+
+	fdt_for_each_subnode(node, fdt, 0) {
+		struct mk_pci_host_bridge *bridge;
+		const fdt32_t *prop;
+		const char *compat;
+		int len, i;
+
+		compat = fdt_getprop(fdt, node, "compatible", NULL);
+		if (!compat || strcmp(compat, "multikernel,pci-host-bridge"))
+			continue;
+
+		prop = fdt_getprop(fdt, node, "bus-range", &len);
+		if (!prop || len != 2 * sizeof(fdt32_t)) {
+			pr_warn("Host bridge node '%s' has no valid bus-range, ignored\n",
+				fdt_get_name(fdt, node, NULL));
+			continue;
+		}
+
+		bridge = kzalloc_obj(*bridge, GFP_KERNEL);
+		if (!bridge)
+			return -ENOMEM;
+
+		bridge->bus_start = fdt32_to_cpu(prop[0]);
+		bridge->bus_end = fdt32_to_cpu(prop[1]);
+
+		prop = fdt_getprop(fdt, node, "linux,pci-domain", &len);
+		if (prop && len == sizeof(fdt32_t))
+			bridge->domain = fdt32_to_cpu(*prop);
+
+		prop = fdt_getprop(fdt, node, "ranges", &len);
+		if (prop && len % (7 * sizeof(fdt32_t)) == 0) {
+			int nr = len / (7 * sizeof(fdt32_t));
+
+			if (nr > MK_PCI_BRIDGE_MAX_WINDOWS)
+				nr = MK_PCI_BRIDGE_MAX_WINDOWS;
+			for (i = 0; i < nr; i++) {
+				const fdt32_t *cell = prop + i * 7;
+				struct mk_pci_bridge_window *win;
+
+				win = &bridge->windows[i];
+				win->flags = fdt32_to_cpu(cell[0]);
+				win->pci_addr = (u64)fdt32_to_cpu(cell[1]) << 32 |
+						fdt32_to_cpu(cell[2]);
+				win->cpu_addr = (u64)fdt32_to_cpu(cell[3]) << 32 |
+						fdt32_to_cpu(cell[4]);
+				win->size = (u64)fdt32_to_cpu(cell[5]) << 32 |
+					    fdt32_to_cpu(cell[6]);
+			}
+			bridge->nr_windows = nr;
+		}
+
+		list_add_tail(&bridge->list, &mk_pci_host_bridges);
+		pr_info("PCI host bridge %04x:[bus %02x-%02x] with %d windows from device tree\n",
+			bridge->domain, bridge->bus_start, bridge->bus_end,
+			bridge->nr_windows);
+	}
+
+	return 0;
+}
+
 /**
  * mk_dt_emit_instance() - Write one instance device tree into @fdt
  * @instance: Instance to describe
@@ -1290,6 +1529,8 @@ static int mk_dt_emit_instance(struct mk_instance *instance, void *fdt,
 		ret = fdt_end_node(fdt);	/* /resources */
 	if (!ret)
 		ret = mk_dt_emit_aliases(instance, fdt);
+	if (!ret)
+		ret = mk_dt_emit_host_bridges(instance, fdt);
 	if (!ret)
 		ret = fdt_end_node(fdt);	/* root */
 	if (!ret)
