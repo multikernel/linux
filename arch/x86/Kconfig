@@ -2932,7 +2932,7 @@ config PCI_DIRECT
 config PCI_MMCONFIG
 	bool "Support mmconfig PCI config space access" if X86_64
 	default y
-	depends on PCI && (ACPI || JAILHOUSE_GUEST)
+	depends on PCI && (ACPI || JAILHOUSE_GUEST || MULTIKERNEL)
 	depends on X86_64 || (PCI_GOANY || PCI_GOMMCONFIG)
 	help
 	  Add support for accessing the PCI configuration space as a memory

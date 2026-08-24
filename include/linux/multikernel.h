@@ -510,6 +510,8 @@ struct mk_pci_host_bridge {
 	u32 domain;
 	u32 bus_start;
 	u32 bus_end;
+	u64 ecam_base;	/* ECAM window for bus_start..bus_end, 0 if unknown */
+	u64 ecam_size;
 	int nr_windows;
 	struct mk_pci_bridge_window windows[MK_PCI_BRIDGE_MAX_WINDOWS];
 };

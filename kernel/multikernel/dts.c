@@ -20,6 +20,9 @@
 #include <linux/sizes.h>
 #include <linux/pci.h>
 #include <linux/cpumask.h>
+#if defined(CONFIG_X86) && defined(CONFIG_PCI_MMCONFIG)
+#include <asm/pci_x86.h>
+#endif
 #include <linux/numa.h>
 #include <linux/multikernel.h>
 
@@ -1264,12 +1267,35 @@ static struct pci_bus *mk_dt_root_bus_of(u32 domain, u32 busn)
 	return NULL;
 }
 
+/*
+ * The ECAM window covering the bridge's bus range, so a spawn kernel can
+ * generate config cycles without the MCFG table only ACPI provides.
+ * This kernel's own window came either from its ACPI or from the tree
+ * that spawned it, so the description propagates down spawn chains.
+ */
+static u64 mk_dt_bridge_ecam(struct pci_bus *root, u64 *size)
+{
+#if defined(CONFIG_X86) && defined(CONFIG_PCI_MMCONFIG)
+	struct pci_mmcfg_region *cfg;
+
+	cfg = pci_mmconfig_lookup(pci_domain_nr(root), root->busn_res.start);
+	if (!cfg || cfg->end_bus < root->busn_res.end)
+		return 0;
+
+	*size = (u64)(root->busn_res.end - root->busn_res.start + 1) << 20;
+	return cfg->address + ((u64)root->busn_res.start << 20);
+#else
+	return 0;
+#endif
+}
+
 static int mk_dt_emit_one_host_bridge(struct pci_bus *root, void *fdt)
 {
 	struct pci_host_bridge *bridge = pci_find_host_bridge(root);
 	fdt32_t ranges[MK_PCI_BRIDGE_MAX_WINDOWS * 7];
 	fdt32_t bus_range[2];
 	struct resource_entry *entry;
+	u64 ecam_base, ecam_size = 0;
 	char name[16];
 	int cells = 0;
 	int ret;
@@ -1298,6 +1324,19 @@ static int mk_dt_emit_one_host_bridge(struct pci_bus *root, void *fdt)
 	ret = fdt_property(fdt, "bus-range", bus_range, sizeof(bus_range));
 	if (ret)
 		return ret;
+
+	ecam_base = mk_dt_bridge_ecam(root, &ecam_size);
+	if (ecam_base) {
+		fdt32_t reg[4];
+
+		reg[0] = cpu_to_fdt32(upper_32_bits(ecam_base));
+		reg[1] = cpu_to_fdt32(lower_32_bits(ecam_base));
+		reg[2] = cpu_to_fdt32(upper_32_bits(ecam_size));
+		reg[3] = cpu_to_fdt32(lower_32_bits(ecam_size));
+		ret = fdt_property(fdt, "reg", reg, sizeof(reg));
+		if (ret)
+			return ret;
+	}
 
 	resource_list_for_each_entry(entry, &bridge->windows) {
 		const struct resource *res = entry->res;
@@ -1348,6 +1387,7 @@ static int mk_dt_emit_one_host_bridge(struct pci_bus *root, void *fdt)
  *       #size-cells = <2>;
  *       linux,pci-domain = <0>;
  *       bus-range = <0x4f 0x50>;
+ *       reg = <ecam.hi ecam.lo size.hi size.lo>;	(when known)
  *       ranges = <flags pci.hi pci.lo cpu.hi cpu.lo size.hi size.lo ...>;
  *   };
  *
@@ -1439,6 +1479,14 @@ int __init mk_dt_parse_host_bridges(const void *fdt)
 		prop = fdt_getprop(fdt, node, "linux,pci-domain", &len);
 		if (prop && len == sizeof(fdt32_t))
 			bridge->domain = fdt32_to_cpu(*prop);
+
+		prop = fdt_getprop(fdt, node, "reg", &len);
+		if (prop && len == 4 * sizeof(fdt32_t)) {
+			bridge->ecam_base = (u64)fdt32_to_cpu(prop[0]) << 32 |
+					    fdt32_to_cpu(prop[1]);
+			bridge->ecam_size = (u64)fdt32_to_cpu(prop[2]) << 32 |
+					    fdt32_to_cpu(prop[3]);
+		}
 
 		prop = fdt_getprop(fdt, node, "ranges", &len);
 		if (prop && len % (7 * sizeof(fdt32_t)) == 0) {
