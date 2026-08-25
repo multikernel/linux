@@ -17,6 +17,7 @@
 #include <linux/pci.h>
 #include <linux/libfdt.h>
 #include <linux/sizes.h>
+#include <linux/smp.h>
 #include "internal.h"
 
 #define PROP_SUB_FDT "fdt"
@@ -33,6 +34,23 @@
  */
 struct mk_instance *root_instance = NULL;
 EXPORT_SYMBOL_GPL(root_instance);
+
+static void __init __noreturn mk_manifest_reject_and_park(int error)
+{
+	int ret;
+
+	ret = mk_arch_prepare_park();
+	if (ret || !mk_arch_park_ready())
+		panic("multikernel: rejected manifest before park path became ready");
+	ret = mk_register_stop_nmi_handler();
+	if (ret)
+		pr_emerg("multikernel: stop-NMI registration failed while rejecting manifest: %d\n",
+			 ret);
+	pr_emerg("multikernel: parking CPUs after rejecting supplied manifest: %d\n",
+		 error);
+	smp_call_function(mk_enter_pool_state, NULL, 0);
+	mk_enter_pool_state(NULL);
+}
 
 /*
  * Collect every CPU the instance might receive through hotplug later:
@@ -386,6 +404,7 @@ static struct mk_instance * __init alloc_mk_instance(int instance_id, const char
 			pr_err("Failed to allocate IPI buffer for instance %d\n", instance_id);
 			goto err_free_name;
 		}
+		mk_shared_data_reset(instance->ipi_data);
 		instance->ipi_phys = virt_to_phys(instance->ipi_data);
 		instance->ipi_pages = (sizeof(struct mk_shared_data) + PAGE_SIZE - 1) / PAGE_SIZE;
 
@@ -543,6 +562,12 @@ static int __init mk_restore_instance_ipi(const void *manifest, struct mk_instan
 			 (unsigned long long)ipi_phys, ipi_pages);
 		return 0;
 	}
+	if (ipi_size < sizeof(struct mk_shared_data)) {
+		pr_err("IPI buffer is too small for ABI %u: %zu < %zu\n",
+		       MK_IPI_ABI_VERSION, ipi_size,
+		       sizeof(struct mk_shared_data));
+		return -EPROTO;
+	}
 
 	instance->ipi_data = memremap(ipi_phys, ipi_size, MEMREMAP_WB);
 	if (!instance->ipi_data) {
@@ -589,6 +614,12 @@ static struct mk_instance * __init mk_restore_host_instance(const void *manifest
 	if (!host_ipi_phys || !host_ipi_pages) {
 		pr_warn("Incomplete host IPI buffer info (phys=0x%llx, pages=%u)\n",
 			(unsigned long long)host_ipi_phys, host_ipi_pages);
+		return NULL;
+	}
+	if (host_ipi_size < sizeof(struct mk_shared_data)) {
+		pr_err("Host IPI buffer is too small for ABI %u: %zu < %zu\n",
+		       MK_IPI_ABI_VERSION, host_ipi_size,
+		       sizeof(struct mk_shared_data));
 		return NULL;
 	}
 
@@ -645,6 +676,9 @@ int __init mk_instance_restore_from_manifest(void)
 	const void *manifest = NULL;
 	phys_addr_t fdt_phys;
 
+	if (mk_manifest_rejected())
+		mk_manifest_reject_and_park(-EPROTO);
+
 	fdt_phys = mk_manifest_phys();
 	if (!fdt_phys) {
 		pr_info("No manifest available for multikernel DTB restoration\n");
@@ -682,15 +716,15 @@ int __init mk_instance_restore_from_manifest(void)
 
 	int mk_node = fdt_subnode_offset(manifest, 0, "multikernel");
 	if (mk_node < 0) {
-		pr_info("No multikernel node found in manifest\n");
-		ret = 0;
+		pr_err("No multikernel node found in supplied manifest\n");
+		ret = -EINVAL;
 		goto cleanup_fdt;
 	}
 
 	const void *dtb_data = fdt_getprop(manifest, mk_node, "dtb-data", &dtb_len);
 	if (!dtb_data || dtb_len <= 0) {
-		pr_info("No dtb-data property found in multikernel node\n");
-		ret = 0;
+		pr_err("No dtb-data property found in multikernel node\n");
+		ret = -EINVAL;
 		goto cleanup_fdt;
 	}
 
@@ -787,8 +821,26 @@ int __init mk_instance_restore_from_manifest(void)
 
 	host_instance = mk_restore_host_instance(manifest);
 	if (!host_instance)
-		pr_warn("Failed to restore host instance (spawn→host communication unavailable)\n");
+		mk_manifest_reject_and_park(-ENODEV);
 
+	ret = mk_ipi_shared_validate(instance->ipi_data);
+	if (ret)
+		mk_manifest_reject_and_park(ret);
+	ret = mk_ipi_shared_validate(host_instance->ipi_data);
+	if (ret)
+		mk_manifest_reject_and_park(ret);
+	if (!atomic_read_acquire(&host_instance->ipi_data->ready) ||
+	    READ_ONCE(host_instance->ipi_data->ready_instance_id) !=
+		    host_instance->id)
+		mk_manifest_reject_and_park(-EHOSTDOWN);
+	ret = mk_arch_prepare_park();
+	if (ret)
+		mk_manifest_reject_and_park(ret);
+	if (!mk_arch_park_ready())
+		mk_manifest_reject_and_park(-EIO);
+	ret = mk_register_stop_nmi_handler();
+	if (ret)
+		mk_manifest_reject_and_park(ret);
 	pr_info("Successfully restored multikernel root instance %d ('%s') from manifest (%d bytes)\n",
 		instance_id, instance_name, dtb_len);
 	mk_dt_config_free(&config);
@@ -822,6 +874,8 @@ cleanup_dtb:
 	kfree(dtb_virt);
 cleanup_fdt:
 	early_memunmap((void *)manifest, PAGE_SIZE);
+	if (ret)
+		mk_manifest_reject_and_park(ret);
 	return ret;
 }
 

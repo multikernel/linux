@@ -286,6 +286,7 @@ bool multikernel_allow_emergency_restart(void)
  */
 int mk_instance_confirm_parked(struct mk_instance *instance)
 {
+	struct mk_cpu_set *snapshot;
 	mk_phys_cpu_t phys_cpu;
 	unsigned int i;
 	int ret, failed = 0;
@@ -293,8 +294,22 @@ int mk_instance_confirm_parked(struct mk_instance *instance)
 	/* Never started, so nothing of it is running */
 	if (!instance->spawn_ctx)
 		return 0;
+	if (!instance->cpus_on_slot) {
+		pr_err("Instance %d (%s): missing parked-CPU tracking for a started instance\n",
+		       instance->id, instance->name);
+		return -EINVAL;
+	}
 
-	mk_cpu_set_for_each(i, phys_cpu, instance->cpus_on_slot) {
+	snapshot = mk_cpu_set_alloc();
+	if (!snapshot)
+		return -ENOMEM;
+	ret = mk_cpu_set_copy(snapshot, instance->cpus_on_slot);
+	if (ret) {
+		mk_cpu_set_free(snapshot);
+		return ret;
+	}
+
+	mk_cpu_set_for_each(i, phys_cpu, snapshot) {
 		ret = mk_arch_confirm_parked(instance, phys_cpu);
 		if (ret) {
 			pr_err("Instance %d (%s): CPU %llu is not parked: %d\n",
@@ -302,6 +317,15 @@ int mk_instance_confirm_parked(struct mk_instance *instance)
 			failed++;
 		}
 	}
+	if (!failed) {
+		ret = mk_ipi_ring_recover_halted(snapshot);
+		if (ret) {
+			pr_err("Instance %d (%s): failed to recover halted IPI producer: %d\n",
+			       instance->id, instance->name, ret);
+			failed++;
+		}
+	}
+	mk_cpu_set_free(snapshot);
 
 	return failed ? -EBUSY : 0;
 }
@@ -1533,38 +1557,16 @@ int multikernel_halt_by_id(int mk_id)
 	return ret;
 }
 
-/**
- * multikernel_force_halt_by_id - Forcible shutdown of a multikernel instance via NMI
- * @mk_id: Instance ID to halt
- *
- * Forces a spawn kernel's CPUs to stop by arming the force-halt marker
- * in the instance's shared IPI area and sending NMIs directly to each
- * CPU. The NMI handler tests the marker and parks the CPU in the pool.
- *
- * No message is queued and no doorbell is rung: a ring message is
- * consumed by the instance's ordinary interrupt path, which on a
- * responsive kernel races the NMIs for it and can leave them with
- * nothing to act on. The marker is host-owned and survives until the
- * instance is re-executed, so the NMIs act on it regardless of timing.
- *
- * Use when: The spawn kernel is stuck/crashed and not responding to graceful
- * shutdown, or when graceful shutdown has failed. May be repeated: an
- * already-halted instance absorbs the NMIs in the park loop, so a rerun
- * only rescues CPUs an earlier halt missed.
- *
- * Returns: 0 on success, negative error code on failure
- */
-int multikernel_force_halt_by_id(int mk_id)
+static int __mk_instance_force_halt(struct mk_instance *instance,
+				    bool allow_loaded)
 {
-	struct mk_instance *instance;
 	mk_phys_cpu_t phys_cpu;
 	unsigned int i;
 	int cpu_count = 0;
 	int ret;
 
-	instance = mk_instance_find(mk_id);
 	if (!instance)
-		return -ENOENT;
+		return -EINVAL;
 
 	/*
 	 * LOADED is allowed for the retry case: a previous halt already
@@ -1573,20 +1575,19 @@ int multikernel_force_halt_by_id(int mk_id)
 	 * a rerun the instance is stuck for good.
 	 */
 	if (instance->state != MK_STATE_ACTIVE &&
-	    instance->state != MK_STATE_LOADED) {
+	    (!allow_loaded || instance->state != MK_STATE_LOADED)) {
 		pr_err("Instance %d not running (state=%d), nothing to force halt\n",
-			mk_id, instance->state);
-		mk_instance_put(instance);
+			instance->id, instance->state);
 		return -EINVAL;
 	}
 
 	if (mk_cpu_set_empty(instance->cpus)) {
-		pr_err("Instance %d has no CPUs assigned\n", mk_id);
-		mk_instance_put(instance);
+		pr_err("Instance %d has no CPUs assigned\n", instance->id);
 		return -EINVAL;
 	}
 
-	pr_info("Force halting multikernel instance %d via NMI\n", mk_id);
+	pr_info("Force halting multikernel instance %d via NMI\n",
+		instance->id);
 
 	ret = mk_arm_force_halt(instance);
 	if (ret)
@@ -1598,21 +1599,69 @@ int multikernel_force_halt_by_id(int mk_id)
 		cpu_count++;
 	}
 
-	pr_info("Sent NMI to %d CPUs in instance %d\n", cpu_count, mk_id);
+	pr_info("Sent NMI to %d CPUs in instance %d\n",
+		cpu_count, instance->id);
 
-	/*
-	 * The NMI handler parks each CPU on the instance's context. Wait
-	 * for them to arrive before reporting the instance re-spawnable,
-	 * exactly as the graceful path does after its shutdown ACK.
-	 */
+	ret = mk_instance_confirm_parked(instance);
+	if (ret) {
+		pr_err("Instance %d CPUs did not park after force halt: %d\n",
+		       instance->id, ret);
+		return ret;
+	}
+
 	mk_instance_settle_halted(instance);
-	mk_instance_put(instance);
 	return 0;
+}
+
+int mk_instance_abort_spawn(struct mk_instance *instance)
+{
+	int ret;
+
+	ret = __mk_instance_force_halt(instance, true);
+	if (ret && instance)
+		mk_instance_set_state(instance, MK_STATE_FAILED);
+	return ret;
+}
+
+/**
+ * mk_instance_force_halt - Forcibly stop an instance via NMI
+ * @instance: Instance to stop
+ *
+ * Forces a spawn kernel's CPUs to stop by arming the persistent force-halt
+ * marker and sending NMIs directly to each CPU. The NMI handler checks the
+ * marker and parks the CPU if it is set.
+ *
+ * Use when: The spawn kernel is stuck/crashed and not responding to graceful
+ * shutdown, or when graceful shutdown has failed.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+int mk_instance_force_halt(struct mk_instance *instance)
+{
+	return __mk_instance_force_halt(instance, false);
+}
+
+int multikernel_force_halt_by_id(int mk_id)
+{
+	struct mk_instance *instance;
+	int ret;
+
+	instance = mk_instance_find(mk_id);
+	if (!instance)
+		return -ENOENT;
+	ret = mk_instance_force_halt(instance);
+	mk_instance_put(instance);
+	return ret;
 }
 
 static int __init multikernel_init(void)
 {
 	int ret;
+
+	if (!root_instance) {
+		pr_err("Multikernel root instance is unavailable\n");
+		return -ENODEV;
+	}
 
 	/* Register NMI handler for forcible shutdown */
 	ret = mk_register_stop_nmi_handler();
@@ -1645,6 +1694,17 @@ static int __init multikernel_init(void)
 	ret = mk_kernfs_init();
 	if (ret < 0) {
 		pr_err("Failed to initialize multikernel sysfs interface: %d\n", ret);
+		mk_hotplug_cleanup();
+		mk_unregister_msg_handler(MK_MSG_SYSTEM, mk_system_msg_handler);
+		mk_messaging_cleanup();
+		return ret;
+	}
+
+	ret = mk_ipi_shared_mark_ready(root_instance->ipi_data,
+				       root_instance->id);
+	if (ret < 0) {
+		pr_err("Failed to publish multikernel IPI readiness: %d\n", ret);
+		mk_kernfs_cleanup();
 		mk_hotplug_cleanup();
 		mk_unregister_msg_handler(MK_MSG_SYSTEM, mk_system_msg_handler);
 		mk_messaging_cleanup();

@@ -21,6 +21,8 @@
 #include <linux/kernel.h>
 #include <linux/compiler.h>
 #include <linux/iopoll.h>
+#include <linux/delay.h>
+#include <linux/jiffies.h>
 #include <linux/smp.h>
 #include <linux/cpu.h>
 #include <linux/mm.h>
@@ -44,6 +46,7 @@
 #include <asm/irqflags.h>
 #include <asm/processor-flags.h>
 #include <asm/processor.h>
+#include <asm/tsc.h>
 #include <asm/apic.h>
 #include <asm/bootparam.h>
 #include <asm/reboot.h>
@@ -68,6 +71,7 @@
 
 /* Set in spawn kernels: the context this kernel booted from */
 static struct mk_spawn_context *mk_boot_context;
+static phys_addr_t mk_boot_context_phys;
 
 /*
  * Spawn kernel's own trampoline for secondary CPU wakeup.
@@ -81,6 +85,16 @@ static struct mk_spawn_context *mk_boot_context;
  */
 static void *spawn_trampoline_va;
 static unsigned long spawn_trampoline_phys;
+static bool spawn_trampoline_prepared;
+static bool spawn_pool_park_prepared;
+static bool spawn_park_ready;
+static int spawn_park_error;
+
+bool mk_arch_park_ready(void)
+{
+	/* Pair with publication after both executable park mappings succeed. */
+	return smp_load_acquire(&spawn_park_ready);
+}
 
 extern char multikernel_relocate_kernel_start[];
 extern char multikernel_relocate_kernel_end[];
@@ -472,6 +486,15 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 			     (unsigned long)instance->trampoline_va,
 			     virt_to_phys(instance->trampoline_va),
 			     park_phys);
+	instance->spawn_ctx->boot_lps = cpu_data(cpu).loops_per_jiffy;
+	if (!instance->spawn_ctx->boot_lps)
+		instance->spawn_ctx->boot_lps = loops_per_jiffy;
+	instance->spawn_ctx->boot_lps *= HZ;
+	instance->spawn_ctx->boot_cpu_khz = cpu_khz;
+	instance->spawn_ctx->boot_tsc_khz = tsc_khz;
+	instance->spawn_ctx->boot_apic_hz =
+		(unsigned long)lapic_timer_period * HZ;
+	instance->spawn_ctx->abi_magic = MK_BOOT_CONTEXT_MAGIC;
 
 	return mk_spawn_cpu(instance, cpu, instance->spawn_ctx);
 }
@@ -694,18 +717,38 @@ void __init mk_arch_register_cpu(u64 phys_id)
 	topology_register_apic((u32)phys_id, CPU_ACPIID_INVALID, true);
 }
 
-/*
- * Initialize boot context tracking in spawn kernel.
- * Called early during spawn kernel boot.
- */
-void mk_init_boot_context(phys_addr_t ctx_phys)
+static __noreturn void mk_reject_spawn_context(void)
+{
+	/*
+	 * The host context layout is unknown, so neither its park state nor any
+	 * shared context field is safe to use. Keep this CPU local and inert. An NMI
+	 * can wake HLT, but returns to this loop with maskable interrupts still
+	 * disabled; disable them again before every halt for defense in depth.
+	 */
+	for (;;) {
+		native_irq_disable();
+		native_halt();
+	}
+}
+
+struct mk_spawn_context *mk_validate_boot_context(phys_addr_t ctx_phys)
 {
 	struct mk_spawn_context *ctx;
+	phys_addr_t stamped_phys;
+	u64 abi_magic;
 
 	if (!ctx_phys) {
 		pr_err("mk_spawn: Boot context physical address is 0!\n");
-		return;
+		return NULL;
 	}
+	if (mk_boot_context) {
+		if (ctx_phys != mk_boot_context_phys)
+			mk_reject_spawn_context();
+		return mk_boot_context;
+	}
+	/* Reject an invalid derived address before mapping or dereferencing it. */
+	if (!IS_ALIGNED(ctx_phys, PAGE_SIZE))
+		mk_reject_spawn_context();
 
 	/*
 	 * The spawn context is in the multikernel pool which is regular RAM,
@@ -722,14 +765,39 @@ void mk_init_boot_context(phys_addr_t ctx_phys)
 	 * work and then fails much later, when this kernel shuts down and
 	 * its CPUs park on nonsense addresses.
 	 */
-	if (ctx->self_phys != ctx_phys) {
-		pr_err("mk_spawn: Boot context at %pa is stamped %pa\n",
-		       &ctx_phys, &ctx->self_phys);
-		pr_err("mk_spawn: Spawn context layout mismatch - host and spawn kernels must be built from the same source\n");
-		return;
-	}
+	stamped_phys = READ_ONCE(ctx->self_phys);
+	if (stamped_phys != ctx_phys)
+		mk_reject_spawn_context();
+	abi_magic = READ_ONCE(ctx->abi_magic);
+	if (abi_magic != MK_BOOT_CONTEXT_MAGIC)
+		mk_reject_spawn_context();
 
+	mk_boot_context_phys = ctx_phys;
 	mk_boot_context = ctx;
+	return ctx;
+}
+
+/*
+ * Initialize boot context tracking in spawn kernel.
+ * Called early during spawn kernel boot.
+ */
+void mk_init_boot_context(phys_addr_t ctx_phys)
+{
+	struct mk_spawn_context *ctx = mk_validate_boot_context(ctx_phys);
+
+	if (!ctx)
+		return;
+	/*
+	 * A spawn kernel cannot calibrate against legacy timers because they
+	 * belong to the host. Reuse the selected physical CPU's delay and local
+	 * APIC timer calibration, while keeping explicit command-line values
+	 * authoritative.
+	 */
+	if (!preset_lpj && ctx->boot_lps)
+		preset_lpj = DIV_ROUND_CLOSEST_ULL(ctx->boot_lps, HZ);
+	if (!lapic_timer_period && ctx->boot_apic_hz)
+		lapic_timer_period =
+			DIV_ROUND_CLOSEST_ULL(ctx->boot_apic_hz, HZ);
 
 	/*
 	 * The host's control area (this context, the trampoline and park
@@ -754,17 +822,25 @@ void mk_init_boot_context(phys_addr_t ctx_phys)
  *
  * One physical page serves every wake path of this instance: the host
  * allocates it once in mk_setup_trampoline() and reuses it across
- * re-spawns, and mk_prepare_trampoline() places our own trampoline copy
+ * re-spawns, and mk_arch_prepare_park() places our own trampoline copy
  * (including the secondary entry) in the same page.
  */
-static int __init mk_prepare_trampoline(void)
+int __init mk_arch_prepare_park(void)
 {
 	struct mk_spawn_context *ctx = mk_boot_context;
 	unsigned long virt;
 	int ret;
 
+	if (mk_arch_park_ready())
+		return 0;
+	if (spawn_park_error)
+		return spawn_park_error;
 	if (!ctx)
 		return 0;
+	if (!ctx->trampoline_phys || !ctx->park_phys || !ctx->park_cr3) {
+		ret = -EINVAL;
+		goto fail;
+	}
 
 	/*
 	 * Put our own copy of the trampoline in the page the host set
@@ -772,34 +848,48 @@ static int __init mk_prepare_trampoline(void)
 	 * is entered from an offline CPU, where changing page attributes
 	 * is not allowed.
 	 */
-	spawn_trampoline_phys = ctx->trampoline_phys;
-	spawn_trampoline_va = __va(spawn_trampoline_phys);
-	memcpy(spawn_trampoline_va, multikernel_relocate_kernel_start,
-	       multikernel_relocate_kernel_end - multikernel_relocate_kernel_start);
+	if (!spawn_trampoline_prepared) {
+		spawn_trampoline_phys = ctx->trampoline_phys;
+		spawn_trampoline_va = __va(spawn_trampoline_phys);
+		memcpy(spawn_trampoline_va, multikernel_relocate_kernel_start,
+		       multikernel_relocate_kernel_end -
+		       multikernel_relocate_kernel_start);
 
-	/*
-	 * Both pages are executed from the direct map, which is writable,
-	 * so drop write before adding execute. Leaving them writable and
-	 * executable trips the kernel's own W^X check.
-	 */
-	virt = (unsigned long)spawn_trampoline_va & PAGE_MASK;
-	ret = set_memory_ro(virt, 1);
-	if (!ret)
-		ret = set_memory_x(virt, 1);
-	if (ret)
-		return ret;
+		/*
+		 * Both pages are executed from the direct map, which is writable,
+		 * so drop write before adding execute. Leaving them writable and
+		 * executable trips the kernel's own W^X check.
+		 */
+		virt = (unsigned long)spawn_trampoline_va & PAGE_MASK;
+		ret = set_memory_ro(virt, 1);
+		if (!ret)
+			ret = set_memory_x(virt, 1);
+		if (ret)
+			goto fail;
+		spawn_trampoline_prepared = true;
+	}
 
 	/* The pool park page is entered the same way when this kernel dies */
-	if (ctx->park_phys) {
+	if (!spawn_pool_park_prepared) {
 		virt = (unsigned long)__va(ctx->park_phys) & PAGE_MASK;
 		ret = set_memory_ro(virt, 1);
 		if (!ret)
 			ret = set_memory_x(virt, 1);
+		if (ret)
+			goto fail;
+		spawn_pool_park_prepared = true;
 	}
 
+	/* Publish executable mappings before any reject or abort can park. */
+	smp_store_release(&spawn_park_ready, true);
+	return 0;
+
+fail:
+	/* A partial W^X transition is not safe to retry. */
+	spawn_park_error = ret;
 	return ret;
 }
-early_initcall(mk_prepare_trampoline);
+early_initcall(mk_arch_prepare_park);
 
 /*
  * Add a 2MB executable mapping to a page table.

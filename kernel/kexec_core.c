@@ -1702,6 +1702,12 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	instance = mk_image->mk_instance;
+	if (instance->state != MK_STATE_LOADED) {
+		pr_err("Multikernel instance %d is not loadable (state=%d)\n",
+		       mk_id, instance->state);
+		rc = -EINVAL;
+		goto unlock;
+	}
 	if (!mk_cpu_set_empty(instance->cpus)) {
 		mk_phys_cpu_t phys_cpu = mk_cpu_set_first(instance->cpus);
 
@@ -1756,10 +1762,11 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	rc = mk_manifest_finalize(mk_image);
-	if (rc)
-		pr_warn("Manifest finalization failed: %d\n", rc);
-	else
-		pr_info("Manifest finalized for multikernel instance\n");
+	if (rc) {
+		pr_err("Manifest finalization failed: %d\n", rc);
+		goto unlock;
+	}
+	pr_info("Manifest finalized for multikernel instance\n");
 
 	/*
 	 * Point at the ring this image actually carries. Every load
@@ -1775,30 +1782,52 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	/*
-	 * Start the instance with an empty ring. It outlives the kernel
-	 * that was using it, so a new instance would otherwise inherit that
-	 * kernel's indices and any slot it left half written - which stalls
-	 * the reader, since an unpublished slot means "the sender is still
-	 * filling this one". Anything left in there was addressed to a
-	 * kernel that is gone.
+	 * Start the instance with an empty downlink after its CPUs have been
+	 * confirmed parked. The host is the only producer for this ring, so no
+	 * publisher can race the reset once the old receiver is quiesced.
 	 */
-	if (instance->ipi_data)
-		memset(instance->ipi_data, 0, sizeof(*instance->ipi_data));
+	if (instance->ipi_data) {
+		rc = mk_ipi_shared_reset_downlink(instance->ipi_data, mk_id);
+		if (rc) {
+			pr_err("Failed to reset instance %d IPI downlink: %d\n",
+			       mk_id, rc);
+			goto unlock;
+		}
+	}
+	rc = mk_arch_spawn_instance(mk_image, instance, cpu);
+	if (rc)
+		goto unlock;
 
 	/*
-	 * Same for the other direction: whatever the halted instance left
-	 * queued for us is addressed from a kernel that no longer exists,
-	 * and a slot it claimed but never published stalls our ring for
-	 * good.
+	 * The instance is running once its CPUs leave the park loop. Publish that
+	 * state before dropping the global kexec lock so another exec cannot race
+	 * this boot while the readiness handshake is pending.
 	 */
-	mk_ipi_ring_drop_pending();
+	rc = mk_instance_set_kexec_active(mk_image->mk_id);
+	if (rc) {
+		int abort_ret = mk_instance_abort_spawn(instance);
 
-	rc = mk_arch_spawn_instance(mk_image, instance, cpu);
-	if (rc == 0) {
-		rc = mk_instance_set_kexec_active(mk_image->mk_id);
-		if (rc)
-			pr_warn("Failed to set instance %d as active: %d\n", mk_image->mk_id, rc);
+		if (abort_ret)
+			pr_crit("Instance %d activation abort failed: %d\n",
+				mk_id, abort_ret);
+		goto unlock;
 	}
+
+	/* Do not block crash kexec while a spawn completes its boot handshake. */
+	kexec_unlock();
+	rc = mk_ipi_shared_wait_ready(instance->ipi_data, mk_id,
+				      MK_IPI_READY_TIMEOUT_MS);
+	if (rc) {
+		int abort_ret;
+
+		pr_err("Instance %d did not acknowledge IPI ABI %u: %d\n",
+		       mk_id, MK_IPI_ABI_VERSION, rc);
+		abort_ret = mk_instance_abort_spawn(instance);
+		if (abort_ret)
+			pr_crit("Instance %d IPI ABI timeout abort failed: %d\n",
+				mk_id, abort_ret);
+	}
+	return rc;
 
 unlock:
 	kexec_unlock();

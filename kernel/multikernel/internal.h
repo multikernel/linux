@@ -13,6 +13,14 @@ extern struct idr mk_instance_idr;
 extern struct list_head mk_instance_list;
 extern struct mk_instance *root_instance;
 
+/* core.c */
+int mk_instance_force_halt(struct mk_instance *instance);
+
+/* ipi.c */
+int mk_send_ipi_data(struct mk_instance *instance, void *data,
+		     size_t data_size, unsigned long type);
+void mk_poll_ipi_messages(void);
+
 /* kernfs.c */
 extern struct kernfs_node *mk_root_kn;
 extern struct kernfs_node *mk_instances_kn;

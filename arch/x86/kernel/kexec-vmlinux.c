@@ -60,6 +60,12 @@ struct elf_kernel_info {
 	unsigned long reloc_size;   /* Size of relocation data */
 };
 
+struct mk_elf_note_desc {
+	u64 entry;
+	u32 ipi_abi_version;
+	u32 reserved;
+};
+
 /*
  * Find multikernel entry point from PT_NOTE section.
  * Looks for note with name "Linux" and type 0x4d4b ('MK').
@@ -93,12 +99,20 @@ static unsigned long find_multikernel_entry_note(const void *buf, size_t len,
 
 			if (nhdr->n_type == 0x4d4b &&
 			    nhdr->n_namesz == 6 &&
-			    nhdr->n_descsz == sizeof(u64) &&
+			    nhdr->n_descsz == sizeof(struct mk_elf_note_desc) &&
 			    !memcmp(ptr + sizeof(*nhdr), "Linux", 6)) {
-				u64 entry = *(u64 *)(ptr + sizeof(*nhdr) +
-						     ALIGN(nhdr->n_namesz, 4));
-				pr_info("multikernel: entry=0x%llx\n", entry);
-				return entry;
+				const struct mk_elf_note_desc *desc;
+
+				desc = ptr + sizeof(*nhdr) +
+				       ALIGN(nhdr->n_namesz, 4);
+				if (desc->ipi_abi_version != MK_IPI_ABI_VERSION) {
+					pr_err("multikernel IPI ABI %u is not supported\n",
+					       desc->ipi_abi_version);
+					return 0;
+				}
+				pr_info("multikernel: entry=0x%llx, IPI ABI=%u\n",
+					desc->entry, desc->ipi_abi_version);
+				return desc->entry;
 			}
 			ptr += note_size;
 		}

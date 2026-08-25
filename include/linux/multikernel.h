@@ -14,6 +14,10 @@
 #include <linux/cpumask.h>
 #include <linux/genalloc.h>
 #include <linux/sizes.h>
+#include <linux/spinlock.h>
+#include <linux/multikernel_abi.h>
+
+struct pci_bus;
 
 /**
  * Physical CPU identifiers
@@ -75,8 +79,17 @@ static inline mk_phys_cpu_t mk_cpu_set_first(const struct mk_cpu_set *set)
 /* IPI ring buffer size - must be power of 2 for efficient modulo */
 #define MK_IPI_RING_SIZE 64
 
+#define MK_IPI_SLOT_EMPTY	0
+#define MK_IPI_SLOT_WRITING	1
+#define MK_IPI_SLOT_READY	2
+#define MK_IPI_SLOT_CONSUMING	3
+#define MK_IPI_SLOT_CANCELLED	4
+#define MK_IPI_ABI_MAGIC		0x4d4b495049303033ULL /* "MKIPI003" */
+#define MK_IPI_READY_TIMEOUT_MS	120000
+
 /* Data structure for passing parameters via IPI */
 struct mk_ipi_data {
+	atomic_t state;
 	u64 sender_cpu;          /* Physical ID of the CPU that sent this IPI */
 	unsigned int type;      /* User-defined type identifier */
 	size_t data_size;        /* Size of the data */
@@ -85,9 +98,15 @@ struct mk_ipi_data {
 
 /* IPI ring buffer for queuing messages */
 struct mk_ipi_ring {
-	atomic_t head;                          /* Producer index */
-	atomic_t tail;                          /* Consumer index */
+	atomic_t head;                          /* Producer allocation cursor */
+	atomic_t tail;                          /* Consumer scan cursor */
 	struct mk_ipi_data entries[MK_IPI_RING_SIZE]; /* Ring buffer entries */
+	/* Appended shared ABI: do not move fields above this line. */
+	atomic64_t producer_gate;               /* Owner CPU and claimed slot */
+	atomic_t producer_contention;           /* Sends that observed a busy gate */
+	atomic_t full_failures;                 /* Sends rejected by a full ring */
+	atomic_t invalid_state;                 /* Invalid slot state observations */
+	atomic_t cancelled_writes;              /* Halted producer writes recovered */
 };
 
 /* Shared memory structures - per-instance design */
@@ -101,7 +120,46 @@ struct mk_shared_data {
 	 * CPUs the first one missed.
 	 */
 	u32 force_halt;
+	/* Appended ABI handshake; existing shared offsets stay unchanged. */
+	u64 abi_magic;
+	u32 abi_version;
+	u32 abi_size;
+	s32 ready_instance_id;
+	atomic_t ready;
 };
+
+static inline void mk_ipi_ring_reset_contents(struct mk_ipi_ring *ring)
+{
+	unsigned int i;
+
+	atomic_set(&ring->head, 0);
+	atomic_set(&ring->tail, 0);
+	for (i = 0; i < MK_IPI_RING_SIZE; i++) {
+		WRITE_ONCE(ring->entries[i].data_size, 0);
+		atomic_set(&ring->entries[i].state, MK_IPI_SLOT_EMPTY);
+	}
+	atomic_set(&ring->producer_contention, 0);
+	atomic_set(&ring->full_failures, 0);
+	atomic_set(&ring->invalid_state, 0);
+	atomic_set(&ring->cancelled_writes, 0);
+}
+
+static inline void mk_ipi_ring_reset(struct mk_ipi_ring *ring)
+{
+	mk_ipi_ring_reset_contents(ring);
+	atomic64_set(&ring->producer_gate, 0);
+}
+
+static inline void mk_shared_data_reset(struct mk_shared_data *shared)
+{
+	mk_ipi_ring_reset(&shared->ring);
+	WRITE_ONCE(shared->force_halt, 0);
+	WRITE_ONCE(shared->abi_magic, MK_IPI_ABI_MAGIC);
+	WRITE_ONCE(shared->abi_version, MK_IPI_ABI_VERSION);
+	WRITE_ONCE(shared->abi_size, sizeof(*shared));
+	WRITE_ONCE(shared->ready_instance_id, -1);
+	atomic_set(&shared->ready, 0);
+}
 
 /* Function pointer type for IPI callbacks */
 typedef void (*mk_ipi_callback_t)(struct mk_ipi_data *data, void *ctx);
@@ -145,8 +203,15 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 
 void generic_multikernel_interrupt(void);
 
-/* Discard everything queued in this kernel's ring (instance re-spawn) */
-void mk_ipi_ring_drop_pending(void);
+int mk_ipi_shared_validate(const struct mk_shared_data *shared);
+int mk_ipi_shared_mark_ready(struct mk_shared_data *shared, int instance_id);
+int mk_ipi_shared_wait_ready(struct mk_shared_data *shared, int instance_id,
+			     unsigned int timeout_ms);
+int mk_ipi_shared_reset_downlink(struct mk_shared_data *shared,
+				 int instance_id);
+
+/* Recover a producer only after every CPU in @halted_cpus is parked. */
+int mk_ipi_ring_recover_halted(const struct mk_cpu_set *halted_cpus);
 
 /*
  * Multikernel Messaging System
@@ -827,6 +892,7 @@ struct mk_instance *mk_instance_find(int mk_id);
 void mk_instance_put(struct mk_instance *instance);
 void mk_instance_set_state(struct mk_instance *instance,
 			   enum mk_instance_state state);
+int mk_instance_abort_spawn(struct mk_instance *instance);
 
 /* Kimage-based access to the instance memory pool */
 void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align);
@@ -841,6 +907,7 @@ void mk_register_cpus_from_manifest(void);
 
 /* Accept the manifest handed over at boot (spawn kernels) */
 void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len);
+bool mk_manifest_rejected(void);
 
 /* Build the manifest for a spawn (host, kexec path) */
 int mk_manifest_finalize(struct kimage *image);
@@ -898,6 +965,11 @@ static inline void mk_register_cpus_from_manifest(void)
 static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 {
 }
+
+static inline bool mk_manifest_rejected(void)
+{
+	return false;
+}
 #endif
 
 /**
@@ -905,7 +977,8 @@ static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
  */
 #define MK_DT_CONFIG_VERSION_1  1
 #define MK_DT_CONFIG_CURRENT    MK_DT_CONFIG_VERSION_1
-#define MK_FDT_COMPATIBLE "multikernel-v1"
+/* Bumped whenever the shared-memory layout or message semantics change. */
+#define MK_FDT_COMPATIBLE "multikernel-v3"
 
 /**
  * Property Names
@@ -1031,6 +1104,8 @@ void mk_set_pool_cpu(int cpu, bool is_pool);
 
 /* Park the calling CPU in the pool wait loop; never returns */
 void __noreturn mk_enter_pool_state(void *info);
+int __init mk_arch_prepare_park(void);
+bool mk_arch_park_ready(void);
 
 /*
  * Forcible stop of another instance's CPUs (NMI on x86). Registration

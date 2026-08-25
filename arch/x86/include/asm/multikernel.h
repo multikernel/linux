@@ -10,6 +10,8 @@
 
 #ifndef __ASSEMBLY__
 
+#include <linux/build_bug.h>
+#include <linux/stddef.h>
 #include <linux/types.h>
 #include <linux/cpumask.h>
 #include <linux/sizes.h>
@@ -54,7 +56,7 @@ static inline int arch_cpu_from_physical_id(u64 phys_id)
  * from a page written by the host while running on CPUs parked by (possibly
  * differently built) spawn kernels.
  *
- * The fields fall into two classes that must not be mixed up:
+ * The fields fall into three classes that must not be mixed up:
  *
  *  - Anchor fields (self_phys, park_phys, park_cr3, ctrl_phys,
  *    ctrl_size): the context's own identity, written once when the
@@ -62,9 +64,13 @@ static inline int arch_cpu_from_physical_id(u64 phys_id)
  *    CPU on halt or offline, so they must stay valid for the context's
  *    whole lifetime.
  *
- *  - Dispatch fields (everything else): the wake mailbox, rewritten for
- *    every publication and staged into registers by the CPU that claims
- *    it. Reparking gets its own repark_* dispatch fields precisely so a
+ *  - Primary boot data (bp and the calibration values appended after it):
+ *    written before the boot CPU is released and consumed while that kernel
+ *    initializes. Secondary and repark publications do not rewrite it.
+ *
+ *  - Dispatch fields (the remaining fixed-size fields): the wake mailbox,
+ *    rewritten for every publication and staged into registers by the CPU
+ *    that claims it. Reparking gets its own repark_* dispatch fields so a
  *    repark publication never overwrites the anchor: the two used to
  *    share fields, and a repark left the anchor pointing at another
  *    kernel's park area, which triple-faulted the next halt.
@@ -91,9 +97,22 @@ struct mk_spawn_context {
 	u32 flags;			/* MK_SPAWN_F_* flags */
 	u32 ready;			/* Signal flag */
 	u32 reserved;			/* Padding for alignment */
-	/* Variable-size struct last - size depends on kernel config */
+	/* Keep all existing context offsets unchanged. */
 	struct boot_params bp;		/* Standard x86 boot params */
+	/* Optional boot data belongs after boot_params, in the zeroed tail. */
+	unsigned long boot_lps;		/* Host delay loops per second */
+	unsigned long boot_cpu_khz;	/* Host CPU frequency calibration */
+	unsigned long boot_tsc_khz;	/* Host TSC frequency calibration */
+	unsigned long boot_apic_hz;	/* Host local APIC timer frequency */
+	u64 abi_magic;			/* Validated context producer */
 } __aligned(PAGE_SIZE);
+
+static_assert(offsetof(struct mk_spawn_context, bp) == 144);
+static_assert(offsetof(struct mk_spawn_context, boot_lps) ==
+	      144 + sizeof(struct boot_params));
+static_assert(offsetof(struct mk_spawn_context, abi_magic) ==
+	      144 + sizeof(struct boot_params) + 4 * sizeof(unsigned long));
+static_assert(sizeof(struct mk_spawn_context) == 2 * PAGE_SIZE);
 
 /* Pool park loop code, copied by the host into per-instance park pages */
 extern char mk_pool_park_start[];
@@ -147,7 +166,8 @@ void mk_set_spawn_context(struct mk_spawn_context *ctx,
 int mk_spawn_cpu(struct mk_instance *instance, int cpu,
 		 struct mk_spawn_context *ctx);
 
-/* Initialize boot context tracking in spawn kernel */
+/* Validate and initialize boot context tracking in spawn kernel */
+struct mk_spawn_context *mk_validate_boot_context(phys_addr_t ctx_phys);
 void mk_init_boot_context(phys_addr_t ctx_phys);
 
 /* Identity page table and trampoline setup */
