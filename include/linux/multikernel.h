@@ -1012,6 +1012,8 @@ void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
  *  - CONFIG_ARCH_HAS_MK_HOST_PARK and the host park functions declared
  *    with the pool chunk API above, for architectures that park CPUs in
  *    software rather than in firmware.
+ *  - CONFIG_ARCH_HAS_MK_POOL_STATE, if the architecture can park an
+ *    offlined CPU for reassignment to another kernel instance.
  */
 
 /* Doorbell for the message ring: IPI a CPU owned by another kernel */

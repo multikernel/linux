@@ -2026,6 +2026,9 @@ config ARCH_SUPPORTS_MULTIKERNEL
 config ARCH_HAS_MK_HOST_PARK
 	def_bool X86_64
 
+config ARCH_HAS_MK_POOL_STATE
+	def_bool X86_64
+
 config ARCH_SUPPORTS_CRASH_DUMP
 	def_bool X86_64 || (X86_32 && HIGHMEM)
 

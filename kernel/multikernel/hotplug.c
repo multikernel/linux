@@ -192,6 +192,10 @@ static int mk_do_cpu_remove(mk_phys_cpu_t cpu_id)
 	int ret;
 	struct mk_hotplug_op *op;
 
+	/* Reject unsupported pool transitions before offlining the CPU. */
+	if (!IS_ENABLED(CONFIG_ARCH_HAS_MK_POOL_STATE))
+		return -EOPNOTSUPP;
+
 	logical_cpu = mk_cpu_to_logical(cpu_id);
 	if (logical_cpu < 0) {
 		pr_err("Multikernel hotplug: Physical CPU %llu not found\n", cpu_id);
