@@ -499,7 +499,12 @@ static int __init mktty_spawn_console_init(void)
 	pr_info("mktty: early console for instance %d\n", mktty_spawn.instance_id);
 	return 0;
 }
-console_initcall(mktty_spawn_console_init);
+/*
+ * root_instance is restored at early_initcall, so this cannot be a
+ * console_initcall. Being an early_initcall too still puts it ahead of
+ * smp_init(), and the link order (kernel/ before drivers/) after the restore.
+ */
+early_initcall(mktty_spawn_console_init);
 
 static int mktty_spawn_init(void)
 {
