@@ -1087,6 +1087,14 @@ config ARCH_SELECTS_KEXEC_FILE
 config ARCH_SUPPORTS_KEXEC_PURGATORY
 	def_bool ARCH_SUPPORTS_KEXEC_FILE
 
+config ARCH_SUPPORTS_MULTIKERNEL
+	def_bool y
+	depends on 64BIT
+	depends on RISCV_SBI
+	depends on KEXEC_FILE
+	depends on HOTPLUG_CPU
+	depends on !RISCV_M_MODE
+
 config ARCH_SUPPORTS_CRASH_DUMP
 	def_bool y
 
