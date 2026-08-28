@@ -8,6 +8,7 @@
 #include <linux/bits.h>
 #include <linux/init.h>
 #include <linux/mm.h>
+#include <linux/multikernel.h>
 #include <linux/pm.h>
 #include <linux/reboot.h>
 #include <asm/sbi.h>
@@ -648,6 +649,7 @@ int sbi_debug_console_read(char *bytes, unsigned int num_bytes)
 
 void __init sbi_init(void)
 {
+	bool spawn_kernel = mk_is_spawn_kernel();
 	bool srst_power_off = false;
 	int ret;
 
@@ -682,11 +684,13 @@ void __init sbi_init(void)
 		if (sbi_spec_version >= sbi_mk_version(0, 3) &&
 		    sbi_probe_extension(SBI_EXT_SRST)) {
 			pr_info("SBI SRST extension detected\n");
-			register_platform_power_off(sbi_srst_power_off);
-			srst_power_off = true;
-			sbi_srst_reboot_nb.notifier_call = sbi_srst_reboot;
-			sbi_srst_reboot_nb.priority = 192;
-			register_restart_handler(&sbi_srst_reboot_nb);
+			if (!spawn_kernel) {
+				register_platform_power_off(sbi_srst_power_off);
+				srst_power_off = true;
+				sbi_srst_reboot_nb.notifier_call = sbi_srst_reboot;
+				sbi_srst_reboot_nb.priority = 192;
+				register_restart_handler(&sbi_srst_reboot_nb);
+			}
 		}
 		if (sbi_spec_version >= sbi_mk_version(2, 0) &&
 		    sbi_probe_extension(SBI_EXT_DBCN) > 0) {
@@ -704,6 +708,6 @@ void __init sbi_init(void)
 		__sbi_rfence	= __sbi_rfence_v01;
 	}
 
-	if (!srst_power_off)
+	if (!spawn_kernel && !srst_power_off)
 		sbi_set_power_off();
 }

@@ -12,6 +12,7 @@
 #include <linux/security.h>
 #include <linux/kexec.h>
 #include <linux/mutex.h>
+#include <linux/multikernel.h>
 #include <linux/list.h>
 #include <linux/syscalls.h>
 #include <linux/vmalloc.h>
@@ -127,6 +128,17 @@ static int do_kexec_load(unsigned long entry, unsigned long nr_segments,
 			int count, i;
 
 			count = kimage_get_all_by_type(KEXEC_TYPE_MULTIKERNEL, images, 10);
+#ifdef CONFIG_MULTIKERNEL
+			for (i = 0; i < count; i++) {
+				if (images[i]->mk_instance &&
+				    mk_instance_confirm_parked(images[i]->mk_instance)) {
+					pr_err("Multikernel instance %d still has running CPUs\n",
+					       images[i]->mk_id);
+					ret = -EBUSY;
+					goto out_unlock;
+				}
+			}
+#endif
 			for (i = 0; i < count; i++) {
 				kimage_remove_from_list(images[i]);
 				kimage_free(images[i]);
