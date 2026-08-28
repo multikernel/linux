@@ -5,8 +5,11 @@
  * Copyright (c) 2020 Western Digital Corporation or its affiliates.
  */
 
+#include <linux/cacheflush.h>
 #include <linux/init.h>
+#include <linux/io.h>
 #include <linux/mm.h>
+#include <linux/multikernel.h>
 #include <linux/sched/task_stack.h>
 #include <asm/cpu_ops.h>
 #include <asm/cpu_ops_sbi.h>
@@ -41,6 +44,8 @@ int sbi_hsm_hart_stop(void)
 {
 	struct sbiret ret;
 
+	/* A stopped hart cannot receive the remote fence for its next entry. */
+	local_flush_icache_all();
 	ret = sbi_ecall(SBI_EXT_HSM, SBI_EXT_HSM_HART_STOP, 0, 0, 0, 0, 0, 0);
 
 	if (ret.error)
@@ -62,6 +67,31 @@ int sbi_hsm_hart_get_status(unsigned long hartid)
 }
 #endif
 
+#ifdef CONFIG_MULTIKERNEL
+static int sbi_spawn_cpu_entry(unsigned long *boot_addr)
+{
+	struct mk_riscv_spawn_context *ctx;
+	phys_addr_t stub_addr;
+
+	if (!mk_is_spawn_kernel())
+		return 0;
+
+	stub_addr = mk_manifest_entry_stub_phys();
+	if (stub_addr < PAGE_SIZE || !IS_ALIGNED(stub_addr, PAGE_SIZE) ||
+	    !pfn_valid(PHYS_PFN(stub_addr - PAGE_SIZE)) ||
+	    !pfn_valid(PHYS_PFN(stub_addr))) {
+		pr_err_once("SBI: invalid multikernel entry stub address %pa\n",
+			    &stub_addr);
+		return -EINVAL;
+	}
+
+	ctx = phys_to_virt(stub_addr - PAGE_SIZE);
+	WRITE_ONCE(ctx->image_entry, *boot_addr);
+	*boot_addr = stub_addr;
+	return 0;
+}
+#endif
+
 static int sbi_cpu_start(unsigned int cpuid, struct task_struct *tidle)
 {
 	unsigned long boot_addr = __pa_symbol(secondary_start_sbi);
@@ -73,6 +103,10 @@ static int sbi_cpu_start(unsigned int cpuid, struct task_struct *tidle)
 	smp_mb();
 	bdata->task_ptr = tidle;
 	bdata->stack_ptr = task_pt_regs(tidle);
+#ifdef CONFIG_MULTIKERNEL
+	if (sbi_spawn_cpu_entry(&boot_addr))
+		return -EINVAL;
+#endif
 	/* Make sure boot data is updated */
 	smp_mb();
 	hsm_data = __pa(bdata);
