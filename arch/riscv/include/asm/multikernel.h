@@ -51,6 +51,9 @@ struct mk_instance_arch {
 struct mk_pool_arch {
 };
 
+extern char mk_riscv_entry_stub_start[];
+extern char mk_riscv_entry_stub_end[];
+
 #endif /* !__ASSEMBLY__ */
 
 #endif /* _ASM_RISCV_MULTIKERNEL_H */

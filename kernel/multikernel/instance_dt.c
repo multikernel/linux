@@ -317,11 +317,17 @@ static int __init mk_restore_host_instance(void)
 {
 	struct mk_instance *hi;
 	phys_addr_t host_ipi_phys;
+	u64 host_doorbell_cpu;
 	u32 host_ipi_pages;
 	size_t host_ipi_size;
 
 	if (!mk_chosen_ring("host-ipi", &host_ipi_phys, &host_ipi_pages)) {
 		pr_warn("No host IPI buffer in the boot tree (spawn won't be able to send to host)\n");
+		return -ENOENT;
+	}
+	if (of_property_read_u64(of_chosen, "multikernel,host-ipi-cpu",
+				 &host_doorbell_cpu)) {
+		pr_warn("No host doorbell CPU in the boot tree\n");
 		return -ENOENT;
 	}
 	host_ipi_size = (size_t)host_ipi_pages << PAGE_SHIFT;
@@ -330,11 +336,8 @@ static int __init mk_restore_host_instance(void)
 	if (!hi)
 		return -ENOMEM;
 
-	/*
-	 * The host's owned CPU set is unknown here; ring its doorbell on
-	 * physical CPU 0 without pretending we know what it owns.
-	 */
-	hi->ipi_target = 0;
+	/* The parent's owned CPU set is unknown; record only its doorbell. */
+	hi->ipi_target = host_doorbell_cpu;
 
 	hi->ipi_data = memremap(host_ipi_phys, host_ipi_size, MEMREMAP_WB);
 	if (!hi->ipi_data) {

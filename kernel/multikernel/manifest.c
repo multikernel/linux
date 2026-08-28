@@ -23,6 +23,7 @@
 #include <linux/libfdt.h>
 #include <linux/sort.h>
 #include <linux/multikernel.h>
+#include <linux/smp.h>
 
 #include "internal.h"
 
@@ -319,6 +320,7 @@ static int mk_manifest_chosen(void *fdt, void *data)
 {
 	struct mk_manifest_ctx *ctx = data;
 	struct kimage *image = ctx->image;
+	mk_phys_cpu_t doorbell_cpu;
 	phys_addr_t slot;
 	int ret;
 
@@ -327,11 +329,15 @@ static int mk_manifest_chosen(void *fdt, void *data)
 		return ret;
 
 	if (mk_self->ipi_data) {
+		doorbell_cpu = arch_cpu_physical_id(get_boot_cpu_id());
 		ret = fdt_property_u64(fdt, "multikernel,host-ipi-buffer",
 				       mk_self->ipi_phys);
 		if (!ret)
 			ret = fdt_property_u32(fdt, "multikernel,host-ipi-pages",
 					       mk_self->ipi_pages);
+		if (!ret)
+			ret = fdt_property_u64(fdt, "multikernel,host-ipi-cpu",
+					       doorbell_cpu);
 		if (ret)
 			return ret;
 	}
