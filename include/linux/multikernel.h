@@ -861,6 +861,13 @@ void mk_register_cpus_from_manifest(void);
 /* Accept the manifest handed over at boot (spawn kernels) */
 void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len);
 
+/* True after early boot observed a multikernel manifest handoff. */
+bool mk_is_spawn_kernel(void);
+
+/* Host-owned entry stub recorded in the manifest, or 0 if absent. */
+phys_addr_t mk_manifest_entry_stub_phys(void);
+int mk_manifest_set_entry_stub(struct kimage *image, phys_addr_t entry);
+
 /* Build the manifest for a spawn (host, kexec path) */
 int mk_manifest_finalize(struct kimage *image);
 #else
@@ -914,6 +921,22 @@ static inline void mk_register_cpus_from_manifest(void)
 static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 {
 }
+
+static inline bool mk_is_spawn_kernel(void)
+{
+	return false;
+}
+
+static inline phys_addr_t mk_manifest_entry_stub_phys(void)
+{
+	return 0;
+}
+
+static inline int mk_manifest_set_entry_stub(struct kimage *image,
+					     phys_addr_t entry)
+{
+	return -ENODEV;
+}
 #endif
 
 /**
@@ -922,6 +945,7 @@ static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 #define MK_DT_CONFIG_VERSION_1  1
 #define MK_DT_CONFIG_CURRENT    MK_DT_CONFIG_VERSION_1
 #define MK_FDT_COMPATIBLE "multikernel-v1"
+#define MK_FDT_ENTRY_STUB "entry-stub"
 
 /**
  * Property Names
