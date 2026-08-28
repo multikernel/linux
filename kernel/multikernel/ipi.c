@@ -176,30 +176,27 @@ int mk_arm_force_halt(struct mk_instance *instance)
  *
  * Returns 0 on success, negative error code on failure
  */
-int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, unsigned long type)
+int mk_send_ipi_data_to_instance(struct mk_instance *instance, const void *data,
+				 size_t data_size, unsigned long type)
 {
 	struct mk_ipi_data *slot;
-	struct mk_instance *instance = mk_instance_find(instance_id);
 	unsigned int head, next_head, tail;
 	mk_phys_cpu_t target;
 
 	if (!instance)
 		return -EINVAL;
-	if (data_size > MK_MAX_DATA_SIZE) {
-		mk_instance_put(instance);
+	if (data_size > MK_MAX_DATA_SIZE)
 		return -EINVAL;
-	}
 
 	target = mk_cpu_set_first(instance->cpus);
 	if (target == MK_PHYS_CPU_INVALID) {
-		pr_err("Instance %d has no CPUs to receive the IPI\n", instance_id);
-		mk_instance_put(instance);
+		pr_err("Instance %d has no CPUs to receive the IPI\n", instance->id);
 		return -ENODEV;
 	}
 
 	if (!mk_instance_ipi_area(instance)) {
-		pr_err("Multikernel IPI buffer not available for instance %d\n", instance_id);
-		mk_instance_put(instance);
+		pr_err("Multikernel IPI buffer not available for instance %d\n",
+		       instance->id);
 		return -ENODEV;
 	}
 
@@ -218,8 +215,7 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 			 */
 			printk_deferred(KERN_WARNING
 					"multikernel: IPI ring full for instance %d (head=%u, tail=%u)\n",
-					instance_id, head, tail);
-			mk_instance_put(instance);
+					instance->id, head, tail);
 			return -ENOSPC;
 		}
 
@@ -244,9 +240,22 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 	smp_store_release(&slot->data_size, data_size);
 
 	mk_arch_send_ipi(target);
-
-	mk_instance_put(instance);
 	return 0;
+}
+
+int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size,
+			      unsigned long type)
+{
+	struct mk_instance *instance;
+	int ret;
+
+	instance = mk_instance_find(instance_id);
+	if (!instance)
+		return -EINVAL;
+
+	ret = mk_send_ipi_data_to_instance(instance, data, data_size, type);
+	mk_instance_put(instance);
+	return ret;
 }
 
 static void mk_ipi_drain_ring(void)

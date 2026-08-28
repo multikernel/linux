@@ -83,6 +83,9 @@ void __init mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 	int len;
 	int err = 0;
 
+	/* A malformed spawn handoff must still never gain host-wide reset. */
+	WRITE_ONCE(mk_spawn_kernel, true);
+
 	pr_info("multikernel: processing manifest at 0x%llx (size: %llu)\n",
 		fdt_phys, fdt_len);
 

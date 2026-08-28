@@ -13,6 +13,8 @@
 #include <linux/init.h>
 #include <linux/mm.h>
 #include <linux/memblock.h>
+#include <linux/multikernel.h>
+#include <linux/panic.h>
 #include <linux/sched.h>
 #include <linux/console.h>
 #include <linux/of_fdt.h>
@@ -316,6 +318,8 @@ extern void __init init_rt_signal_env(void);
 void __init setup_arch(char **cmdline_p)
 {
 	parse_dtb();
+	if (mk_is_spawn_kernel())
+		set_arch_panic_timeout(-1, 0);
 	setup_initial_init_mm(_stext, _etext, _edata, _end);
 
 	*cmdline_p = boot_command_line;

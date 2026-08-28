@@ -764,6 +764,9 @@ struct mk_instance *mk_instance_get(struct mk_instance *instance);
  */
 void __noreturn mk_halt_to_pool(void);
 
+/* Panic-safe variant: best-effort parent notification, then local HART_STOP. */
+void __noreturn mk_panic_to_pool(void);
+
 /**
  * mk_instance_reserve_resources() - Reserve CPU and memory resources for instance
  * @instance: Instance to reserve resources for

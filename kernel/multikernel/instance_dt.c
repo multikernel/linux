@@ -37,6 +37,7 @@
  */
 struct mk_instance *root_instance = NULL;
 EXPORT_SYMBOL_GPL(root_instance);
+struct mk_instance *mk_parent_instance;
 
 /**
  * mk_dt_extract_instance_info() - Extract instance ID and name from DTB
@@ -349,8 +350,8 @@ static struct mk_instance * __init mk_restore_host_instance(void)
 	}
 	if (of_property_read_u64(of_chosen, "multikernel,host-ipi-cpu",
 				 &host_doorbell_cpu)) {
-		pr_warn("No host doorbell CPU in the boot tree\n");
-		return NULL;
+		pr_warn("No host doorbell CPU; defaulting to physical CPU 0\n");
+		host_doorbell_cpu = 0;
 	}
 	host_ipi_size = (size_t)host_ipi_pages << PAGE_SHIFT;
 
@@ -498,6 +499,8 @@ int __init mk_instance_restore_from_manifest(void)
 	host_instance = mk_restore_host_instance();
 	if (!host_instance)
 		pr_warn("Failed to restore host instance (spawn→host communication unavailable)\n");
+	else
+		mk_parent_instance = host_instance;
 
 	pr_info("Successfully restored multikernel root instance %d ('%s') from the boot tree (%d bytes)\n",
 		instance_id, instance_name, dtb_len);

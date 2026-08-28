@@ -475,6 +475,14 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 				ret = -ENOENT;
 				goto out;
 			}
+#ifdef CONFIG_MULTIKERNEL
+			ret = mk_instance_confirm_parked(mk_image->mk_instance);
+			if (ret) {
+				pr_err("Multikernel instance %d still has running CPUs\n",
+				       mk_id);
+				goto out;
+			}
+#endif
 
 			pr_info("Unloading kernel from multikernel instance %d\n", mk_id);
 			kimage_remove_from_list(mk_image);
