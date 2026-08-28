@@ -12,6 +12,14 @@
 
 extern const struct cpu_operations cpu_ops_sbi;
 
+int sbi_hsm_hart_start(unsigned long hartid, unsigned long saddr,
+		       unsigned long priv);
+
+#ifdef CONFIG_HOTPLUG_CPU
+int sbi_hsm_hart_stop(void);
+int sbi_hsm_hart_get_status(unsigned long hartid);
+#endif
+
 /**
  * struct sbi_hart_boot_data - Hart specific boot used during booting and
  *			       cpu hotplug.

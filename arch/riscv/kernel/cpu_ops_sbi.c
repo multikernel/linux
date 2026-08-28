@@ -23,8 +23,8 @@ const struct cpu_operations cpu_ops_sbi;
  */
 static struct sbi_hart_boot_data boot_data[NR_CPUS];
 
-static int sbi_hsm_hart_start(unsigned long hartid, unsigned long saddr,
-			      unsigned long priv)
+int sbi_hsm_hart_start(unsigned long hartid, unsigned long saddr,
+		       unsigned long priv)
 {
 	struct sbiret ret;
 
@@ -37,7 +37,7 @@ static int sbi_hsm_hart_start(unsigned long hartid, unsigned long saddr,
 }
 
 #ifdef CONFIG_HOTPLUG_CPU
-static int sbi_hsm_hart_stop(void)
+int sbi_hsm_hart_stop(void)
 {
 	struct sbiret ret;
 
@@ -49,7 +49,7 @@ static int sbi_hsm_hart_stop(void)
 		return 0;
 }
 
-static int sbi_hsm_hart_get_status(unsigned long hartid)
+int sbi_hsm_hart_get_status(unsigned long hartid)
 {
 	struct sbiret ret;
 
