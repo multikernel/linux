@@ -48,6 +48,9 @@ struct mk_instance_arch {
 	phys_addr_t stub_phys;
 };
 
+extern char mk_riscv_entry_stub_start[];
+extern char mk_riscv_entry_stub_end[];
+
 #endif /* !__ASSEMBLY__ */
 
 #endif /* _ASM_RISCV_MULTIKERNEL_H */

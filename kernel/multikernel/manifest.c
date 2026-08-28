@@ -21,6 +21,7 @@
 #include <linux/kexec.h>
 #include <linux/libfdt.h>
 #include <linux/multikernel.h>
+#include <linux/smp.h>
 
 #include "internal.h"
 
@@ -211,11 +212,17 @@ static int mk_manifest_chosen(void *fdt, void *data)
 		return ret;
 
 	if (root_instance->ipi_data) {
+		mk_phys_cpu_t doorbell_cpu;
+
+		doorbell_cpu = arch_cpu_physical_id(get_boot_cpu_id());
 		ret = fdt_property_u64(fdt, "multikernel,host-ipi-buffer",
 				       root_instance->ipi_phys);
 		if (!ret)
 			ret = fdt_property_u32(fdt, "multikernel,host-ipi-pages",
 					       root_instance->ipi_pages);
+		if (!ret)
+			ret = fdt_property_u64(fdt, "multikernel,host-ipi-cpu",
+					       doorbell_cpu);
 		if (ret)
 			return ret;
 	}

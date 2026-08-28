@@ -339,11 +339,17 @@ static struct mk_instance * __init mk_restore_host_instance(void)
 {
 	struct mk_instance *host_instance;
 	phys_addr_t host_ipi_phys;
+	u64 host_doorbell_cpu;
 	u32 host_ipi_pages;
 	size_t host_ipi_size;
 
 	if (!mk_chosen_ring("host-ipi", &host_ipi_phys, &host_ipi_pages)) {
 		pr_warn("No host IPI buffer in the boot tree (spawn won't be able to send to host)\n");
+		return NULL;
+	}
+	if (of_property_read_u64(of_chosen, "multikernel,host-ipi-cpu",
+				 &host_doorbell_cpu)) {
+		pr_warn("No host doorbell CPU in the boot tree\n");
 		return NULL;
 	}
 	host_ipi_size = (size_t)host_ipi_pages << PAGE_SHIFT;
@@ -352,8 +358,7 @@ static struct mk_instance * __init mk_restore_host_instance(void)
 	if (!host_instance)
 		return NULL;
 
-	/* Set physical CPU 0 as default target for host IPIs */
-	if (mk_cpu_set_add(host_instance->cpus, 0)) {
+	if (mk_cpu_set_add(host_instance->cpus, host_doorbell_cpu)) {
 		kfree(host_instance->name);
 		mk_cpu_set_free(host_instance->cpus);
 		kfree(host_instance);

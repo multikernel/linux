@@ -296,12 +296,17 @@ bool multikernel_allow_emergency_restart(void)
  */
 int mk_instance_confirm_parked(struct mk_instance *instance)
 {
+	const struct mk_cpu_set *cpus;
 	mk_phys_cpu_t phys_cpu;
 	unsigned int i;
 	int ret, failed = 0;
 
-	/* Empty until the instance first ran, so nothing of it is executing */
-	mk_cpu_set_for_each(i, phys_cpu, instance->cpus_on_slot) {
+	/* Firmware-park architectures never put CPUs on an instance slot. */
+	cpus = IS_ENABLED(CONFIG_ARCH_HAS_MK_HOST_PARK) ?
+		instance->cpus_on_slot : instance->cpus;
+
+	/* An empty set means no CPU can still be executing this image. */
+	mk_cpu_set_for_each(i, phys_cpu, cpus) {
 		ret = mk_arch_confirm_parked(instance, phys_cpu);
 		if (ret) {
 			pr_err("Instance %d (%s): CPU %llu is not parked: %d\n",
