@@ -36,11 +36,16 @@ static inline int arch_cpu_from_physical_id(u64 hartid)
  */
 #define MK_CTRL_BLOCK_SIZE	(SZ_64K + 2 * PAGE_SIZE)
 
-/*
- * Architecture-private spawn state is added with the SBI HSM and Image
- * loader support. The compile-only skeleton intentionally has none.
- */
+struct mk_riscv_spawn_context {
+	unsigned long image_entry;
+};
+
+/* Per-instance state, allocated from the control block on first spawn. */
 struct mk_instance_arch {
+	struct mk_riscv_spawn_context *ctx;
+	phys_addr_t ctx_phys;
+	const void *stub;
+	phys_addr_t stub_phys;
 };
 
 #endif /* !__ASSEMBLY__ */
