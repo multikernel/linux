@@ -24,6 +24,8 @@ int mk_instance_destroy(struct mk_instance *instance);
 /* dts.c */
 int mk_dt_parse_resources(const void *fdt, int resources_node,
 			  const char *instance_name, struct mk_dt_config *config);
+int mk_dt_emit_boot_tree(struct mk_instance *instance, void *fdt, size_t size,
+			 int (*chosen)(void *fdt, void *data), void *data);
 int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 				 void **out_dtb, size_t *out_size);
 

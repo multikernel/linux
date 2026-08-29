@@ -2,14 +2,17 @@
 /*
  * Copyright (C) 2025 Multikernel Technologies, Inc. All rights reserved
  *
- * The multikernel manifest: an FDT the host hands to a spawn kernel,
- * carrying the instance's identity and resources (the instance DTB),
- * the pool CPUs it may receive later, and the message ring addresses.
+ * The multikernel manifest: the device tree a spawn kernel boots from.
+ * It is the instance's tree as the host generates it, with a /chosen
+ * node carrying what only the boot handoff knows: the pool CPUs the
+ * instance may receive later and the message ring addresses in both
+ * directions. The spawn's OF core unflattens it like a tree from a
+ * bootloader, so everything in it is read with the usual of_* helpers.
  *
  * The manifest travels on multikernel's own boot channel (a dedicated
- * setup_data type on x86, the linux,multikernel-fdt /chosen property on
- * device tree architectures), separate from KHO: a spawn kernel may use
- * the real KHO channel for its own live update within its partition.
+ * setup_data type on x86, pointing at the tree), separate from KHO: a
+ * spawn kernel may use the real KHO channel for its own live update
+ * within its partition.
  */
 
 #include <linux/kernel.h>
@@ -78,19 +81,128 @@ out:
 		pr_warn("multikernel: ignoring invalid manifest\n");
 }
 
+/*
+ * Collect every CPU the instance might receive through hotplug later:
+ * the unassigned pool plus every other kernel's CPUs (the host's and
+ * other instances'), minus the instance's own (those are already in its
+ * DTB). The spawn kernel can only online a CPU whose physical ID it
+ * enumerated at boot, so the whole pool must be in its topology from
+ * the start.
+ */
+static int mk_manifest_add_pool_cpus(void *fdt, struct mk_instance *target)
+{
+	struct mk_cpu_set *pool;
+	struct mk_instance *other;
+	mk_phys_cpu_t id;
+	fdt64_t *cells;
+	unsigned int i, count;
+	int ret = 0;
+
+	pool = mk_cpu_set_alloc();
+	if (!pool)
+		return -ENOMEM;
+
+	mutex_lock(&mk_instance_mutex);
+	list_for_each_entry(other, &mk_instance_list, list) {
+		/*
+		 * Skip the root instance: its set is the CPUs the host
+		 * itself runs on, and enumerating a big host's full CPU set
+		 * in every spawn bloats the spawn's possible map and percpu
+		 * allocations.
+		 */
+		if (other == target || other == root_instance)
+			continue;
+		mk_cpu_set_for_each(i, id, other->cpus) {
+			ret = mk_cpu_set_add(pool, id);
+			if (ret)
+				break;
+		}
+		if (ret)
+			break;
+	}
+	if (!ret) {
+		mk_cpu_set_for_each(i, id, mk_cpu_pool) {
+			ret = mk_cpu_set_add(pool, id);
+			if (ret)
+				break;
+		}
+	}
+	mutex_unlock(&mk_instance_mutex);
+
+	count = mk_cpu_set_count(pool);
+	if (ret || count == 0)
+		goto out;
+
+	cells = kmalloc_array(count, sizeof(*cells), GFP_KERNEL);
+	if (!cells) {
+		ret = -ENOMEM;
+		goto out;
+	}
+
+	mk_cpu_set_for_each(i, id, pool)
+		cells[i] = cpu_to_fdt64(id);
+
+	ret = fdt_property(fdt, "multikernel,pool-cpus", cells, count * sizeof(*cells));
+	kfree(cells);
+out:
+	mk_cpu_set_free(pool);
+	return ret;
+}
+
+struct mk_manifest_ctx {
+	struct kimage *image;
+	struct mk_instance *instance;
+};
+
+static int mk_manifest_chosen(void *fdt, void *data)
+{
+	struct mk_manifest_ctx *ctx = data;
+	struct kimage *image = ctx->image;
+	int ret;
+
+	ret = mk_manifest_add_pool_cpus(fdt, ctx->instance);
+	if (ret)
+		return ret;
+
+	if (root_instance->ipi_data) {
+		ret = fdt_property_u64(fdt, "multikernel,host-ipi-buffer",
+				       root_instance->ipi_phys);
+		if (!ret)
+			ret = fdt_property_u32(fdt, "multikernel,host-ipi-pages",
+					       root_instance->ipi_pages);
+		if (ret)
+			return ret;
+	}
+
+	if (image->mk_ipi) {
+		u32 pages = PAGE_ALIGN(sizeof(struct mk_shared_data)) >> PAGE_SHIFT;
+
+		ret = fdt_property_u64(fdt, "multikernel,ipi-buffer",
+				       (u64)image->mk_ipi);
+		if (!ret)
+			ret = fdt_property_u32(fdt, "multikernel,ipi-pages", pages);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 /**
- * mk_manifest_finalize - Build the manifest for a spawn
+ * mk_manifest_finalize - Write the boot tree for a spawn
  * @image: The multikernel kimage being executed
  *
- * Creates the manifest FDT in the page allocated at load time: the
- * instance DTB, the pool CPUs the instance may receive later, and the
- * message ring addresses for both directions.
+ * Generates the instance's device tree into the manifest page allocated
+ * at load time, with /chosen carrying the boot handoff, and keeps a copy
+ * as the instance's current tree.
  *
  * Returns: 0 on success, negative error code on failure
  */
 int mk_manifest_finalize(struct kimage *image)
 {
-	void *fdt;
+	struct mk_manifest_ctx ctx = { .image = image };
+	struct mk_instance *instance;
+	void *fdt, *copy;
 	int ret;
 
 	if (image->mk_id <= 0) {
@@ -103,70 +215,32 @@ int mk_manifest_finalize(struct kimage *image)
 		return -EINVAL;
 	}
 
-	/* Use the pre-allocated manifest page */
+	instance = mk_instance_find(image->mk_id);
+	if (!instance) {
+		pr_err("Target multikernel instance %d not found\n", image->mk_id);
+		return -ENOENT;
+	}
+
+	ctx.instance = instance;
 	fdt = phys_to_virt(image->mk_manifest);
-
-	ret = fdt_create(fdt, PAGE_SIZE);
-	ret |= fdt_finish_reservemap(fdt);
-	ret |= fdt_begin_node(fdt, "");
-	ret |= fdt_property_string(fdt, "compatible", MK_FDT_COMPATIBLE);
+	ret = mk_dt_emit_boot_tree(instance, fdt, PAGE_SIZE, mk_manifest_chosen,
+				   &ctx);
 	if (ret) {
-		pr_err("Failed to create manifest FDT structure: %d\n", ret);
-		return ret;
+		pr_err("Failed to write the boot tree for instance %d: %d\n",
+		       image->mk_id, ret);
+		mk_instance_put(instance);
+		return ret == -FDT_ERR_NOSPACE ? -ENOSPC : ret;
 	}
 
-	ret = mk_manifest_add_instance_dtb(image, fdt, image->mk_id);
-	if (ret) {
-		pr_err("Failed to preserve multikernel DTB: %d\n", ret);
-		fdt_end_node(fdt);
-		fdt_finish(fdt);
-		return ret;
+	copy = kmemdup(fdt, fdt_totalsize(fdt), GFP_KERNEL);
+	if (copy) {
+		kfree(instance->dtb_data);
+		instance->dtb_data = copy;
+		instance->dtb_size = fdt_totalsize(fdt);
 	}
 
-	ret = mk_manifest_add_host_ipi(image, fdt);
-	if (ret) {
-		pr_err("Failed to preserve host IPI buffer: %d\n", ret);
-		fdt_end_node(fdt);
-		fdt_finish(fdt);
-		return ret;
-	}
-
-	/* Add IPI buffer information if allocated */
-	if (image->mk_ipi) {
-		u64 ipi_phys = (u64)image->mk_ipi;
-		size_t ipi_buffer_size = sizeof(struct mk_shared_data);
-		u32 ipi_pages = (u32)(PAGE_ALIGN(ipi_buffer_size) >> PAGE_SHIFT);
-
-		ret = fdt_begin_node(fdt, "ipi-buffer");
-		ret |= fdt_property_u64(fdt, "phys-addr", ipi_phys);
-		ret |= fdt_property_u32(fdt, "pages", ipi_pages);
-		ret |= fdt_end_node(fdt);
-
-		if (ret) {
-			pr_err("Failed to add IPI buffer to manifest: %d\n", ret);
-			fdt_end_node(fdt);
-			fdt_finish(fdt);
-			return ret;
-		}
-
-		pr_info("multikernel: added IPI buffer to manifest: phys=0x%llx, pages=%u (%zu bytes)\n",
-			ipi_phys, ipi_pages, ipi_buffer_size);
-	}
-
-	ret = fdt_end_node(fdt);
-	ret |= fdt_finish(fdt);
-	if (ret) {
-		pr_err("Failed to finalize manifest FDT: %d\n", ret);
-		return ret;
-	}
-
-	if (fdt_totalsize(fdt) > PAGE_SIZE) {
-		pr_err("Manifest FDT size (%d bytes) exceeds allocated page size (%lu bytes)\n",
-		       fdt_totalsize(fdt), PAGE_SIZE);
-		return -ENOSPC;
-	}
-
-	pr_info("multikernel: finalized manifest for instance %d (size: %d bytes)\n",
+	pr_info("multikernel: boot tree for instance %d written (%u bytes)\n",
 		image->mk_id, fdt_totalsize(fdt));
+	mk_instance_put(instance);
 	return 0;
 }

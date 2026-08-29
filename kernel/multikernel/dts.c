@@ -1731,8 +1731,9 @@ int __init mk_dt_parse_host_bridges(const void *fdt)
  * Returns: 0 on success, a libfdt error (-FDT_ERR_NOSPACE for a buffer
  * that is too small) or a negative error code on failure.
  */
-static int mk_dt_emit_instance(struct mk_instance *instance, void *fdt,
-			       size_t size)
+static int mk_dt_emit_tree(struct mk_instance *instance, void *fdt,
+			   size_t size, int (*chosen)(void *fdt, void *data),
+			   void *data)
 {
 	bool pool = instance == root_instance && mk_cpu_pool;
 	int ret;
@@ -1777,12 +1778,45 @@ static int mk_dt_emit_instance(struct mk_instance *instance, void *fdt,
 		ret = mk_dt_emit_aliases(instance, fdt);
 	if (!ret)
 		ret = mk_dt_emit_host_bridges(instance, fdt);
+	if (!ret && chosen) {
+		ret = fdt_begin_node(fdt, "chosen");
+		if (!ret)
+			ret = chosen(fdt, data);
+		if (!ret)
+			ret = fdt_end_node(fdt);
+	}
 	if (!ret)
 		ret = fdt_end_node(fdt);	/* root */
 	if (!ret)
 		ret = fdt_finish(fdt);
 
 	return ret;
+}
+
+static int mk_dt_emit_instance(struct mk_instance *instance, void *fdt,
+			       size_t size)
+{
+	return mk_dt_emit_tree(instance, fdt, size, NULL, NULL);
+}
+
+/**
+ * mk_dt_emit_boot_tree() - Write the tree a spawn of @instance boots from
+ * @instance: Instance to describe
+ * @fdt: Buffer to write into
+ * @size: Size of @fdt
+ * @chosen: Writes the boot-time handoff properties of /chosen
+ * @data: Passed to @chosen
+ *
+ * The instance's device tree with a /chosen node, as a bootloader would
+ * hand it to a kernel.
+ *
+ * Returns: 0 on success, a libfdt error (-FDT_ERR_NOSPACE for a buffer
+ * that is too small) or a negative error code on failure.
+ */
+int mk_dt_emit_boot_tree(struct mk_instance *instance, void *fdt, size_t size,
+			 int (*chosen)(void *fdt, void *data), void *data)
+{
+	return mk_dt_emit_tree(instance, fdt, size, chosen, data);
 }
 
 /**

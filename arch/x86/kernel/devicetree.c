@@ -38,6 +38,12 @@ void __init add_dtb(u64 data)
 	initial_dtb = data + offsetof(struct setup_data, data);
 }
 
+/* A tree that a setup_data entry points at rather than carries */
+void __init set_dtb(u64 phys)
+{
+	initial_dtb = phys;
+}
+
 /*
  * CE4100 ids. Will be moved to machine_device_initcall() once we have it.
  */
@@ -318,6 +324,8 @@ void __init x86_flattree_get_config(void)
 	if (initial_dtb)
 		early_memunmap(dt, map_len);
 #endif
-	if (acpi_disabled && of_have_populated_dt())
+	/* A platform that already chose its SMP parser keeps it */
+	if (acpi_disabled && of_have_populated_dt() &&
+	    x86_init.mpparse.parse_smp_cfg == mpparse_parse_smp_config)
 		x86_init.mpparse.parse_smp_cfg = x86_dtb_parse_smp_config;
 }

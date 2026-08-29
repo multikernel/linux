@@ -17,6 +17,8 @@
 #include <linux/pci.h>
 #include <linux/netdevice.h>
 #include <linux/libfdt.h>
+#include <linux/of.h>
+#include <linux/of_fdt.h>
 #include <linux/sizes.h>
 #include "internal.h"
 
@@ -34,165 +36,6 @@
  */
 struct mk_instance *root_instance = NULL;
 EXPORT_SYMBOL_GPL(root_instance);
-
-/*
- * Collect every CPU the instance might receive through hotplug later:
- * the unassigned pool plus every other kernel's CPUs (the host's and
- * other instances'), minus the instance's own (those are already in its
- * DTB). The spawn kernel can only online a CPU whose physical ID it
- * enumerated at boot, so the whole pool must be in its topology from
- * the start.
- */
-static int mk_manifest_add_pool_cpus(void *fdt, struct mk_instance *target)
-{
-	struct mk_cpu_set *pool;
-	struct mk_instance *other;
-	mk_phys_cpu_t id;
-	fdt64_t *cells;
-	unsigned int i, count;
-	int ret = 0;
-
-	pool = mk_cpu_set_alloc();
-	if (!pool)
-		return -ENOMEM;
-
-	mutex_lock(&mk_instance_mutex);
-	list_for_each_entry(other, &mk_instance_list, list) {
-		/*
-		 * Skip the root instance: its set is the CPUs the host
-		 * itself runs on, and enumerating a big host's full CPU set
-		 * in every spawn bloats the spawn's possible map and percpu
-		 * allocations.
-		 */
-		if (other == target || other == root_instance)
-			continue;
-		mk_cpu_set_for_each(i, id, other->cpus) {
-			ret = mk_cpu_set_add(pool, id);
-			if (ret)
-				break;
-		}
-		if (ret)
-			break;
-	}
-	if (!ret) {
-		mk_cpu_set_for_each(i, id, mk_cpu_pool) {
-			ret = mk_cpu_set_add(pool, id);
-			if (ret)
-				break;
-		}
-	}
-	mutex_unlock(&mk_instance_mutex);
-
-	count = mk_cpu_set_count(pool);
-	if (ret || count == 0)
-		goto out;
-
-	cells = kmalloc_array(count, sizeof(*cells), GFP_KERNEL);
-	if (!cells) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	mk_cpu_set_for_each(i, id, pool)
-		cells[i] = cpu_to_fdt64(id);
-
-	ret = fdt_property(fdt, "pool-cpus", cells, count * sizeof(*cells));
-	kfree(cells);
-out:
-	mk_cpu_set_free(pool);
-	return ret;
-}
-
-/**
- * mk_manifest_add_instance_dtb() - Preserve multikernel DTB for kexec
- * @image: Target kimage
- * @fdt: The manifest FDT being built
- * @mk_id: Multikernel instance ID
- *
- * Called by mk_manifest_finalize() to preserve the multikernel DTB
- * in the manifest for the target kernel.
- *
- * Returns: 0 on success, negative error code on failure
- */
-int mk_manifest_add_instance_dtb(struct kimage *image, void *fdt, int mk_id)
-{
-	struct mk_instance *instance;
-	void *fresh_dtb = NULL;
-	size_t fresh_dtb_size = 0;
-	int ret = 0;
-
-	pr_info("Preserving multikernel DTB for instance %d\n", mk_id);
-
-	/* Find the target multikernel instance */
-	instance = mk_instance_find(mk_id);
-	if (!instance) {
-		pr_err("Target multikernel instance %d not found\n", mk_id);
-		return -ENOENT;
-	}
-
-	ret = mk_dt_generate_instance_dtb(instance, &fresh_dtb, &fresh_dtb_size);
-	if (ret) {
-		pr_err("Failed to generate fresh DTB for instance %d: %d\n", mk_id, ret);
-		mk_instance_put(instance);
-		return ret;
-	}
-
-	kfree(instance->dtb_data);
-	instance->dtb_data = fresh_dtb;
-	instance->dtb_size = fresh_dtb_size;
-
-	ret |= fdt_begin_node(fdt, "multikernel");
-	ret |= fdt_property(fdt, "dtb-data", instance->dtb_data, instance->dtb_size);
-	ret |= mk_manifest_add_pool_cpus(fdt, instance);
-	ret |= fdt_end_node(fdt);
-
-	if (ret) {
-		pr_err("Failed to add DTB for instance %d to FDT: %d\n", mk_id, ret);
-		mk_instance_put(instance);
-		return ret;
-	}
-
-	pr_info("Preserved DTB for instance %d (%zu bytes)\n", mk_id, instance->dtb_size);
-	mk_instance_put(instance);
-	return 0;
-}
-
-/**
- * mk_manifest_add_host_ipi() - Add the host's IPI buffer address to the manifest
- * @image: Target kimage
- * @fdt: The manifest FDT being built
- *
- * Called during kexec preparation to pass the host's IPI receive buffer
- * address to the spawn kernel so it can send messages back to the host.
- *
- * Returns: 0 on success, negative error code on failure
- */
-int mk_manifest_add_host_ipi(struct kimage *image, void *fdt)
-{
-	int ret = 0;
-
-	if (!root_instance->ipi_data) {
-		pr_debug("No host IPI buffer to preserve\n");
-		return 0;
-	}
-
-	pr_info("Preserving host IPI buffer: phys=0x%llx, pages=%u\n",
-		(unsigned long long)root_instance->ipi_phys, root_instance->ipi_pages);
-
-	ret |= fdt_begin_node(fdt, "host-ipi-buffer");
-	ret |= fdt_property_u64(fdt, "phys-addr", root_instance->ipi_phys);
-	ret |= fdt_property_u32(fdt, "pages", root_instance->ipi_pages);
-	ret |= fdt_end_node(fdt);
-
-	if (ret) {
-		pr_err("Failed to add host IPI buffer to manifest: %d\n", ret);
-		return ret;
-	}
-
-	pr_info("Added host IPI buffer to manifest\n");
-	return 0;
-}
-
 
 /**
  * mk_dt_extract_instance_info() - Extract instance ID and name from DTB
@@ -242,54 +85,36 @@ static int mk_dt_extract_instance_info(const void *dtb_data, size_t dtb_size,
 	return 0;
 }
 
+static void __init mk_register_cpus_from(struct device_node *np,
+					 const char *prop)
+{
+	int i, n = of_property_count_u64_elems(np, prop);
+
+	for (i = 0; i < n; i++) {
+		u64 phys_id;
+
+		if (of_property_read_u64_index(np, prop, i, &phys_id))
+			break;
+		mk_arch_register_cpu(phys_id);
+	}
+}
+
 /*
- * Register CPUs from the manifest during SMP config phase.
- * Called from multikernel_parse_smp_config() before topology is finalized.
+ * Register CPUs from the boot tree during SMP config phase. Called from
+ * multikernel_parse_smp_config(), after the tree has been unflattened
+ * and before the topology is finalized.
  */
 void __init mk_register_cpus_from_manifest(void)
 {
-	phys_addr_t fdt_phys;
-	const void *manifest;
-	int mk_node, resources_node;
-	const fdt64_t *cpus_prop;
-	int cpus_len, i;
-	const void *dtb_data;
-	int dtb_len;
+	struct device_node *np;
 
-	fdt_phys = mk_manifest_phys();
-	if (!fdt_phys)
+	if (!mk_manifest_phys())
 		return;
 
-	manifest = early_memremap(fdt_phys, PAGE_SIZE);
-	if (!manifest)
-		return;
-
-	mk_node = fdt_subnode_offset(manifest, 0, "multikernel");
-	if (mk_node < 0)
-		goto out;
-
-	/* Get the embedded DTB */
-	dtb_data = fdt_getprop(manifest, mk_node, "dtb-data", &dtb_len);
-	if (!dtb_data || dtb_len <= 0)
-		goto out;
-
-	/* Find /resources node in the embedded DTB */
-	resources_node = fdt_subnode_offset(dtb_data, 0, "resources");
-	if (resources_node < 0)
-		goto out;
-
-	/* Get the cpus property (64-bit physical IDs) from resources node */
-	cpus_prop = fdt_getprop(dtb_data, resources_node, "cpus", &cpus_len);
-	if (!cpus_prop || cpus_len < sizeof(fdt64_t) ||
-	    cpus_len % sizeof(fdt64_t))
-		goto out;
-
-	/* Register each CPU from the DTB */
-	for (i = 0; i < cpus_len / sizeof(fdt64_t); i++) {
-		mk_phys_cpu_t phys_id = fdt64_to_cpu(cpus_prop[i]);
-
-		mk_arch_register_cpu(phys_id);
-		pr_debug("Registered CPU physical ID %llu from manifest\n", phys_id);
+	np = of_find_node_by_path("/resources");
+	if (np) {
+		mk_register_cpus_from(np, "cpus");
+		of_node_put(np);
 	}
 
 	/*
@@ -299,20 +124,8 @@ void __init mk_register_cpus_from_manifest(void)
 	 * the present mask in mk_restore_instance_cpus(), which keeps a logical
 	 * CPU assigned to each and avoids the hot-pluggable-APIC checks.
 	 */
-	cpus_prop = fdt_getprop(manifest, mk_node, "pool-cpus", &cpus_len);
-	if (cpus_prop && cpus_len >= sizeof(fdt64_t) &&
-	    cpus_len % sizeof(fdt64_t) == 0) {
-		for (i = 0; i < cpus_len / sizeof(fdt64_t); i++) {
-			mk_phys_cpu_t phys_id = fdt64_to_cpu(cpus_prop[i]);
-
-			mk_arch_register_cpu(phys_id);
-			pr_debug("Registered pool CPU physical ID %llu from manifest\n",
-				 phys_id);
-		}
-	}
-
-out:
-	early_memunmap((void *)manifest, PAGE_SIZE);
+	if (of_chosen)
+		mk_register_cpus_from(of_chosen, "multikernel,pool-cpus");
 }
 
 /*
@@ -507,39 +320,39 @@ static int __init mk_copy_platform_devices(const struct mk_dt_config *config,
 	return 0;
 }
 
-static int __init mk_restore_instance_ipi(const void *manifest, struct mk_instance *instance)
+/* A message ring the host describes in /chosen: its address and size */
+static bool __init mk_chosen_ring(const char *what, phys_addr_t *phys,
+				  u32 *pages)
 {
-	int ipi_node;
-	const fdt64_t *phys_prop;
-	const fdt32_t *pages_prop;
-	int len;
-	phys_addr_t ipi_phys = 0;
-	u32 ipi_pages = 0;
-	size_t ipi_size = 0;
+	char name[48];
+	u64 addr;
 
-	ipi_node = fdt_subnode_offset(manifest, 0, "ipi-buffer");
-	if (ipi_node < 0) {
+	if (!of_chosen)
+		return false;
+
+	snprintf(name, sizeof(name), "multikernel,%s-buffer", what);
+	if (of_property_read_u64(of_chosen, name, &addr))
+		return false;
+	snprintf(name, sizeof(name), "multikernel,%s-pages", what);
+	if (of_property_read_u32(of_chosen, name, pages))
+		return false;
+
+	*phys = addr;
+	return *phys && *pages;
+}
+
+static int __init mk_restore_instance_ipi(struct mk_instance *instance)
+{
+	phys_addr_t ipi_phys;
+	u32 ipi_pages;
+	size_t ipi_size;
+
+	if (!mk_chosen_ring("ipi", &ipi_phys, &ipi_pages)) {
 		instance->ipi_data = NULL;
-		pr_debug("No IPI buffer available in manifest\n");
+		pr_debug("No IPI buffer in the boot tree\n");
 		return 0;
 	}
-
-	phys_prop = fdt_getprop(manifest, ipi_node, "phys-addr", &len);
-	if (phys_prop && len == sizeof(*phys_prop))
-		ipi_phys = (phys_addr_t)fdt64_to_cpu(*phys_prop);
-
-	pages_prop = fdt_getprop(manifest, ipi_node, "pages", &len);
-	if (pages_prop && len == sizeof(*pages_prop)) {
-		ipi_pages = fdt32_to_cpu(*pages_prop);
-		ipi_size = (size_t)ipi_pages << PAGE_SHIFT;
-	}
-
-	if (!ipi_phys || !ipi_pages) {
-		instance->ipi_data = NULL;
-		pr_debug("IPI buffer node exists but incomplete info (phys=0x%llx, pages=%u)\n",
-			 (unsigned long long)ipi_phys, ipi_pages);
-		return 0;
-	}
+	ipi_size = (size_t)ipi_pages << PAGE_SHIFT;
 
 	instance->ipi_data = memremap(ipi_phys, ipi_size, MEMREMAP_WB);
 	if (!instance->ipi_data) {
@@ -556,38 +369,18 @@ static int __init mk_restore_instance_ipi(const void *manifest, struct mk_instan
 	return 0;
 }
 
-static struct mk_instance * __init mk_restore_host_instance(const void *manifest)
+static struct mk_instance * __init mk_restore_host_instance(void)
 {
 	struct mk_instance *host_instance;
-	int host_ipi_node;
-	const fdt64_t *phys_prop;
-	const fdt32_t *pages_prop;
-	phys_addr_t host_ipi_phys = 0;
-	u32 host_ipi_pages = 0;
-	size_t host_ipi_size = 0;
-	int len;
+	phys_addr_t host_ipi_phys;
+	u32 host_ipi_pages;
+	size_t host_ipi_size;
 
-	host_ipi_node = fdt_subnode_offset(manifest, 0, "host-ipi-buffer");
-	if (host_ipi_node < 0) {
-		pr_warn("No host-ipi-buffer node in manifest (spawn won't be able to send to host)\n");
+	if (!mk_chosen_ring("host-ipi", &host_ipi_phys, &host_ipi_pages)) {
+		pr_warn("No host IPI buffer in the boot tree (spawn won't be able to send to host)\n");
 		return NULL;
 	}
-
-	phys_prop = fdt_getprop(manifest, host_ipi_node, "phys-addr", &len);
-	if (phys_prop && len == sizeof(*phys_prop))
-		host_ipi_phys = (phys_addr_t)fdt64_to_cpu(*phys_prop);
-
-	pages_prop = fdt_getprop(manifest, host_ipi_node, "pages", &len);
-	if (pages_prop && len == sizeof(*pages_prop)) {
-		host_ipi_pages = fdt32_to_cpu(*pages_prop);
-		host_ipi_size = (size_t)host_ipi_pages << PAGE_SHIFT;
-	}
-
-	if (!host_ipi_phys || !host_ipi_pages) {
-		pr_warn("Incomplete host IPI buffer info (phys=0x%llx, pages=%u)\n",
-			(unsigned long long)host_ipi_phys, host_ipi_pages);
-		return NULL;
-	}
+	host_ipi_size = (size_t)host_ipi_pages << PAGE_SHIFT;
 
 	host_instance = alloc_mk_instance(0, "", false);
 	if (!host_instance)
@@ -631,7 +424,7 @@ static struct mk_instance * __init mk_restore_host_instance(const void *manifest
  */
 int __init mk_instance_restore_from_manifest(void)
 {
-	void *dtb_virt;
+	const void *dtb_virt;
 	int dtb_len;
 	int ret, cpu;
 	char cpus_buf[256];
@@ -639,11 +432,8 @@ int __init mk_instance_restore_from_manifest(void)
 	struct mk_dt_config config;
 	int instance_id;
 	const char *instance_name;
-	const void *manifest = NULL;
-	phys_addr_t fdt_phys;
 
-	fdt_phys = mk_manifest_phys();
-	if (!fdt_phys) {
+	if (!mk_manifest_phys()) {
 		pr_info("No manifest available for multikernel DTB restoration\n");
 
 		instance = alloc_mk_instance(0, "", true);
@@ -668,58 +458,23 @@ int __init mk_instance_restore_from_manifest(void)
 		return 0;
 	}
 
-	pr_info("Restoring multikernel DTB from manifest (phys: 0x%llx)\n", fdt_phys);
-
-	/* Map the FDT for early boot access */
-	manifest = early_memremap(fdt_phys, PAGE_SIZE);
-	if (!manifest) {
-		pr_err("Failed to map manifest at 0x%llx\n", fdt_phys);
-		return -EFAULT;
+	/*
+	 * The manifest is this kernel's boot device tree; the OF core keeps
+	 * the flattened copy it unflattened, so parse that one.
+	 */
+	dtb_virt = initial_boot_params;
+	if (!dtb_virt || !of_have_populated_dt()) {
+		pr_err("Boot device tree from the manifest was not unflattened\n");
+		return -ENOENT;
 	}
+	dtb_len = fdt_totalsize(dtb_virt);
 
-	int mk_node = fdt_subnode_offset(manifest, 0, "multikernel");
-	if (mk_node < 0) {
-		pr_info("No multikernel node found in manifest\n");
-		ret = 0;
-		goto cleanup_fdt;
-	}
+	pr_info("Restoring instance from the boot device tree (%d bytes)\n", dtb_len);
 
-	const void *dtb_data = fdt_getprop(manifest, mk_node, "dtb-data", &dtb_len);
-	if (!dtb_data || dtb_len <= 0) {
-		pr_info("No dtb-data property found in multikernel node\n");
-		ret = 0;
-		goto cleanup_fdt;
-	}
-
-	pr_info("Found preserved multikernel DTB (%d bytes)\n", dtb_len);
-
-	/* Validate DTB header */
-	ret = fdt_check_header(dtb_data);
-	if (ret) {
-		pr_err("Invalid DTB header in manifest: %d\n", ret);
-		ret = -EINVAL;
-		goto cleanup_fdt;
-	}
-
-	if (dtb_len > SZ_1M) {
-		pr_err("DTB size too large: %d bytes\n", dtb_len);
-		ret = -EINVAL;
-		goto cleanup_fdt;
-	}
-
-	dtb_virt = kmalloc(dtb_len, GFP_KERNEL);
-	if (!dtb_virt) {
-		pr_err("Failed to allocate memory for DTB (%d bytes)\n", dtb_len);
-		ret = -ENOMEM;
-		goto cleanup_fdt;
-	}
-	memcpy(dtb_virt, dtb_data, dtb_len);
-
-	/* Parse DTB to get the actual instance ID and name */
 	ret = mk_dt_extract_instance_info(dtb_virt, dtb_len, &instance_id, &instance_name);
 	if (ret) {
 		pr_err("Failed to extract instance info from DTB: %d\n", ret);
-		goto cleanup_dtb;
+		return ret;
 	}
 
 	pr_info("DTB contains instance ID %d, name '%s'\n", instance_id, instance_name);
@@ -752,14 +507,12 @@ int __init mk_instance_restore_from_manifest(void)
 		goto cleanup_instance_name;
 	}
 
-	instance->dtb_data = kmalloc(dtb_len, GFP_KERNEL);
+	instance->dtb_data = kmemdup(dtb_virt, dtb_len, GFP_KERNEL);
 	if (!instance->dtb_data) {
 		pr_err("Failed to allocate memory for DTB restoration\n");
 		ret = -ENOMEM;
 		goto cleanup_instance_name;
 	}
-
-	memcpy(instance->dtb_data, dtb_virt, dtb_len);
 	instance->dtb_size = dtb_len;
 
 	ret = mk_copy_pci_devices(&config, instance);
@@ -780,7 +533,7 @@ int __init mk_instance_restore_from_manifest(void)
 		goto cleanup_devices;
 	}
 
-	ret = mk_restore_instance_ipi(manifest, instance);
+	ret = mk_restore_instance_ipi(instance);
 	if (ret) {
 		pr_err("Failed to restore IPI buffer: %d\n", ret);
 		goto cleanup_devices;
@@ -788,15 +541,13 @@ int __init mk_instance_restore_from_manifest(void)
 
 	root_instance = instance;
 
-	host_instance = mk_restore_host_instance(manifest);
+	host_instance = mk_restore_host_instance();
 	if (!host_instance)
 		pr_warn("Failed to restore host instance (spawn→host communication unavailable)\n");
 
-	pr_info("Successfully restored multikernel root instance %d ('%s') from manifest (%d bytes)\n",
+	pr_info("Successfully restored multikernel root instance %d ('%s') from the boot tree (%d bytes)\n",
 		instance_id, instance_name, dtb_len);
 	mk_dt_config_free(&config);
-	kfree(dtb_virt);
-	early_memunmap((void *)manifest, PAGE_SIZE);
 	return 0;
 
 cleanup_devices:
@@ -821,10 +572,6 @@ cleanup_instance_name:
 	kfree(instance);
 config_free:
 	mk_dt_config_free(&config);
-cleanup_dtb:
-	kfree(dtb_virt);
-cleanup_fdt:
-	early_memunmap((void *)manifest, PAGE_SIZE);
 	return ret;
 }
 

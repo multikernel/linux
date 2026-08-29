@@ -976,26 +976,6 @@ static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
  * the host side, and restore an instance from it on the spawn side.
  */
 
-/**
- * mk_manifest_add_instance_dtb() - Preserve multikernel DTB for kexec
- * @image: Target kimage
- * @fdt: The manifest FDT being built
- * @mk_id: Multikernel instance ID
- *
- * Called by mk_manifest_finalize() to add the multikernel DTB to the manifest.
- *
- * Returns: 0 on success, negative error code on failure
- */
-int mk_manifest_add_instance_dtb(struct kimage *image, void *fdt, int mk_id);
-
-/**
- * mk_manifest_add_host_ipi() - Add the host's IPI buffer address to the manifest
- * @image: Target kimage
- * @fdt: The manifest FDT being built
- *
- * Returns: 0 on success, negative error code on failure
- */
-int mk_manifest_add_host_ipi(struct kimage *image, void *fdt);
 
 
 /**

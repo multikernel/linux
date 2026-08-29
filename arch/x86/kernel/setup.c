@@ -496,6 +496,8 @@ static void __init add_multikernel(u64 phys_addr, u32 data_len)
 	}
 
 	mk_manifest_populate(mk->fdt_addr, mk->fdt_size);
+	/* The manifest is the device tree a spawn boots from */
+	set_dtb(mk->fdt_addr);
 
 	early_memunmap(mk, size);
 }
