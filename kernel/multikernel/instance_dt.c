@@ -44,8 +44,8 @@ EXPORT_SYMBOL_GPL(root_instance);
  * @instance_id: Output parameter for instance ID
  * @instance_name: Output parameter for instance name (caller must free)
  *
- * Parses the DTB in the new flat format where the root node IS the instance:
- * /<instance-name> { compatible = "multikernel-v1"; id = <N>; resources {...}; }
+ * The root node is the instance, named by its model property:
+ * / { compatible = "multikernel-v1"; model = "web"; id = <N>; resources {...}; }
  *
  * Returns: 0 on success, negative error code on failure
  */
@@ -67,9 +67,9 @@ static int mk_dt_extract_instance_info(const void *dtb_data, size_t dtb_size,
 		return -EINVAL;
 	}
 
-	name = fdt_get_name(fdt, root_node, NULL);
+	name = fdt_getprop(fdt, root_node, "model", NULL);
 	if (!name) {
-		pr_err("Failed to get instance name from root DTB node\n");
+		pr_err("No 'model' property naming the instance in the DTB\n");
 		return -EINVAL;
 	}
 

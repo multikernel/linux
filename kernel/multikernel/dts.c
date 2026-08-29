@@ -1667,9 +1667,11 @@ static int mk_dt_emit_tree(struct mk_instance *instance, void *fdt,
 	if (!ret)
 		ret = fdt_finish_reservemap(fdt);
 	if (!ret)
-		ret = fdt_begin_node(fdt, instance->name);
+		ret = fdt_begin_node(fdt, "");
 	if (!ret)
 		ret = fdt_property_string(fdt, "compatible", "multikernel-v1");
+	if (!ret && instance->name[0])
+		ret = fdt_property_string(fdt, "model", instance->name);
 	if (!ret)
 		ret = fdt_property_u32(fdt, "#address-cells", 2);
 	if (!ret)
