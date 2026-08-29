@@ -43,13 +43,6 @@ static const void *mk_dt_get_base_fdt(void)
 	return root_instance->dtb_data;
 }
 
-static void mk_dt_pci_node_name(const struct mk_pci_device *pci_dev, char *buf,
-				size_t size)
-{
-	snprintf(buf, size, "pci_%04x_%02x_%02x_%x", pci_dev->domain,
-		 pci_dev->bus, pci_dev->slot, pci_dev->func);
-}
-
 /**
  * mk_dt_node_alias() - Find the /aliases entry naming a node
  * @fdt: Device tree blob
@@ -191,6 +184,8 @@ static int mk_dt_parse_numa(const void *fdt, int chosen_node,
 			    struct mk_dt_config *config);
 static int mk_dt_parse_devices(const void *fdt, int chosen_node,
 			       struct mk_dt_config *config);
+static int mk_dt_pci_node_path(const struct mk_pci_device *dev, char *buf,
+			       size_t size);
 static int mk_dt_validate_memory(const struct mk_dt_config *config);
 static int mk_dt_validate_cpus(const struct mk_dt_config *config);
 
@@ -323,31 +318,18 @@ static int mk_dt_parse_cpus(const void *fdt, int chosen_node,
 	return 0;
 }
 
-static int mk_dt_parse_single_pci_device(const void *source_fdt, int dev_node,
-					 struct mk_dt_config *config,
-					 const char *device_name)
+static int mk_dt_add_pci_device(const void *source_fdt, int dev_node,
+				struct mk_dt_config *config,
+				const char *device_name, unsigned int domain,
+				unsigned int bus, unsigned int slot,
+				unsigned int func)
 {
-	const char *pci_id_str;
 	const fdt32_t *vendor_prop, *device_prop;
 	struct mk_pci_device *pci_dev;
-	unsigned int domain, bus, slot, func;
 	const char *node_name, *alias;
 	int len;
 
 	node_name = fdt_get_name(source_fdt, dev_node, NULL);
-
-	pci_id_str = fdt_getprop(source_fdt, dev_node, "pci-id", &len);
-	if (!pci_id_str) {
-		pr_err("No pci-id property in device '%s' (node '%s')\n",
-		       device_name, node_name ? node_name : "<unnamed>");
-		return -EINVAL;
-	}
-
-	if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
-		pr_err("Invalid pci-id format: '%s' (expected domain:bus:slot.func)\n",
-		       pci_id_str);
-		return -EINVAL;
-	}
 
 	vendor_prop = fdt_getprop(source_fdt, dev_node, "vendor-id", &len);
 	if (!vendor_prop || len != 4) {
@@ -385,6 +367,94 @@ static int mk_dt_parse_single_pci_device(const void *source_fdt, int dev_node,
 	pr_info("Added PCI device '%s': %04x:%04x@%04x:%02x:%02x.%x\n",
 		device_name, pci_dev->vendor, pci_dev->device,
 		pci_dev->domain, pci_dev->bus, pci_dev->slot, pci_dev->func);
+
+	return 0;
+}
+
+static int mk_dt_parse_single_pci_device(const void *source_fdt, int dev_node,
+					 struct mk_dt_config *config,
+					 const char *device_name)
+{
+	unsigned int domain, bus, slot, func;
+	const char *pci_id_str;
+	int len;
+
+	pci_id_str = fdt_getprop(source_fdt, dev_node, "pci-id", &len);
+	if (!pci_id_str) {
+		pr_err("No pci-id property in device '%s'\n", device_name);
+		return -EINVAL;
+	}
+
+	if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
+		pr_err("Invalid pci-id format: '%s' (expected domain:bus:slot.func)\n",
+		       pci_id_str);
+		return -EINVAL;
+	}
+
+	return mk_dt_add_pci_device(source_fdt, dev_node, config, device_name,
+				    domain, bus, slot, func);
+}
+
+/*
+ * The devices below a PCI bus node in the tree this kernel was given:
+ * a leaf carries vendor-id, a bridge is recursed into. The unit address
+ * in reg names the bus, device and function.
+ */
+static int mk_dt_parse_pci_bus(const void *fdt, int node, unsigned int domain,
+			       struct mk_dt_config *config)
+{
+	int child, len, ret;
+
+	fdt_for_each_subnode(child, fdt, node) {
+		const fdt32_t *reg = fdt_getprop(fdt, child, "reg", &len);
+		u32 hi;
+
+		if (!reg || len < (int)sizeof(*reg))
+			continue;
+
+		if (!fdt_getprop(fdt, child, "vendor-id", NULL)) {
+			ret = mk_dt_parse_pci_bus(fdt, child, domain, config);
+			if (ret)
+				return ret;
+			continue;
+		}
+
+		hi = fdt32_to_cpu(reg[0]);
+		ret = mk_dt_add_pci_device(fdt, child, config,
+					   fdt_get_name(fdt, child, NULL),
+					   domain, (hi >> 16) & 0xff,
+					   PCI_SLOT((hi >> 8) & 0xff),
+					   PCI_FUNC((hi >> 8) & 0xff));
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int mk_dt_parse_pci_tree(const void *fdt, struct mk_dt_config *config)
+{
+	int node, len, ret;
+
+	if (!config->pci_devices_valid)
+		return 0;
+
+	fdt_for_each_subnode(node, fdt, 0) {
+		const char *compat = fdt_getprop(fdt, node, "compatible", NULL);
+		const fdt32_t *prop;
+		unsigned int domain = 0;
+
+		if (!compat || strcmp(compat, "multikernel,pci-host-bridge"))
+			continue;
+
+		prop = fdt_getprop(fdt, node, "linux,pci-domain", &len);
+		if (prop && len == sizeof(fdt32_t))
+			domain = fdt32_to_cpu(*prop);
+
+		ret = mk_dt_parse_pci_bus(fdt, node, domain, config);
+		if (ret)
+			return ret;
+	}
 
 	return 0;
 }
@@ -691,6 +761,8 @@ int mk_dt_parse(const void *dtb_data, size_t dtb_size,
 	}
 
 	ret = mk_dt_parse_devices(fdt, resources_node, config);
+	if (!ret)
+		ret = mk_dt_parse_pci_tree(fdt, config);
 	if (ret) {
 		pr_err("Failed to parse device resources: %d\n", ret);
 		mk_dt_config_free(config);
@@ -1141,64 +1213,27 @@ static int mk_dt_emit_instance_memory(struct mk_instance *instance, void *fdt)
 static int mk_dt_emit_devices(struct mk_instance *instance, void *fdt)
 {
 	struct mk_platform_device *plat_dev;
-	struct mk_pci_device *pci_dev;
-	bool has_pci, has_platform;
 	int ret;
 
-	has_pci = instance->pci_devices_valid && instance->pci_device_count > 0;
-	has_platform = instance->platform_devices_valid &&
-		       instance->platform_device_count > 0;
-	if (!has_pci && !has_platform)
+	if (!instance->platform_devices_valid ||
+	    instance->platform_device_count == 0)
 		return 0;
 
 	ret = fdt_begin_node(fdt, "devices");
 	if (ret)
 		return ret;
 
-	if (has_pci) {
-		list_for_each_entry(pci_dev, &instance->pci_devices, list) {
-			char pci_id_str[32], node_name[32];
-
-			snprintf(pci_id_str, sizeof(pci_id_str),
-				 "%04x:%02x:%02x.%x", pci_dev->domain,
-				 pci_dev->bus, pci_dev->slot, pci_dev->func);
-			mk_dt_pci_node_name(pci_dev, node_name,
-					    sizeof(node_name));
-
-			ret = fdt_begin_node(fdt, node_name);
-			if (!ret)
-				ret = fdt_property_string(fdt, "device-type",
-							  "pci");
-			if (!ret)
-				ret = fdt_property_string(fdt, "pci-id",
-							  pci_id_str);
-			if (!ret)
-				ret = fdt_property_u32(fdt, "vendor-id",
-						       pci_dev->vendor);
-			if (!ret)
-				ret = fdt_property_u32(fdt, "device-id",
-						       pci_dev->device);
-			if (!ret)
-				ret = fdt_end_node(fdt);
-			if (ret)
-				return ret;
-		}
-	}
-
-	if (has_platform) {
-		list_for_each_entry(plat_dev, &instance->platform_devices, list) {
-			ret = fdt_begin_node(fdt, plat_dev->name);
-			if (!ret)
-				ret = fdt_property_string(fdt, "device-type",
-							  "platform");
-			if (!ret && plat_dev->name[0])
-				ret = fdt_property_string(fdt, "device-name",
-							  plat_dev->name);
-			if (!ret)
-				ret = fdt_end_node(fdt);
-			if (ret)
-				return ret;
-		}
+	list_for_each_entry(plat_dev, &instance->platform_devices, list) {
+		ret = fdt_begin_node(fdt, plat_dev->name);
+		if (!ret)
+			ret = fdt_property_string(fdt, "device-type", "platform");
+		if (!ret && plat_dev->name[0])
+			ret = fdt_property_string(fdt, "device-name",
+						  plat_dev->name);
+		if (!ret)
+			ret = fdt_end_node(fdt);
+		if (ret)
+			return ret;
 	}
 
 	return fdt_end_node(fdt);
@@ -1214,7 +1249,7 @@ static int mk_dt_emit_aliases(struct mk_instance *instance, void *fdt)
 		return 0;
 
 	list_for_each_entry(pci_dev, &instance->pci_devices, list) {
-		char node_name[32], path[64];
+		char path[128];
 
 		if (!pci_dev->alias[0])
 			continue;
@@ -1226,8 +1261,8 @@ static int mk_dt_emit_aliases(struct mk_instance *instance, void *fdt)
 			open = true;
 		}
 
-		mk_dt_pci_node_name(pci_dev, node_name, sizeof(node_name));
-		snprintf(path, sizeof(path), "/resources/devices/%s", node_name);
+		if (mk_dt_pci_node_path(pci_dev, path, sizeof(path)))
+			continue;
 		ret = fdt_property_string(fdt, pci_dev->alias, path);
 		if (ret)
 			return ret;
@@ -1237,6 +1272,145 @@ static int mk_dt_emit_aliases(struct mk_instance *instance, void *fdt)
 }
 
 #ifdef CONFIG_PCI
+/* phys.hi of a PCI unit address: bbbbbbbb dddddfff 00000000 */
+static u32 mk_dt_pci_phys_hi(u8 bus, u8 devfn)
+{
+	return (u32)bus << 16 | (u32)devfn << 8;
+}
+
+/*
+ * The path of a device's node in the tree this kernel generates: the
+ * host bridge of its root bus, then one node per bridge on the way
+ * down, as pci_set_of_node() expects to find a device under its bus.
+ */
+static int mk_dt_pci_node_path(const struct mk_pci_device *dev, char *buf,
+			       size_t size)
+{
+	struct pci_bus *bus = pci_find_bus(dev->domain, dev->bus);
+	u8 devfns[8];
+	int depth = 0, pos, i;
+
+	if (!bus)
+		return -ENODEV;
+
+	while (bus->parent) {
+		if (depth == ARRAY_SIZE(devfns))
+			return -E2BIG;
+		devfns[depth++] = bus->self->devfn;
+		bus = bus->parent;
+	}
+
+	pos = scnprintf(buf, size, "/pci@%llx",
+			(unsigned long long)bus->busn_res.start);
+	for (i = depth - 1; i >= 0; i--)
+		pos += scnprintf(buf + pos, size - pos, "/pci@%x,%x",
+				 PCI_SLOT(devfns[i]), PCI_FUNC(devfns[i]));
+	scnprintf(buf + pos, size - pos, "/pci@%x,%x", dev->slot, dev->func);
+	return 0;
+}
+
+static int mk_dt_emit_pci_reg(void *fdt, u8 bus, u8 devfn)
+{
+	fdt32_t reg[5] = { cpu_to_fdt32(mk_dt_pci_phys_hi(bus, devfn)) };
+
+	return fdt_property(fdt, "reg", reg, sizeof(reg));
+}
+
+/* The bus directly below @parent on the way to bus @busnr, or NULL */
+static struct pci_bus *mk_dt_bus_toward(struct pci_bus *parent, u16 domain,
+					u8 busnr)
+{
+	struct pci_bus *bus = pci_find_bus(domain, busnr);
+
+	while (bus && bus->parent != parent)
+		bus = bus->parent;
+	return bus;
+}
+
+/*
+ * Describe what @instance owns below @bus: its devices on this bus as
+ * leaves, and one bridge node, recursed into, per child bus that leads
+ * to a device further down. The topology comes from the bus structures,
+ * which outlive a leaf device that has been detached from this kernel.
+ */
+static int mk_dt_emit_pci_bus(struct mk_instance *instance,
+			      struct pci_bus *bus, void *fdt)
+{
+	struct pci_bus *children[16];
+	struct mk_pci_device *dev;
+	u16 domain = pci_domain_nr(bus);
+	char name[16];
+	int nr = 0, i, ret;
+
+	list_for_each_entry(dev, &instance->pci_devices, list) {
+		if (dev->domain != domain || dev->bus != bus->number)
+			continue;
+
+		snprintf(name, sizeof(name), "pci@%x,%x", dev->slot, dev->func);
+		ret = fdt_begin_node(fdt, name);
+		if (!ret)
+			ret = mk_dt_emit_pci_reg(fdt, dev->bus,
+						 PCI_DEVFN(dev->slot, dev->func));
+		if (!ret)
+			ret = fdt_property_u32(fdt, "vendor-id", dev->vendor);
+		if (!ret)
+			ret = fdt_property_u32(fdt, "device-id", dev->device);
+		if (!ret)
+			ret = fdt_end_node(fdt);
+		if (ret)
+			return ret;
+	}
+
+	list_for_each_entry(dev, &instance->pci_devices, list) {
+		struct pci_bus *child;
+		fdt32_t bus_range[2];
+
+		if (dev->domain != domain || dev->bus == bus->number)
+			continue;
+
+		child = mk_dt_bus_toward(bus, domain, dev->bus);
+		if (!child || !child->self)
+			continue;
+		for (i = 0; i < nr; i++)
+			if (children[i] == child)
+				break;
+		if (i < nr)
+			continue;
+		if (nr == ARRAY_SIZE(children)) {
+			pr_warn("Bus %04x:%02x has more than %zu child buses in use, rest not described\n",
+				domain, bus->number, ARRAY_SIZE(children));
+			break;
+		}
+		children[nr++] = child;
+
+		snprintf(name, sizeof(name), "pci@%x,%x",
+			 PCI_SLOT(child->self->devfn), PCI_FUNC(child->self->devfn));
+		bus_range[0] = cpu_to_fdt32(child->busn_res.start);
+		bus_range[1] = cpu_to_fdt32(child->busn_res.end);
+		ret = fdt_begin_node(fdt, name);
+		if (!ret)
+			ret = fdt_property_string(fdt, "device_type", "pci");
+		if (!ret)
+			ret = fdt_property_u32(fdt, "#address-cells", 3);
+		if (!ret)
+			ret = fdt_property_u32(fdt, "#size-cells", 2);
+		if (!ret)
+			ret = mk_dt_emit_pci_reg(fdt, bus->number,
+						 child->self->devfn);
+		if (!ret)
+			ret = fdt_property(fdt, "bus-range", bus_range,
+					   sizeof(bus_range));
+		if (!ret)
+			ret = mk_dt_emit_pci_bus(instance, child, fdt);
+		if (!ret)
+			ret = fdt_end_node(fdt);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 static u32 mk_dt_window_flags(const struct resource *res)
 {
 	u32 hi;
@@ -1289,7 +1463,8 @@ static u64 mk_dt_bridge_ecam(struct pci_bus *root, u64 *size)
 #endif
 }
 
-static int mk_dt_emit_one_host_bridge(struct pci_bus *root, void *fdt)
+static int mk_dt_emit_one_host_bridge(struct mk_instance *instance,
+				      struct pci_bus *root, void *fdt)
 {
 	struct pci_host_bridge *bridge = pci_find_host_bridge(root);
 	fdt32_t ranges[MK_PCI_BRIDGE_MAX_WINDOWS * 7];
@@ -1370,6 +1545,10 @@ static int mk_dt_emit_one_host_bridge(struct pci_bus *root, void *fdt)
 			return ret;
 	}
 
+	ret = mk_dt_emit_pci_bus(instance, root, fdt);
+	if (ret)
+		return ret;
+
 	return fdt_end_node(fdt);
 }
 
@@ -1389,10 +1568,23 @@ static int mk_dt_emit_one_host_bridge(struct pci_bus *root, void *fdt)
  *       bus-range = <0x4f 0x50>;
  *       reg = <ecam.hi ecam.lo size.hi size.lo>;	(when known)
  *       ranges = <flags pci.hi pci.lo cpu.hi cpu.lo size.hi size.lo ...>;
+ *       pci@2,7 {				a bridge on the way down
+ *           device_type = "pci";
+ *           #address-cells = <3>;
+ *           #size-cells = <2>;
+ *           reg = <phys.hi 0 0 0 0>;
+ *           bus-range = <0x50 0x50>;
+ *           pci@0,0 {				a device the instance owns
+ *               reg = <phys.hi 0 0 0 0>;
+ *               vendor-id = <0x1af4>;
+ *               device-id = <0x1041>;
+ *           };
+ *       };
  *   };
  *
- * The ranges cells follow the devicetree PCI encoding so the format
- * stays mechanical to migrate to the OF core later.
+ * This is the devicetree PCI bus binding, with a device under the bus
+ * it sits on, so the tree can be handed to the OF core as is and
+ * pci_set_of_node() will find each device by its unit address.
  */
 static int mk_dt_emit_host_bridges(struct mk_instance *instance, void *fdt)
 {
@@ -1400,7 +1592,7 @@ static int mk_dt_emit_host_bridges(struct mk_instance *instance, void *fdt)
 	struct mk_pci_device *pci_dev;
 	int nr = 0, i, ret;
 
-	if (instance == root_instance || !instance->pci_devices_valid)
+	if (!instance->pci_devices_valid)
 		return 0;
 
 	list_for_each_entry(pci_dev, &instance->pci_devices, list) {
@@ -1428,7 +1620,7 @@ static int mk_dt_emit_host_bridges(struct mk_instance *instance, void *fdt)
 	}
 
 	for (i = 0; i < nr; i++) {
-		ret = mk_dt_emit_one_host_bridge(roots[i], fdt);
+		ret = mk_dt_emit_one_host_bridge(instance, roots[i], fdt);
 		if (ret)
 			return ret;
 	}
@@ -1436,6 +1628,12 @@ static int mk_dt_emit_host_bridges(struct mk_instance *instance, void *fdt)
 	return 0;
 }
 #else /* !CONFIG_PCI */
+static int mk_dt_pci_node_path(const struct mk_pci_device *dev, char *buf,
+			       size_t size)
+{
+	return -ENODEV;
+}
+
 static int mk_dt_emit_host_bridges(struct mk_instance *instance, void *fdt)
 {
 	return 0;
