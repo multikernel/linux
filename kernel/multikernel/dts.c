@@ -1272,6 +1272,8 @@ static int mk_dt_emit_aliases(struct mk_instance *instance, void *fdt)
 }
 
 #ifdef CONFIG_PCI
+#define MK_PCI_BRIDGE_MAX_WINDOWS 16
+
 /* phys.hi of a PCI unit address: bbbbbbbb dddddfff 00000000 */
 static u32 mk_dt_pci_phys_hi(u8 bus, u8 devfn)
 {
@@ -1640,83 +1642,6 @@ static int mk_dt_emit_host_bridges(struct mk_instance *instance, void *fdt)
 }
 #endif
 
-/*
- * The parsed counterpart, filled on a spawn kernel from its own device
- * tree so PCI initialization can create the described root buses.
- */
-LIST_HEAD(mk_pci_host_bridges);
-
-int __init mk_dt_parse_host_bridges(const void *fdt)
-{
-	int node;
-
-	fdt_for_each_subnode(node, fdt, 0) {
-		struct mk_pci_host_bridge *bridge;
-		const fdt32_t *prop;
-		const char *compat;
-		int len, i;
-
-		compat = fdt_getprop(fdt, node, "compatible", NULL);
-		if (!compat || strcmp(compat, "multikernel,pci-host-bridge"))
-			continue;
-
-		prop = fdt_getprop(fdt, node, "bus-range", &len);
-		if (!prop || len != 2 * sizeof(fdt32_t)) {
-			pr_warn("Host bridge node '%s' has no valid bus-range, ignored\n",
-				fdt_get_name(fdt, node, NULL));
-			continue;
-		}
-
-		bridge = kzalloc_obj(*bridge, GFP_KERNEL);
-		if (!bridge)
-			return -ENOMEM;
-
-		bridge->bus_start = fdt32_to_cpu(prop[0]);
-		bridge->bus_end = fdt32_to_cpu(prop[1]);
-
-		prop = fdt_getprop(fdt, node, "linux,pci-domain", &len);
-		if (prop && len == sizeof(fdt32_t))
-			bridge->domain = fdt32_to_cpu(*prop);
-
-		prop = fdt_getprop(fdt, node, "reg", &len);
-		if (prop && len == 4 * sizeof(fdt32_t)) {
-			bridge->ecam_base = (u64)fdt32_to_cpu(prop[0]) << 32 |
-					    fdt32_to_cpu(prop[1]);
-			bridge->ecam_size = (u64)fdt32_to_cpu(prop[2]) << 32 |
-					    fdt32_to_cpu(prop[3]);
-		}
-
-		prop = fdt_getprop(fdt, node, "ranges", &len);
-		if (prop && len % (7 * sizeof(fdt32_t)) == 0) {
-			int nr = len / (7 * sizeof(fdt32_t));
-
-			if (nr > MK_PCI_BRIDGE_MAX_WINDOWS)
-				nr = MK_PCI_BRIDGE_MAX_WINDOWS;
-			for (i = 0; i < nr; i++) {
-				const fdt32_t *cell = prop + i * 7;
-				struct mk_pci_bridge_window *win;
-
-				win = &bridge->windows[i];
-				win->flags = fdt32_to_cpu(cell[0]);
-				win->pci_addr = (u64)fdt32_to_cpu(cell[1]) << 32 |
-						fdt32_to_cpu(cell[2]);
-				win->cpu_addr = (u64)fdt32_to_cpu(cell[3]) << 32 |
-						fdt32_to_cpu(cell[4]);
-				win->size = (u64)fdt32_to_cpu(cell[5]) << 32 |
-					    fdt32_to_cpu(cell[6]);
-			}
-			bridge->nr_windows = nr;
-		}
-
-		list_add_tail(&bridge->list, &mk_pci_host_bridges);
-		pr_info("PCI host bridge %04x:[bus %02x-%02x] with %d windows from device tree\n",
-			bridge->domain, bridge->bus_start, bridge->bus_end,
-			bridge->nr_windows);
-	}
-
-	return 0;
-}
-
 /**
  * mk_dt_emit_instance() - Write one instance device tree into @fdt
  * @instance: Instance to describe
@@ -1745,6 +1670,10 @@ static int mk_dt_emit_tree(struct mk_instance *instance, void *fdt,
 		ret = fdt_begin_node(fdt, instance->name);
 	if (!ret)
 		ret = fdt_property_string(fdt, "compatible", "multikernel-v1");
+	if (!ret)
+		ret = fdt_property_u32(fdt, "#address-cells", 2);
+	if (!ret)
+		ret = fdt_property_u32(fdt, "#size-cells", 2);
 	if (!ret)
 		ret = fdt_property_u32(fdt, "id", instance->id);
 	if (!ret)

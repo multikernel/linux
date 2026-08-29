@@ -521,12 +521,6 @@ int __init mk_instance_restore_from_manifest(void)
 		goto cleanup_devices;
 	}
 
-	ret = mk_dt_parse_host_bridges(dtb_virt);
-	if (ret) {
-		pr_err("Failed to parse PCI host bridges: %d\n", ret);
-		goto cleanup_devices;
-	}
-
 	ret = mk_copy_platform_devices(&config, instance);
 	if (ret) {
 		pr_err("Failed to copy platform devices: %d\n", ret);

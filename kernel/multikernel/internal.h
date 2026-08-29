@@ -68,7 +68,6 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size);
 
 /* dts.c */
 const char *mk_dt_node_alias(const void *fdt, int node);
-int __init mk_dt_parse_host_bridges(const void *fdt);
 /*
  * Parked CPUs this kernel can assign to child instances. Created when a
  * baseline is applied to this kernel; NULL until then. Managing a pool
