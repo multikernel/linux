@@ -956,14 +956,21 @@ static int mk_netdev_alias_event(struct notifier_block *nb,
 				 unsigned long event, void *ptr)
 {
 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+	struct device *parent;
 	const char *alias;
 	int ret;
 
-	if (event != NETDEV_REGISTER || !dev->dev.parent ||
-	    !dev_is_pci(dev->dev.parent))
+	if (event != NETDEV_REGISTER)
 		return NOTIFY_DONE;
 
-	alias = mk_pci_alias(to_pci_dev(dev->dev.parent));
+	/* A virtio or USB netdev hangs off its bus device, not the function */
+	for (parent = dev->dev.parent; parent; parent = parent->parent)
+		if (dev_is_pci(parent))
+			break;
+	if (!parent)
+		return NOTIFY_DONE;
+
+	alias = mk_pci_alias(to_pci_dev(parent));
 	if (!alias)
 		return NOTIFY_DONE;
 
