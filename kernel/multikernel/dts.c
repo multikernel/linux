@@ -1230,6 +1230,8 @@ static int mk_dt_emit_devices(struct mk_instance *instance, void *fdt)
 		if (!ret && plat_dev->name[0])
 			ret = fdt_property_string(fdt, "device-name",
 						  plat_dev->name);
+		if (!ret && plat_dev->hid[0])
+			ret = fdt_property_string(fdt, "acpi-hid", plat_dev->hid);
 		if (!ret)
 			ret = fdt_end_node(fdt);
 		if (ret)

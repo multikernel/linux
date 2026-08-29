@@ -19,6 +19,7 @@
 #include <linux/libfdt.h>
 #include <linux/of.h>
 #include <linux/of_fdt.h>
+#include <linux/of_pci.h>
 #include <linux/sizes.h>
 #include "internal.h"
 
@@ -573,85 +574,31 @@ config_free:
 early_initcall(mk_instance_restore_from_manifest);
 
 /**
- * mk_pci_should_probe - Check if PCI probing should occur at all
+ * mk_pci_should_probe - Whether a PCI slot is this kernel's to probe
  * @bus: PCI bus
  * @devfn: device/function number
  *
- * Called BEFORE any PCI config space reads to determine if probing
- * should proceed. This prevents config space accesses to devices
- * that are not in the whitelist.
+ * Called before any config space read of the slot. A spawn kernel owns
+ * exactly the devices its device tree describes under the bus's node,
+ * bridges on the way down included, and must not touch any other slot
+ * on the fabric it shares. A host probes everything: what it gives away
+ * leaves it by explicit hot-unplug.
  *
  * Returns: true if probing should proceed, false to skip entirely
  */
 bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
 {
-	struct mk_pci_device *pci_dev;
-	u16 domain = pci_domain_nr(bus);
-	u8 bus_num = bus->number;
-	u8 slot = PCI_SLOT(devfn);
-	u8 func = PCI_FUNC(devfn);
-	u8 hdr_type;
+	struct device_node *np;
 
-	if (!root_instance)
+	if (!mk_manifest_phys())
 		return true;
 
-	if (!root_instance->dtb_data)
-		return true;
-
-	if (!root_instance->pci_devices_valid || root_instance->pci_device_count == 0)
+	if (!bus->dev.of_node)
 		return false;
 
-	list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
-		if (pci_dev->domain != domain)
-			continue;
-
-		/* Exact location match - always allow */
-		if (pci_dev->bus == bus_num &&
-		    pci_dev->slot == slot &&
-		    pci_dev->func == func)
-			return true;
-	}
-
-	/*
-	 * Check if any whitelisted device is on a downstream bus.
-	 * If so, this might be a bridge in the path to that device.
-	 */
-	list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
-		if (pci_dev->domain == domain && pci_dev->bus > bus_num)
-			goto check_bridge;
-	}
-	return false;
-
-check_bridge:
-	/*
-	 * There's a whitelisted device on a downstream bus. Check if this
-	 * is a bridge that serves it.
-	 */
-	if (pci_bus_read_config_byte(bus, devfn, PCI_HEADER_TYPE, &hdr_type) == 0) {
-		bool is_bridge = ((hdr_type & PCI_HEADER_TYPE_MASK) == PCI_HEADER_TYPE_BRIDGE);
-
-		if (is_bridge) {
-			u8 secondary_bus = 0, subordinate_bus = 0;
-
-			pci_bus_read_config_byte(bus, devfn, PCI_SECONDARY_BUS, &secondary_bus);
-			pci_bus_read_config_byte(bus, devfn, PCI_SUBORDINATE_BUS, &subordinate_bus);
-
-			/*
-			 * Allow bridge if there's a whitelisted device on any bus
-			 * between secondary and subordinate (inclusive).
-			 */
-			if (secondary_bus > 0 && subordinate_bus >= secondary_bus) {
-				list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
-					if (pci_dev->domain == domain &&
-					    pci_dev->bus >= secondary_bus &&
-					    pci_dev->bus <= subordinate_bus)
-						return true;
-				}
-			}
-		}
-	}
-
-	return false;
+	np = of_pci_find_child_device(bus->dev.of_node, devfn);
+	of_node_put(np);
+	return np != NULL;
 }
 EXPORT_SYMBOL_GPL(mk_pci_should_probe);
 
@@ -733,32 +680,49 @@ static int __init mk_netdev_alias_init(void)
 /* Before device_initcall, where the drivers that register netdevs run */
 subsys_initcall(mk_netdev_alias_init);
 
+/**
+ * mk_platform_device_allowed - Whether a platform device is this kernel's
+ * @name: Platform device name, or NULL
+ * @hid: ACPI hardware id, or NULL
+ *
+ * A spawn kernel has the platform devices its device tree lists under
+ * /resources/devices, each named by device-name or acpi-hid. A host
+ * has them all.
+ *
+ * Returns: true if the device may be registered
+ */
 bool mk_platform_device_allowed(const char *name, const char *hid)
 {
-	struct mk_platform_device *plat_dev;
+	struct device_node *devices, *np;
+	bool allowed = false;
 
-	if (!root_instance->dtb_data)
+	if (!mk_manifest_phys())
 		return true;
 
-	if (!root_instance->platform_devices_valid)
+	devices = of_find_node_by_path("/resources/devices");
+	if (!devices)
 		return false;
 
-	if (list_empty(&root_instance->platform_devices) || root_instance->platform_device_count == 0)
-		return false;
+	for_each_child_of_node(devices, np) {
+		const char *want;
 
-	list_for_each_entry(plat_dev, &root_instance->platform_devices, list) {
-		if (hid && plat_dev->hid[0] && strcmp(plat_dev->hid, hid) == 0) {
-			pr_info("Platform device '%s' allowed by HID match: hid='%s'\n",
-				name ? name : "(none)", hid);
-			return true;
-		}
-
-		if (name && plat_dev->name[0] && strcmp(plat_dev->name, name) == 0) {
-			pr_info("Platform device '%s' allowed by name match\n", name);
-			return true;
+		if (of_property_match_string(np, "device-type", "platform") < 0)
+			continue;
+		if (hid && !of_property_read_string(np, "acpi-hid", &want) &&
+		    !strcmp(want, hid))
+			allowed = true;
+		if (name && !of_property_read_string(np, "device-name", &want) &&
+		    !strcmp(want, name))
+			allowed = true;
+		if (allowed) {
+			pr_info("Platform device '%s' is described by %pOF\n",
+				name ? name : hid, np);
+			of_node_put(np);
+			break;
 		}
 	}
 
-	return false;
+	of_node_put(devices);
+	return allowed;
 }
 EXPORT_SYMBOL_GPL(mk_platform_device_allowed);
