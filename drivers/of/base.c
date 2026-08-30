@@ -1991,6 +1991,31 @@ int of_alias_get_id(const struct device_node *np, const char *stem)
 EXPORT_SYMBOL_GPL(of_alias_get_id);
 
 /**
+ * of_alias_from_node - Get the alias name of a node
+ * @np: Pointer to the given device_node
+ *
+ * The alias entry pointing at @np, as written in the aliases node, or
+ * NULL if no alias names it. The string lives as long as the tree.
+ */
+const char *of_alias_from_node(const struct device_node *np)
+{
+	struct alias_prop *app;
+	const char *alias = NULL;
+
+	mutex_lock(&of_mutex);
+	list_for_each_entry(app, &aliases_lookup, link) {
+		if (np == app->np) {
+			alias = app->alias;
+			break;
+		}
+	}
+	mutex_unlock(&of_mutex);
+
+	return alias;
+}
+EXPORT_SYMBOL_GPL(of_alias_from_node);
+
+/**
  * of_alias_get_highest_id - Get highest alias id for the given stem
  * @stem:	Alias stem to be examined
  *

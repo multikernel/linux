@@ -408,6 +408,7 @@ extern int of_phandle_iterator_args(struct of_phandle_iterator *it,
 
 extern int of_alias_get_id(const struct device_node *np, const char *stem);
 extern int of_alias_get_highest_id(const char *stem);
+extern const char *of_alias_from_node(const struct device_node *np);
 
 bool of_machine_compatible_match(const char *const *compats);
 bool of_machine_device_match(const struct of_device_id *matches);
@@ -844,6 +845,11 @@ static inline int of_alias_get_id(struct device_node *np, const char *stem)
 static inline int of_alias_get_highest_id(const char *stem)
 {
 	return -ENOSYS;
+}
+
+static inline const char *of_alias_from_node(const struct device_node *np)
+{
+	return NULL;
 }
 
 static inline int of_machine_is_compatible(const char *compat)
