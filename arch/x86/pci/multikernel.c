@@ -56,9 +56,9 @@ static int __init mk_pci_scan_bridge(struct device_node *np)
 {
 	struct of_pci_range_parser parser;
 	struct of_pci_range range;
+	struct pci_host_bridge *bridge;
 	struct resource *bus_res;
 	struct pci_sysdata *sd;
-	struct pci_bus *bus;
 	LIST_HEAD(resources);
 	int domain = mk_pci_domain(np);
 	int nr_windows = 0;
@@ -109,12 +109,26 @@ static int __init mk_pci_scan_bridge(struct device_node *np)
 		}
 	}
 
-	bus = pci_scan_root_bus(NULL, bus_res->start, &pci_root_ops, sd,
-				&resources);
-	if (!bus)
+	/*
+	 * The bridge carries its node, so the bus binds to it by identity
+	 * rather than by a bus-number search that knows nothing of domains.
+	 */
+	bridge = pci_alloc_host_bridge(0);
+	if (!bridge)
 		goto err;
+	bridge->dev.of_node = of_node_get(np);
+	bridge->sysdata = sd;
+	bridge->busnr = bus_res->start;
+	bridge->ops = &pci_root_ops;
+	list_splice_init(&resources, &bridge->windows);
 
-	pci_bus_add_devices(bus);
+	if (pci_scan_root_bus_bridge(bridge)) {
+		pci_free_host_bridge(bridge);
+		kfree(sd);
+		return -ENODEV;
+	}
+
+	pci_bus_add_devices(bridge->bus);
 	pr_info("PCI: root bus %04x:%02llx with %d windows from %pOF\n",
 		domain, (u64)bus_res->start, nr_windows, np);
 	return 0;
