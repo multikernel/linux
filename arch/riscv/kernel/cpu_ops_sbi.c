@@ -26,6 +26,20 @@ const struct cpu_operations cpu_ops_sbi;
  */
 static struct sbi_hart_boot_data boot_data[NR_CPUS];
 
+static int sbi_hsm_err_map_linux_errno(long err)
+{
+	switch (err) {
+	case SBI_ERR_ALREADY_AVAILABLE:
+	case SBI_ERR_ALREADY_STARTED:
+	case SBI_ERR_ALREADY_STOPPED:
+		return -EALREADY;
+	case SBI_ERR_FAILURE:
+		return -EIO;
+	default:
+		return sbi_err_map_linux_errno(err);
+	}
+}
+
 int sbi_hsm_hart_start(unsigned long hartid, unsigned long saddr,
 		       unsigned long priv)
 {
@@ -34,7 +48,7 @@ int sbi_hsm_hart_start(unsigned long hartid, unsigned long saddr,
 	ret = sbi_ecall(SBI_EXT_HSM, SBI_EXT_HSM_HART_START,
 			hartid, saddr, priv, 0, 0, 0);
 	if (ret.error)
-		return sbi_err_map_linux_errno(ret.error);
+		return sbi_hsm_err_map_linux_errno(ret.error);
 	else
 		return 0;
 }
@@ -49,7 +63,7 @@ int sbi_hsm_hart_stop(void)
 	ret = sbi_ecall(SBI_EXT_HSM, SBI_EXT_HSM_HART_STOP, 0, 0, 0, 0, 0, 0);
 
 	if (ret.error)
-		return sbi_err_map_linux_errno(ret.error);
+		return sbi_hsm_err_map_linux_errno(ret.error);
 	else
 		return 0;
 }
@@ -61,7 +75,7 @@ int sbi_hsm_hart_get_status(unsigned long hartid)
 	ret = sbi_ecall(SBI_EXT_HSM, SBI_EXT_HSM_HART_STATUS,
 			hartid, 0, 0, 0, 0, 0);
 	if (ret.error)
-		return sbi_err_map_linux_errno(ret.error);
+		return sbi_hsm_err_map_linux_errno(ret.error);
 	else
 		return ret.value;
 }

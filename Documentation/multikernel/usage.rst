@@ -88,10 +88,20 @@ RISC-V entry stub
 =================
 
 OpenSBI ``HART_START`` does not invalidate a stopped hart's instruction
-cache, and RFENCE cannot target that hart.  The host therefore copies one
-immutable entry stub into its control block.  The stub begins with ``fence.i``
-before loading the current entry from the preceding context page and jumping
-to it.  It preserves the boot ABI registers ``a0`` and ``a1``.
+cache, and RFENCE cannot target that hart.  The host therefore first starts
+every assigned hart at an immutable host-text trampoline.  Every hart made
+available to the pool has executed a local ``fence.i`` immediately before
+``HART_STOP``, so the trampoline cannot be fetched from an older cache line.
+The trampoline executes another ``fence.i`` and immediately calls
+``HART_STOP``, making a newly copied per-instance stub visible before its
+first fetch.  The host confirms ``STOPPED`` before the real start.  It repeats
+the handshake before donating a hart to an active instance through CPU
+hot-add.
+
+The host copies one immutable entry stub into the instance control block.
+That stub begins with ``fence.i`` before loading the current entry from the
+preceding context page and jumping to it.  It preserves the boot ABI
+registers ``a0`` and ``a1``.
 
 The multikernel manifest advertises the stub address to the spawn kernel.
 Before starting a secondary hart, the spawn kernel changes the context entry
@@ -101,8 +111,9 @@ Image code; the primary still receives its DTB and secondaries still receive
 their SBI boot data.
 
 Every local HSM stop path also executes ``fence.i`` immediately before the
-hart enters firmware, so the stub's first fetch cannot reuse an older line.
+hart enters firmware, keeping the immutable host trampoline safe to fetch on
+the next start.
 
 Respawns update only the host-owned entry data, never the copied instructions.
-The immutable stub can safely execute from a stale cache long enough to run
-``fence.i``, which makes the newly written Image visible before the jump.
+The priming handshake makes the immutable stub visible; the stub's own
+``fence.i`` then makes the newly written Image visible before the jump.

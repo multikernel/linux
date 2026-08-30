@@ -80,6 +80,25 @@ static int mk_riscv_hart_stopped(unsigned long hartid)
 	return 0;
 }
 
+static int mk_riscv_prime_icache(unsigned long hartid)
+{
+	int ret;
+
+	ret = mk_riscv_hart_stopped(hartid);
+	if (ret)
+		return ret;
+
+	ret = sbi_hsm_hart_start(hartid,
+				 __pa_symbol(mk_riscv_entry_fence_stop), 0);
+	if (ret) {
+		pr_err("mk_spawn: failed to prime hart %lu I-cache: %d\n",
+		       hartid, ret);
+		return ret;
+	}
+
+	return mk_riscv_hart_stopped(hartid);
+}
+
 void mk_arch_send_ipi(mk_phys_cpu_t phys_cpu)
 {
 	struct sbiret ret;
@@ -127,15 +146,13 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 			   int cpu)
 {
 	unsigned long hartid = arch_cpu_physical_id(cpu);
+	mk_phys_cpu_t phys_cpu;
+	unsigned int i;
 	int ret;
 
 	if (hartid == INVALID_HARTID || !image->start ||
 	    !image->arch.fdt_addr)
 		return -EINVAL;
-
-	ret = mk_riscv_hart_stopped(hartid);
-	if (ret)
-		return ret;
 
 	ret = mk_riscv_setup_instance(instance);
 	if (ret)
@@ -146,8 +163,13 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 		return ret;
 
 	WRITE_ONCE(instance->arch.ctx->image_entry, image->start);
-	/* Publish all Image, DTB and context stores before firmware starts it. */
+	/* Publish all Image, DTB, stub and context stores before starting it. */
 	smp_mb();
+	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
+		ret = mk_riscv_prime_icache(phys_cpu);
+		if (ret)
+			return ret;
+	}
 
 	ret = sbi_hsm_hart_start(hartid, instance->arch.stub_phys,
 				 image->arch.fdt_addr);
@@ -192,7 +214,10 @@ int mk_repark_instance_to_host(struct mk_instance *instance)
 int mk_repark_cpu_to_instance(struct mk_instance *instance,
 			      mk_phys_cpu_t phys_cpu)
 {
-	return 0;
+	if (!instance->arch.stub)
+		return -EINVAL;
+
+	return mk_riscv_prime_icache(phys_cpu);
 }
 
 int mk_repark_cpu_to_host(struct mk_instance *instance,
