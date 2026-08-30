@@ -193,8 +193,7 @@ static int mk_manifest_chosen(void *fdt, void *data)
  * @image: The multikernel kimage being executed
  *
  * Generates the instance's device tree into the manifest page allocated
- * at load time, with /chosen carrying the boot handoff, and keeps a copy
- * as the instance's current tree.
+ * at load time, with /chosen carrying the boot handoff.
  *
  * Returns: 0 on success, negative error code on failure
  */
@@ -202,7 +201,7 @@ int mk_manifest_finalize(struct kimage *image)
 {
 	struct mk_manifest_ctx ctx = { .image = image };
 	struct mk_instance *instance;
-	void *fdt, *copy;
+	void *fdt;
 	int ret;
 
 	if (image->mk_id <= 0) {
@@ -230,13 +229,6 @@ int mk_manifest_finalize(struct kimage *image)
 		       image->mk_id, ret);
 		mk_instance_put(instance);
 		return ret == -FDT_ERR_NOSPACE ? -ENOSPC : ret;
-	}
-
-	copy = kmemdup(fdt, fdt_totalsize(fdt), GFP_KERNEL);
-	if (copy) {
-		kfree(instance->dtb_data);
-		instance->dtb_data = copy;
-		instance->dtb_size = fdt_totalsize(fdt);
 	}
 
 	pr_info("multikernel: boot tree for instance %d written (%u bytes)\n",

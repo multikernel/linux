@@ -1015,7 +1015,7 @@ static int mk_overlay_op_instance_create(struct mk_overlay_tx *tx,
 	pr_info("Overlay tx%d: Creating instance '%s'\n", tx->id, instance_name);
 
 	ret = mk_create_instance_from_dtb(instance_name, instance_id, fdt,
-					  resources_node, tx->dtbo_size);
+					  resources_node);
 	mutex_unlock(&mk_instance_mutex);
 
 	if (ret) {

@@ -28,21 +28,6 @@
 
 #include "internal.h"
 
-static const void *mk_dt_get_base_fdt(void)
-{
-	if (!root_instance || !root_instance->dtb_data) {
-		pr_err("No base DTB available (root_instance not initialized)\n");
-		return NULL;
-	}
-
-	if (fdt_check_header(root_instance->dtb_data) != 0) {
-		pr_err("Base DTB has invalid header\n");
-		return NULL;
-	}
-
-	return root_instance->dtb_data;
-}
-
 /**
  * mk_dt_node_alias() - Find the /aliases entry naming a node
  * @fdt: Device tree blob
@@ -67,50 +52,6 @@ const char *mk_dt_node_alias(const void *fdt, int node)
 	}
 
 	return NULL;
-}
-
-/**
- * mk_dt_find_device() - Resolve a device reference to its node
- * @fdt: Device tree blob holding /resources/devices
- * @ref: An alias, a node name, a pci-id ("DDDD:BB:SS.F") or the node
- *       name derived from one ("pci_DDDD_BB_SS_F")
- *
- * Returns: the node offset, or a negative libfdt error
- */
-static int mk_dt_find_device(const void *fdt, const char *ref)
-{
-	unsigned int domain, bus, slot, func;
-	char path[128];
-	int devices, node;
-
-	node = fdt_path_offset(fdt, ref);
-	if (node >= 0)
-		return node;
-
-	snprintf(path, sizeof(path), "/resources/devices/%s", ref);
-	node = fdt_path_offset(fdt, path);
-	if (node >= 0)
-		return node;
-
-	if (sscanf(ref, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4 &&
-	    sscanf(ref, "pci_%x_%x_%x_%x", &domain, &bus, &slot, &func) != 4)
-		return -FDT_ERR_NOTFOUND;
-
-	devices = fdt_path_offset(fdt, "/resources/devices");
-	if (devices < 0)
-		return devices;
-
-	fdt_for_each_subnode(node, fdt, devices) {
-		unsigned int d, b, sl, f;
-		const char *pci_id;
-
-		pci_id = fdt_getprop(fdt, node, "pci-id", NULL);
-		if (pci_id && sscanf(pci_id, "%x:%x:%x.%x", &d, &b, &sl, &f) == 4 &&
-		    d == domain && b == bus && sl == slot && f == func)
-			return node;
-	}
-
-	return -FDT_ERR_NOTFOUND;
 }
 
 /**
@@ -167,10 +108,7 @@ void mk_dt_config_free(struct mk_dt_config *config)
 		config->platform_devices_valid = false;
 	}
 
-	/* Reset memory size */
 	config->memory_size = 0;
-
-	/* Note: We don't free dtb_data here as it's managed by the caller */
 }
 
 /**
@@ -553,142 +491,22 @@ static int mk_dt_parse_embedded_devices(const void *fdt, int resources_node,
 	return 0;
 }
 
-/**
- * Device parsing using string array with device-type dispatching
- *
- * Format: device-names = "dev1", "dev2", ...;
- *
- * A PCI device is identified by its address, never by a name: names
- * differ between kernels while the BDF is fixed by the fabric. Each
- * entry is resolved against the base DTB as an /aliases name, a node
- * name under /resources/devices, a pci-id or the node name derived
- * from one, and the device-type property of the node found dispatches
- * to the right parser. Aliases follow the devicetree specification and
- * name a device as the kernel that owns it does, so a spawn kernel names
- * its devices from them (nvme0, enp9s0) instead of by probe order.
- *
- * Example base DTB:
- *   resources {
- *       devices {
- *           pci_0000_09_00_0 {
- *               device-type = "pci";
- *               pci-id = "0000:09:00.0";
- *               vendor-id = <0x1af4>;
- *               device-id = <0x1041>;
- *           };
- *           serial_console {
- *               device-type = "platform";
- *               device-name = "serial8250";
- *           };
- *           keyboard {
- *               device-type = "platform";
- *               acpi-hid = "PNP0303";
- *           };
- *       };
- *   };
- *   aliases {
- *       enp9s0 = "/resources/devices/pci_0000_09_00_0";
- *   };
- *
- * Example overlay, any of the three PCI spellings is accepted:
- *   resources {
- *       device-names = "enp9s0", "serial_console", "keyboard";
- *       device-names = "0000:09:00.0", "serial_console", "keyboard";
- *       device-names = "pci_0000_09_00_0", "serial_console", "keyboard";
- *   };
+/*
+ * An instance's devices are the child nodes of resources/devices, each
+ * described in full. A device-names string list naming nodes of the
+ * baseline was resolved against a copy of that baseline taken at init,
+ * which never learned of devices pooled later; an overlay hands devices
+ * to an instance with device-add by PCI address instead.
  */
-static int mk_dt_parse_devices(const void *fdt, int chosen_node,
+static int mk_dt_parse_devices(const void *fdt, int resources_node,
 			       struct mk_dt_config *config)
 {
-	const void *base_fdt;
-	const char *prop_data;
-	const char *device_name;
-	const char *device_type;
-	int len, offset, dev_node, ret;
-	int device_count = 0;
-
-	/* First try device-names property (overlay format) */
-	prop_data = fdt_getprop(fdt, chosen_node, "device-names", &len);
-	if (!prop_data) {
-		return mk_dt_parse_embedded_devices(fdt, chosen_node, config);
+	if (fdt_getprop(fdt, resources_node, "device-names", NULL)) {
+		pr_err("device-names is not supported; assign devices with device-add\n");
+		return -EINVAL;
 	}
 
-	if (len == 0) {
-		pr_debug("Empty device-names property\n");
-		return 0;
-	}
-
-	base_fdt = mk_dt_get_base_fdt();
-	if (!base_fdt) {
-		pr_err("No base DTB available - cannot resolve device names\n");
-		return -ENOENT;
-	}
-
-	offset = 0;
-	while (offset < len) {
-		device_name = prop_data + offset;
-
-		if (device_name[0] == '\0')
-			break;
-
-		device_count++;
-
-		dev_node = mk_dt_find_device(base_fdt, device_name);
-		if (dev_node < 0) {
-			pr_err("Device '%s' not found in base DTB\n", device_name);
-			return -ENOENT;
-		}
-
-		device_type = fdt_getprop(base_fdt, dev_node, "device-type", NULL);
-		if (!device_type) {
-			pr_err("Missing device-type property in device '%s'\n",
-			       device_name);
-			return -EINVAL;
-		}
-
-		if (strcmp(device_type, "pci") == 0) {
-			if (!config->pci_devices_valid) {
-				pr_warn("PCI device '%s' found but PCI device list not available\n",
-					device_name);
-				offset += strlen(device_name) + 1;
-				continue;
-			}
-			ret = mk_dt_parse_single_pci_device(base_fdt, dev_node,
-							    config, device_name);
-			if (ret) {
-				pr_err("Failed to parse PCI device '%s': %d\n",
-				       device_name, ret);
-				return ret;
-			}
-		} else if (strcmp(device_type, "platform") == 0) {
-			if (!config->platform_devices_valid) {
-				pr_warn("Platform device '%s' found but platform device list not available\n",
-					device_name);
-				offset += strlen(device_name) + 1;
-				continue;
-			}
-			ret = mk_dt_parse_single_platform_device(base_fdt, dev_node,
-								 config, device_name);
-			if (ret) {
-				pr_err("Failed to parse platform device '%s': %d\n",
-				       device_name, ret);
-				return ret;
-			}
-		} else {
-			pr_err("Unknown device-type '%s' for device '%s'\n",
-			       device_type, device_name);
-			return -EINVAL;
-		}
-
-		offset += strlen(device_name) + 1;
-	}
-
-	if (device_count == 0) {
-		pr_debug("No device names found in property\n");
-		return 0;
-	}
-
-	return 0;
+	return mk_dt_parse_embedded_devices(fdt, resources_node, config);
 }
 
 /**
@@ -732,10 +550,6 @@ int mk_dt_parse(const void *dtb_data, size_t dtb_size,
 		pr_err("No resources node found in instance\n");
 		return -ENOENT;
 	}
-
-	/* Store raw DTB reference */
-	config->dtb_data = (void *)dtb_data;
-	config->dtb_size = dtb_size;
 
 	/* Parse memory regions */
 	ret = mk_dt_parse_memory(fdt, resources_node, config);
@@ -1078,8 +892,6 @@ void mk_dt_print_config(const struct mk_dt_config *config)
 	} else {
 		pr_info("  Platform devices: unavailable\n");
 	}
-
-	pr_info("  DTB: %zu bytes\n", config->dtb_size);
 }
 
 #define MK_DT_FDT_MIN_SIZE	SZ_4K
@@ -1645,10 +1457,12 @@ static int mk_dt_emit_host_bridges(struct mk_instance *instance, void *fdt)
 #endif
 
 /**
- * mk_dt_emit_instance() - Write one instance device tree into @fdt
+ * mk_dt_emit_tree() - Write one instance device tree into @fdt
  * @instance: Instance to describe
  * @fdt: Buffer to write the sequential-write FDT into
  * @size: Size of @fdt
+ * @chosen: Writes the /chosen node's properties, or NULL for no /chosen
+ * @data: Passed to @chosen
  *
  * The root device tree of a kernel that manages a pool describes the
  * pool itself: its CPU members, the free subset, and one standard

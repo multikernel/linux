@@ -557,10 +557,6 @@ struct mk_dt_config {
 
 	/* Extensibility: Reserved fields for future use */
 	u32 reserved[6];                 /* Reduced due to added fields */
-
-	/* Raw device tree data */
-	void *dtb_data;
-	size_t dtb_size;
 };
 
 /**
@@ -593,10 +589,6 @@ struct mk_instance {
 	struct list_head platform_devices;   /* List of struct mk_platform_device */
 	int platform_device_count;           /* Number of platform devices */
 	bool platform_devices_valid;         /* Whether platform device list is valid */
-
-	/* Device tree information */
-	void *dtb_data;                 /* Device tree blob data */
-	size_t dtb_size;                /* Size of DTB */
 
 	/* IPI communication buffer */
 	struct mk_shared_data *ipi_data; /* IPI shared memory buffer (virtual address) */

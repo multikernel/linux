@@ -508,14 +508,6 @@ int __init mk_instance_restore_from_manifest(void)
 		goto cleanup_instance_name;
 	}
 
-	instance->dtb_data = kmemdup(dtb_virt, dtb_len, GFP_KERNEL);
-	if (!instance->dtb_data) {
-		pr_err("Failed to allocate memory for DTB restoration\n");
-		ret = -ENOMEM;
-		goto cleanup_instance_name;
-	}
-	instance->dtb_size = dtb_len;
-
 	ret = mk_copy_pci_devices(&config, instance);
 	if (ret) {
 		pr_err("Failed to copy PCI devices: %d\n", ret);
@@ -563,7 +555,6 @@ cleanup_devices:
 cleanup_instance_name:
 	kfree(instance->name);
 	mk_cpu_set_free(instance->cpus);
-	kfree(instance->dtb_data);
 	kfree(instance);
 config_free:
 	mk_dt_config_free(&config);

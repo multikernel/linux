@@ -8,7 +8,6 @@ struct mk_dt_config;
 struct mk_cpu_resource_payload;
 
 extern struct mutex mk_instance_mutex;
-extern struct mutex mk_host_dtb_mutex;
 extern struct idr mk_instance_idr;
 extern struct list_head mk_instance_list;
 extern struct mk_instance *root_instance;
@@ -17,7 +16,7 @@ extern struct mk_instance *root_instance;
 extern struct kernfs_node *mk_root_kn;
 extern struct kernfs_node *mk_instances_kn;
 int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
-				      int resources_node, size_t dtb_size);
+				      int resources_node);
 struct mk_instance *mk_instance_find_by_name(const char *name);
 int mk_instance_destroy(struct mk_instance *instance);
 

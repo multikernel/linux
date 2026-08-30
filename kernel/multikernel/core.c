@@ -146,7 +146,6 @@ static void mk_instance_release(struct kref *kref)
 	mk_instance_free_memory(instance);
 
 	mk_cpu_set_free(instance->cpus);
-	kfree(instance->dtb_data);
 	kfree(instance->name);
 	kfree(instance);
 }

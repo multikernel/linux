@@ -39,7 +39,6 @@ LIST_HEAD(mk_instance_list);                      /* List of all instances */
 DEFINE_MUTEX(mk_instance_mutex);                  /* Protects instance list */
 DEFINE_IDR(mk_instance_idr);               /* ID allocator for instances */
 
-DEFINE_MUTEX(mk_host_dtb_mutex);           /* Protects host DTB access */
 
 /* Filesystem context structure */
 struct mk_fs_context {
@@ -236,12 +235,11 @@ static ssize_t root_device_tree_write(struct kernfs_open_file *of, char *buf, si
  * Returns 0 on success, negative error code on failure.
  */
 int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
-				      int resources_node, size_t dtb_size)
+				      int resources_node)
 {
 	struct mk_instance *instance;
 	struct kernfs_node *kn;
 	struct mk_dt_config config;
-	void *dtb_copy;
 	int ret;
 	int allocated_id;
 
@@ -316,15 +314,6 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 		goto err_free_resources;
 	}
 
-	ret = mk_dt_generate_instance_dtb(instance, &dtb_copy, &dtb_size);
-	if (ret) {
-		pr_err("Failed to generate DTB for instance '%s': %d\n", name, ret);
-		goto err_free_resources;
-	}
-
-	instance->dtb_data = dtb_copy;
-	instance->dtb_size = dtb_size;
-
 	list_add_tail(&instance->list, &mk_instance_list);
 
 	kernfs_activate(kn);
@@ -333,8 +322,6 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 
 	return 0;
 
-	kfree(instance->dtb_data);
-	instance->dtb_data = NULL;
 err_free_resources:
 	mk_instance_free_memory(instance);
 err_free_idr:
@@ -603,13 +590,6 @@ void mk_kernfs_cleanup(void)
 
 	/* Clean up IDR */
 	idr_destroy(&mk_instance_idr);
-
-	/* Free host kernel DTB */
-	mutex_lock(&mk_host_dtb_mutex);
-	kfree(root_instance->dtb_data);
-	root_instance->dtb_data = NULL;
-	root_instance->dtb_size = 0;
-	mutex_unlock(&mk_host_dtb_mutex);
 
 	/* Remove sysfs mount point */
 	sysfs_remove_mount_point(fs_kobj, "multikernel");

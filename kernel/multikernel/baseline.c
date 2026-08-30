@@ -535,23 +535,6 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 		goto out;
 	}
 
-	if (root_instance->dtb_data) {
-		pr_info("Replacing existing DTB (%zu bytes) with baseline DTB\n",
-			root_instance->dtb_size);
-		kfree(root_instance->dtb_data);
-	}
-
-	root_instance->dtb_data = kmalloc(fdt_size, GFP_KERNEL);
-	if (!root_instance->dtb_data) {
-		pr_err("Failed to allocate memory for baseline DTB\n");
-		root_instance->dtb_size = 0;
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	memcpy(root_instance->dtb_data, fdt, fdt_size);
-	root_instance->dtb_size = fdt_size;
-
 	pr_info("Multikernel baseline initialized successfully\n");
 	ret = 0;
 out:
