@@ -602,41 +602,11 @@ bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
 }
 EXPORT_SYMBOL_GPL(mk_pci_should_probe);
 
-/**
- * mk_pci_alias - The /aliases name of a PCI device this kernel was given
- * @pdev: The PCI device being probed
- *
- * The host lists only pool devices it no longer drives, so its own
- * naming is never affected; a spawn kernel lists exactly the devices it
- * was given, so their aliases decide its names.
- *
- * Returns: the alias, valid while the device stays listed, or NULL
- */
-const char *mk_pci_alias(struct pci_dev *pdev)
-{
-	struct mk_pci_device *pci_dev;
-	u16 domain = pci_domain_nr(pdev->bus);
-
-	if (!root_instance || !root_instance->pci_devices_valid)
-		return NULL;
-
-	list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
-		if (pci_dev->alias[0] &&
-		    pci_dev->domain == domain &&
-		    pci_dev->bus == pdev->bus->number &&
-		    pci_dev->slot == PCI_SLOT(pdev->devfn) &&
-		    pci_dev->func == PCI_FUNC(pdev->devfn))
-			return pci_dev->alias;
-	}
-
-	return NULL;
-}
-EXPORT_SYMBOL_GPL(mk_pci_alias);
-
 /*
  * A netdev's alias is its interface name, the one the device had in the
- * kernel that gave it away, so rename it once it is registered through
- * the same path as a rename from userspace. netif_change_name() rejects
+ * kernel that gave it away, found from the node its device is bound to,
+ * so rename it once it is registered through the same path as a rename
+ * from userspace. netif_change_name() rejects
  * a name that is too long or already in use, and the driver's name then
  * stands.
  */
@@ -653,12 +623,12 @@ static int mk_netdev_alias_event(struct notifier_block *nb,
 
 	/* A virtio or USB netdev hangs off its bus device, not the function */
 	for (parent = dev->dev.parent; parent; parent = parent->parent)
-		if (dev_is_pci(parent))
+		if (parent->of_node)
 			break;
 	if (!parent)
 		return NOTIFY_DONE;
 
-	alias = mk_pci_alias(to_pci_dev(parent));
+	alias = of_alias_from_node(parent->of_node);
 	if (!alias)
 		return NOTIFY_DONE;
 
