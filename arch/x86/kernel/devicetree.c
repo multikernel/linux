@@ -68,15 +68,23 @@ struct device_node *pcibios_get_phb_of_node(struct pci_bus *bus)
 {
 	struct device_node *np;
 
+	/* A host bridge created from its node already knows it */
+	if (bus->bridge->of_node)
+		return of_node_get(bus->bridge->of_node);
+	if (bus->bridge->parent && bus->bridge->parent->of_node)
+		return of_node_get(bus->bridge->parent->of_node);
+
 	for_each_node_by_type(np, "pci") {
 		const void *prop;
 		unsigned int bus_min;
+		u32 domain = 0;
 
 		prop = of_get_property(np, "bus-range", NULL);
 		if (!prop)
 			continue;
 		bus_min = be32_to_cpup(prop);
-		if (bus->number == bus_min)
+		of_property_read_u32(np, "linux,pci-domain", &domain);
+		if (bus->number == bus_min && pci_domain_nr(bus) == domain)
 			return np;
 	}
 	return NULL;
