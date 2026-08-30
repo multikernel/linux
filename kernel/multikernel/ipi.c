@@ -363,7 +363,8 @@ void generic_multikernel_interrupt(void)
  * gives the same answer no matter when each NMI arrives.
  *
  * A spawn kernel that has no ring cannot be asked anything, so an NMI
- * is the only voice the host has left; it is taken as the demand. A
+ * no local source claims is the only voice the host has left; it is
+ * taken as the demand (the caller sits on the unknown-NMI chain). A
  * host without a pool has no ring either, but its NMIs are its own.
  *
  * Safe to call from NMI context (a single read of shared memory).

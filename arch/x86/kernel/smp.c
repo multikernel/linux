@@ -372,6 +372,12 @@ EXPORT_SYMBOL_GPL(mk_enter_pool_state);
 /*
  * NMI handler for multikernel forcible shutdown.
  *
+ * Sits on the unknown-NMI chain, so it only sees NMIs no local source
+ * has claimed. The host's force-halt NMI has no local source and lands
+ * here; a PMI from the hardlockup detector is claimed by perf first and
+ * never reaches it, which matters because a spawn without a ring takes
+ * any NMI it is offered as the demand to park.
+ *
  * We enter a pool state (HLT loop) rather than calling stop_this_cpu(),
  * because stop_this_cpu() disables the APIC - preventing re-spawn.
  */
@@ -422,8 +428,8 @@ int mk_arch_register_force_stop(void)
 	if (mk_nmi_handler_registered)
 		return 0;
 
-	ret = register_nmi_handler(NMI_LOCAL, mk_stop_nmi_callback,
-				   NMI_FLAG_FIRST, "mk_stop");
+	ret = register_nmi_handler(NMI_UNKNOWN, mk_stop_nmi_callback, 0,
+				   "mk_stop");
 	if (ret) {
 		pr_err("Failed to register multikernel NMI stop handler: %d\n", ret);
 		return ret;
