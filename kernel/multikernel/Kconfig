@@ -22,6 +22,7 @@ config MULTIKERNEL
 	depends on KEXEC_CORE
 	depends on MEMORY_HOTPLUG
 	depends on MEMORY_HOTREMOVE
+	depends on OF
 	select LIBFDT
 	select OF_DYNAMIC if OF
 	help
