@@ -231,6 +231,8 @@ kernel that manages a pool, its ``/resources`` node describes the pool::
 
     / {
         compatible = "multikernel-v1";
+        #address-cells = <2>;
+        #size-cells = <2>;
         id = <0>;
         resources {
             cpus = <...>;                       /* every pool member */
@@ -241,15 +243,19 @@ kernel that manages a pool, its ``/resources`` node describes the pool::
                 reg = <0x1 0x00000000  0x0 0x40000000>;
                 numa-node-id = <0>;
             };
-
-            devices { ... };
         };
+        aliases { ... };
+        pci@0 { ... };                          /* free pool PCI devices */
     };
 
 ``cpus`` lists every CPU the pool owns, including CPUs currently lent to
 instances; ``cpus-available`` lists only the free ones. There is one
 ``memory@<base>`` node per pool chunk, in the standard memory node form, and
-its ``reg`` is what a ``/resources memory-remove`` item must name.
+its ``reg`` is what a ``/resources memory-remove`` item must name. Free pool
+PCI devices are described under their host bridge in the devicetree PCI bus
+binding, and ``/aliases`` names them; the ``pci-id`` a ``device-add`` or
+``device-remove`` item must name is the address encoded in a device node's
+``reg``. See ``device-tree.rst`` for the full layout.
 
 Examples
 ========
@@ -411,6 +417,7 @@ A failed overlay still creates a transaction with ``status = failed``; check
 See Also
 ========
 
+* The trees themselves: ``Documentation/multikernel/device-tree.rst``
 * Linux device tree documentation: ``Documentation/devicetree/``
 * Overlay notes: ``Documentation/devicetree/overlay-notes.rst``
 * Device tree compiler: ``dtc(1)``
