@@ -362,14 +362,21 @@ void generic_multikernel_interrupt(void)
  * and stays up until the host has confirmed all CPUs parked, so it
  * gives the same answer no matter when each NMI arrives.
  *
+ * A spawn kernel that has no ring cannot be asked anything, so an NMI
+ * is the only voice the host has left; it is taken as the demand. A
+ * host without a pool has no ring either, but its NMIs are its own.
+ *
  * Safe to call from NMI context (a single read of shared memory).
  *
  * Returns: true if shutdown requested, false otherwise
  */
 bool mk_has_pending_shutdown(void)
 {
-	if (!root_instance || !root_instance->ipi_data)
+	if (!root_instance)
 		return false;
+
+	if (!root_instance->ipi_data)
+		return mk_manifest_phys() != 0;
 
 	return READ_ONCE(root_instance->ipi_data->force_halt);
 }
