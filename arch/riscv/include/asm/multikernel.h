@@ -53,6 +53,7 @@ struct mk_pool_arch {
 
 extern char mk_riscv_entry_stub_start[];
 extern char mk_riscv_entry_stub_end[];
+extern char mk_riscv_entry_fence_stop[];
 
 #endif /* !__ASSEMBLY__ */
 
