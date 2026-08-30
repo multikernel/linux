@@ -43,6 +43,16 @@ static void mk_instance_return_pci_devices(struct mk_instance *instance)
 		goto cleanup;
 	}
 
+	/* A spawn's pool is its tree; the device just loses its reserved status */
+	if (mk_manifest_phys()) {
+		list_for_each_entry(pci_dev, &instance->pci_devices, list) {
+			mk_of_pci_take_back(pci_dev->domain, pci_dev->bus,
+					    PCI_DEVFN(pci_dev->slot, pci_dev->func));
+			returned_count++;
+		}
+		goto done;
+	}
+
 	list_for_each_entry_safe(pci_dev, pci_tmp, &instance->pci_devices, list) {
 		struct mk_pci_device *root_dev;
 
@@ -66,6 +76,7 @@ static void mk_instance_return_pci_devices(struct mk_instance *instance)
 		returned_count++;
 	}
 
+done:
 	if (returned_count > 0) {
 		pr_info("Returned %d PCI devices from instance %d (%s) to root instance\n",
 			returned_count, instance->id, instance->name);
@@ -521,6 +532,34 @@ static int mk_instance_transfer_pci_devices(struct mk_instance *instance,
 		return 0;
 	}
 
+	/* A spawn lends out of its tree */
+	if (mk_manifest_phys()) {
+		list_for_each_entry(req_dev, requested_devices, list) {
+			u8 devfn = PCI_DEVFN(req_dev->slot, req_dev->func);
+
+			if (!mk_of_pci_available(req_dev->domain, req_dev->bus, devfn)) {
+				pr_err("PCI device %04x:%02x:%02x.%x is not this kernel's to lend\n",
+				       req_dev->domain, req_dev->bus, req_dev->slot,
+				       req_dev->func);
+				not_found++;
+			}
+		}
+		if (not_found)
+			return -ENOENT;
+		list_for_each_entry(req_dev, requested_devices, list) {
+			int ret = mk_of_pci_lend(instance, req_dev->domain, req_dev->bus,
+						 PCI_DEVFN(req_dev->slot, req_dev->func));
+
+			if (ret)
+				return ret;
+			transferred++;
+		}
+		instance->pci_devices_valid = true;
+		pr_info("Lent %d PCI devices to instance %d (%s)\n",
+			transferred, instance->id, instance->name);
+		return 0;
+	}
+
 	list_for_each_entry(req_dev, requested_devices, list) {
 		found = false;
 		list_for_each_entry(root_dev, &root_instance->pci_devices, list) {
@@ -700,6 +739,18 @@ int mk_instance_add_pci_device(struct mk_instance *instance,
 		return -EINVAL;
 	}
 
+	if (mk_manifest_phys()) {
+		int ret = mk_of_pci_lend(instance, domain, bus, devfn);
+
+		if (ret)
+			pr_err("PCI device %04x:%02x:%02x.%x is not this kernel's to lend\n",
+			       domain, bus, slot, func);
+		else
+			pr_info("Lent PCI device %04x:%02x:%02x.%x to instance %d\n",
+				domain, bus, slot, func, instance->id);
+		return ret;
+	}
+
 	list_for_each_entry_safe(root_dev, tmp, &root_instance->pci_devices, list) {
 		if (root_dev->domain == domain &&
 		    root_dev->bus == bus &&
@@ -760,6 +811,16 @@ int mk_instance_remove_pci_device(struct mk_instance *instance,
 		    inst_dev->slot == slot &&
 		    inst_dev->func == func) {
 
+			if (mk_manifest_phys()) {
+				mk_of_pci_take_back(domain, bus, devfn);
+				list_del(&inst_dev->list);
+				kfree(inst_dev);
+				instance->pci_device_count--;
+				pr_info("Took PCI device %04x:%02x:%02x.%x back from instance %d\n",
+					domain, bus, slot, func, instance->id);
+				return 0;
+			}
+
 			root_dev = kzalloc(sizeof(*root_dev), GFP_KERNEL);
 			if (!root_dev) {
 				pr_err("Failed to allocate PCI device entry for root instance\n");
@@ -802,6 +863,9 @@ bool mk_root_has_pci_device(u16 domain, u8 bus, u8 devfn)
 	struct mk_pci_device *root_dev;
 	u8 slot = PCI_SLOT(devfn);
 	u8 func = PCI_FUNC(devfn);
+
+	if (mk_manifest_phys())
+		return mk_of_pci_available(domain, bus, devfn);
 
 	if (!root_instance || !root_instance->pci_devices_valid)
 		return false;

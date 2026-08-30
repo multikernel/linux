@@ -1456,6 +1456,89 @@ static int mk_dt_emit_host_bridges(struct mk_instance *instance, void *fdt)
 }
 #endif
 
+#ifdef CONFIG_OF
+static int mk_dt_emit_of_node(void *fdt, struct device_node *np)
+{
+	struct device_node *child;
+	struct property *pp;
+	int ret;
+
+	ret = fdt_begin_node(fdt, np->full_name);
+	if (ret)
+		return ret;
+
+	for_each_property_of_node(np, pp) {
+		if (!strcmp(pp->name, "name"))
+			continue;
+		ret = fdt_property(fdt, pp->name, pp->value, pp->length);
+		if (ret)
+			return ret;
+	}
+
+	for_each_child_of_node(np, child) {
+		if (!of_device_is_available(child))
+			continue;
+		ret = mk_dt_emit_of_node(fdt, child);
+		if (ret) {
+			of_node_put(child);
+			return ret;
+		}
+	}
+
+	return fdt_end_node(fdt);
+}
+
+/*
+ * A spawn's devices are the nodes of its boot tree, with a lent device
+ * marked reserved there, so the tree it serves is a projection of that
+ * tree: its aliases and host bridges with the reserved devices left out.
+ */
+static int mk_dt_emit_own_devices(void *fdt)
+{
+	struct device_node *np;
+	struct property *pp;
+	int ret;
+
+	if (of_aliases) {
+		ret = fdt_begin_node(fdt, "aliases");
+		if (ret)
+			return ret;
+		for_each_property_of_node(of_aliases, pp) {
+			struct device_node *target;
+
+			if (!strcmp(pp->name, "name") || !strcmp(pp->name, "phandle"))
+				continue;
+			target = of_find_node_by_path(pp->value);
+			if (!target)
+				continue;
+			ret = of_device_is_available(target) ?
+			      fdt_property(fdt, pp->name, pp->value, pp->length) : 0;
+			of_node_put(target);
+			if (ret)
+				return ret;
+		}
+		ret = fdt_end_node(fdt);
+		if (ret)
+			return ret;
+	}
+
+	for_each_compatible_node(np, NULL, "multikernel,pci-host-bridge") {
+		ret = mk_dt_emit_of_node(fdt, np);
+		if (ret) {
+			of_node_put(np);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+#else
+static int mk_dt_emit_own_devices(void *fdt)
+{
+	return 0;
+}
+#endif
+
 /**
  * mk_dt_emit_tree() - Write one instance device tree into @fdt
  * @instance: Instance to describe
@@ -1521,10 +1604,15 @@ static int mk_dt_emit_tree(struct mk_instance *instance, void *fdt,
 	ret = mk_dt_emit_devices(instance, fdt);
 	if (!ret)
 		ret = fdt_end_node(fdt);	/* /resources */
-	if (!ret)
-		ret = mk_dt_emit_aliases(instance, fdt);
-	if (!ret)
-		ret = mk_dt_emit_host_bridges(instance, fdt);
+	if (!ret) {
+		if (instance == root_instance && mk_manifest_phys()) {
+			ret = mk_dt_emit_own_devices(fdt);
+		} else {
+			ret = mk_dt_emit_aliases(instance, fdt);
+			if (!ret)
+				ret = mk_dt_emit_host_bridges(instance, fdt);
+		}
+	}
 	if (!ret && chosen) {
 		ret = fdt_begin_node(fdt, "chosen");
 		if (!ret)

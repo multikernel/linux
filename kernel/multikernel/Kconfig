@@ -15,6 +15,7 @@ config MULTIKERNEL
 	depends on ARCH_SUPPORTS_MULTIKERNEL
 	depends on KEXEC_CORE
 	select LIBFDT
+	select OF_DYNAMIC if OF
 	help
 	  Enable multikernel support, which allows running multiple kernel
 	  instances simultaneously with resource isolation and inter-kernel

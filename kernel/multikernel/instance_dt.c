@@ -249,41 +249,6 @@ err_free_instance:
 	return NULL;
 }
 
-static int __init mk_copy_pci_devices(const struct mk_dt_config *config,
-					  struct mk_instance *instance)
-{
-	struct mk_pci_device *src_dev, *dst_dev;
-
-	if (!config->pci_devices_valid || config->pci_device_count == 0) {
-		INIT_LIST_HEAD(&instance->pci_devices);
-		instance->pci_device_count = 0;
-		instance->pci_devices_valid = false;
-		pr_debug("No PCI devices in DTB\n");
-		return 0;
-	}
-
-	INIT_LIST_HEAD(&instance->pci_devices);
-	instance->pci_device_count = 0;
-	instance->pci_devices_valid = true;
-
-	list_for_each_entry(src_dev, &config->pci_devices, list) {
-		dst_dev = kzalloc(sizeof(*dst_dev), GFP_KERNEL);
-		if (!dst_dev) {
-			pr_err("Failed to allocate PCI device entry\n");
-			return -ENOMEM;
-		}
-
-		*dst_dev = *src_dev;
-		INIT_LIST_HEAD(&dst_dev->list);
-
-		list_add_tail(&dst_dev->list, &instance->pci_devices);
-		instance->pci_device_count++;
-	}
-
-	pr_info("Copied %d PCI devices to root instance\n", instance->pci_device_count);
-	return 0;
-}
-
 static int __init mk_copy_platform_devices(const struct mk_dt_config *config,
 					       struct mk_instance *instance)
 {
@@ -508,11 +473,8 @@ int __init mk_instance_restore_from_manifest(void)
 		goto cleanup_instance_name;
 	}
 
-	ret = mk_copy_pci_devices(&config, instance);
-	if (ret) {
-		pr_err("Failed to copy PCI devices: %d\n", ret);
-		goto cleanup_devices;
-	}
+	/* The tree is the record of this kernel's PCI devices; the list stays empty */
+	instance->pci_devices_valid = true;
 
 	ret = mk_copy_platform_devices(&config, instance);
 	if (ret) {
@@ -580,6 +542,7 @@ early_initcall(mk_instance_restore_from_manifest);
 bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
 {
 	struct device_node *np;
+	bool available;
 
 	if (!mk_manifest_phys())
 		return true;
@@ -588,8 +551,9 @@ bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
 		return false;
 
 	np = of_pci_find_child_device(bus->dev.of_node, devfn);
+	available = np && of_device_is_available(np);
 	of_node_put(np);
-	return np != NULL;
+	return available;
 }
 EXPORT_SYMBOL_GPL(mk_pci_should_probe);
 

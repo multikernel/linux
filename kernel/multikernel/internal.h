@@ -75,6 +75,27 @@ const char *mk_dt_node_alias(const void *fdt, int node);
  */
 extern struct mk_cpu_set *mk_cpu_pool;
 
+/* of_devices.c: a spawn's devices are the nodes of its tree */
+#ifdef CONFIG_OF
+struct device_node *mk_of_pci_node(u16 domain, u8 bus, u8 devfn);
+bool mk_of_pci_available(u16 domain, u8 bus, u8 devfn);
+int mk_of_pci_lend(struct mk_instance *instance, u16 domain, u8 bus, u8 devfn);
+void mk_of_pci_take_back(u16 domain, u8 bus, u8 devfn);
+#else
+static inline bool mk_of_pci_available(u16 domain, u8 bus, u8 devfn)
+{
+	return false;
+}
+static inline int mk_of_pci_lend(struct mk_instance *instance, u16 domain,
+				 u8 bus, u8 devfn)
+{
+	return -ENOENT;
+}
+static inline void mk_of_pci_take_back(u16 domain, u8 bus, u8 devfn)
+{
+}
+#endif
+
 /* manifest.c */
 phys_addr_t mk_manifest_phys(void);
 
