@@ -585,7 +585,7 @@ static bool mk_transport_stream_is_active(struct vsock_sock *vsk)
 	return true;
 }
 
-static bool mk_transport_stream_allow(u32 cid, u32 port)
+static bool mk_transport_stream_allow(struct vsock_sock *vsk, u32 cid, u32 port)
 {
 	/* Allow connections to any multikernel instance */
 	return true;
