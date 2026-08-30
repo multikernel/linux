@@ -1688,6 +1688,7 @@ int multikernel_kexec_by_id(int mk_id)
 {
 	struct kimage *mk_image;
 	struct mk_instance *instance;
+	bool parked = false;
 	int cpu = -1;
 	int i, rc;
 
@@ -1702,6 +1703,23 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	instance = mk_image->mk_instance;
+	if (instance->state == MK_STATE_ACTIVE) {
+		rc = mk_instance_confirm_parked(instance);
+		if (rc) {
+			pr_err("Multikernel instance %d is still active\n", mk_id);
+			goto unlock;
+		}
+		pr_warn("Multikernel instance %d stopped without a halt notification; recovering it\n",
+			mk_id);
+		mk_instance_set_state(instance, MK_STATE_LOADED);
+		parked = true;
+	}
+	if (instance->state != MK_STATE_LOADED) {
+		pr_err("Multikernel instance %d is not ready to spawn (state=%d)\n",
+		       mk_id, instance->state);
+		rc = -EBUSY;
+		goto unlock;
+	}
 	if (!mk_cpu_set_empty(instance->cpus)) {
 		mk_phys_cpu_t phys_cpu = mk_cpu_set_first(instance->cpus);
 
@@ -1726,7 +1744,7 @@ int multikernel_kexec_by_id(int mk_id)
 	 * when it is overwritten faults with interrupts disabled and takes
 	 * the machine down, console included.
 	 */
-	rc = mk_instance_confirm_parked(instance);
+	rc = parked ? 0 : mk_instance_confirm_parked(instance);
 	if (rc) {
 		pr_err("Instance %d still has running CPUs, refusing to reload its image\n",
 		       mk_id);
