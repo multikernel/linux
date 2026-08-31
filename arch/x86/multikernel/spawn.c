@@ -109,9 +109,6 @@ typedef void (*mk_pool_park_fn)(unsigned long park_cr3, unsigned long slot_phys,
 				unsigned long apic_id, unsigned long park_phys,
 				unsigned long mwait_usable);
 
-/* Nests outside the pool mutex: a growing pool maps itself in here */
-static DEFINE_MUTEX(mk_pool_park_lock);
-
 struct mk_spawn_context *mk_alloc_spawn_context(struct mk_instance *instance,
 						phys_addr_t *phys_out)
 {
@@ -1296,8 +1293,11 @@ void *mk_setup_park_page(struct mk_instance *instance, unsigned long *phys_out)
 	void *park_va;
 	int rc;
 
+	if (!mk_pool)
+		return ERR_PTR(-ENODEV);
+
 	/* Runs under kexec_lock, which nothing takes under this mutex */
-	guard(mutex)(&mk_pool_park_lock);
+	guard(mutex)(&mk_pool->park_lock);
 
 	if (!mk_pool->arch.pgt)
 		return ERR_PTR(-ENODEV);
@@ -1371,10 +1371,7 @@ static int __mk_pool_park_setup(void)
 	phys_addr_t phys;
 	int rc;
 
-	lockdep_assert_held(&mk_pool_park_lock);
-
-	if (!mk_pool)
-		return -ENODEV;
+	lockdep_assert_held(&mk_pool->park_lock);
 
 	if (mk_pool->arch.slot)
 		return 0;
@@ -1450,7 +1447,10 @@ err_pgt:
 
 int mk_arch_pool_chunk_added(phys_addr_t start, size_t size)
 {
-	guard(mutex)(&mk_pool_park_lock);
+	if (!mk_pool)
+		return -ENODEV;
+
+	guard(mutex)(&mk_pool->park_lock);
 
 	/*
 	 * A pool emptied of memory has no park area, so the chunk that
@@ -1474,7 +1474,10 @@ int mk_arch_pool_chunk_added(phys_addr_t start, size_t size)
  */
 int mk_pool_park_setup(void)
 {
-	guard(mutex)(&mk_pool_park_lock);
+	if (!mk_pool)
+		return -ENODEV;
+
+	guard(mutex)(&mk_pool->park_lock);
 
 	return __mk_pool_park_setup();
 }
@@ -1511,9 +1514,12 @@ static bool mk_ident_pgtable_in_range(struct mk_ident_pgtable *pgt,
  */
 bool mk_pool_park_uses(phys_addr_t start, size_t size)
 {
-	guard(mutex)(&mk_pool_park_lock);
+	if (!mk_pool)
+		return false;
 
-	if (!mk_pool || !mk_pool->arch.slot)
+	guard(mutex)(&mk_pool->park_lock);
+
+	if (!mk_pool->arch.slot)
 		return false;
 
 	return mk_phys_in_range(mk_pool->arch.park_phys, start, size) ||
@@ -1535,9 +1541,12 @@ bool mk_pool_park_uses(phys_addr_t start, size_t size)
  */
 int mk_pool_park_teardown(void)
 {
-	guard(mutex)(&mk_pool_park_lock);
+	if (!mk_pool)
+		return 0;
 
-	if (!mk_pool || !mk_pool->arch.slot)
+	guard(mutex)(&mk_pool->park_lock);
+
+	if (!mk_pool->arch.slot)
 		return 0;
 
 	if (!mk_pool_cpus_returned())
