@@ -203,6 +203,7 @@ struct mk_instance *mk_instance_alloc(int id, const char *name)
 		goto err_free_name;
 
 	instance->state = MK_STATE_READY;
+	instance->ipi_target = MK_PHYS_CPU_INVALID;
 	INIT_LIST_HEAD(&instance->memory_regions);
 	INIT_LIST_HEAD(&instance->list);
 	INIT_LIST_HEAD(&instance->pci_devices);

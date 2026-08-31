@@ -594,6 +594,13 @@ struct mk_instance {
 	struct mk_shared_data *ipi_data; /* IPI shared memory buffer (virtual address) */
 	phys_addr_t ipi_phys;           /* IPI buffer physical address */
 	u32 ipi_pages;                  /* IPI buffer size in pages */
+	/*
+	 * Doorbell CPU for the instance's inbox. MK_PHYS_CPU_INVALID means
+	 * derive it from the instance's first owned CPU (its boot CPU);
+	 * a record whose owned set is unknown (the parent's) sets it
+	 * explicitly so routing never masquerades as ownership in @cpus.
+	 */
+	mk_phys_cpu_t ipi_target;
 
 	/* Kexec integration */
 	struct kimage *kimage;          /* Associated kimage object */

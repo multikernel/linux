@@ -190,9 +190,11 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 		return -EINVAL;
 	}
 
-	target = mk_cpu_set_first(instance->cpus);
+	target = instance->ipi_target;
+	if (target == MK_PHYS_CPU_INVALID)
+		target = mk_cpu_set_first(instance->cpus);
 	if (target == MK_PHYS_CPU_INVALID) {
-		pr_err("Instance %d has no CPUs to receive the IPI\n", instance_id);
+		pr_err("Instance %d has no CPU to receive the IPI\n", instance_id);
 		mk_instance_put(instance);
 		return -ENODEV;
 	}

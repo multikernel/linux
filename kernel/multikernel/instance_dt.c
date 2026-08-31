@@ -308,9 +308,11 @@ static struct mk_instance * __init mk_restore_host_instance(void)
 	if (!host_instance)
 		return NULL;
 
-	/* Set physical CPU 0 as default target for host IPIs */
-	if (mk_cpu_set_add(host_instance->cpus, 0))
-		goto err_free;
+	/*
+	 * The host's owned CPU set is unknown here; ring its doorbell on
+	 * physical CPU 0 without pretending we know what it owns.
+	 */
+	host_instance->ipi_target = 0;
 
 	host_instance->ipi_data = memremap(host_ipi_phys, host_ipi_size, MEMREMAP_WB);
 	if (!host_instance->ipi_data) {
