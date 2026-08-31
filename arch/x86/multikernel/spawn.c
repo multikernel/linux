@@ -85,19 +85,6 @@ static struct mk_spawn_context *mk_own_context(void)
 	return mk_pool ? mk_pool->arch.slot : NULL;
 }
 
-/*
- * Spawn kernel's own trampoline for secondary CPU wakeup.
- * The boot context's trampoline_phys was set by the HOST kernel and contains
- * HOST kernel's trampoline code. When host and spawn kernel binaries differ,
- * the offsets and code layout differ, causing hangs.
- *
- * The spawn kernel copies its OWN trampoline code here for secondary CPU wakeup.
- * This ensures binary compatibility - the spawn kernel doesn't rely on any
- * code from the host kernel.
- */
-static void *spawn_trampoline_va;
-static unsigned long spawn_trampoline_phys;
-
 extern char multikernel_relocate_kernel_start[];
 extern char multikernel_relocate_kernel_end[];
 extern char mk_secondary_trampoline[];
@@ -773,7 +760,9 @@ void mk_init_boot_context(phys_addr_t ctx_phys)
  * One physical page serves every wake path of this instance: the host
  * allocates it once in mk_setup_trampoline() and reuses it across
  * re-spawns, and mk_prepare_trampoline() places our own trampoline copy
- * (including the secondary entry) in the same page.
+ * (including the secondary entry) in the same page. The copy matters:
+ * the page arrives holding the HOST kernel's trampoline code, and when
+ * the two binaries differ its offsets are wrong for this kernel.
  */
 static int __init mk_prepare_trampoline(void)
 {
@@ -790,9 +779,7 @@ static int __init mk_prepare_trampoline(void)
 	 * is entered from an offline CPU, where changing page attributes
 	 * is not allowed.
 	 */
-	spawn_trampoline_phys = ctx->trampoline_phys;
-	spawn_trampoline_va = __va(spawn_trampoline_phys);
-	memcpy(spawn_trampoline_va, multikernel_relocate_kernel_start,
+	memcpy(__va(ctx->trampoline_phys), multikernel_relocate_kernel_start,
 	       multikernel_relocate_kernel_end - multikernel_relocate_kernel_start);
 
 	/*
@@ -800,7 +787,7 @@ static int __init mk_prepare_trampoline(void)
 	 * so drop write before adding execute. Leaving them writable and
 	 * executable trips the kernel's own W^X check.
 	 */
-	virt = (unsigned long)spawn_trampoline_va & PAGE_MASK;
+	virt = (unsigned long)__va(ctx->trampoline_phys) & PAGE_MASK;
 	ret = set_memory_ro(virt, 1);
 	if (!ret)
 		ret = set_memory_x(virt, 1);
@@ -946,12 +933,13 @@ int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 		return -ENODEV;
 	}
 
-	if (!spawn_trampoline_phys) {
+	if (!ctx->trampoline_phys) {
 		pr_err("mk_spawn: trampoline not prepared\n");
 		return -ENODEV;
 	}
-	trampoline_phys = spawn_trampoline_phys;
-	trampoline_va = (unsigned long)spawn_trampoline_va;
+	/* mk_prepare_trampoline() put this kernel's own copy in the page */
+	trampoline_phys = ctx->trampoline_phys;
+	trampoline_va = (unsigned long)__va(trampoline_phys);
 
 	/* Build identity page table for two-stage CR3 switch */
 	ret = mk_build_trampoline_pgtable(trampoline_va, ctx->trampoline_virt,
