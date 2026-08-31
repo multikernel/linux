@@ -85,6 +85,39 @@ static int mk_send_pkt(struct sk_buff *skb)
 	return ret < 0 ? ret : total_len;
 }
 
+/*
+ * Reply with a reset, as virtio vsock does, so a sender addressing a
+ * connection that does not exist here learns the kernel is alive but
+ * the connection is not. Never reset a reset, to avoid storms.
+ */
+static void mk_vsock_send_rst(struct virtio_vsock_hdr *hdr)
+{
+	struct virtio_vsock_hdr *rst_hdr;
+	struct sk_buff *skb;
+
+	if (le16_to_cpu(hdr->op) == VIRTIO_VSOCK_OP_RST)
+		return;
+
+	skb = alloc_skb(sizeof(*rst_hdr), GFP_KERNEL);
+	if (!skb)
+		return;
+
+	rst_hdr = (struct virtio_vsock_hdr *)skb_put(skb, sizeof(*rst_hdr));
+	rst_hdr->op = cpu_to_le16(VIRTIO_VSOCK_OP_RST);
+	rst_hdr->src_cid = hdr->dst_cid;
+	rst_hdr->dst_cid = hdr->src_cid;
+	rst_hdr->src_port = hdr->dst_port;
+	rst_hdr->dst_port = hdr->src_port;
+	rst_hdr->type = hdr->type;
+	rst_hdr->flags = 0;
+	rst_hdr->len = 0;
+	rst_hdr->buf_alloc = 0;
+	rst_hdr->fwd_cnt = 0;
+
+	mk_send_pkt(skb);
+	kfree_skb(skb);
+}
+
 static void mk_queue_rx_pkt(struct sk_buff *skb)
 {
 	struct mk_vsock *mk = &mk_vsock_dev;
@@ -110,6 +143,7 @@ static void mk_vsock_rx_pkt(struct sk_buff *skb)
 	if (!sk) {
 		sk = vsock_find_bound_socket(&dst);
 		if (!sk) {
+			mk_vsock_send_rst(hdr);
 			kfree_skb(skb);
 			return;
 		}
@@ -217,23 +251,7 @@ static void mk_vsock_rx_pkt(struct sk_buff *skb)
 		return;
 
 reset:
-		rsp_skb = alloc_skb(sizeof(*rsp_hdr), GFP_KERNEL);
-		if (rsp_skb) {
-			rsp_hdr = (struct virtio_vsock_hdr *)skb_put(rsp_skb, sizeof(*rsp_hdr));
-			rsp_hdr->op = cpu_to_le16(VIRTIO_VSOCK_OP_RST);
-			rsp_hdr->src_cid = hdr->dst_cid;
-			rsp_hdr->dst_cid = hdr->src_cid;
-			rsp_hdr->src_port = hdr->dst_port;
-			rsp_hdr->dst_port = hdr->src_port;
-			rsp_hdr->type = cpu_to_le16(VIRTIO_VSOCK_TYPE_STREAM);
-			rsp_hdr->flags = 0;
-			rsp_hdr->len = 0;
-			rsp_hdr->buf_alloc = 0;
-			rsp_hdr->fwd_cnt = 0;
-
-			mk_send_pkt(rsp_skb);
-			kfree_skb(rsp_skb);
-		}
+		mk_vsock_send_rst(hdr);
 		break;
 	}
 
