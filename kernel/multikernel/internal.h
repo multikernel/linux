@@ -71,12 +71,6 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size);
 
 /* dts.c */
 const char *mk_dt_node_alias(const void *fdt, int node);
-/*
- * The pool this kernel manages. Created when a baseline is applied to
- * this kernel; NULL until then, which is the "manages no pool" test.
- */
-extern struct mk_pool *mk_pool;
-
 /* of_devices.c: a spawn's devices are the nodes of its tree */
 #ifdef CONFIG_OF
 struct device_node *mk_of_pci_node(u16 domain, u8 bus, u8 devfn);

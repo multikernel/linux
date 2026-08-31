@@ -247,7 +247,7 @@ static struct kernfs_ops mk_overlay_new_ops = {
  * that a resource is released by its source before its destination
  * acquires it. A /resources fragment moves memory-remove after
  * cpu-remove and device-remove instead, so resources leave the pool as
- * CPU, device, memory and join it as memory, CPU, device: the host park
+ * CPU, device, memory and join it as memory, CPU, device: the pool park
  * area lives in pool memory and cannot be released until the pool CPUs
  * that run on it have come back, so a single fragment that returns the
  * CPUs and removes the last chunk has to do the CPUs first. Rollback
@@ -673,7 +673,7 @@ static int mk_overlay_op_memory_add(struct mk_overlay_tx *tx, const void *fdt,
 }
 
 /*
- * Take one chunk out of the pool. The host park area is pool memory, so
+ * Take one chunk out of the pool. The pool park area is pool memory, so
  * the chunk holding it only comes out once every pool CPU is home, and
  * whatever memory the pool has left has to host the area again: nothing
  * else would rebuild it until the pool next grows.
@@ -688,15 +688,15 @@ static int mk_overlay_pool_mem_remove(struct mk_overlay_tx *tx, u64 base,
 	 * that matches no chunk at all never costs the pool its park area.
 	 */
 	ret = mk_pool_mem_shrink(base, size);
-	if (ret != -EBUSY || !mk_host_park_uses(base, size)) {
+	if (ret != -EBUSY || !mk_pool_park_uses(base, size)) {
 		if (ret)
 			pr_err("Failed to resize the pool: %d\n", ret);
 		return ret;
 	}
 
-	ret = mk_teardown_host_park();
+	ret = mk_pool_park_teardown();
 	if (ret) {
-		pr_err("Overlay tx%d: chunk 0x%llx+0x%llx holds the host park area; return every pool CPU first (%d)\n",
+		pr_err("Overlay tx%d: chunk 0x%llx+0x%llx holds the pool park area; return every pool CPU first (%d)\n",
 		       tx->id, base, size, ret);
 		return ret;
 	}
@@ -705,17 +705,17 @@ static int mk_overlay_pool_mem_remove(struct mk_overlay_tx *tx, u64 base,
 	if (ret) {
 		pr_err("Failed to resize the pool: %d\n", ret);
 		/* The chunk stayed, so the pool must get its park area back */
-		if (mk_setup_host_park())
-			pr_err("Overlay tx%d: the host park area could not be rebuilt; a memory-add will retry\n",
+		if (mk_pool_park_setup())
+			pr_err("Overlay tx%d: the pool park area could not be rebuilt; a memory-add will retry\n",
 			       tx->id);
 		return ret;
 	}
 
-	ret = mk_setup_host_park();
+	ret = mk_pool_park_setup();
 	if (ret == -ENODEV)		/* nothing left to park in */
 		return 0;
 	if (ret)
-		pr_err("Overlay tx%d: chunk removed but the host park area could not be rebuilt (%d); a memory-add will retry\n",
+		pr_err("Overlay tx%d: chunk removed but the pool park area could not be rebuilt (%d); a memory-add will retry\n",
 		       tx->id, ret);
 
 	return ret;
@@ -759,7 +759,7 @@ static int mk_overlay_op_memory_remove(struct mk_overlay_tx *tx, const void *fdt
 				/*
 				 * Only the capacity can be restored: the
 				 * kernel has since handed the old range
-				 * back to the buddy allocator. A host park
+				 * back to the buddy allocator. A pool park
 				 * area torn down below is rebuilt inside
 				 * the new chunk by the grow itself.
 				 */
@@ -1173,7 +1173,7 @@ static const u8 mk_overlay_order[MK_OVERLAY_OP_COUNT] = {
 };
 
 /*
- * The pool takes its memory back last: the host park area every pool CPU
+ * The pool takes its memory back last: the pool park area every pool CPU
  * runs on is pool memory, and it can only be released once the CPUs have
  * come home, so one fragment can empty the pool completely.
  */

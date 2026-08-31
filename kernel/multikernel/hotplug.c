@@ -1089,7 +1089,7 @@ int mk_pool_cpu_add(mk_phys_cpu_t cpu_id)
 	if (ret)
 		return ret;
 
-	/* The CPU parked in the host park area and is assignable again */
+	/* The CPU parked in the pool park area and is assignable again */
 	mk_cpu_set_add(mk_pool->cpus, cpu_id);
 
 	return 0;

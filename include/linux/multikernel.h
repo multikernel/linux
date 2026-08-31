@@ -22,6 +22,8 @@
 #else
 struct mk_instance_arch {
 };
+struct mk_pool_arch {
+};
 #endif
 
 /**
@@ -398,7 +400,11 @@ struct mk_pool {
 	struct list_head chunks;	/* Donated memory (struct mk_pool_chunk) */
 	struct gen_pool *node_pools[MAX_NUMNODES];
 	struct mutex mem_lock;		/* Protects chunks and node_pools */
+	struct mk_pool_arch arch;	/* Park area for unassigned CPUs */
 };
+
+/* The pool this kernel manages; NULL until a baseline creates it */
+extern struct mk_pool *mk_pool;
 
 int mk_pool_mem_grow(size_t size, int node, phys_addr_t *out_base);
 int mk_pool_mem_shrink(phys_addr_t start, size_t size);
@@ -426,18 +432,18 @@ struct mk_pool_chunk_range {
 int mk_pool_snapshot_chunks(struct mk_pool_chunk_range *out, int max);
 
 /*
- * Host park area: on architectures that park pool CPUs in software, the
+ * Pool park area: on architectures that park pool CPUs in software, the
  * park loop and its page tables live in pool memory and pin the chunks
  * they occupy. Architectures whose firmware holds parked CPUs (PSCI, SBI
  * HSM) have no such area and use the stubs.
  */
 #ifdef CONFIG_ARCH_HAS_MK_HOST_PARK
-int mk_setup_host_park(void);
+int mk_pool_park_setup(void);
 int mk_arch_pool_chunk_added(phys_addr_t start, size_t size);
-bool mk_host_park_uses(phys_addr_t start, size_t size);
-int mk_teardown_host_park(void);
+bool mk_pool_park_uses(phys_addr_t start, size_t size);
+int mk_pool_park_teardown(void);
 #else
-static inline int mk_setup_host_park(void)
+static inline int mk_pool_park_setup(void)
 {
 	return 0;
 }
@@ -447,12 +453,12 @@ static inline int mk_arch_pool_chunk_added(phys_addr_t start, size_t size)
 	return 0;
 }
 
-static inline bool mk_host_park_uses(phys_addr_t start, size_t size)
+static inline bool mk_pool_park_uses(phys_addr_t start, size_t size)
 {
 	return false;
 }
 
-static inline int mk_teardown_host_park(void)
+static inline int mk_pool_park_teardown(void)
 {
 	return 0;
 }
@@ -1032,7 +1038,7 @@ void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
  *    kernel's allocator.
  *  - struct mk_instance_arch: the arch's per-instance spawn state
  *    (boot context, trampolines, park area), opaque to the core.
- *  - CONFIG_ARCH_HAS_MK_HOST_PARK and the host park functions declared
+ *  - CONFIG_ARCH_HAS_MK_HOST_PARK and the pool park functions declared
  *    with the pool chunk API above, for architectures that park CPUs in
  *    software rather than in firmware.
  */

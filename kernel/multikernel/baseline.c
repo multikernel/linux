@@ -528,9 +528,9 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 		goto out;
 	}
 
-	ret = mk_setup_host_park();
+	ret = mk_pool_park_setup();
 	if (ret) {
-		pr_err("Baseline host park setup failed: %d\n", ret);
+		pr_err("Baseline pool park setup failed: %d\n", ret);
 		goto out;
 	}
 

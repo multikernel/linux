@@ -33,6 +33,24 @@ struct mk_instance_arch {
 };
 
 /*
+ * The pool's park area, set up when the baseline is applied.
+ * Unassigned pool CPUs park here watching the pool slot; once an
+ * instance first spawns, its CPUs are re-parked onto the instance's
+ * own context so the spawn kernel can wake secondaries by writing
+ * memory it can address. The page table identity-maps the whole
+ * pool, so park pages and contexts of every instance are reachable
+ * from it.
+ */
+struct mk_pool_arch {
+	struct mk_spawn_context *slot;
+	unsigned long slot_phys;
+	void *park_va;
+	unsigned long park_phys;
+	struct mk_ident_pgtable *pgt;
+	unsigned long cr3;
+};
+
+/*
  * Physical CPU IDs are APIC IDs, widened to the generic u64 type. The
  * parentheses keep asm/smp.h's cpu_physical_id() macro from expanding
  * over the smp_ops member of the same name.

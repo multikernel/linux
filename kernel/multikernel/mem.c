@@ -684,7 +684,7 @@ int mk_pool_mem_shrink(phys_addr_t start, size_t size)
 
 	if (chunk->res.parent)
 		remove_resource(&chunk->res);
-	/* The host park table keeps the stale range mapped, but never dereferences it */
+	/* The pool park table keeps the stale range mapped, but never dereferences it */
 	mk_free_contig_pages(chunk->pages, chunk->nr_pages);
 	pr_info("Multikernel pool: removed %pa-%pa (%zu MB)\n",
 		&chunk->res.start, &chunk->res.end, size >> 20);
