@@ -166,15 +166,6 @@ void mk_set_spawn_context(struct mk_spawn_context *ctx,
 }
 
 /*
- * Serializes wake publications on the host slot and on instance contexts.
- * Every mailbox is single-producer: two concurrent publications interleave
- * their dispatch fields and the parked CPU stages a mix of both. Spawn,
- * hotplug repark and parked-confirmation run from different syscall paths
- * with no common lock, so they take this one.
- */
-static DEFINE_MUTEX(mk_park_mutex);
-
-/*
  * Publish a wakeup in @slot for the CPU with @apic_id and wait for the
  * parked CPU to claim it. The dispatch fields must be set before the
  * call; parked CPUs stage them in registers before claiming, so once the
@@ -228,7 +219,7 @@ static int mk_publish_repark(struct mk_spawn_context *from, u32 apic_id,
 			     unsigned long park_phys, unsigned long park_cr3,
 			     unsigned long slot_phys, const char *what)
 {
-	lockdep_assert_held(&mk_park_mutex);
+	lockdep_assert_held(&mk_pool->pub_lock);
 
 	from->repark_park_phys = park_phys;
 	from->repark_park_cr3 = park_cr3;
@@ -294,7 +285,7 @@ int mk_spawn_cpu(struct mk_instance *instance, int cpu,
 		return -ENODEV;
 	}
 
-	guard(mutex)(&mk_park_mutex);
+	guard(mutex)(&mk_pool->pub_lock);
 
 	/*
 	 * Move every secondary still parked on the host slot onto the
@@ -535,7 +526,7 @@ int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_c
 	if (ret)
 		return ret;
 
-	guard(mutex)(&mk_park_mutex);
+	guard(mutex)(&mk_pool->pub_lock);
 
 	if (mk_cpu_set_contains(on_slot, phys_cpu))
 		return 0;
@@ -562,7 +553,7 @@ int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 	struct mk_spawn_context *ctx = instance->arch.spawn_ctx;
 	int ret;
 
-	guard(mutex)(&mk_park_mutex);
+	guard(mutex)(&mk_pool->pub_lock);
 
 	/* Already on the host slot: nothing watches this context for it */
 	if (!mk_cpu_set_contains(instance->cpus_on_slot, phys_cpu))
@@ -599,7 +590,7 @@ int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 	if (!ctx || !ctx->park_phys)
 		return -ENODEV;
 
-	guard(mutex)(&mk_park_mutex);
+	guard(mutex)(&mk_pool->pub_lock);
 
 	ret = mk_publish_repark(ctx, (u32)phys_cpu, ctx->park_phys,
 				ctx->park_cr3, instance->arch.spawn_ctx_phys,
@@ -652,7 +643,7 @@ int mk_repark_instance_to_host(struct mk_instance *instance)
 	if (mk_cpu_set_empty(on_slot) || !ctx || !mk_pool || !mk_pool->arch.slot)
 		return 0;
 
-	guard(mutex)(&mk_park_mutex);
+	guard(mutex)(&mk_pool->pub_lock);
 
 	/*
 	 * Only the CPUs actually watching this context: waking one that is

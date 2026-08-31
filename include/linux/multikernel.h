@@ -401,6 +401,13 @@ struct mk_pool {
 	struct gen_pool *node_pools[MAX_NUMNODES];
 	struct mutex mem_lock;		/* Protects chunks and node_pools */
 	struct mk_pool_arch arch;	/* Park area for unassigned CPUs */
+	/*
+	 * Serializes wake and repark publications on the pool slot and on
+	 * child instance contexts. Every mailbox is single-producer (this
+	 * kernel), but spawn, hotplug repark and parked-confirmation run
+	 * from different syscall paths with no common lock.
+	 */
+	struct mutex pub_lock;
 };
 
 /* The pool this kernel manages; NULL until a baseline creates it */
