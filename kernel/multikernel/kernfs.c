@@ -132,7 +132,7 @@ static int root_device_tree_seq_show(struct seq_file *sf, void *v)
 	size_t dtb_size = 0;
 	int ret;
 
-	ret = mk_dt_generate_instance_dtb(root_instance, &dtb_data, &dtb_size);
+	ret = mk_dt_generate_instance_dtb(mk_self, &dtb_data, &dtb_size);
 	if (ret) {
 		pr_err("Failed to generate baseline DTB: %d\n", ret);
 		return ret;
@@ -284,7 +284,7 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 
 	/* Allocate instance ID early so resource reservation logs show correct ID */
 	if (id == 0) {
-		pr_err("Instance ID 0 is reserved for root instance\n");
+		pr_err("Instance ID 0 is reserved for the host kernel\n");
 		ret = -ENOMEM;
 		goto err_remove_dir;
 	}

@@ -26,7 +26,7 @@
 #define PROP_SUB_FDT "fdt"
 
 /*
- * Global root instance representing the current kernel.
+ * The self instance: the record describing this running kernel.
  *
  * Initialization (in mk_instance_restore_from_manifest at early_initcall):
  *   - For host kernels (no manifest): Created with id=0, name="/"
@@ -35,8 +35,8 @@
  * Overlay operations reach this kernel through an /instances/<name> fragment
  * naming it, or through an /resources fragment when it manages a pool.
  */
-struct mk_instance *root_instance = NULL;
-EXPORT_SYMBOL_GPL(root_instance);
+struct mk_instance *mk_self;
+EXPORT_SYMBOL_GPL(mk_self);
 
 /**
  * mk_dt_extract_instance_info() - Extract instance ID and name from DTB
@@ -282,7 +282,7 @@ static int __init mk_copy_platform_devices(const struct mk_dt_config *config,
 		instance->platform_device_count++;
 	}
 
-	pr_info("Copied %d platform devices to root instance\n", instance->platform_device_count);
+	pr_info("Copied %d platform devices to self\n", instance->platform_device_count);
 	return 0;
 }
 
@@ -329,8 +329,8 @@ static int __init mk_restore_instance_ipi(struct mk_instance *instance)
 
 	instance->ipi_phys = ipi_phys;
 	instance->ipi_pages = ipi_pages;
-	pr_info("Restored IPI buffer for root instance: phys=0x%llx, virt=%px, pages=%u, size=%zu\n",
-		(unsigned long long)ipi_phys, instance->ipi_data, ipi_pages, ipi_size);
+	pr_info("Restored IPI buffer for the self instance: phys=0x%llx, pages=%u, size=%zu\n",
+		(unsigned long long)ipi_phys, ipi_pages, ipi_size);
 
 	return 0;
 }
@@ -404,23 +404,23 @@ int __init mk_instance_restore_from_manifest(void)
 
 		instance = alloc_mk_instance(0, "", true);
 		if (!instance) {
-			pr_err("Failed to allocate root instance\n");
+			pr_err("Failed to allocate the self instance\n");
 			return -ENOMEM;
 		}
 		/* Initially, root owns all online CPUs (physical IDs) */
 		for_each_online_cpu(cpu) {
 			if (mk_cpu_set_add(instance->cpus,
 					   arch_cpu_physical_id(cpu)))
-				pr_warn("Failed to add CPU %d to root instance\n",
+				pr_warn("Failed to add CPU %d to the self instance\n",
 					cpu);
 		}
 		mk_cpu_set_format(cpus_buf, sizeof(cpus_buf), instance->cpus);
-		pr_info("Root instance initialized with CPUs (physical): %s\n",
+		pr_info("Self instance initialized with CPUs (physical): %s\n",
 			cpus_buf);
 
-		root_instance = instance;
+		mk_self = instance;
 
-		pr_info("Initialized root instance (id=0, name='/')\n");
+		pr_info("Initialized self instance (id=0, name='/')\n");
 		return 0;
 	}
 
@@ -488,13 +488,13 @@ int __init mk_instance_restore_from_manifest(void)
 		goto cleanup_devices;
 	}
 
-	root_instance = instance;
+	mk_self = instance;
 
 	host_instance = mk_restore_host_instance();
 	if (!host_instance)
 		pr_warn("Failed to restore host instance (spawn→host communication unavailable)\n");
 
-	pr_info("Successfully restored multikernel root instance %d ('%s') from the boot tree (%d bytes)\n",
+	pr_info("Successfully restored multikernel self instance %d ('%s') from the boot tree (%d bytes)\n",
 		instance_id, instance_name, dtb_len);
 	mk_dt_config_free(&config);
 	return 0;

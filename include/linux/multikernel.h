@@ -462,11 +462,11 @@ enum mk_instance_state {
 };
 
 /**
- * Root instance pointer - points to the current running kernel instance
- * In the host kernel, this is instance 0.
- * In a spawn kernel, this is the spawned instance (1, 2, etc.).
+ * The self instance: the record describing this running kernel.
+ * In the host kernel its id is 0; in a spawn kernel it is the
+ * spawned instance's id (1, 2, etc.).
  */
-extern struct mk_instance *root_instance;
+extern struct mk_instance *mk_self;
 
 /**
  * Memory region wrapper
@@ -980,7 +980,7 @@ int __init mk_instance_restore_from_manifest(void);
  * @hid: ACPI Hardware ID if available (e.g., "PNP0303"), can be NULL
  *
  * Checks if the specified platform device is allowed according to the DTB
- * configuration in the root instance. If no root instance exists or no
+ * configuration in the self instance. If no self instance exists or no
  * platform device restrictions are configured, all devices are allowed.
  *
  * The check matches against either the device name or ACPI HID for portability.

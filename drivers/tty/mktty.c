@@ -490,17 +490,17 @@ static struct console mktty_spawn_console = {
 
 static int __init mktty_spawn_console_init(void)
 {
-	if (!root_instance || root_instance->id == 0)
+	if (!mk_self || mk_self->id == 0)
 		return 0;
 
-	mktty_spawn.instance_id = root_instance->id;
+	mktty_spawn.instance_id = mk_self->id;
 	register_console(&mktty_spawn_console);
 	mktty_console_registered = true;
 	pr_info("mktty: early console for instance %d\n", mktty_spawn.instance_id);
 	return 0;
 }
 /*
- * root_instance is restored at early_initcall, so this cannot be a
+ * mk_self is restored at early_initcall, so this cannot be a
  * console_initcall. Being an early_initcall too still puts it ahead of
  * smp_init(), and the link order (kernel/ before drivers/) after the restore.
  */
@@ -511,10 +511,10 @@ static int mktty_spawn_init(void)
 	struct tty_driver *driver;
 	int ret;
 
-	if (!root_instance)
+	if (!mk_self)
 		return -ENODEV;
 
-	mktty_spawn.instance_id = root_instance->id;
+	mktty_spawn.instance_id = mk_self->id;
 	spin_lock_init(&mktty_spawn.lock);
 
 	pr_info("mktty: initializing spawn (instance %d)\n", mktty_spawn.instance_id);
@@ -586,13 +586,13 @@ static void mktty_spawn_cleanup(void)
 
 static int __init mktty_init(void)
 {
-	int id = root_instance ? root_instance->id : 0;
+	int id = mk_self ? mk_self->id : 0;
 	return (id == 0) ? mktty_host_init() : mktty_spawn_init();
 }
 
 static void __exit mktty_exit(void)
 {
-	int id = root_instance ? root_instance->id : 0;
+	int id = mk_self ? mk_self->id : 0;
 	if (id == 0)
 		mktty_host_cleanup();
 	else

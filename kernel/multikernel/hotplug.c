@@ -78,7 +78,7 @@ struct mk_cpu_hotplug_work {
 };
 
 /*
- * Ownership tracking for this kernel's own hotplug: root_instance->cpus
+ * Ownership tracking for this kernel's own hotplug: mk_self->cpus
  * is the set of CPUs this kernel owns, in the host and in spawn kernels
  * alike. The assignable-pool bookkeeping (mk_cpu_pool) is not done here;
  * it belongs to the mk_send_cpu_* initiator paths of the kernel that
@@ -86,14 +86,14 @@ struct mk_cpu_hotplug_work {
  */
 static void mk_account_cpu_online(mk_phys_cpu_t cpu_id)
 {
-	if (root_instance->cpus && mk_cpu_set_add(root_instance->cpus, cpu_id))
+	if (mk_self->cpus && mk_cpu_set_add(mk_self->cpus, cpu_id))
 		pr_warn("Multikernel hotplug: Failed to track CPU %llu\n",
 			cpu_id);
 }
 
 static void mk_account_cpu_offline(mk_phys_cpu_t cpu_id)
 {
-	mk_cpu_set_del(root_instance->cpus, cpu_id);
+	mk_cpu_set_del(mk_self->cpus, cpu_id);
 }
 
 /**
@@ -1200,7 +1200,7 @@ int mk_pool_device_remove(u16 domain, u8 bus, u8 devfn,
  * For local instance, executes removal synchronously and returns after completion.
  * For remote instance, sends IPI and waits for ACK response.
  * For instances that are not yet running (MK_STATE_READY/LOADED), transfers
- * the CPU back to root instance without sending IPIs.
+ * the CPU back to this kernel without sending IPIs.
  *
  * Returns: 0 on success, negative error code on failure or timeout
  */
@@ -1210,14 +1210,14 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 		.cpu_id = cpu_id,
 		.numa_node = 0,
 		.flags = 0,
-		.sender_instance_id = root_instance->id
+		.sender_instance_id = mk_self->id
 	};
 	struct mk_pending_msg *pending;
 	struct mk_instance *target_instance;
 	int ret;
 
 	/* For self-removal, execute directly (we're in process context) */
-	if (instance_id == root_instance->id) {
+	if (instance_id == mk_self->id) {
 		if (mk_cpu_pool)
 			return mk_pool_cpu_add(cpu_id);
 		return mk_do_cpu_remove(cpu_id);
@@ -1311,7 +1311,7 @@ out:
  * For local instance, executes addition synchronously and returns after completion.
  * For remote instance, sends IPI and waits for ACK response.
  * For instances that are not yet running (MK_STATE_READY/LOADED), transfers
- * the CPU from root instance without sending IPIs.
+ * the CPU from this kernel without sending IPIs.
  *
  * Returns: 0 on success, negative error code on failure or timeout
  */
@@ -1321,14 +1321,14 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 		.cpu_id = cpu_id,
 		.numa_node = numa_node,
 		.flags = flags,
-		.sender_instance_id = root_instance->id
+		.sender_instance_id = mk_self->id
 	};
 	struct mk_pending_msg *pending;
 	struct mk_instance *target_instance;
 	int ret;
 
 	/* For self-addition, execute directly (we're in process context) */
-	if (instance_id == root_instance->id) {
+	if (instance_id == mk_self->id) {
 		if (mk_cpu_pool)
 			return mk_pool_cpu_remove(cpu_id, numa_node, flags);
 		return mk_do_cpu_add(cpu_id, numa_node, flags);
@@ -1433,14 +1433,14 @@ int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
 		.nr_pages = nr_pages,
 		.numa_node = numa_node,
 		.mem_type = mem_type,
-		.sender_instance_id = root_instance->id
+		.sender_instance_id = mk_self->id
 	};
 	struct mk_pending_msg *pending;
 	struct mk_instance *target_instance;
 	int ret;
 
 	/* For self-addition, execute directly (we're in process context) */
-	if (instance_id == root_instance->id)
+	if (instance_id == mk_self->id)
 		return mk_do_mem_add(start_pfn, nr_pages, numa_node, mem_type);
 
 	target_instance = mk_instance_find(instance_id);
@@ -1501,14 +1501,14 @@ int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages)
 		.nr_pages = nr_pages,
 		.numa_node = 0,
 		.mem_type = 0,
-		.sender_instance_id = root_instance->id
+		.sender_instance_id = mk_self->id
 	};
 	struct mk_pending_msg *pending;
 	struct mk_instance *target_instance;
 	int ret;
 
 	/* For self-removal, execute directly (we're in process context) */
-	if (instance_id == root_instance->id)
+	if (instance_id == mk_self->id)
 		return mk_do_mem_remove(start_pfn, nr_pages);
 
 	target_instance = mk_instance_find(instance_id);
@@ -1576,7 +1576,7 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 		.bus = bus,
 		.devfn = devfn,
 		.flags = flags,
-		.sender_instance_id = root_instance->id
+		.sender_instance_id = mk_self->id
 	};
 	struct mk_pending_msg *pending;
 	struct mk_instance *target_instance;
@@ -1590,7 +1590,7 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 
 	resource_id = (domain << 16) | (bus << 8) | devfn;
 
-	if (instance_id == root_instance->id) {
+	if (instance_id == mk_self->id) {
 		if (mk_cpu_pool)
 			return mk_pool_device_remove(domain, bus, devfn,
 						     driver_override, flags);
@@ -1658,7 +1658,7 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 		.bus = bus,
 		.devfn = devfn,
 		.flags = 0,
-		.sender_instance_id = root_instance->id
+		.sender_instance_id = mk_self->id
 	};
 	struct mk_pending_msg *pending;
 	struct mk_instance *target_instance;
@@ -1668,7 +1668,7 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 	payload.driver_override[0] = '\0';
 	resource_id = (domain << 16) | (bus << 8) | devfn;
 
-	if (instance_id == root_instance->id) {
+	if (instance_id == mk_self->id) {
 		if (mk_cpu_pool)
 			return mk_pool_device_add(domain, bus, devfn, NULL);
 		return mk_do_device_remove(domain, bus, devfn);

@@ -387,7 +387,7 @@ static int mk_stop_nmi_callback(unsigned int val, struct pt_regs *regs)
 		return NMI_DONE;
 
 	pr_emerg("CPU %d: Forcible shutdown via NMI (instance %d)\n",
-		 smp_processor_id(), root_instance ? root_instance->id : -1);
+		 smp_processor_id(), mk_self ? mk_self->id : -1);
 
 	cpu_emergency_disable_virtualization();
 	mk_enter_pool_state(NULL);

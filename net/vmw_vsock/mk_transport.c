@@ -328,10 +328,10 @@ static void mk_vsock_ipi_handler(u32 msg_type, u32 subtype,
 
 static u32 mk_transport_get_local_cid(void)
 {
-	if (!root_instance)
+	if (!mk_self)
 		return VMADDR_CID_ANY;
 
-	return (u32)root_instance->id;
+	return (u32)mk_self->id;
 }
 
 static int mk_transport_init(struct vsock_sock *vsk, struct vsock_sock *psk)

@@ -105,12 +105,12 @@ static int mk_manifest_add_pool_cpus(void *fdt, struct mk_instance *target)
 	mutex_lock(&mk_instance_mutex);
 	list_for_each_entry(other, &mk_instance_list, list) {
 		/*
-		 * Skip the root instance: its set is the CPUs the host
+		 * Skip the self instance: its set is the CPUs the host
 		 * itself runs on, and enumerating a big host's full CPU set
 		 * in every spawn bloats the spawn's possible map and percpu
 		 * allocations.
 		 */
-		if (other == target || other == root_instance)
+		if (other == target || other == mk_self)
 			continue;
 		mk_cpu_set_for_each(i, id, other->cpus) {
 			ret = mk_cpu_set_add(pool, id);
@@ -164,12 +164,12 @@ static int mk_manifest_chosen(void *fdt, void *data)
 	if (ret)
 		return ret;
 
-	if (root_instance->ipi_data) {
+	if (mk_self->ipi_data) {
 		ret = fdt_property_u64(fdt, "multikernel,host-ipi-buffer",
-				       root_instance->ipi_phys);
+				       mk_self->ipi_phys);
 		if (!ret)
 			ret = fdt_property_u32(fdt, "multikernel,host-ipi-pages",
-					       root_instance->ipi_pages);
+					       mk_self->ipi_pages);
 		if (ret)
 			return ret;
 	}

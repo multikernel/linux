@@ -20,7 +20,7 @@ static void mk_instance_return_all_cpus(struct mk_instance *instance)
 	if (!instance || mk_cpu_set_empty(instance->cpus))
 		return;
 
-	if (instance == root_instance || instance->id == 0)
+	if (instance == mk_self || instance->id == 0)
 		return;
 
 	mk_instance_return_cpus(instance, instance->cpus);
@@ -34,11 +34,11 @@ static void mk_instance_return_pci_devices(struct mk_instance *instance)
 	if (!instance || !instance->pci_devices_valid)
 		return;
 
-	if (instance == root_instance || instance->id == 0)
+	if (instance == mk_self || instance->id == 0)
 		return;
 
-	if (!root_instance) {
-		pr_warn("Cannot return PCI devices from instance %d (%s): no root instance\n",
+	if (!mk_self) {
+		pr_warn("Cannot return PCI devices from instance %d (%s): no self instance\n",
 			instance->id, instance->name);
 		goto cleanup;
 	}
@@ -54,31 +54,29 @@ static void mk_instance_return_pci_devices(struct mk_instance *instance)
 	}
 
 	list_for_each_entry_safe(pci_dev, pci_tmp, &instance->pci_devices, list) {
-		struct mk_pci_device *root_dev;
+		struct mk_pci_device *self_dev;
 
-		root_dev = kzalloc(sizeof(*root_dev), GFP_KERNEL);
-		if (!root_dev) {
-			pr_warn("Failed to allocate PCI device entry for root instance\n");
+		self_dev = kzalloc_obj(*self_dev, GFP_KERNEL);
+		if (!self_dev)
 			continue;
-		}
 
-		*root_dev = *pci_dev;
-		INIT_LIST_HEAD(&root_dev->list);
+		*self_dev = *pci_dev;
+		INIT_LIST_HEAD(&self_dev->list);
 
-		list_add_tail(&root_dev->list, &root_instance->pci_devices);
-		root_instance->pci_device_count++;
-		root_instance->pci_devices_valid = true;
+		list_add_tail(&self_dev->list, &mk_self->pci_devices);
+		mk_self->pci_device_count++;
+		mk_self->pci_devices_valid = true;
 
 		pr_debug("Returned PCI device %04x:%02x:%02x.%d from instance %d to root\n",
-			 root_dev->domain, root_dev->bus, root_dev->slot,
-			 root_dev->func, instance->id);
+			 self_dev->domain, self_dev->bus, self_dev->slot,
+			 self_dev->func, instance->id);
 
 		returned_count++;
 	}
 
 done:
 	if (returned_count > 0) {
-		pr_info("Returned %d PCI devices from instance %d (%s) to root instance\n",
+		pr_info("Returned %d PCI devices from instance %d (%s) to self instance\n",
 			returned_count, instance->id, instance->name);
 	}
 
@@ -99,39 +97,37 @@ static void mk_instance_return_platform_devices(struct mk_instance *instance)
 	if (!instance || !instance->platform_devices_valid)
 		return;
 
-	if (instance == root_instance || instance->id == 0)
+	if (instance == mk_self || instance->id == 0)
 		return;
 
-	if (!root_instance) {
-		pr_warn("Cannot return platform devices from instance %d (%s): no root instance\n",
+	if (!mk_self) {
+		pr_warn("Cannot return platform devices from instance %d (%s): no self instance\n",
 			instance->id, instance->name);
 		goto cleanup;
 	}
 
 	list_for_each_entry_safe(plat_dev, plat_tmp, &instance->platform_devices, list) {
-		struct mk_platform_device *root_dev;
+		struct mk_platform_device *self_dev;
 
-		root_dev = kzalloc(sizeof(*root_dev), GFP_KERNEL);
-		if (!root_dev) {
-			pr_warn("Failed to allocate platform device entry for root instance\n");
+		self_dev = kzalloc_obj(*self_dev, GFP_KERNEL);
+		if (!self_dev)
 			continue;
-		}
 
-		*root_dev = *plat_dev;
-		INIT_LIST_HEAD(&root_dev->list);
+		*self_dev = *plat_dev;
+		INIT_LIST_HEAD(&self_dev->list);
 
-		list_add_tail(&root_dev->list, &root_instance->platform_devices);
-		root_instance->platform_device_count++;
-		root_instance->platform_devices_valid = true;
+		list_add_tail(&self_dev->list, &mk_self->platform_devices);
+		mk_self->platform_device_count++;
+		mk_self->platform_devices_valid = true;
 
 		pr_debug("Returned platform device '%s' from instance %d to root\n",
-			 root_dev->name, instance->id);
+			 self_dev->name, instance->id);
 
 		returned_count++;
 	}
 
 	if (returned_count > 0) {
-		pr_info("Returned %d platform devices from instance %d (%s) to root instance\n",
+		pr_info("Returned %d platform devices from instance %d (%s) to self instance\n",
 			returned_count, instance->id, instance->name);
 	}
 
@@ -318,7 +314,7 @@ int mk_instance_confirm_parked(struct mk_instance *instance)
  * @instance: Target instance
  * @cpus: Set of physical CPU IDs to transfer
  *
- * Transfers CPUs from root instance to the target instance.
+ * Transfers CPUs from self instance to the target instance.
  * Validates that CPUs are available in root.
  *
  * Returns: 0 on success, negative error code on failure
@@ -386,7 +382,7 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
  * @instance: Source instance
  * @cpus: Set of physical CPU IDs to return (may be instance->cpus itself)
  *
- * Transfers CPUs from the instance back to root instance.
+ * Transfers CPUs from the instance back to self instance.
  * Validates that CPUs are assigned to the source instance.
  *
  * Returns: 0 on success, negative error code on failure
@@ -485,7 +481,7 @@ bool mk_pool_cpus_returned(void)
 
 	mutex_lock(&mk_instance_mutex);
 	list_for_each_entry(instance, &mk_instance_list, list) {
-		if (instance == root_instance)
+		if (instance == mk_self)
 			continue;
 
 		if (!mk_cpu_set_empty(instance->cpus) ||
@@ -515,13 +511,13 @@ static int mk_instance_transfer_pci_devices(struct mk_instance *instance,
 					     const struct list_head *requested_devices,
 					     int requested_count)
 {
-	struct mk_pci_device *req_dev, *root_dev, *tmp;
+	struct mk_pci_device *req_dev, *self_dev, *tmp;
 	int transferred = 0;
 	int not_found = 0;
 	bool found;
 
-	if (!root_instance || !root_instance->pci_devices_valid) {
-		pr_err("No root instance or PCI devices not initialized\n");
+	if (!mk_self || !mk_self->pci_devices_valid) {
+		pr_err("No self instance or PCI devices not initialized\n");
 		return -EINVAL;
 	}
 
@@ -562,13 +558,13 @@ static int mk_instance_transfer_pci_devices(struct mk_instance *instance,
 
 	list_for_each_entry(req_dev, requested_devices, list) {
 		found = false;
-		list_for_each_entry(root_dev, &root_instance->pci_devices, list) {
-			if (root_dev->vendor == req_dev->vendor &&
-			    root_dev->device == req_dev->device &&
-			    root_dev->domain == req_dev->domain &&
-			    root_dev->bus == req_dev->bus &&
-			    root_dev->slot == req_dev->slot &&
-			    root_dev->func == req_dev->func) {
+		list_for_each_entry(self_dev, &mk_self->pci_devices, list) {
+			if (self_dev->vendor == req_dev->vendor &&
+			    self_dev->device == req_dev->device &&
+			    self_dev->domain == req_dev->domain &&
+			    self_dev->bus == req_dev->bus &&
+			    self_dev->slot == req_dev->slot &&
+			    self_dev->func == req_dev->func) {
 				found = true;
 				break;
 			}
@@ -588,23 +584,23 @@ static int mk_instance_transfer_pci_devices(struct mk_instance *instance,
 	}
 
 	list_for_each_entry(req_dev, requested_devices, list) {
-		list_for_each_entry_safe(root_dev, tmp, &root_instance->pci_devices, list) {
-			if (root_dev->vendor == req_dev->vendor &&
-			    root_dev->device == req_dev->device &&
-			    root_dev->domain == req_dev->domain &&
-			    root_dev->bus == req_dev->bus &&
-			    root_dev->slot == req_dev->slot &&
-			    root_dev->func == req_dev->func) {
+		list_for_each_entry_safe(self_dev, tmp, &mk_self->pci_devices, list) {
+			if (self_dev->vendor == req_dev->vendor &&
+			    self_dev->device == req_dev->device &&
+			    self_dev->domain == req_dev->domain &&
+			    self_dev->bus == req_dev->bus &&
+			    self_dev->slot == req_dev->slot &&
+			    self_dev->func == req_dev->func) {
 
-				list_del(&root_dev->list);
-				list_add_tail(&root_dev->list, &instance->pci_devices);
-				root_instance->pci_device_count--;
+				list_del(&self_dev->list);
+				list_add_tail(&self_dev->list, &instance->pci_devices);
+				mk_self->pci_device_count--;
 				instance->pci_device_count++;
 				transferred++;
 
 				pr_debug("Transferred PCI device %04x:%04x@%04x:%02x:%02x.%x to instance %d\n",
-					 root_dev->vendor, root_dev->device, root_dev->domain,
-					 root_dev->bus, root_dev->slot, root_dev->func,
+					 self_dev->vendor, self_dev->device, self_dev->domain,
+					 self_dev->bus, self_dev->slot, self_dev->func,
 					 instance->id);
 				break;
 			}
@@ -613,7 +609,7 @@ static int mk_instance_transfer_pci_devices(struct mk_instance *instance,
 
 	instance->pci_devices_valid = true;
 	pr_info("Transferred %d PCI devices from root to instance %d (%s), root pool remaining: %d devices\n",
-		transferred, instance->id, instance->name, root_instance->pci_device_count);
+		transferred, instance->id, instance->name, mk_self->pci_device_count);
 
 	return 0;
 }
@@ -638,13 +634,13 @@ static int mk_instance_transfer_platform_devices(struct mk_instance *instance,
 						 const struct list_head *requested_devices,
 						 int requested_count)
 {
-	struct mk_platform_device *req_dev, *root_dev, *tmp;
+	struct mk_platform_device *req_dev, *self_dev, *tmp;
 	int transferred = 0;
 	int not_found = 0;
 	bool found;
 
-	if (!root_instance || !root_instance->platform_devices_valid) {
-		pr_err("No root instance or platform devices not initialized\n");
+	if (!mk_self || !mk_self->platform_devices_valid) {
+		pr_err("No self instance or platform devices not initialized\n");
 		return -EINVAL;
 	}
 
@@ -657,8 +653,8 @@ static int mk_instance_transfer_platform_devices(struct mk_instance *instance,
 
 	list_for_each_entry(req_dev, requested_devices, list) {
 		found = false;
-		list_for_each_entry(root_dev, &root_instance->platform_devices, list) {
-			if (strcmp(root_dev->name, req_dev->name) == 0) {
+		list_for_each_entry(self_dev, &mk_self->platform_devices, list) {
+			if (strcmp(self_dev->name, req_dev->name) == 0) {
 				found = true;
 				break;
 			}
@@ -677,16 +673,16 @@ static int mk_instance_transfer_platform_devices(struct mk_instance *instance,
 	}
 
 	list_for_each_entry(req_dev, requested_devices, list) {
-		list_for_each_entry_safe(root_dev, tmp, &root_instance->platform_devices, list) {
-			if (strcmp(root_dev->name, req_dev->name) == 0) {
-				list_del(&root_dev->list);
-				list_add_tail(&root_dev->list, &instance->platform_devices);
-				root_instance->platform_device_count--;
+		list_for_each_entry_safe(self_dev, tmp, &mk_self->platform_devices, list) {
+			if (strcmp(self_dev->name, req_dev->name) == 0) {
+				list_del(&self_dev->list);
+				list_add_tail(&self_dev->list, &instance->platform_devices);
+				mk_self->platform_device_count--;
 				instance->platform_device_count++;
 				transferred++;
 
 				pr_debug("Transferred platform device '%s' to instance %d\n",
-					 root_dev->name, instance->id);
+					 self_dev->name, instance->id);
 				break;
 			}
 		}
@@ -694,7 +690,7 @@ static int mk_instance_transfer_platform_devices(struct mk_instance *instance,
 
 	instance->platform_devices_valid = true;
 	pr_info("Transferred %d platform devices from root to instance %d (%s), root pool remaining: %d devices\n",
-		transferred, instance->id, instance->name, root_instance->platform_device_count);
+		transferred, instance->id, instance->name, mk_self->platform_device_count);
 
 	return 0;
 }
@@ -722,7 +718,7 @@ static int mk_instance_reserve_platform_devices(struct mk_instance *instance,
  * @bus: PCI bus
  * @devfn: PCI device and function (combined)
  *
- * Transfers a single PCI device from root instance to the specified instance.
+ * Transfers a single PCI device from self instance to the specified instance.
  * Used for dynamic PCI device hotplug to non-running instances.
  *
  * Returns: 0 on success, negative error code on failure
@@ -730,12 +726,12 @@ static int mk_instance_reserve_platform_devices(struct mk_instance *instance,
 int mk_instance_add_pci_device(struct mk_instance *instance,
 			       u16 domain, u8 bus, u8 devfn)
 {
-	struct mk_pci_device *root_dev, *tmp;
+	struct mk_pci_device *self_dev, *tmp;
 	u8 slot = PCI_SLOT(devfn);
 	u8 func = PCI_FUNC(devfn);
 
-	if (!root_instance || !root_instance->pci_devices_valid) {
-		pr_err("No root instance or PCI devices not initialized\n");
+	if (!mk_self || !mk_self->pci_devices_valid) {
+		pr_err("No self instance or PCI devices not initialized\n");
 		return -EINVAL;
 	}
 
@@ -751,20 +747,20 @@ int mk_instance_add_pci_device(struct mk_instance *instance,
 		return ret;
 	}
 
-	list_for_each_entry_safe(root_dev, tmp, &root_instance->pci_devices, list) {
-		if (root_dev->domain == domain &&
-		    root_dev->bus == bus &&
-		    root_dev->slot == slot &&
-		    root_dev->func == func) {
+	list_for_each_entry_safe(self_dev, tmp, &mk_self->pci_devices, list) {
+		if (self_dev->domain == domain &&
+		    self_dev->bus == bus &&
+		    self_dev->slot == slot &&
+		    self_dev->func == func) {
 
-			list_del(&root_dev->list);
-			list_add_tail(&root_dev->list, &instance->pci_devices);
-			root_instance->pci_device_count--;
+			list_del(&self_dev->list);
+			list_add_tail(&self_dev->list, &instance->pci_devices);
+			mk_self->pci_device_count--;
 			instance->pci_device_count++;
 			instance->pci_devices_valid = true;
 
 			pr_info("Transferred PCI device %04x:%04x@%04x:%02x:%02x.%x to instance %d\n",
-				root_dev->vendor, root_dev->device, domain, bus, slot, func,
+				self_dev->vendor, self_dev->device, domain, bus, slot, func,
 				instance->id);
 			return 0;
 		}
@@ -782,7 +778,7 @@ int mk_instance_add_pci_device(struct mk_instance *instance,
  * @bus: PCI bus
  * @devfn: PCI device and function (combined)
  *
- * Returns a single PCI device from the specified instance back to root instance.
+ * Returns a single PCI device from the specified instance back to self instance.
  * Used for dynamic PCI device hotplug from non-running instances.
  *
  * Returns: 0 on success, negative error code on failure
@@ -791,7 +787,7 @@ int mk_instance_remove_pci_device(struct mk_instance *instance,
 				  u16 domain, u8 bus, u8 devfn)
 {
 	struct mk_pci_device *inst_dev, *tmp;
-	struct mk_pci_device *root_dev;
+	struct mk_pci_device *self_dev;
 	u8 slot = PCI_SLOT(devfn);
 	u8 func = PCI_FUNC(devfn);
 
@@ -800,8 +796,8 @@ int mk_instance_remove_pci_device(struct mk_instance *instance,
 		return -EINVAL;
 	}
 
-	if (!root_instance) {
-		pr_err("Cannot return PCI device: no root instance\n");
+	if (!mk_self) {
+		pr_err("Cannot return PCI device: no self instance\n");
 		return -EINVAL;
 	}
 
@@ -821,25 +817,23 @@ int mk_instance_remove_pci_device(struct mk_instance *instance,
 				return 0;
 			}
 
-			root_dev = kzalloc(sizeof(*root_dev), GFP_KERNEL);
-			if (!root_dev) {
-				pr_err("Failed to allocate PCI device entry for root instance\n");
+			self_dev = kzalloc_obj(*self_dev, GFP_KERNEL);
+			if (!self_dev)
 				return -ENOMEM;
-			}
 
-			*root_dev = *inst_dev;
-			INIT_LIST_HEAD(&root_dev->list);
+			*self_dev = *inst_dev;
+			INIT_LIST_HEAD(&self_dev->list);
 
-			list_add_tail(&root_dev->list, &root_instance->pci_devices);
-			root_instance->pci_device_count++;
-			root_instance->pci_devices_valid = true;
+			list_add_tail(&self_dev->list, &mk_self->pci_devices);
+			mk_self->pci_device_count++;
+			mk_self->pci_devices_valid = true;
 
 			list_del(&inst_dev->list);
 			kfree(inst_dev);
 			instance->pci_device_count--;
 
 			pr_info("Returned PCI device %04x:%04x@%04x:%02x:%02x.%x from instance %d to root\n",
-				root_dev->vendor, root_dev->device, domain, bus, slot, func,
+				self_dev->vendor, self_dev->device, domain, bus, slot, func,
 				instance->id);
 			return 0;
 		}
@@ -856,25 +850,25 @@ int mk_instance_remove_pci_device(struct mk_instance *instance,
  * @bus: PCI bus
  * @devfn: PCI device and function (combined)
  *
- * Returns: true when the device is listed on the root instance
+ * Returns: true when the device is listed on the self instance
  */
 bool mk_root_has_pci_device(u16 domain, u8 bus, u8 devfn)
 {
-	struct mk_pci_device *root_dev;
+	struct mk_pci_device *self_dev;
 	u8 slot = PCI_SLOT(devfn);
 	u8 func = PCI_FUNC(devfn);
 
 	if (mk_manifest_phys())
 		return mk_of_pci_available(domain, bus, devfn);
 
-	if (!root_instance || !root_instance->pci_devices_valid)
+	if (!mk_self || !mk_self->pci_devices_valid)
 		return false;
 
-	list_for_each_entry(root_dev, &root_instance->pci_devices, list) {
-		if (root_dev->domain == domain &&
-		    root_dev->bus == bus &&
-		    root_dev->slot == slot &&
-		    root_dev->func == func)
+	list_for_each_entry(self_dev, &mk_self->pci_devices, list) {
+		if (self_dev->domain == domain &&
+		    self_dev->bus == bus &&
+		    self_dev->slot == slot &&
+		    self_dev->func == func)
 			return true;
 	}
 
@@ -888,16 +882,16 @@ bool mk_root_has_pci_device(u16 domain, u8 bus, u8 devfn)
  * @devfn: PCI device and function (combined)
  * @alias: Stable name for the device tree /aliases node, NULL or "" for none
  *
- * Returns: 0 on success, -EINVAL if there is no root instance, -EEXIST if
+ * Returns: 0 on success, -EINVAL if there is no self instance, -EEXIST if
  * already listed, -ENODEV if the device does not exist, -ENOMEM on allocation
  * failure
  */
 int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn, const char *alias)
 {
-	struct mk_pci_device *root_dev;
+	struct mk_pci_device *self_dev;
 	struct pci_dev *pdev;
 
-	if (!root_instance)
+	if (!mk_self)
 		return -EINVAL;
 
 	if (mk_root_has_pci_device(domain, bus, devfn))
@@ -907,30 +901,30 @@ int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn, const char *alias)
 	if (!pdev)
 		return -ENODEV;
 
-	root_dev = kzalloc_obj(*root_dev, GFP_KERNEL);
-	if (!root_dev) {
+	self_dev = kzalloc_obj(*self_dev, GFP_KERNEL);
+	if (!self_dev) {
 		pci_dev_put(pdev);
 		return -ENOMEM;
 	}
 
-	root_dev->domain = domain;
-	root_dev->bus = bus;
-	root_dev->slot = PCI_SLOT(devfn);
-	root_dev->func = PCI_FUNC(devfn);
-	root_dev->vendor = pdev->vendor;
-	root_dev->device = pdev->device;
+	self_dev->domain = domain;
+	self_dev->bus = bus;
+	self_dev->slot = PCI_SLOT(devfn);
+	self_dev->func = PCI_FUNC(devfn);
+	self_dev->vendor = pdev->vendor;
+	self_dev->device = pdev->device;
 	if (alias)
-		strscpy(root_dev->alias, alias, sizeof(root_dev->alias));
-	INIT_LIST_HEAD(&root_dev->list);
+		strscpy(self_dev->alias, alias, sizeof(self_dev->alias));
+	INIT_LIST_HEAD(&self_dev->list);
 	pci_dev_put(pdev);
 
-	list_add_tail(&root_dev->list, &root_instance->pci_devices);
-	root_instance->pci_device_count++;
-	root_instance->pci_devices_valid = true;
+	list_add_tail(&self_dev->list, &mk_self->pci_devices);
+	mk_self->pci_device_count++;
+	mk_self->pci_devices_valid = true;
 
 	pr_info("PCI device %04x:%04x@%04x:%02x:%02x.%x is free in the root pool\n",
-		root_dev->vendor, root_dev->device, domain, bus,
-		root_dev->slot, root_dev->func);
+		self_dev->vendor, self_dev->device, domain, bus,
+		self_dev->slot, self_dev->func);
 	return 0;
 }
 
@@ -944,21 +938,21 @@ int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn, const char *alias)
  */
 int mk_root_del_pci_device(u16 domain, u8 bus, u8 devfn)
 {
-	struct mk_pci_device *root_dev, *tmp;
+	struct mk_pci_device *self_dev, *tmp;
 	u8 slot = PCI_SLOT(devfn);
 	u8 func = PCI_FUNC(devfn);
 
-	if (!root_instance || !root_instance->pci_devices_valid)
+	if (!mk_self || !mk_self->pci_devices_valid)
 		return -ENOENT;
 
-	list_for_each_entry_safe(root_dev, tmp, &root_instance->pci_devices, list) {
-		if (root_dev->domain == domain &&
-		    root_dev->bus == bus &&
-		    root_dev->slot == slot &&
-		    root_dev->func == func) {
-			list_del(&root_dev->list);
-			kfree(root_dev);
-			root_instance->pci_device_count--;
+	list_for_each_entry_safe(self_dev, tmp, &mk_self->pci_devices, list) {
+		if (self_dev->domain == domain &&
+		    self_dev->bus == bus &&
+		    self_dev->slot == slot &&
+		    self_dev->func == func) {
+			list_del(&self_dev->list);
+			kfree(self_dev);
+			mk_self->pci_device_count--;
 			return 0;
 		}
 	}
@@ -987,8 +981,8 @@ static int mk_instance_transfer_memory(struct mk_instance *instance, u64 size,
 		return 0;
 	}
 
-	if (!root_instance) {
-		pr_err("No root instance - cannot transfer memory\n");
+	if (!mk_self) {
+		pr_err("No self instance - cannot transfer memory\n");
 		return -EINVAL;
 	}
 
@@ -1087,7 +1081,7 @@ static int mk_instance_reserve_memory(struct mk_instance *instance,
  *
  * Note: The memory is returned to the global multikernel pool by
  * multikernel_destroy_instance_pool(), which makes it available for
- * future instance allocations (including root_instance).
+ * future instance allocations (including mk_self).
  */
 void mk_instance_free_memory(struct mk_instance *instance)
 {
@@ -1407,11 +1401,11 @@ static void __noreturn mk_notify_down_and_park(int target_id, u32 subtype)
 
 	ack.operation = MK_SYS_SHUTDOWN;
 	ack.result = 0;
-	ack.resource_id = root_instance->id;
+	ack.resource_id = mk_self->id;
 
 	mk_send_message(target_id, MK_MSG_SYSTEM, subtype, &ack, sizeof(ack));
 
-	pr_info("Multikernel instance %d shutting down\n", root_instance->id);
+	pr_info("Multikernel instance %d shutting down\n", mk_self->id);
 
 	/*
 	 * Enter pool state: every CPU parks where the host can re-spawn
@@ -1577,7 +1571,7 @@ int multikernel_halt_by_id(int mk_id)
 	}
 
 	payload.flags = MK_SHUTDOWN_GRACEFUL;
-	payload.sender_instance_id = root_instance->id;
+	payload.sender_instance_id = mk_self->id;
 
 	pending = mk_msg_pending_add(MK_MSG_SYSTEM, MK_SYS_SHUTDOWN, mk_id);
 	if (!pending) {

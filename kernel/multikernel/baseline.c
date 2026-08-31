@@ -34,7 +34,7 @@ struct mk_baseline_mem_req {
  * Parked CPUs this kernel can assign to child instances. The baseline
  * creates it, so it exists exactly in a kernel acting as a parent; it
  * stays NULL until a baseline is applied. instance->cpus,
- * root_instance's included, always means "CPUs that kernel instance
+ * mk_self's included, always means "CPUs that kernel instance
  * owns".
  */
 struct mk_cpu_set *mk_cpu_pool;
@@ -427,18 +427,18 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 		return -EINVAL;
 	}
 
-	if (!root_instance) {
-		pr_err("root_instance not initialized\n");
+	if (!mk_self) {
+		pr_err("mk_self not initialized\n");
 		return -EINVAL;
 	}
 
-	if (!root_instance->cpus) {
-		pr_err("root_instance CPUs bitmap not allocated\n");
+	if (!mk_self->cpus) {
+		pr_err("mk_self CPUs bitmap not allocated\n");
 		return -ENOMEM;
 	}
 
 	if (!mk_pool_empty() || (mk_cpu_pool && !mk_cpu_set_empty(mk_cpu_pool)) ||
-	    root_instance->pci_device_count) {
+	    mk_self->pci_device_count) {
 		pr_err("Baseline already applied; change the pool with an overlay targeting /resources\n");
 		return -EBUSY;
 	}
@@ -471,7 +471,7 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 		return -ENOMEM;
 	}
 
-	mk_baseline_clear_resources(root_instance);
+	mk_baseline_clear_resources(mk_self);
 
 	ret = mk_baseline_parse_cpus(fdt, resources_node, requested);
 	if (ret) {
@@ -486,7 +486,7 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 		goto out;
 	}
 
-	ret = mk_baseline_parse_devices(fdt, resources_node, root_instance,
+	ret = mk_baseline_parse_devices(fdt, resources_node, mk_self,
 					&pci_list);
 	if (ret) {
 		pr_err("Failed to parse baseline devices: %d\n", ret);

@@ -952,7 +952,7 @@ static int mk_dt_emit_pool_members(void *fdt)
 	list_for_each_entry(instance, &mk_instance_list, list) {
 		if (ret)
 			break;
-		if (instance == root_instance)
+		if (instance == mk_self)
 			continue;
 		mk_cpu_set_for_each(i, phys_cpu_id, instance->cpus) {
 			ret = mk_cpu_set_add(members, phys_cpu_id);
@@ -1559,7 +1559,7 @@ static int mk_dt_emit_tree(struct mk_instance *instance, void *fdt,
 			   size_t size, int (*chosen)(void *fdt, void *data),
 			   void *data)
 {
-	bool pool = instance == root_instance && mk_cpu_pool;
+	bool pool = instance == mk_self && mk_cpu_pool;
 	int ret;
 
 	ret = fdt_create(fdt, size);
@@ -1605,7 +1605,7 @@ static int mk_dt_emit_tree(struct mk_instance *instance, void *fdt,
 	if (!ret)
 		ret = fdt_end_node(fdt);	/* /resources */
 	if (!ret) {
-		if (instance == root_instance && mk_manifest_phys()) {
+		if (instance == mk_self && mk_manifest_phys()) {
 			ret = mk_dt_emit_own_devices(fdt);
 		} else {
 			ret = mk_dt_emit_aliases(instance, fdt);

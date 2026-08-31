@@ -44,10 +44,10 @@ void mk_ipi_ring_drop_pending(void)
 	struct mk_ipi_ring *ring;
 	unsigned int head, tail;
 
-	if (!root_instance || !root_instance->ipi_data)
+	if (!mk_self || !mk_self->ipi_data)
 		return;
 
-	ring = &root_instance->ipi_data->ring;
+	ring = &mk_self->ipi_data->ring;
 	head = mk_ring_idx(atomic_read(&ring->head));
 
 	for (tail = mk_ring_idx(atomic_read(&ring->tail)); tail != head;
@@ -257,17 +257,17 @@ static void mk_ipi_drain_ring(void)
 	size_t data_size;
 	int messages_processed = 0;
 
-	if (!root_instance || !root_instance->ipi_data)
+	if (!mk_self || !mk_self->ipi_data)
 		return;
 
 	while (1) {
-		tail = mk_ring_idx(atomic_read(&root_instance->ipi_data->ring.tail));
-		head = mk_ring_idx(atomic_read(&root_instance->ipi_data->ring.head));
+		tail = mk_ring_idx(atomic_read(&mk_self->ipi_data->ring.tail));
+		head = mk_ring_idx(atomic_read(&mk_self->ipi_data->ring.head));
 
 		if (tail == head)
 			break;
 
-		slot = &root_instance->ipi_data->ring.entries[tail];
+		slot = &mk_self->ipi_data->ring.entries[tail];
 
 		/*
 		 * Pairs with the store_release in multikernel_send_ipi_data().
@@ -289,7 +289,7 @@ static void mk_ipi_drain_ring(void)
 				     tail, data_size);
 			slot->data_size = 0;
 			next_tail = mk_ring_idx(tail + 1);
-			atomic_set(&root_instance->ipi_data->ring.tail, next_tail);
+			atomic_set(&mk_self->ipi_data->ring.tail, next_tail);
 			continue;
 		}
 
@@ -311,7 +311,7 @@ advance_tail:
 		/* Mark consumed so the slot reads as unpublished again */
 		slot->data_size = 0;
 		next_tail = mk_ring_idx(tail + 1);
-		atomic_set(&root_instance->ipi_data->ring.tail, next_tail);
+		atomic_set(&mk_self->ipi_data->ring.tail, next_tail);
 		messages_processed++;
 
 		if (messages_processed >= MK_IPI_RING_SIZE)
@@ -327,7 +327,7 @@ advance_tail:
  */
 static void multikernel_interrupt_handler(void)
 {
-	if (!root_instance || !root_instance->ipi_data)
+	if (!mk_self || !mk_self->ipi_data)
 		return;
 
 	/*
@@ -373,11 +373,11 @@ void generic_multikernel_interrupt(void)
  */
 bool mk_has_pending_shutdown(void)
 {
-	if (!root_instance)
+	if (!mk_self)
 		return false;
 
-	if (!root_instance->ipi_data)
+	if (!mk_self->ipi_data)
 		return mk_manifest_phys() != 0;
 
-	return READ_ONCE(root_instance->ipi_data->force_halt);
+	return READ_ONCE(mk_self->ipi_data->force_halt);
 }
