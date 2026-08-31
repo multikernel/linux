@@ -468,6 +468,7 @@ int __init mk_instance_restore_from_manifest(void)
 	}
 
 	mk_self = instance;
+	mk_arch_adopt_boot_context();
 
 	host_instance = mk_restore_host_instance();
 	if (!host_instance)

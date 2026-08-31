@@ -196,6 +196,9 @@ int mk_spawn_cpu(struct mk_instance *instance, int cpu,
 /* Initialize boot context tracking in spawn kernel */
 void mk_init_boot_context(phys_addr_t ctx_phys);
 
+/* Make the boot context the restored self instance's own park context */
+void mk_arch_adopt_boot_context(void);
+
 /* Identity page table and trampoline setup */
 struct mk_ident_pgtable *mk_build_identity_pgtable(struct mk_instance *instance);
 int mk_ident_map_range(struct mk_ident_pgtable *pgt, unsigned long start,

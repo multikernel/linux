@@ -70,7 +70,34 @@
  */
 
 /* Set in spawn kernels: the context this kernel booted from */
+/*
+ * Boot context handoff: set by mk_init_boot_context() long before the
+ * instance system exists. Once mk_self is restored it adopts this as
+ * its own park context (mk_arch_adopt_boot_context()); from then on
+ * mk_own_context() serves everyone from mk_self->arch.
+ */
 static struct mk_spawn_context *mk_boot_context;
+
+/*
+ * This kernel's own context: where its CPUs park and wake. A spawn's
+ * is the boot context its parent gave it; the machine host's is the
+ * pool slot it builds at baseline time. NULL only on a host with no
+ * pool yet, or in the first instants of a spawn's boot.
+ */
+static struct mk_spawn_context *mk_own_context(void)
+{
+	if (mk_self && mk_self->arch.spawn_ctx)
+		return mk_self->arch.spawn_ctx;
+	return mk_boot_context;
+}
+
+void mk_arch_adopt_boot_context(void)
+{
+	if (!mk_self || !mk_boot_context)
+		return;
+	mk_self->arch.spawn_ctx = mk_boot_context;
+	mk_self->arch.spawn_ctx_phys = mk_boot_context->self_phys;
+}
 
 /*
  * Spawn kernel's own trampoline for secondary CPU wakeup.
@@ -764,7 +791,7 @@ void mk_init_boot_context(phys_addr_t ctx_phys)
  */
 static int __init mk_prepare_trampoline(void)
 {
-	struct mk_spawn_context *ctx = mk_boot_context;
+	struct mk_spawn_context *ctx = mk_own_context();
 	unsigned long virt;
 	int ret;
 
@@ -923,7 +950,7 @@ static int mk_build_trampoline_pgtable(unsigned long trampoline_va,
 int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 					unsigned int cpu)
 {
-	struct mk_spawn_context *ctx = mk_boot_context;
+	struct mk_spawn_context *ctx = mk_own_context();
 	unsigned long trampoline_phys, trampoline_va;
 	unsigned long identity_cr3;
 	int ret;
@@ -1433,6 +1460,18 @@ static int __mk_pool_park_setup(void)
 	mk_pool->arch.slot = __va(phys);
 	memset(mk_pool->arch.slot, 0, sizeof(*mk_pool->arch.slot));
 	mk_pool->arch.slot->self_phys = phys;
+	mk_pool->arch.slot->park_phys = mk_pool->arch.park_phys;
+	mk_pool->arch.slot->park_cr3 = mk_pool->arch.cr3;
+
+	/*
+	 * A kernel with no parent-given boot context parks its own CPUs
+	 * on the pool slot it just built; a spawn managing a pool keeps
+	 * its boot context and never takes this branch.
+	 */
+	if (!mk_self->arch.spawn_ctx) {
+		mk_self->arch.spawn_ctx = mk_pool->arch.slot;
+		mk_self->arch.spawn_ctx_phys = mk_pool->arch.slot_phys;
+	}
 
 	pr_info("mk_spawn: pool park area at %pa (slot %pa)\n",
 		&mk_pool->arch.park_phys, &mk_pool->arch.slot_phys);
@@ -1544,6 +1583,10 @@ int mk_pool_park_teardown(void)
 	if (!mk_pool_cpus_returned())
 		return -EBUSY;
 
+	if (mk_self->arch.spawn_ctx == mk_pool->arch.slot) {
+		mk_self->arch.spawn_ctx = NULL;
+		mk_self->arch.spawn_ctx_phys = 0;
+	}
 	multikernel_free(mk_pool->arch.slot_phys,
 			 ALIGN(sizeof(struct mk_spawn_context), PAGE_SIZE));
 	mk_pool->arch.slot = NULL;
@@ -1592,14 +1635,14 @@ void mk_pool_park_cpu(void)
 /* True only in a spawn kernel whose boot context carries a park area */
 bool mk_cpu_parkable(void)
 {
-	struct mk_spawn_context *ctx = mk_boot_context;
+	struct mk_spawn_context *ctx = mk_own_context();
 
 	return ctx && ctx->park_phys && ctx->park_cr3;
 }
 
 void mk_park_cpu(void)
 {
-	struct mk_spawn_context *ctx = mk_boot_context;
+	struct mk_spawn_context *ctx = mk_own_context();
 	mk_pool_park_fn park;
 
 	if (!ctx) {
