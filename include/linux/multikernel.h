@@ -402,17 +402,16 @@ struct mk_pool {
 	struct mutex mem_lock;		/* Protects chunks and node_pools */
 	struct mk_pool_arch arch;	/* Park area for unassigned CPUs */
 	/*
-	 * Protects arch (park area setup, teardown, pool growth mapping).
-	 * Nests outside mem_lock: a growing pool maps itself in under it.
+	 * The park world's one lock: arch setup, teardown and growth
+	 * mapping, and every wake or repark publication on the pool slot
+	 * or a child instance context. Each mailbox is single-producer
+	 * (this kernel), but spawn, hotplug repark, parked-confirmation
+	 * and pool reshaping run from different syscall paths with no
+	 * common lock, and a publication must never overlap the teardown
+	 * of the slot it writes. Nests outside mem_lock: park setup
+	 * allocates pool memory while holding it.
 	 */
 	struct mutex park_lock;
-	/*
-	 * Serializes wake and repark publications on the pool slot and on
-	 * child instance contexts. Every mailbox is single-producer (this
-	 * kernel), but spawn, hotplug repark and parked-confirmation run
-	 * from different syscall paths with no common lock.
-	 */
-	struct mutex pub_lock;
 };
 
 /* The pool this kernel manages; NULL until a baseline creates it */
