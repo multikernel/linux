@@ -481,6 +481,41 @@ static void mk_kill_sb(struct super_block *sb)
 	kernfs_kill_sb(sb);
 }
 
+/*
+ * Give the records restored before kernfs existed (the self instance,
+ * and on a spawn its parent) the same instances/<name> directory the
+ * runtime create path builds. The host's self record has an empty name
+ * and stays off; its tree is already the root device_tree file.
+ */
+static void mk_kernfs_register_boot_instances(void)
+{
+	struct mk_instance *instance;
+
+	mutex_lock(&mk_instance_mutex);
+	list_for_each_entry(instance, &mk_instance_list, list) {
+		struct kernfs_node *kn;
+
+		if (instance->kn || !instance->name[0])
+			continue;
+
+		kn = kernfs_create_dir(mk_instances_kn, instance->name, 0755,
+				       instance);
+		if (IS_ERR(kn)) {
+			pr_warn("No instances/%s directory: %ld\n",
+				instance->name, PTR_ERR(kn));
+			continue;
+		}
+		instance->kn = kn;
+		mk_instance_get(instance);
+
+		if (mk_create_instance_files(instance))
+			pr_warn("Incomplete files for instance '%s'\n",
+				instance->name);
+		kernfs_activate(kn);
+	}
+	mutex_unlock(&mk_instance_mutex);
+}
+
 /**
  * Module initialization and cleanup
  */
@@ -543,6 +578,8 @@ int mk_kernfs_init(void)
 		pr_warn("Failed to initialize overlay support: %d\n", ret);
 		/* Continue without overlay support - this is not fatal */
 	}
+
+	mk_kernfs_register_boot_instances();
 
 	/* Activate the kernfs root */
 	kernfs_activate(mk_root_kn);
