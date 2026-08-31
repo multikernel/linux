@@ -120,8 +120,8 @@ static int mk_manifest_add_pool_cpus(void *fdt, struct mk_instance *target)
 		if (ret)
 			break;
 	}
-	if (!ret) {
-		mk_cpu_set_for_each(i, id, mk_cpu_pool) {
+	if (!ret && mk_pool) {
+		mk_cpu_set_for_each(i, id, mk_pool->cpus) {
 			ret = mk_cpu_set_add(pool, id);
 			if (ret)
 				break;

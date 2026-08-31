@@ -31,13 +31,13 @@ struct mk_baseline_mem_req {
 };
 
 /*
- * Parked CPUs this kernel can assign to child instances. The baseline
- * creates it, so it exists exactly in a kernel acting as a parent; it
- * stays NULL until a baseline is applied. instance->cpus,
- * mk_self's included, always means "CPUs that kernel instance
- * owns".
+ * The pool this kernel manages. The baseline creates it, so it exists
+ * exactly in a kernel acting as a parent; it stays NULL until a
+ * baseline is applied. instance->cpus, mk_self's included, always
+ * means "CPUs that kernel instance owns"; the pool's set holds what
+ * is owned by nobody and free to assign.
  */
-struct mk_cpu_set *mk_cpu_pool;
+struct mk_pool *mk_pool;
 
 static int mk_baseline_parse_cpus(const void *fdt, int resources_node,
 				  struct mk_cpu_set *requested)
@@ -437,7 +437,7 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 		return -ENOMEM;
 	}
 
-	if (!mk_pool_empty() || (mk_cpu_pool && !mk_cpu_set_empty(mk_cpu_pool)) ||
+	if (!mk_pool_empty() || (mk_pool && !mk_cpu_set_empty(mk_pool->cpus)) ||
 	    mk_self->pci_device_count) {
 		pr_err("Baseline already applied; change the pool with an overlay targeting /resources\n");
 		return -EBUSY;
@@ -501,14 +501,23 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 
 	/*
 	 * The move primitives only track a resource in the pool once the
-	 * pool set exists, so it has to be there before the first move.
+	 * pool exists, so it has to be there before the first move.
 	 */
-	if (!mk_cpu_pool) {
-		mk_cpu_pool = mk_cpu_set_alloc();
-		if (!mk_cpu_pool) {
+	if (!mk_pool) {
+		struct mk_pool *pool;
+
+		pool = kzalloc_obj(*pool, GFP_KERNEL);
+		if (!pool) {
 			ret = -ENOMEM;
 			goto out;
 		}
+		pool->cpus = mk_cpu_set_alloc();
+		if (!pool->cpus) {
+			kfree(pool);
+			ret = -ENOMEM;
+			goto out;
+		}
+		mk_pool = pool;
 	}
 
 	ret = mk_baseline_grow_pool(reqs, nr_reqs);

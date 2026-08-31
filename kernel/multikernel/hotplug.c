@@ -80,7 +80,7 @@ struct mk_cpu_hotplug_work {
 /*
  * Ownership tracking for this kernel's own hotplug: mk_self->cpus
  * is the set of CPUs this kernel owns, in the host and in spawn kernels
- * alike. The assignable-pool bookkeeping (mk_cpu_pool) is not done here;
+ * alike. The assignable-pool bookkeeping (mk_pool) is not done here;
  * it belongs to the mk_send_cpu_* initiator paths of the kernel that
  * manages the pool.
  */
@@ -1056,7 +1056,7 @@ void mk_hotplug_cleanup(void)
  * mk_pool_cpu_add - Move a CPU of this kernel into its assignable pool
  * @cpu_id: Physical CPU ID
  *
- * Only meaningful in a kernel that manages a pool (mk_cpu_pool non-NULL).
+ * Only meaningful in a kernel that manages a pool (mk_pool non-NULL).
  *
  * Returns: 0 on success, negative error code on failure
  */
@@ -1081,7 +1081,7 @@ int mk_pool_cpu_add(mk_phys_cpu_t cpu_id)
 	 * below must not be able to fail: grow it while the CPU is still
 	 * ours to keep.
 	 */
-	ret = mk_cpu_set_reserve(mk_cpu_pool, 1);
+	ret = mk_cpu_set_reserve(mk_pool->cpus, 1);
 	if (ret)
 		return ret;
 
@@ -1090,7 +1090,7 @@ int mk_pool_cpu_add(mk_phys_cpu_t cpu_id)
 		return ret;
 
 	/* The CPU parked in the host park area and is assignable again */
-	mk_cpu_set_add(mk_cpu_pool, cpu_id);
+	mk_cpu_set_add(mk_pool->cpus, cpu_id);
 
 	return 0;
 }
@@ -1107,7 +1107,7 @@ int mk_pool_cpu_remove(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 {
 	int ret;
 
-	if (!mk_cpu_set_contains(mk_cpu_pool, cpu_id)) {
+	if (!mk_cpu_set_contains(mk_pool->cpus, cpu_id)) {
 		pr_err("Multikernel hotplug: CPU %llu is not free in the pool\n",
 		       cpu_id);
 		return -EBUSY;
@@ -1118,7 +1118,7 @@ int mk_pool_cpu_remove(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 		return ret;
 
 	/* From here on it is an ordinary CPU of this kernel */
-	if (mk_cpu_set_del(mk_cpu_pool, cpu_id)) {
+	if (mk_cpu_set_del(mk_pool->cpus, cpu_id)) {
 		int cpu = arch_cpu_from_physical_id(cpu_id);
 
 		if (cpu >= 0)
@@ -1218,7 +1218,7 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 
 	/* For self-removal, execute directly (we're in process context) */
 	if (instance_id == mk_self->id) {
-		if (mk_cpu_pool)
+		if (mk_pool)
 			return mk_pool_cpu_add(cpu_id);
 		return mk_do_cpu_remove(cpu_id);
 	}
@@ -1251,12 +1251,12 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	}
 
 	/* The pool set must be able to take the CPU once it parks */
-	if (!mk_cpu_pool) {
+	if (!mk_pool) {
 		ret = -ENODEV;
 		goto out;
 	}
 
-	ret = mk_cpu_set_reserve(mk_cpu_pool, 1);
+	ret = mk_cpu_set_reserve(mk_pool->cpus, 1);
 	if (ret)
 		goto out;
 
@@ -1293,7 +1293,7 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	}
 
 	mk_cpu_set_del(target_instance->cpus, cpu_id);
-	mk_cpu_set_add(mk_cpu_pool, cpu_id);
+	mk_cpu_set_add(mk_pool->cpus, cpu_id);
 
 	ret = 0;
 out:
@@ -1329,7 +1329,7 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 
 	/* For self-addition, execute directly (we're in process context) */
 	if (instance_id == mk_self->id) {
-		if (mk_cpu_pool)
+		if (mk_pool)
 			return mk_pool_cpu_remove(cpu_id, numa_node, flags);
 		return mk_do_cpu_add(cpu_id, numa_node, flags);
 	}
@@ -1353,7 +1353,7 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 	 * Only a CPU from the assignable pool is parked on the host slot;
 	 * publishing a wakeup for any other CPU can only time out.
 	 */
-	if (!mk_cpu_set_contains(mk_cpu_pool, cpu_id)) {
+	if (!mk_cpu_set_contains(mk_pool->cpus, cpu_id)) {
 		pr_err("Multikernel hotplug: CPU %llu is not in this kernel's pool\n",
 		       cpu_id);
 		ret = -EBUSY;
@@ -1402,7 +1402,7 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 	if (mk_cpu_set_add(target_instance->cpus, cpu_id))
 		pr_warn("Multikernel hotplug: Failed to track CPU %llu in instance %d\n",
 			cpu_id, instance_id);
-	mk_cpu_set_del(mk_cpu_pool, cpu_id);
+	mk_cpu_set_del(mk_pool->cpus, cpu_id);
 
 	ret = 0;
 out:
@@ -1591,7 +1591,7 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 	resource_id = (domain << 16) | (bus << 8) | devfn;
 
 	if (instance_id == mk_self->id) {
-		if (mk_cpu_pool)
+		if (mk_pool)
 			return mk_pool_device_remove(domain, bus, devfn,
 						     driver_override, flags);
 		return mk_do_device_add(domain, bus, devfn, driver_override, flags);
@@ -1669,7 +1669,7 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 	resource_id = (domain << 16) | (bus << 8) | devfn;
 
 	if (instance_id == mk_self->id) {
-		if (mk_cpu_pool)
+		if (mk_pool)
 			return mk_pool_device_add(domain, bus, devfn, NULL);
 		return mk_do_device_remove(domain, bus, devfn);
 	}

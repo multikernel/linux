@@ -941,14 +941,14 @@ static int mk_dt_emit_pool_members(void *fdt)
 	/*
 	 * The root device tree is only generated from kernfs reads, which
 	 * hold no instance lock; instance creation generates a device tree
-	 * for the new instance, never for the root. mk_cpu_pool itself is
+	 * for the new instance, never for the root. The pool set itself is
 	 * mutated under no lock, so a concurrent move can still make this
 	 * snapshot stale.
 	 */
 	lockdep_assert_not_held(&mk_instance_mutex);
 
 	mutex_lock(&mk_instance_mutex);
-	ret = mk_cpu_set_copy(members, mk_cpu_pool);
+	ret = mk_cpu_set_copy(members, mk_pool->cpus);
 	list_for_each_entry(instance, &mk_instance_list, list) {
 		if (ret)
 			break;
@@ -1559,7 +1559,7 @@ static int mk_dt_emit_tree(struct mk_instance *instance, void *fdt,
 			   size_t size, int (*chosen)(void *fdt, void *data),
 			   void *data)
 {
-	bool pool = instance == mk_self && mk_cpu_pool;
+	bool pool = instance == mk_self && mk_pool;
 	int ret;
 
 	ret = fdt_create(fdt, size);
@@ -1586,7 +1586,7 @@ static int mk_dt_emit_tree(struct mk_instance *instance, void *fdt,
 		ret = mk_dt_emit_pool_members(fdt);
 		if (!ret)
 			ret = mk_dt_emit_cpu_prop(fdt, "cpus-available",
-						  mk_cpu_pool);
+						  mk_pool->cpus);
 	} else {
 		ret = mk_dt_emit_instance_memory(instance, fdt);
 		if (!ret)

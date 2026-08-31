@@ -430,7 +430,7 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 	char buf[256];
 	int ret;
 
-	if (!cpus || !instance->cpus || !mk_cpu_pool) {
+	if (!cpus || !instance->cpus || !mk_pool) {
 		pr_err("Invalid CPU sets for transfer\n");
 		return -EINVAL;
 	}
@@ -443,7 +443,7 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 	}
 
 	mk_cpu_set_for_each(i, phys_cpu, cpus) {
-		if (!mk_cpu_set_contains(mk_cpu_pool, phys_cpu)) {
+		if (!mk_cpu_set_contains(mk_pool->cpus, phys_cpu)) {
 			pr_err("CPU %llu not available in the pool\n",
 			       phys_cpu);
 			unavailable++;
@@ -468,7 +468,7 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 		return ret;
 
 	mk_cpu_set_for_each(i, phys_cpu, cpus) {
-		mk_cpu_set_del(mk_cpu_pool, phys_cpu);
+		mk_cpu_set_del(mk_pool->cpus, phys_cpu);
 		mk_cpu_set_add(instance->cpus, phys_cpu);
 	}
 
@@ -498,7 +498,7 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 	char buf[256];
 	int ret;
 
-	if (!cpus || !instance->cpus || !mk_cpu_pool) {
+	if (!cpus || !instance->cpus || !mk_pool) {
 		pr_err("Invalid CPU sets for return\n");
 		return -EINVAL;
 	}
@@ -525,7 +525,7 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 		return -EINVAL;
 	}
 
-	ret = mk_cpu_set_reserve(mk_cpu_pool, requested_count);
+	ret = mk_cpu_set_reserve(mk_pool->cpus, requested_count);
 	if (ret)
 		return ret;
 
@@ -538,7 +538,7 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 	 */
 	for (i = requested_count; i-- > 0; ) {
 		phys_cpu = cpus->ids[i];
-		mk_cpu_set_add(mk_cpu_pool, phys_cpu);
+		mk_cpu_set_add(mk_pool->cpus, phys_cpu);
 		mk_cpu_set_del(instance->cpus, phys_cpu);
 	}
 
@@ -578,7 +578,7 @@ bool mk_pool_cpus_returned(void)
 	struct mk_instance *instance;
 	bool returned = true;
 
-	if (mk_cpu_pool && !mk_cpu_set_empty(mk_cpu_pool))
+	if (mk_pool && !mk_cpu_set_empty(mk_pool->cpus))
 		return false;
 
 	mutex_lock(&mk_instance_mutex);

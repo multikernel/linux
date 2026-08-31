@@ -384,6 +384,17 @@ struct mk_pool_chunk {
 	struct resource res;
 };
 
+/*
+ * The resource pool a kernel manages: what it can assign to child
+ * instances. Holds the assignable CPUs today; the memory chunks and
+ * the park area are joining it step by step. Managing a pool is a
+ * role, not an identity: any kernel given a baseline becomes a
+ * parent, which is what allows spawn kernels to spawn in turn.
+ */
+struct mk_pool {
+	struct mk_cpu_set *cpus;	/* Parked CPUs free to assign */
+};
+
 int mk_pool_mem_grow(size_t size, int node, phys_addr_t *out_base);
 int mk_pool_mem_shrink(phys_addr_t start, size_t size);
 extern phys_addr_t multikernel_alloc(size_t size, int node);

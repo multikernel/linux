@@ -49,7 +49,7 @@ int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_le
 
 /*
  * Move primitives between this kernel and the pool it manages. Valid
- * only while mk_cpu_pool is non-NULL.
+ * only while mk_pool is non-NULL.
  */
 int mk_pool_cpu_add(mk_phys_cpu_t cpu_id);
 int mk_pool_cpu_remove(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags);
@@ -72,12 +72,10 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size);
 /* dts.c */
 const char *mk_dt_node_alias(const void *fdt, int node);
 /*
- * Parked CPUs this kernel can assign to child instances. Created when a
- * baseline is applied to this kernel; NULL until then. Managing a pool
- * is a role, not an identity: any kernel given a baseline becomes a
- * parent, which is what allows spawn kernels to spawn in turn.
+ * The pool this kernel manages. Created when a baseline is applied to
+ * this kernel; NULL until then, which is the "manages no pool" test.
  */
-extern struct mk_cpu_set *mk_cpu_pool;
+extern struct mk_pool *mk_pool;
 
 /* of_devices.c: a spawn's devices are the nodes of its tree */
 #ifdef CONFIG_OF

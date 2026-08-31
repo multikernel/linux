@@ -397,7 +397,7 @@ static int mk_overlay_resolve_target(struct mk_overlay_tx *tx, const void *fdt,
 	target->instance = NULL;
 
 	if (!strcmp(path, MK_OVERLAY_POOL_PATH)) {
-		if (!mk_cpu_pool) {
+		if (!mk_pool) {
 			pr_err("Overlay tx%d: this kernel manages no pool, %s is not a valid target\n",
 			       tx->id, path);
 			return -EPERM;
