@@ -151,7 +151,7 @@ extern char mk_pool_park_end[];
  */
 void mk_park_cpu(void);
 
-/* True only in a spawn kernel whose boot context carries a park area */
+/* True once this kernel has an own context with a park area */
 bool mk_cpu_parkable(void);
 
 /* Build a spawn E820 table from the instance's current memory grant */
@@ -196,8 +196,6 @@ int mk_spawn_cpu(struct mk_instance *instance, int cpu,
 /* Initialize boot context tracking in spawn kernel */
 void mk_init_boot_context(phys_addr_t ctx_phys);
 
-/* Make the boot context the restored self instance's own park context */
-void mk_arch_adopt_boot_context(void);
 
 /* Identity page table and trampoline setup */
 struct mk_ident_pgtable *mk_build_identity_pgtable(struct mk_instance *instance);
