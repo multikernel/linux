@@ -19,17 +19,13 @@
 
 #include "internal.h"
 
-static struct gen_pool *mk_node_pools[MAX_NUMNODES];
-static LIST_HEAD(mk_pool_chunks);
-static DEFINE_MUTEX(multikernel_mem_mutex);
-
 static struct gen_pool *mk_node_pool_get(int node)
 {
-	if (mk_node_pools[node])
-		return mk_node_pools[node];
+	if (mk_pool->node_pools[node])
+		return mk_pool->node_pools[node];
 
-	mk_node_pools[node] = gen_pool_create(PAGE_SHIFT, node);
-	return mk_node_pools[node];
+	mk_pool->node_pools[node] = gen_pool_create(PAGE_SHIFT, node);
+	return mk_pool->node_pools[node];
 }
 
 /**
@@ -46,21 +42,23 @@ phys_addr_t multikernel_alloc(size_t size, int node)
 
 	if (node != NUMA_NO_NODE && (node < 0 || node >= MAX_NUMNODES))
 		return 0;
+	if (!mk_pool)
+		return 0;
 
-	mutex_lock(&multikernel_mem_mutex);
+	mutex_lock(&mk_pool->mem_lock);
 	if (node != NUMA_NO_NODE) {
-		if (mk_node_pools[node])
-			addr = gen_pool_alloc(mk_node_pools[node], size);
+		if (mk_pool->node_pools[node])
+			addr = gen_pool_alloc(mk_pool->node_pools[node], size);
 	} else {
 		for_each_online_node(nid) {
-			if (!mk_node_pools[nid])
+			if (!mk_pool->node_pools[nid])
 				continue;
-			addr = gen_pool_alloc(mk_node_pools[nid], size);
+			addr = gen_pool_alloc(mk_pool->node_pools[nid], size);
 			if (addr)
 				break;
 		}
 	}
-	mutex_unlock(&multikernel_mem_mutex);
+	mutex_unlock(&mk_pool->mem_lock);
 
 	return (phys_addr_t)addr;
 }
@@ -74,26 +72,26 @@ void multikernel_free(phys_addr_t addr, size_t size)
 {
 	int nid;
 
-	if (!addr)
+	if (!addr || !mk_pool)
 		return;
 
-	mutex_lock(&multikernel_mem_mutex);
+	mutex_lock(&mk_pool->mem_lock);
 	for_each_online_node(nid) {
-		if (mk_node_pools[nid] &&
-		    gen_pool_has_addr(mk_node_pools[nid], addr, size)) {
-			gen_pool_free(mk_node_pools[nid], addr, size);
+		if (mk_pool->node_pools[nid] &&
+		    gen_pool_has_addr(mk_pool->node_pools[nid], addr, size)) {
+			gen_pool_free(mk_pool->node_pools[nid], addr, size);
 			break;
 		}
 	}
-	mutex_unlock(&multikernel_mem_mutex);
+	mutex_unlock(&mk_pool->mem_lock);
 }
 
 static struct mk_pool_chunk *mk_pool_chunk_find(phys_addr_t addr)
 {
 	struct mk_pool_chunk *chunk;
 
-	lockdep_assert_held(&multikernel_mem_mutex);
-	list_for_each_entry(chunk, &mk_pool_chunks, list)
+	lockdep_assert_held(&mk_pool->mem_lock);
+	list_for_each_entry(chunk, &mk_pool->chunks, list)
 		if (addr >= chunk->res.start && addr <= chunk->res.end)
 			return chunk;
 	return NULL;
@@ -111,9 +109,12 @@ struct resource *mk_pool_chunk_resource(phys_addr_t addr)
 {
 	struct mk_pool_chunk *chunk;
 
-	mutex_lock(&multikernel_mem_mutex);
+	if (!mk_pool)
+		return NULL;
+
+	mutex_lock(&mk_pool->mem_lock);
 	chunk = mk_pool_chunk_find(addr);
-	mutex_unlock(&multikernel_mem_mutex);
+	mutex_unlock(&mk_pool->mem_lock);
 	return chunk ? &chunk->res : NULL;
 }
 
@@ -124,9 +125,12 @@ bool mk_pool_empty(void)
 {
 	bool empty;
 
-	mutex_lock(&multikernel_mem_mutex);
-	empty = list_empty(&mk_pool_chunks);
-	mutex_unlock(&multikernel_mem_mutex);
+	if (!mk_pool)
+		return true;
+
+	mutex_lock(&mk_pool->mem_lock);
+	empty = list_empty(&mk_pool->chunks);
+	mutex_unlock(&mk_pool->mem_lock);
 	return empty;
 }
 
@@ -138,10 +142,13 @@ size_t mk_pool_total_bytes(void)
 	struct mk_pool_chunk *chunk;
 	size_t total = 0;
 
-	mutex_lock(&multikernel_mem_mutex);
-	list_for_each_entry(chunk, &mk_pool_chunks, list)
+	if (!mk_pool)
+		return 0;
+
+	mutex_lock(&mk_pool->mem_lock);
+	list_for_each_entry(chunk, &mk_pool->chunks, list)
 		total += resource_size(&chunk->res);
-	mutex_unlock(&multikernel_mem_mutex);
+	mutex_unlock(&mk_pool->mem_lock);
 	return total;
 }
 
@@ -153,11 +160,14 @@ size_t mk_pool_avail_bytes(void)
 	size_t avail = 0;
 	int nid;
 
-	mutex_lock(&multikernel_mem_mutex);
+	if (!mk_pool)
+		return 0;
+
+	mutex_lock(&mk_pool->mem_lock);
 	for_each_online_node(nid)
-		if (mk_node_pools[nid])
-			avail += gen_pool_avail(mk_node_pools[nid]);
-	mutex_unlock(&multikernel_mem_mutex);
+		if (mk_pool->node_pools[nid])
+			avail += gen_pool_avail(mk_pool->node_pools[nid]);
+	mutex_unlock(&mk_pool->mem_lock);
 	return avail;
 }
 
@@ -176,13 +186,16 @@ int mk_pool_for_each_chunk(int (*fn)(struct mk_pool_chunk *, void *), void *data
 	struct mk_pool_chunk *chunk;
 	int ret = 0;
 
-	mutex_lock(&multikernel_mem_mutex);
-	list_for_each_entry(chunk, &mk_pool_chunks, list) {
+	if (!mk_pool)
+		return 0;
+
+	mutex_lock(&mk_pool->mem_lock);
+	list_for_each_entry(chunk, &mk_pool->chunks, list) {
 		ret = fn(chunk, data);
 		if (ret)
 			break;
 	}
-	mutex_unlock(&multikernel_mem_mutex);
+	mutex_unlock(&mk_pool->mem_lock);
 	return ret;
 }
 
@@ -200,20 +213,23 @@ int mk_pool_snapshot_chunks(struct mk_pool_chunk_range *out, int max)
 	struct mk_pool_chunk *chunk;
 	int n = 0;
 
-	mutex_lock(&multikernel_mem_mutex);
-	list_for_each_entry(chunk, &mk_pool_chunks, list)
+	if (!mk_pool)
+		return 0;
+
+	mutex_lock(&mk_pool->mem_lock);
+	list_for_each_entry(chunk, &mk_pool->chunks, list)
 		n++;
 
 	if (n <= max) {
 		n = 0;
-		list_for_each_entry(chunk, &mk_pool_chunks, list) {
+		list_for_each_entry(chunk, &mk_pool->chunks, list) {
 			out[n].start = chunk->res.start;
 			out[n].size = resource_size(&chunk->res);
 			out[n].node = chunk->node;
 			n++;
 		}
 	}
-	mutex_unlock(&multikernel_mem_mutex);
+	mutex_unlock(&mk_pool->mem_lock);
 	return n;
 }
 
@@ -575,6 +591,8 @@ int mk_pool_mem_grow(size_t size, int node, phys_addr_t *out_base)
 
 	if (!size || !PAGE_ALIGNED(size))
 		return -EINVAL;
+	if (!mk_pool)
+		return -ENODEV;
 	if (node != NUMA_NO_NODE && (node < 0 || node >= MAX_NUMNODES ||
 				     !node_online(node)))
 		return -EINVAL;
@@ -596,7 +614,7 @@ int mk_pool_mem_grow(size_t size, int node, phys_addr_t *out_base)
 	chunk->res.flags = IORESOURCE_BUSY | IORESOURCE_MEM;
 	chunk->res.desc = IORES_DESC_RESERVED;
 
-	mutex_lock(&multikernel_mem_mutex);
+	mutex_lock(&mk_pool->mem_lock);
 	pool = mk_node_pool_get(chunk->node);
 	if (!pool) {
 		ret = -ENOMEM;
@@ -608,11 +626,11 @@ int mk_pool_mem_grow(size_t size, int node, phys_addr_t *out_base)
 	if (insert_resource(&iomem_resource, &chunk->res))
 		pr_warn("Multikernel pool: chunk %pa not registered in /proc/iomem\n",
 			&chunk->res.start);
-	list_add_tail(&chunk->list, &mk_pool_chunks);
+	list_add_tail(&chunk->list, &mk_pool->chunks);
 	/* A concurrent shrink may free @chunk once the mutex is dropped */
 	start = chunk->res.start;
 	node_id = chunk->node;
-	mutex_unlock(&multikernel_mem_mutex);
+	mutex_unlock(&mk_pool->mem_lock);
 
 	ret = mk_arch_pool_chunk_added(start, size);
 	if (ret) {
@@ -627,7 +645,7 @@ int mk_pool_mem_grow(size_t size, int node, phys_addr_t *out_base)
 	return 0;
 
 err_unlock:
-	mutex_unlock(&multikernel_mem_mutex);
+	mutex_unlock(&mk_pool->mem_lock);
 	mk_free_contig_pages(chunk->pages, chunk->nr_pages);
 	kfree(chunk);
 	return ret;
@@ -646,20 +664,23 @@ int mk_pool_mem_shrink(phys_addr_t start, size_t size)
 	struct mk_pool_chunk *chunk;
 	int ret;
 
-	mutex_lock(&multikernel_mem_mutex);
+	if (!mk_pool)
+		return -ENOENT;
+
+	mutex_lock(&mk_pool->mem_lock);
 	chunk = mk_pool_chunk_find(start);
 	if (!chunk || chunk->res.start != start ||
 	    resource_size(&chunk->res) != size) {
-		mutex_unlock(&multikernel_mem_mutex);
+		mutex_unlock(&mk_pool->mem_lock);
 		return -ENOENT;
 	}
-	ret = gen_pool_remove_chunk(mk_node_pools[chunk->node], start, size);
+	ret = gen_pool_remove_chunk(mk_pool->node_pools[chunk->node], start, size);
 	if (ret) {
-		mutex_unlock(&multikernel_mem_mutex);
+		mutex_unlock(&mk_pool->mem_lock);
 		return ret;
 	}
 	list_del(&chunk->list);
-	mutex_unlock(&multikernel_mem_mutex);
+	mutex_unlock(&mk_pool->mem_lock);
 
 	if (chunk->res.parent)
 		remove_resource(&chunk->res);

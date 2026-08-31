@@ -13,6 +13,8 @@
 #include <linux/of.h>
 #include <linux/cpumask.h>
 #include <linux/genalloc.h>
+#include <linux/mutex.h>
+#include <linux/numa.h>
 #include <linux/sizes.h>
 
 #ifdef CONFIG_MULTIKERNEL
@@ -386,13 +388,16 @@ struct mk_pool_chunk {
 
 /*
  * The resource pool a kernel manages: what it can assign to child
- * instances. Holds the assignable CPUs today; the memory chunks and
- * the park area are joining it step by step. Managing a pool is a
- * role, not an identity: any kernel given a baseline becomes a
- * parent, which is what allows spawn kernels to spawn in turn.
+ * instances. Holds the assignable CPUs and the donated memory; the
+ * park area joins it next. Managing a pool is a role, not an
+ * identity: any kernel given a baseline becomes a parent, which is
+ * what allows spawn kernels to spawn in turn.
  */
 struct mk_pool {
 	struct mk_cpu_set *cpus;	/* Parked CPUs free to assign */
+	struct list_head chunks;	/* Donated memory (struct mk_pool_chunk) */
+	struct gen_pool *node_pools[MAX_NUMNODES];
+	struct mutex mem_lock;		/* Protects chunks and node_pools */
 };
 
 int mk_pool_mem_grow(size_t size, int node, phys_addr_t *out_base);

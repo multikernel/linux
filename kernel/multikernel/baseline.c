@@ -517,6 +517,8 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 			ret = -ENOMEM;
 			goto out;
 		}
+		INIT_LIST_HEAD(&pool->chunks);
+		mutex_init(&pool->mem_lock);
 		mk_pool = pool;
 	}
 
