@@ -304,7 +304,7 @@ static struct mk_instance * __init mk_restore_host_instance(void)
 	}
 	host_ipi_size = (size_t)host_ipi_pages << PAGE_SHIFT;
 
-	host_instance = mk_instance_alloc(0, "");
+	host_instance = mk_instance_alloc(0, "host");
 	if (!host_instance)
 		return NULL;
 
@@ -327,6 +327,8 @@ static struct mk_instance * __init mk_restore_host_instance(void)
 		memunmap(host_instance->ipi_data);
 		goto err_free;
 	}
+	/* The parent is running, or this kernel would not be */
+	mk_instance_set_state(host_instance, MK_STATE_ACTIVE);
 
 	pr_info("Restored host IPI buffer: phys=0x%llx, pages=%u\n",
 		(unsigned long long)host_ipi_phys, host_ipi_pages);
