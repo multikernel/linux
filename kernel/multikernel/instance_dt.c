@@ -179,74 +179,30 @@ static int __init mk_restore_instance_cpus(struct mk_dt_config *config)
 	return 0;
 }
 
-static struct mk_instance * __init alloc_mk_instance(int instance_id, const char *name,
-						     bool alloc_ipi)
+/* Allocate this kernel's own IPI inbox and record where it lives */
+static int __init mk_instance_alloc_ipi(struct mk_instance *instance)
 {
-	struct mk_instance *instance;
-	int ret;
-
-	instance = kzalloc(sizeof(*instance), GFP_KERNEL);
-	if (!instance)
-		return NULL;
-
-	instance->id = instance_id;
-	instance->name = kstrdup(name, GFP_KERNEL);
-	if (!instance->name)
-		goto err_free_instance;
-
-	if (alloc_ipi) {
-		instance->ipi_data = (struct mk_shared_data *)__get_free_pages(
-			GFP_KERNEL | __GFP_ZERO, get_order(sizeof(struct mk_shared_data)));
-		if (!instance->ipi_data) {
-			pr_err("Failed to allocate IPI buffer for instance %d\n", instance_id);
-			goto err_free_name;
-		}
-		instance->ipi_phys = virt_to_phys(instance->ipi_data);
-		instance->ipi_pages = (sizeof(struct mk_shared_data) + PAGE_SIZE - 1) / PAGE_SIZE;
-
-		pr_info("Allocated IPI buffer for instance %d: phys=0x%llx, virt=%px, pages=%u\n",
-			instance_id, (unsigned long long)instance->ipi_phys,
-			instance->ipi_data, instance->ipi_pages);
+	instance->ipi_data = (struct mk_shared_data *)__get_free_pages(
+		GFP_KERNEL | __GFP_ZERO, get_order(sizeof(struct mk_shared_data)));
+	if (!instance->ipi_data) {
+		pr_err("Failed to allocate IPI buffer for instance %d\n",
+		       instance->id);
+		return -ENOMEM;
 	}
+	instance->ipi_phys = virt_to_phys(instance->ipi_data);
+	instance->ipi_pages = (sizeof(struct mk_shared_data) + PAGE_SIZE - 1) / PAGE_SIZE;
 
-	instance->cpus = mk_cpu_set_alloc();
-	if (!instance->cpus)
-		goto err_free_ipi;
+	pr_info("Allocated IPI buffer for instance %d: phys=0x%llx, pages=%u\n",
+		instance->id, (unsigned long long)instance->ipi_phys,
+		instance->ipi_pages);
+	return 0;
+}
 
-	instance->state = MK_STATE_READY;
-	INIT_LIST_HEAD(&instance->memory_regions);
-	INIT_LIST_HEAD(&instance->list);
-	kref_init(&instance->refcount);
-	INIT_LIST_HEAD(&instance->pci_devices);
-	instance->pci_devices_valid = false;
-	instance->pci_device_count = 0;
-	INIT_LIST_HEAD(&instance->platform_devices);
-	instance->platform_devices_valid = false;
-	instance->platform_device_count = 0;
-
-	mutex_lock(&mk_instance_mutex);
-	ret = idr_alloc(&mk_instance_idr, instance, instance_id, instance_id + 1, GFP_KERNEL);
-	if (ret < 0) {
-		mutex_unlock(&mk_instance_mutex);
-		goto err_free_cpus;
-	}
-	list_add(&instance->list, &mk_instance_list);
-	mutex_unlock(&mk_instance_mutex);
-
-	mk_instance_set_state(instance, MK_STATE_READY);
-	return instance;
-
-err_free_cpus:
-	mk_cpu_set_free(instance->cpus);
-err_free_ipi:
-	if (alloc_ipi)
-		free_pages((unsigned long)instance->ipi_data,
-			   get_order(sizeof(struct mk_shared_data)));
-err_free_name:
-	kfree(instance->name);
-err_free_instance:
-	kfree(instance);
-	return NULL;
+static void __init mk_instance_free_ipi(struct mk_instance *instance)
+{
+	free_pages((unsigned long)instance->ipi_data,
+		   get_order(sizeof(struct mk_shared_data)));
+	instance->ipi_data = NULL;
 }
 
 static int __init mk_copy_platform_devices(const struct mk_dt_config *config,
@@ -348,35 +304,37 @@ static struct mk_instance * __init mk_restore_host_instance(void)
 	}
 	host_ipi_size = (size_t)host_ipi_pages << PAGE_SHIFT;
 
-	host_instance = alloc_mk_instance(0, "", false);
+	host_instance = mk_instance_alloc(0, "");
 	if (!host_instance)
 		return NULL;
 
 	/* Set physical CPU 0 as default target for host IPIs */
-	if (mk_cpu_set_add(host_instance->cpus, 0)) {
-		kfree(host_instance->name);
-		mk_cpu_set_free(host_instance->cpus);
-		kfree(host_instance);
-		return NULL;
-	}
+	if (mk_cpu_set_add(host_instance->cpus, 0))
+		goto err_free;
 
 	host_instance->ipi_data = memremap(host_ipi_phys, host_ipi_size, MEMREMAP_WB);
 	if (!host_instance->ipi_data) {
 		pr_err("Failed to map host IPI buffer at 0x%llx\n",
 		       (unsigned long long)host_ipi_phys);
-		kfree(host_instance->name);
-		mk_cpu_set_free(host_instance->cpus);
-		kfree(host_instance);
-		return NULL;
+		goto err_free;
 	}
 	host_instance->ipi_phys = host_ipi_phys;
 	host_instance->ipi_pages = host_ipi_pages;
-	pr_info("Restored host IPI buffer: phys=0x%llx, virt=%px, pages=%u\n",
-		(unsigned long long)host_ipi_phys, host_instance->ipi_data,
-		host_ipi_pages);
+
+	if (mk_instance_publish(host_instance)) {
+		memunmap(host_instance->ipi_data);
+		goto err_free;
+	}
+
+	pr_info("Restored host IPI buffer: phys=0x%llx, pages=%u\n",
+		(unsigned long long)host_ipi_phys, host_ipi_pages);
 	pr_info("Registered host instance (ID 0) for spawn→host communication\n");
 
 	return host_instance;
+
+err_free:
+	mk_instance_free(host_instance);
+	return NULL;
 }
 
 /**
@@ -402,7 +360,7 @@ int __init mk_instance_restore_from_manifest(void)
 	if (!mk_manifest_phys()) {
 		pr_info("No manifest available for multikernel DTB restoration\n");
 
-		instance = alloc_mk_instance(0, "", true);
+		instance = mk_instance_alloc(0, "");
 		if (!instance) {
 			pr_err("Failed to allocate the self instance\n");
 			return -ENOMEM;
@@ -417,6 +375,16 @@ int __init mk_instance_restore_from_manifest(void)
 		mk_cpu_set_format(cpus_buf, sizeof(cpus_buf), instance->cpus);
 		pr_info("Self instance initialized with CPUs (physical): %s\n",
 			cpus_buf);
+
+		ret = mk_instance_alloc_ipi(instance);
+		if (!ret)
+			ret = mk_instance_publish(instance);
+		if (ret) {
+			if (instance->ipi_data)
+				mk_instance_free_ipi(instance);
+			mk_instance_free(instance);
+			return ret;
+		}
 
 		mk_self = instance;
 
@@ -462,7 +430,7 @@ int __init mk_instance_restore_from_manifest(void)
 	}
 
 	/* Create a new instance for this DTB */
-	instance = alloc_mk_instance(instance_id, instance_name, false);
+	instance = mk_instance_alloc(instance_id, instance_name);
 	if (!instance) {
 		ret = -ENOMEM;
 		goto config_free;
@@ -470,7 +438,7 @@ int __init mk_instance_restore_from_manifest(void)
 
 	if (config.cpus && mk_cpu_set_copy(instance->cpus, config.cpus)) {
 		ret = -ENOMEM;
-		goto cleanup_instance_name;
+		goto cleanup_instance;
 	}
 
 	/* The tree is the record of this kernel's PCI devices; the list stays empty */
@@ -479,13 +447,20 @@ int __init mk_instance_restore_from_manifest(void)
 	ret = mk_copy_platform_devices(&config, instance);
 	if (ret) {
 		pr_err("Failed to copy platform devices: %d\n", ret);
-		goto cleanup_devices;
+		goto cleanup_instance;
 	}
 
 	ret = mk_restore_instance_ipi(instance);
 	if (ret) {
 		pr_err("Failed to restore IPI buffer: %d\n", ret);
-		goto cleanup_devices;
+		goto cleanup_instance;
+	}
+
+	ret = mk_instance_publish(instance);
+	if (ret) {
+		if (instance->ipi_data)
+			memunmap(instance->ipi_data);
+		goto cleanup_instance;
 	}
 
 	mk_self = instance;
@@ -499,25 +474,8 @@ int __init mk_instance_restore_from_manifest(void)
 	mk_dt_config_free(&config);
 	return 0;
 
-cleanup_devices:
-	if (instance->pci_devices_valid) {
-		struct mk_pci_device *pci_dev, *tmp_pci;
-		list_for_each_entry_safe(pci_dev, tmp_pci, &instance->pci_devices, list) {
-			list_del(&pci_dev->list);
-			kfree(pci_dev);
-		}
-	}
-	if (instance->platform_devices_valid) {
-		struct mk_platform_device *plat_dev, *tmp_plat;
-		list_for_each_entry_safe(plat_dev, tmp_plat, &instance->platform_devices, list) {
-			list_del(&plat_dev->list);
-			kfree(plat_dev);
-		}
-	}
-cleanup_instance_name:
-	kfree(instance->name);
-	mk_cpu_set_free(instance->cpus);
-	kfree(instance);
+cleanup_instance:
+	mk_instance_free(instance);
 config_free:
 	mk_dt_config_free(&config);
 	return ret;

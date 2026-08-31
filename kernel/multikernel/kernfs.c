@@ -243,35 +243,16 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 	int ret;
 	int allocated_id;
 
-	instance = kzalloc(sizeof(*instance), GFP_KERNEL);
+	instance = mk_instance_alloc(0, name);
 	if (!instance)
 		return -ENOMEM;
-
-	instance->id = 0;
-	instance->name = kstrdup(name, GFP_KERNEL);
-	if (!instance->name) {
-		ret = -ENOMEM;
-		goto err_free_instance;
-	}
-
-	instance->cpus = mk_cpu_set_alloc();
-	if (!instance->cpus) {
-		ret = -ENOMEM;
-		goto err_free_name;
-	}
 
 	mk_dt_config_init(&config);
 	ret = mk_dt_parse_resources(fdt, resources_node, name, &config);
 	if (ret) {
 		pr_err("Failed to parse resources for instance '%s': %d\n", name, ret);
-		goto err_free_cpumask;
+		goto err_free_config;
 	}
-
-	INIT_LIST_HEAD(&instance->memory_regions);
-	INIT_LIST_HEAD(&instance->list);
-	INIT_LIST_HEAD(&instance->pci_devices);
-	INIT_LIST_HEAD(&instance->platform_devices);
-	kref_init(&instance->refcount);
 
 	kn = kernfs_create_dir(mk_instances_kn, name, 0755, instance);
 	if (IS_ERR(kn)) {
@@ -331,12 +312,7 @@ err_remove_dir:
 	mk_instance_put(instance);
 err_free_config:
 	mk_dt_config_free(&config);
-err_free_cpumask:
-	mk_cpu_set_free(instance->cpus);
-err_free_name:
-	kfree(instance->name);
-err_free_instance:
-	kfree(instance);
+	mk_instance_free(instance);
 	return ret;
 }
 

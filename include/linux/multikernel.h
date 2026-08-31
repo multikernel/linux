@@ -800,8 +800,8 @@ int mk_instance_add_pci_device(struct mk_instance *instance,
 int mk_instance_remove_pci_device(struct mk_instance *instance,
 				  u16 domain, u8 bus, u8 devfn);
 
-void *mk_instance_alloc(struct mk_instance *instance, size_t size, size_t align);
-void mk_instance_free(struct mk_instance *instance, void *virt_addr, size_t size);
+void *mk_instance_mem_alloc(struct mk_instance *instance, size_t size, size_t align);
+void mk_instance_mem_free(struct mk_instance *instance, void *virt_addr, size_t size);
 
 /**
  * String conversion helpers

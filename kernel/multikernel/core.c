@@ -174,6 +174,107 @@ void mk_instance_put(struct mk_instance *instance)
 }
 
 /**
+ * mk_instance_alloc - Construct an unpublished instance record
+ * @id: Instance ID to record (a later publish may reassign it)
+ * @name: Instance name, copied
+ *
+ * The record is fully initialized but owns no resources and is not
+ * yet visible: not in the IDR, the instance list, or kernfs. Until
+ * it is published, dispose of it with mk_instance_free(); afterwards
+ * it is shared and must go through mk_instance_put().
+ *
+ * Returns the instance, or NULL on allocation failure.
+ */
+struct mk_instance *mk_instance_alloc(int id, const char *name)
+{
+	struct mk_instance *instance;
+
+	instance = kzalloc_obj(*instance, GFP_KERNEL);
+	if (!instance)
+		return NULL;
+
+	instance->id = id;
+	instance->name = kstrdup(name, GFP_KERNEL);
+	if (!instance->name)
+		goto err_free_instance;
+
+	instance->cpus = mk_cpu_set_alloc();
+	if (!instance->cpus)
+		goto err_free_name;
+
+	instance->state = MK_STATE_READY;
+	INIT_LIST_HEAD(&instance->memory_regions);
+	INIT_LIST_HEAD(&instance->list);
+	INIT_LIST_HEAD(&instance->pci_devices);
+	INIT_LIST_HEAD(&instance->platform_devices);
+	kref_init(&instance->refcount);
+
+	return instance;
+
+err_free_name:
+	kfree(instance->name);
+err_free_instance:
+	kfree(instance);
+	return NULL;
+}
+
+/**
+ * mk_instance_publish - Make a constructed instance findable
+ * @instance: Instance from mk_instance_alloc()
+ *
+ * Registers the instance in the IDR under its exact id and adds it
+ * to the instance list. On failure the instance is untouched and
+ * still owned by the caller.
+ *
+ * Returns 0 on success, negative error code on failure.
+ */
+int mk_instance_publish(struct mk_instance *instance)
+{
+	int ret;
+
+	mutex_lock(&mk_instance_mutex);
+	ret = idr_alloc(&mk_instance_idr, instance, instance->id,
+			instance->id + 1, GFP_KERNEL);
+	if (ret < 0) {
+		mutex_unlock(&mk_instance_mutex);
+		return ret;
+	}
+	list_add(&instance->list, &mk_instance_list);
+	mutex_unlock(&mk_instance_mutex);
+
+	mk_instance_set_state(instance, MK_STATE_READY);
+	return 0;
+}
+
+/**
+ * mk_instance_free - Dispose of a never-published instance record
+ * @instance: Instance from mk_instance_alloc(), or NULL
+ *
+ * Frees the record without returning resources anywhere; a published
+ * instance must be dropped with mk_instance_put() instead.
+ */
+void mk_instance_free(struct mk_instance *instance)
+{
+	struct mk_pci_device *pci_dev, *pci_tmp;
+	struct mk_platform_device *plat_dev, *plat_tmp;
+
+	if (!instance)
+		return;
+
+	list_for_each_entry_safe(pci_dev, pci_tmp, &instance->pci_devices, list) {
+		list_del(&pci_dev->list);
+		kfree(pci_dev);
+	}
+	list_for_each_entry_safe(plat_dev, plat_tmp, &instance->platform_devices, list) {
+		list_del(&plat_dev->list);
+		kfree(plat_dev);
+	}
+	mk_cpu_set_free(instance->cpus);
+	kfree(instance->name);
+	kfree(instance);
+}
+
+/**
  * Instance state management
  */
 void mk_instance_set_state(struct mk_instance *instance,
@@ -1140,7 +1241,7 @@ void mk_instance_free_memory(struct mk_instance *instance)
 		}
 
 		if (instance->ctrl_va) {
-			mk_instance_free(instance, instance->ctrl_va,
+			mk_instance_mem_free(instance, instance->ctrl_va,
 					 MK_CTRL_BLOCK_SIZE);
 			instance->ctrl_va = NULL;
 			instance->ctrl_phys = 0;
@@ -1222,16 +1323,6 @@ int mk_instance_reserve_resources(struct mk_instance *instance,
  */
 
 /**
- * mk_instance_alloc() - Allocate memory from instance pool
- * @instance: Instance to allocate from
- * @size: Size to allocate
- * @align: Alignment requirement (must be power of 2)
- *
- * Returns virtual address of allocated memory, or NULL on failure.
- * The returned address is a direct-mapped kernel virtual address,
- * which can be converted back to physical using virt_to_phys().
- */
-/**
  * mk_instance_ctrl_alloc() - Allocate from the instance control block
  * @instance: Instance to allocate from
  * @size: Allocation size
@@ -1256,7 +1347,7 @@ void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
 		return NULL;
 
 	if (!instance->ctrl_va) {
-		void *va = mk_instance_alloc(instance, MK_CTRL_BLOCK_SIZE,
+		void *va = mk_instance_mem_alloc(instance, MK_CTRL_BLOCK_SIZE,
 					     PAGE_SIZE);
 
 		if (!va) {
@@ -1282,13 +1373,23 @@ void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
 	return instance->ctrl_va + off;
 }
 
-void *mk_instance_alloc(struct mk_instance *instance, size_t size, size_t align)
+/**
+ * mk_instance_mem_alloc() - Allocate memory from instance pool
+ * @instance: Instance to allocate from
+ * @size: Size to allocate
+ * @align: Alignment requirement (must be power of 2)
+ *
+ * Returns virtual address of allocated memory, or NULL on failure.
+ * The returned address is a direct-mapped kernel virtual address,
+ * which can be converted back to physical using virt_to_phys().
+ */
+void *mk_instance_mem_alloc(struct mk_instance *instance, size_t size, size_t align)
 {
 	phys_addr_t phys_addr;
 	void *virt_addr;
 
 	if (!instance || !instance->instance_pool) {
-		pr_debug("mk_instance_alloc: instance %p has no pool\n", instance);
+		pr_debug("%s: instance %p has no pool\n", __func__, instance);
 		return NULL;
 	}
 
@@ -1310,12 +1411,12 @@ void *mk_instance_alloc(struct mk_instance *instance, size_t size, size_t align)
 }
 
 /**
- * mk_instance_free() - Free memory back to instance pool
+ * mk_instance_mem_free() - Free memory back to instance pool
  * @instance: Instance to free to
  * @virt_addr: Virtual address to free
  * @size: Size to free
  */
-void mk_instance_free(struct mk_instance *instance, void *virt_addr, size_t size)
+void mk_instance_mem_free(struct mk_instance *instance, void *virt_addr, size_t size)
 {
 	phys_addr_t phys_addr;
 
@@ -1346,7 +1447,7 @@ void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align)
 	if (!image || !image->mk_instance)
 		return NULL;
 
-	return mk_instance_alloc(image->mk_instance, size, align);
+	return mk_instance_mem_alloc(image->mk_instance, size, align);
 }
 
 /**
@@ -1360,7 +1461,7 @@ void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size)
 	if (!image || !image->mk_instance)
 		return;
 
-	mk_instance_free(image->mk_instance, virt_addr, size);
+	mk_instance_mem_free(image->mk_instance, virt_addr, size);
 }
 
 /*

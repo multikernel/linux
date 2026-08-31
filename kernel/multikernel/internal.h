@@ -11,6 +11,11 @@ extern struct mutex mk_instance_mutex;
 extern struct idr mk_instance_idr;
 extern struct list_head mk_instance_list;
 
+/* core.c */
+struct mk_instance *mk_instance_alloc(int id, const char *name);
+int mk_instance_publish(struct mk_instance *instance);
+void mk_instance_free(struct mk_instance *instance);
+
 /* kernfs.c */
 extern struct kernfs_node *mk_root_kn;
 extern struct kernfs_node *mk_instances_kn;
