@@ -877,8 +877,6 @@ struct pci_dev;
 bool multikernel_allow_emergency_restart(void);
 int multikernel_halt_by_id(int mk_id);
 int multikernel_force_halt_by_id(int mk_id);
-bool cpu_is_multikernel_pool(unsigned int cpu);
-void mk_set_pool_cpu(int cpu, bool is_pool);
 bool mk_has_pending_shutdown(void);
 
 /* Instance lookup and reference counting */
@@ -915,10 +913,6 @@ static inline int multikernel_halt_by_id(int mk_id)
 static inline int multikernel_force_halt_by_id(int mk_id)
 {
 	return -ENODEV;
-}
-static inline bool cpu_is_multikernel_pool(unsigned int cpu)
-{
-	return false;
 }
 static inline struct mk_instance *mk_instance_find(int mk_id)
 {

@@ -1508,6 +1508,16 @@ int cpu_device_down(struct device *dev)
 	return cpu_down(dev->id, CPUHP_OFFLINE);
 }
 
+/* device_offline() bookkeeping for a CPU taken down without it */
+static void cpuhp_offline_cpu_device(unsigned int cpu)
+{
+	struct device *dev = get_cpu_device(cpu);
+
+	dev->offline = true;
+	/* Tell user space about the state change */
+	kobject_uevent(&dev->kobj, KOBJ_OFFLINE);
+}
+
 int remove_cpu(unsigned int cpu)
 {
 	int ret;
@@ -1519,6 +1529,49 @@ int remove_cpu(unsigned int cpu)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(remove_cpu);
+
+/**
+ * depart_cpu - Take @cpu down into the CPUHP_DEPARTED resting state
+ * @cpu: CPU to surrender
+ *
+ * Like remove_cpu(), but the takedown ends in CPUHP_DEPARTED instead
+ * of CPUHP_OFFLINE: the CPU is handed to another kernel and is not
+ * expected back. It stays departed until a later add_cpu() brings it
+ * up; a bringup that fails rolls it back to departed.
+ *
+ * Return: %0 on success or a negative errno code
+ */
+int depart_cpu(unsigned int cpu)
+{
+	int ret;
+
+	lock_device_hotplug();
+	ret = cpu_down(cpu, CPUHP_DEPARTED);
+	if (!ret)
+		cpuhp_offline_cpu_device(cpu);
+	unlock_device_hotplug();
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(depart_cpu);
+
+/**
+ * cpu_departing - Is @cpu leaving, or gone, for another kernel?
+ * @cpu: CPU to query
+ *
+ * True from the start of a depart_cpu() takedown for as long as the
+ * CPU rests in CPUHP_DEPARTED. The offline paths read it on the dying
+ * CPU itself: it must answer during the takedown, and still answer
+ * after depart_cpu() has returned, because the dying CPU chooses its
+ * dead loop last.
+ */
+bool cpu_departing(unsigned int cpu)
+{
+	struct cpuhp_cpu_state *st = per_cpu_ptr(&cpuhp_state, cpu);
+
+	return st->target == CPUHP_DEPARTED || st->state == CPUHP_DEPARTED;
+}
+EXPORT_SYMBOL_GPL(cpu_departing);
 
 void smp_shutdown_nonboot_cpus(unsigned int primary_cpu)
 {
@@ -1633,7 +1686,7 @@ static int _cpu_up(unsigned int cpu, int tasks_frozen, enum cpuhp_state target)
 	if (st->state >= target)
 		goto out;
 
-	if (st->state == CPUHP_OFFLINE) {
+	if (st->state <= CPUHP_DEPARTED) {
 		/* Let it fail before we try to bring the cpu up */
 		idle = idle_thread_get(cpu);
 		if (IS_ERR(idle)) {
@@ -2049,6 +2102,11 @@ static struct cpuhp_step cpuhp_hp_states[] = {
 		.startup.single		= NULL,
 		.teardown.single	= NULL,
 	},
+	[CPUHP_DEPARTED] = {
+		.name			= "departed",
+		.startup.single		= NULL,
+		.teardown.single	= NULL,
+	},
 #ifdef CONFIG_SMP
 	[CPUHP_CREATE_THREADS]= {
 		.name			= "threads:prepare",
@@ -2249,7 +2307,7 @@ static struct cpuhp_step cpuhp_hp_states[] = {
 /* Sanity check for callbacks */
 static int cpuhp_cb_check(enum cpuhp_state state)
 {
-	if (state <= CPUHP_OFFLINE || state >= CPUHP_ONLINE)
+	if (state <= CPUHP_DEPARTED || state >= CPUHP_ONLINE)
 		return -EINVAL;
 	return 0;
 }
@@ -2635,14 +2693,6 @@ void __cpuhp_remove_state(enum cpuhp_state state, bool invoke)
 EXPORT_SYMBOL(__cpuhp_remove_state);
 
 #ifdef CONFIG_HOTPLUG_SMT
-static void cpuhp_offline_cpu_device(unsigned int cpu)
-{
-	struct device *dev = get_cpu_device(cpu);
-
-	dev->offline = true;
-	/* Tell user space about the state change */
-	kobject_uevent(&dev->kobj, KOBJ_OFFLINE);
-}
 
 static void cpuhp_online_cpu_device(unsigned int cpu)
 {

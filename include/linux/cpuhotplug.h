@@ -59,6 +59,15 @@ enum cpuhp_state {
 
 	/* PREPARE section invoked on a control CPU */
 	CPUHP_OFFLINE = 0,
+	/*
+	 * Resting state of a CPU surrendered to another kernel: torn
+	 * down exactly like CPUHP_OFFLINE, but not expected back, so
+	 * the offline paths migrate managed interrupts instead of
+	 * shutting them down and park the CPU instead of letting it
+	 * die. Reached only through depart_cpu(); no callbacks can
+	 * attach here.
+	 */
+	CPUHP_DEPARTED,
 	CPUHP_CREATE_THREADS,
 	CPUHP_PERF_X86_PREPARE,
 	CPUHP_PERF_X86_AMD_UNCORE_PREP,

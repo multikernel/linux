@@ -548,21 +548,6 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 	return 0;
 }
 
-static DEFINE_PER_CPU(bool, mk_pool_cpu);
-
-/* Mark/query a CPU as parked in the multikernel pool */
-void mk_set_pool_cpu(int cpu, bool is_pool)
-{
-	per_cpu(mk_pool_cpu, cpu) = is_pool;
-}
-EXPORT_SYMBOL_GPL(mk_set_pool_cpu);
-
-bool cpu_is_multikernel_pool(unsigned int cpu)
-{
-	return per_cpu(mk_pool_cpu, cpu);
-}
-EXPORT_SYMBOL_GPL(cpu_is_multikernel_pool);
-
 /**
  * mk_pool_cpus_returned() - Is every pool CPU back in this kernel?
  *

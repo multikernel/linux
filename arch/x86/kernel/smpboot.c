@@ -1384,7 +1384,7 @@ int native_cpu_disable(void)
 
 	cpu_disable_common();
 
-	if (cpu_is_multikernel_pool(smp_processor_id()))
+	if (cpu_departing(smp_processor_id()))
 		return 0;
 
         /*
@@ -1537,7 +1537,7 @@ void __noreturn native_play_dead(void)
 	if (cpu_feature_enabled(X86_FEATURE_KERNEL_IBRS))
 		__update_spec_ctrl(0);
 
-	if (cpu_is_multikernel_pool(smp_processor_id()))
+	if (cpu_departing(smp_processor_id()))
 		multikernel_play_dead();
 
 	play_dead_common();

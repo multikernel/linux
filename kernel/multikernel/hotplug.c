@@ -211,13 +211,10 @@ static int mk_do_cpu_remove(mk_phys_cpu_t cpu_id)
 		return -EINVAL;
 	}
 
-	mk_set_pool_cpu(logical_cpu, true);
-
-	ret = remove_cpu(logical_cpu);
+	ret = depart_cpu(logical_cpu);
 	if (ret < 0) {
 		pr_err("Multikernel hotplug: Failed to remove CPU %d (phys %llu): %d\n",
 		       logical_cpu, cpu_id, ret);
-		mk_set_pool_cpu(logical_cpu, false);
 		return ret;
 	}
 
@@ -1118,12 +1115,7 @@ int mk_pool_cpu_remove(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 		return ret;
 
 	/* From here on it is an ordinary CPU of this kernel */
-	if (mk_cpu_set_del(mk_pool->cpus, cpu_id)) {
-		int cpu = arch_cpu_from_physical_id(cpu_id);
-
-		if (cpu >= 0)
-			mk_set_pool_cpu(cpu, false);
-	}
+	mk_cpu_set_del(mk_pool->cpus, cpu_id);
 
 	return 0;
 }

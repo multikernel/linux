@@ -13,7 +13,7 @@
 #include <linux/ratelimit.h>
 #include <linux/irq.h>
 #include <linux/sched/isolation.h>
-#include <linux/multikernel.h>
+#include <linux/cpu.h>
 
 #include "internals.h"
 
@@ -116,13 +116,13 @@ static bool migrate_one_irq(struct irq_desc *desc)
 		 * If the interrupt is managed, then shut it down and leave
 		 * the affinity untouched.
 		 *
-		 * Exception: For multikernel pool CPUs, force-migrate managed
-		 * IRQs instead of shutting them down. The CPU won't return to
-		 * this kernel, so shutdown would cause permanent I/O issues
+		 * Exception: a departing CPU is surrendered to another
+		 * kernel and will not return, so force-migrate managed
+		 * IRQs instead; shutdown would cause permanent I/O issues
 		 * for devices like NVMe that use managed per-CPU queues.
 		 */
 		if (irqd_affinity_is_managed(d) &&
-		    !cpu_is_multikernel_pool(smp_processor_id())) {
+		    !cpu_departing(smp_processor_id())) {
 			irqd_set_managed_shutdown(d);
 			irq_shutdown_and_deactivate(desc);
 			return false;
@@ -159,12 +159,12 @@ static bool migrate_one_irq(struct irq_desc *desc)
 		brokeaff = false;
 
 		/*
-		 * For multikernel pool CPUs, we cannot leave the IRQ pointing
-		 * at a CPU that will be running a different kernel. If migration
-		 * failed, shut down the IRQ as a last resort to prevent the
+		 * A departing CPU will be running a different kernel, so
+		 * the IRQ cannot keep pointing at it. If migration failed,
+		 * shut the IRQ down as a last resort to prevent the
 		 * hardware from delivering interrupts to the wrong kernel.
 		 */
-		if (cpu_is_multikernel_pool(smp_processor_id()) &&
+		if (cpu_departing(smp_processor_id()) &&
 		    irqd_affinity_is_managed(d)) {
 			pr_warn_ratelimited("IRQ%u: shutting down managed IRQ after failed migration\n",
 					    d->irq);
