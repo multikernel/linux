@@ -411,35 +411,23 @@ void noinstr mk_nmi_offline_park(void)
 	instrumentation_end();
 }
 
-static bool mk_nmi_handler_registered;
-
-/**
- * mk_arch_register_force_stop - Register the multikernel NMI stop handler
- *
- * Called during multikernel initialization to register the NMI handler
- * that enables forcible shutdown of spawn kernels.
- *
- * Returns: 0 on success, negative error code on failure
+/*
+ * Register the NMI handler that forcibly parks this kernel's CPUs when a
+ * peer arms the force-halt marker. It only acts on an armed marker, so
+ * it is harmless on the whole NMI_UNKNOWN chain and can be installed
+ * unconditionally at init on any multikernel-capable kernel; a force
+ * halt cannot arrive until a spawn is running, long after this.
  */
-int mk_arch_register_force_stop(void)
+static int __init mk_register_force_stop(void)
 {
-	int ret;
-
-	if (mk_nmi_handler_registered)
-		return 0;
-
-	ret = register_nmi_handler(NMI_UNKNOWN, mk_stop_nmi_callback, 0,
-				   "mk_stop");
-	if (ret) {
-		pr_err("Failed to register multikernel NMI stop handler: %d\n", ret);
-		return ret;
-	}
-
-	mk_nmi_handler_registered = true;
-	pr_info("Multikernel NMI stop handler registered\n");
-	return 0;
+	int ret = register_nmi_handler(NMI_UNKNOWN, mk_stop_nmi_callback, 0,
+				       "mk_stop");
+	if (ret)
+		pr_err("Failed to register multikernel NMI stop handler: %d\n",
+		       ret);
+	return ret;
 }
-EXPORT_SYMBOL_GPL(mk_arch_register_force_stop);
+device_initcall(mk_register_force_stop);
 
 /**
  * mk_force_stop_cpu - Send NMI to a specific CPU to force it to stop

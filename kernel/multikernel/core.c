@@ -1817,12 +1817,6 @@ static int __init multikernel_init(void)
 {
 	int ret;
 
-	ret = mk_arch_register_force_stop();
-	if (ret < 0) {
-		pr_warn("No force stop handler: %d (force halt unavailable)\n", ret);
-		/* Continue anyway - graceful shutdown still works */
-	}
-
 	ret = mk_messaging_init();
 	if (ret < 0) {
 		pr_err("Failed to initialize multikernel messaging: %d\n", ret);

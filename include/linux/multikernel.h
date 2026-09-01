@@ -1061,7 +1061,6 @@ void __noreturn mk_enter_pool_state(void *info);
  * pseudo-NMI on arm64). Registration may fail where the architecture
  * has nothing suitable; graceful shutdown must keep working without it.
  */
-int mk_arch_register_force_stop(void);
 void mk_force_stop_cpu(mk_phys_cpu_t phys_cpu);
 
 /*
