@@ -101,6 +101,9 @@ struct mk_ipi_ring {
 	struct mk_ipi_data entries[MK_IPI_RING_SIZE]; /* Ring buffer entries */
 };
 
+/* The spawn boot tree's fixed budget, shared by allocator and writer */
+#define MK_MANIFEST_SIZE SZ_16K
+
 /* Shared memory structures - per-instance design */
 struct mk_shared_data {
 	struct mk_ipi_ring ring;  /* IPI message ring buffer */

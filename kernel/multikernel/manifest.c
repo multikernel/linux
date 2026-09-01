@@ -216,7 +216,8 @@ static int mk_note_emit_reg(void *fdt, const char *name, u64 base, u64 size)
  * pages, the pool park set): claiming it would corrupt the slot the
  * fenced CPUs spin on and the ring the backup still reads.
  */
-static int mk_note_build(void *fdt, size_t size, struct kimage *image)
+static int mk_note_build(void *fdt, size_t size, struct kimage *image,
+			 const void *pool_tree, size_t pool_tree_len)
 {
 	struct mk_note_ranges r;
 	struct mk_instance *other;
@@ -266,7 +267,7 @@ static int mk_note_build(void *fdt, size_t size, struct kimage *image)
 		ret = mk_note_add(&r, image->mk_ipi,
 				  PAGE_ALIGN(sizeof(struct mk_shared_data)));
 	if (!ret && image->mk_manifest)
-		ret = mk_note_add(&r, image->mk_manifest, PAGE_SIZE);
+		ret = mk_note_add(&r, image->mk_manifest, MK_MANIFEST_SIZE);
 
 	mutex_lock(&mk_instance_mutex);
 	list_for_each_entry(other, &mk_instance_list, list) {
@@ -278,7 +279,7 @@ static int mk_note_build(void *fdt, size_t size, struct kimage *image)
 				  (u64)other->ipi_pages << PAGE_SHIFT);
 		if (!ret && other->kimage && other->kimage->mk_manifest)
 			ret = mk_note_add(&r, other->kimage->mk_manifest,
-					  PAGE_SIZE);
+					  MK_MANIFEST_SIZE);
 	}
 	mutex_unlock(&mk_instance_mutex);
 	if (!ret) {
@@ -292,6 +293,13 @@ static int mk_note_build(void *fdt, size_t size, struct kimage *image)
 	}
 	if (ret)
 		goto out;
+
+	if (pool_tree) {
+		ret = fdt_property(fdt, "multikernel,pool-tree", pool_tree,
+				   pool_tree_len);
+		if (ret)
+			goto out;
+	}
 
 	ret = fdt_begin_node(fdt, "reserved-memory");
 	if (!ret)
@@ -314,22 +322,39 @@ out:
 	return ret;
 }
 
-#define MK_NOTE_MAX SZ_16K
+#define MK_NOTE_MAX (MK_MANIFEST_SIZE - SZ_4K)
 
 static int mk_manifest_add_note(void *fdt, struct kimage *image)
 {
-	void *note;
+	void *note, *pool_tree = NULL;
+	size_t pool_tree_len = 0;
 	int ret;
 
 	note = kmalloc(MK_NOTE_MAX, GFP_KERNEL);
 	if (!note)
 		return -ENOMEM;
 
-	ret = mk_note_build(note, MK_NOTE_MAX, image);
+	/*
+	 * The host's own generated device tree rides along for richer
+	 * takeover (CPU membership, chunk layout, device inventory). It
+	 * is an extra, not a requirement: a pool tree too large for the
+	 * note drops out rather than failing the exec.
+	 */
+	if (mk_dt_generate_instance_dtb(mk_self, &pool_tree, &pool_tree_len))
+		pool_tree = NULL;
+
+	ret = mk_note_build(note, MK_NOTE_MAX, image, pool_tree,
+			    pool_tree_len);
+	if (ret == -FDT_ERR_NOSPACE && pool_tree) {
+		pr_warn("Pool tree (%zu bytes) too large for the takeover note, omitted\n",
+			pool_tree_len);
+		ret = mk_note_build(note, MK_NOTE_MAX, image, NULL, 0);
+	}
 	if (!ret)
 		ret = fdt_property(fdt, "multikernel,host-tree", note,
 				   fdt_totalsize(note));
 
+	kfree(pool_tree);
 	kfree(note);
 	return ret;
 }
@@ -411,7 +436,7 @@ int mk_manifest_finalize(struct kimage *image)
 
 	ctx.instance = instance;
 	fdt = phys_to_virt(image->mk_manifest);
-	ret = mk_dt_emit_boot_tree(instance, fdt, PAGE_SIZE, mk_manifest_chosen,
+	ret = mk_dt_emit_boot_tree(instance, fdt, MK_MANIFEST_SIZE, mk_manifest_chosen,
 				   &ctx);
 	if (ret) {
 		pr_err("Failed to write the boot tree for instance %d: %d\n",

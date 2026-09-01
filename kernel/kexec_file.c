@@ -352,9 +352,10 @@ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 
 		pr_info("Associated kimage with multikernel instance %d\n", mk_id);
 
-		fdt_page = alloc_page(GFP_KERNEL);
+		fdt_page = alloc_pages(GFP_KERNEL | __GFP_ZERO,
+				       get_order(MK_MANIFEST_SIZE));
 		if (!fdt_page) {
-			pr_err("Failed to allocate FDT page for multikernel kimage\n");
+			pr_err("Failed to allocate FDT pages for multikernel kimage\n");
 			ret = -ENOMEM;
 			goto out_free_image;
 		}
@@ -420,7 +421,8 @@ out_free_fdt:
 			image->mk_ipi = 0;
 		}
 		if (image->mk_manifest) {
-			put_page(phys_to_page(image->mk_manifest));
+			__free_pages(phys_to_page(image->mk_manifest),
+				     get_order(MK_MANIFEST_SIZE));
 			image->mk_manifest = 0;
 		}
 		if (image->mk_instance) {

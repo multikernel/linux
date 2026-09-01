@@ -634,7 +634,8 @@ void kimage_free(struct kimage *image)
 		}
 
 		if (image->mk_manifest) {
-			put_page(phys_to_page(image->mk_manifest));
+			__free_pages(phys_to_page(image->mk_manifest),
+				     get_order(MK_MANIFEST_SIZE));
 			image->mk_manifest = 0;
 		}
 

@@ -318,7 +318,7 @@ static void setup_multikernel(const struct kimage *image,
 	sd->len = sizeof(struct mk_setup_data);
 
 	mk->fdt_addr = image->mk_manifest;
-	mk->fdt_size = PAGE_SIZE;
+	mk->fdt_size = MK_MANIFEST_SIZE;
 
 	sd->next = params->hdr.setup_data;
 	params->hdr.setup_data = params_load_addr + setup_data_offset;
