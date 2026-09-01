@@ -725,17 +725,6 @@ void mk_dt_config_init(struct mk_dt_config *config);
 void mk_dt_config_free(struct mk_dt_config *config);
 
 /**
- * mk_dt_resources_available() - Check if memory and CPU resources are available
- * @config: Configuration with resources to check
- *
- * Checks if the specified memory size is available in the
- * multikernel memory pool and all CPUs are possible on the system.
- *
- * Returns true if all resources are available, false otherwise.
- */
-bool mk_dt_resources_available(const struct mk_dt_config *config);
-
-/**
  * mk_dt_get_property_size() - Get size of a specific property
  * @dtb_data: Device tree blob
  * @dtb_size: Size of DTB

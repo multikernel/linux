@@ -752,53 +752,6 @@ static int mk_dt_validate_cpus(const struct mk_dt_config *config)
 }
 
 /**
- * Resource availability checking
- */
-bool mk_dt_resources_available(const struct mk_dt_config *config)
-{
-	size_t pool_size;
-
-	if (!config)
-		return false;
-
-	pool_size = mk_pool_total_bytes();
-	if (!pool_size && config->memory_size > 0) {
-		pr_debug("No multikernel pool available\n");
-		return false;
-	}
-
-	/* Check if requested memory size is available */
-	if (config->memory_size > pool_size) {
-		pr_debug("Pool too small: need %zu, have %zu\n",
-			 config->memory_size, pool_size);
-		return false;
-	}
-
-	/* Check CPU availability - config->cpus contains physical CPU IDs */
-	if (!mk_cpu_set_empty(config->cpus)) {
-		mk_phys_cpu_t phys_cpu_id;
-		unsigned int i;
-
-		mk_cpu_set_for_each(i, phys_cpu_id, config->cpus) {
-			if (arch_cpu_from_physical_id(phys_cpu_id) < 0) {
-				pr_debug("Physical CPU ID %llu is not present\n",
-					 phys_cpu_id);
-				return false;
-			}
-		}
-	}
-
-	/* TODO: More sophisticated checking:
-	 * - Check for fragmentation
-	 * - Honor specific start address requests
-	 * - Check for conflicts with existing allocations
-	 * - Check for CPU conflicts with other instances
-	 */
-
-	return true;
-}
-
-/**
  * Property size helper
  */
 int mk_dt_get_property_size(const void *dtb_data, size_t dtb_size,
