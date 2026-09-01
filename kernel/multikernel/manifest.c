@@ -388,6 +388,17 @@ static int mk_manifest_chosen(void *fdt, void *data)
 			return ret;
 	}
 
+	/*
+	 * Where this host's pool CPUs park. A backup adopts this as its
+	 * own pool slot after fencing, to wake the fenced CPUs from it.
+	 */
+	if (mk_pool && mk_pool->arch.slot_phys) {
+		ret = fdt_property_u64(fdt, "multikernel,pool-slot",
+				       mk_pool->arch.slot_phys);
+		if (ret)
+			return ret;
+	}
+
 	if (image->mk_ipi) {
 		u32 pages = PAGE_ALIGN(sizeof(struct mk_shared_data)) >> PAGE_SHIFT;
 

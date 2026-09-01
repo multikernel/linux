@@ -909,29 +909,55 @@ static int mk_build_trampoline_pgtable(unsigned long trampoline_va,
  * Custom wakeup function for multikernel spawn kernels.
  * Wakes a pool CPU to join this spawn kernel as a secondary CPU.
  */
+/*
+ * Where to publish a wakeup for @apicid. A CPU the fence parked on the
+ * host's slot is woken from that slot, which this kernel adopted as
+ * its own after fencing (host_instance->pool_slot_phys); every other
+ * secondary is woken from this kernel's own context. The returned slot
+ * is memremapped when it differs from @own and must be released with
+ * mk_put_wake_slot().
+ */
+static struct mk_spawn_context *mk_wake_slot(u32 apicid,
+					     struct mk_spawn_context *own)
+{
+	if (host_instance && host_instance->pool_slot_phys &&
+	    mk_cpu_set_contains(host_instance->cpus_on_slot, apicid))
+		return memremap(host_instance->pool_slot_phys,
+				sizeof(struct mk_spawn_context), MEMREMAP_WB);
+	return own;
+}
+
+static void mk_put_wake_slot(struct mk_spawn_context *slot,
+			     struct mk_spawn_context *own)
+{
+	if (slot && slot != own)
+		memunmap(slot);
+}
+
 int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 					unsigned int cpu)
 {
-	struct mk_spawn_context *ctx = mk_own_context();
+	struct mk_spawn_context *own = mk_own_context();
+	struct mk_spawn_context *slot;
 	unsigned long trampoline_phys, trampoline_va;
 	unsigned long identity_cr3;
 	int ret;
 
-	if (!ctx) {
+	if (!own) {
 		pr_err("mk_spawn: Boot context not initialized\n");
 		return -ENODEV;
 	}
 
-	if (!ctx->trampoline_phys) {
+	if (!own->trampoline_phys) {
 		pr_err("mk_spawn: trampoline not prepared\n");
 		return -ENODEV;
 	}
 	/* mk_prepare_trampoline() put this kernel's own copy in the page */
-	trampoline_phys = ctx->trampoline_phys;
+	trampoline_phys = own->trampoline_phys;
 	trampoline_va = (unsigned long)__va(trampoline_phys);
 
 	/* Build identity page table for two-stage CR3 switch */
-	ret = mk_build_trampoline_pgtable(trampoline_va, ctx->trampoline_virt,
+	ret = mk_build_trampoline_pgtable(trampoline_va, own->trampoline_virt,
 					  trampoline_phys, &identity_cr3);
 	if (ret)
 		return ret;
@@ -955,35 +981,45 @@ int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 	if (ret)
 		return ret;
 
+	slot = mk_wake_slot(apicid, own);
+	if (!slot)
+		return -ENODEV;
+
 	/*
 	 * Revoke any unconsumed wakeup left over from a failed earlier
 	 * bringup, so a parked CPU cannot wake mid-rewrite and read a mix
 	 * of old and new fields. A CPU that already claimed the context
 	 * still sees the old, consistent snapshot.
 	 */
-	cmpxchg(&ctx->ready, 1, 0);
-
-	/* Set up spawn context for secondary CPU */
-	ctx->identity_cr3 = identity_cr3;
-	ctx->trampoline_phys = trampoline_phys;
-	ctx->secondary_trampoline_phys = trampoline_phys +
-		(mk_secondary_trampoline - multikernel_relocate_kernel_start);
-	ctx->kernel_entry = (unsigned long)multikernel_secondary_startup;
-	ctx->gs_base = per_cpu_offset(cpu);
-	ctx->stack = (unsigned long)idle_task(cpu)->thread.sp;
-	ctx->spawn_cr3 = __sme_pa(init_mm.pgd);
-	ctx->target_apic_id = apicid;
-	ctx->flags = MK_SPAWN_F_SECONDARY;
+	cmpxchg(&slot->ready, 1, 0);
 
 	/*
-	 * Publish the wakeup. The parked CPU watches this context with
+	 * The dispatch is this kernel's (its trampoline, its secondary
+	 * entry, its page tables), even when published into an adopted
+	 * host slot: the parked CPU transitions from wherever it waits
+	 * into this kernel.
+	 */
+	slot->identity_cr3 = identity_cr3;
+	slot->trampoline_phys = trampoline_phys;
+	slot->secondary_trampoline_phys = trampoline_phys +
+		(mk_secondary_trampoline - multikernel_relocate_kernel_start);
+	slot->kernel_entry = (unsigned long)multikernel_secondary_startup;
+	slot->gs_base = per_cpu_offset(cpu);
+	slot->stack = (unsigned long)idle_task(cpu)->thread.sp;
+	slot->spawn_cr3 = __sme_pa(init_mm.pgd);
+	slot->target_apic_id = apicid;
+	slot->flags = MK_SPAWN_F_SECONDARY;
+
+	/*
+	 * Publish the wakeup. The parked CPU watches this slot with
 	 * MONITOR/MWAIT (or a poll loop), so the write itself wakes it;
 	 * no IPI is needed and none could be delivered anyway, since
 	 * parked CPUs keep interrupts disabled.
 	 */
 	smp_wmb();
-	WRITE_ONCE(ctx->ready, 1);
+	WRITE_ONCE(slot->ready, 1);
 
+	mk_put_wake_slot(slot, own);
 	return 0;
 }
 

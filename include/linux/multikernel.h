@@ -654,6 +654,13 @@ struct mk_instance {
 	phys_addr_t ipi_phys;           /* IPI buffer physical address */
 	u32 ipi_pages;                  /* IPI buffer size in pages */
 	/*
+	 * On a spawn's record of its host: the physical address of the
+	 * host's pool wake slot, where the host's CPUs park. A backup
+	 * adopts it after fencing to wake the fenced CPUs (in cpus_on_slot)
+	 * into itself. Zero when not a host record or not published.
+	 */
+	phys_addr_t pool_slot_phys;
+	/*
 	 * Doorbell CPU for the instance's inbox. MK_PHYS_CPU_INVALID means
 	 * derive it from the instance's first owned CPU (its boot CPU);
 	 * a record whose owned set is unknown (the parent's) sets it

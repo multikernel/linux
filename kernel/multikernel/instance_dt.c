@@ -333,6 +333,16 @@ static int __init mk_restore_host_instance(void)
 	}
 	/* The host is running, or this kernel would not be */
 	mk_instance_set_state(hi, MK_STATE_ACTIVE);
+
+	/* Where the host's CPUs park, for waking them after a fence */
+	if (of_chosen) {
+		u64 slot;
+
+		if (!of_property_read_u64(of_chosen, "multikernel,pool-slot",
+					  &slot))
+			hi->pool_slot_phys = slot;
+	}
+
 	host_instance = hi;
 
 	pr_info("Restored host IPI buffer: phys=0x%llx, pages=%u\n",
