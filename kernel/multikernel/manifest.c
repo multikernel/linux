@@ -113,14 +113,14 @@ static int mk_manifest_add_pool_cpus(void *fdt, struct mk_instance *target)
 
 	mutex_lock(&mk_instance_mutex);
 	list_for_each_entry(other, &mk_instance_list, list) {
-		/*
-		 * Skip the self instance: its set is the CPUs the host
-		 * itself runs on, and enumerating a big host's full CPU set
-		 * in every spawn bloats the spawn's possible map and percpu
-		 * allocations.
-		 */
-		if (other == target || other == mk_self)
+		if (other == target)
 			continue;
+		/*
+		 * Include the host's own CPUs (mk_self) too: a backup must
+		 * enumerate every machine CPU to fence the host after a
+		 * crash. This costs a larger possible map in every spawn;
+		 * gating it to backup instances is a later refinement.
+		 */
 		mk_cpu_set_for_each(i, id, other->cpus) {
 			ret = mk_cpu_set_add(pool, id);
 			if (ret)
