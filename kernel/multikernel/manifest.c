@@ -20,6 +20,7 @@
 #include <linux/io.h>
 #include <linux/kexec.h>
 #include <linux/libfdt.h>
+#include <linux/sort.h>
 #include <linux/multikernel.h>
 
 #include "internal.h"
@@ -89,6 +90,13 @@ out:
  * enumerated at boot, so the whole pool must be in its topology from
  * the start.
  */
+static int mk_phys_cpu_cmp(const void *a, const void *b)
+{
+	const mk_phys_cpu_t *x = a, *y = b;
+
+	return *x < *y ? -1 : *x > *y;
+}
+
 static int mk_manifest_add_pool_cpus(void *fdt, struct mk_instance *target)
 {
 	struct mk_cpu_set *pool;
@@ -139,6 +147,13 @@ static int mk_manifest_add_pool_cpus(void *fdt, struct mk_instance *target)
 		goto out;
 	}
 
+	/*
+	 * The spawn assigns logical CPU ids in this list's order, and the
+	 * pool set's insertion order churns with every instance create,
+	 * delete and pool resize. Sort so a spawn's numbering does not
+	 * depend on the host's operation history.
+	 */
+	sort(pool->ids, count, sizeof(*pool->ids), mk_phys_cpu_cmp, NULL);
 	mk_cpu_set_for_each(i, id, pool)
 		cells[i] = cpu_to_fdt64(id);
 
