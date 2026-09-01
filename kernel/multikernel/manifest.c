@@ -19,6 +19,7 @@
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/kexec.h>
+#include <linux/ioport.h>
 #include <linux/libfdt.h>
 #include <linux/sort.h>
 #include <linux/multikernel.h>
@@ -164,6 +165,175 @@ out:
 	return ret;
 }
 
+#define MK_NOTE_PAIRS 80
+
+struct mk_note_ranges {
+	u64 *pair;
+	int n;
+};
+
+static int mk_note_add(struct mk_note_ranges *r, u64 base, u64 size)
+{
+	if (r->n == MK_NOTE_PAIRS)
+		return -E2BIG;
+	r->pair[2 * r->n] = base;
+	r->pair[2 * r->n + 1] = size;
+	r->n++;
+	return 0;
+}
+
+static int mk_note_add_res(struct resource *res, void *arg)
+{
+	return mk_note_add(arg, res->start, resource_size(res));
+}
+
+static int mk_note_emit_reg(void *fdt, const char *name, u64 base, u64 size)
+{
+	fdt64_t reg[2] = { cpu_to_fdt64(base), cpu_to_fdt64(size) };
+	char node[40];
+	int ret;
+
+	snprintf(node, sizeof(node), "%s@%llx", name, base);
+	ret = fdt_begin_node(fdt, node);
+	if (!ret && !strcmp(name, "memory"))
+		ret = fdt_property_string(fdt, "device_type", "memory");
+	if (!ret)
+		ret = fdt_property(fdt, "reg", reg, sizeof(reg));
+	if (!ret)
+		ret = fdt_end_node(fdt);
+	return ret;
+}
+
+/*
+ * The takeover note: the host's own device tree, compiled at spawn
+ * exec time and embedded verbatim in the spawn's boot tree. The spawn
+ * never interprets it; it sits in /proc/device-tree like a sealed
+ * note until the host stops answering, when the backup's user space
+ * reads it and drives the takeover: every memory@ range minus its own
+ * RAM minus /reserved-memory is takeable, and the fenced CPUs wait at
+ * multikernel,pool-slot. /reserved-memory is the memory the takeover
+ * machinery itself lives in (both ends' message rings, boot tree
+ * pages, the pool park set): claiming it would corrupt the slot the
+ * fenced CPUs spin on and the ring the backup still reads.
+ */
+static int mk_note_build(void *fdt, size_t size, struct kimage *image)
+{
+	struct mk_note_ranges r;
+	struct mk_instance *other;
+	int ret, i;
+
+	r.pair = kmalloc_array(2 * MK_NOTE_PAIRS, sizeof(*r.pair),
+			       GFP_KERNEL);
+	if (!r.pair)
+		return -ENOMEM;
+
+	ret = fdt_create(fdt, size);
+	if (!ret)
+		ret = fdt_finish_reservemap(fdt);
+	if (!ret)
+		ret = fdt_begin_node(fdt, "");
+	if (!ret)
+		ret = fdt_property_string(fdt, "compatible",
+					  "multikernel-host-v1");
+	if (!ret)
+		ret = fdt_property_u32(fdt, "#address-cells", 2);
+	if (!ret)
+		ret = fdt_property_u32(fdt, "#size-cells", 2);
+	if (!ret && mk_pool && mk_pool->arch.slot_phys)
+		ret = fdt_property_u64(fdt, "multikernel,pool-slot",
+				       mk_pool->arch.slot_phys);
+	if (ret)
+		goto out;
+
+	/* The machine's RAM, before any kernel's view of it */
+	r.n = 0;
+	ret = walk_system_ram_res(0, (u64)-1, &r, mk_note_add_res);
+	for (i = 0; i < r.n && !ret; i++)
+		ret = mk_note_emit_reg(fdt, "memory", r.pair[2 * i],
+				       r.pair[2 * i + 1]);
+	if (ret)
+		goto out;
+
+	r.n = 0;
+	if (mk_self->ipi_data)
+		ret = mk_note_add(&r, mk_self->ipi_phys,
+				  (u64)mk_self->ipi_pages << PAGE_SHIFT);
+	/*
+	 * This image's ring and boot tree; the instance record points
+	 * at them only after finalization, so take them from the image.
+	 */
+	if (!ret && image->mk_ipi)
+		ret = mk_note_add(&r, image->mk_ipi,
+				  PAGE_ALIGN(sizeof(struct mk_shared_data)));
+	if (!ret && image->mk_manifest)
+		ret = mk_note_add(&r, image->mk_manifest, PAGE_SIZE);
+
+	mutex_lock(&mk_instance_mutex);
+	list_for_each_entry(other, &mk_instance_list, list) {
+		if (ret)
+			break;
+		if (other == mk_self || !other->ipi_data)
+			continue;
+		ret = mk_note_add(&r, other->ipi_phys,
+				  (u64)other->ipi_pages << PAGE_SHIFT);
+		if (!ret && other->kimage && other->kimage->mk_manifest)
+			ret = mk_note_add(&r, other->kimage->mk_manifest,
+					  PAGE_SIZE);
+	}
+	mutex_unlock(&mk_instance_mutex);
+	if (!ret) {
+		int pairs = mk_pool_park_regions(r.pair + 2 * r.n,
+						 MK_NOTE_PAIRS - r.n);
+
+		if (pairs < 0)
+			ret = pairs;
+		else
+			r.n += pairs;
+	}
+	if (ret)
+		goto out;
+
+	ret = fdt_begin_node(fdt, "reserved-memory");
+	if (!ret)
+		ret = fdt_property_u32(fdt, "#address-cells", 2);
+	if (!ret)
+		ret = fdt_property_u32(fdt, "#size-cells", 2);
+	if (!ret)
+		ret = fdt_property(fdt, "ranges", NULL, 0);
+	for (i = 0; i < r.n && !ret; i++)
+		ret = mk_note_emit_reg(fdt, "region", r.pair[2 * i],
+				       r.pair[2 * i + 1]);
+	if (!ret)
+		ret = fdt_end_node(fdt);	/* /reserved-memory */
+	if (!ret)
+		ret = fdt_end_node(fdt);	/* root */
+	if (!ret)
+		ret = fdt_finish(fdt);
+out:
+	kfree(r.pair);
+	return ret;
+}
+
+#define MK_NOTE_MAX SZ_16K
+
+static int mk_manifest_add_note(void *fdt, struct kimage *image)
+{
+	void *note;
+	int ret;
+
+	note = kmalloc(MK_NOTE_MAX, GFP_KERNEL);
+	if (!note)
+		return -ENOMEM;
+
+	ret = mk_note_build(note, MK_NOTE_MAX, image);
+	if (!ret)
+		ret = fdt_property(fdt, "multikernel,host-tree", note,
+				   fdt_totalsize(note));
+
+	kfree(note);
+	return ret;
+}
+
 struct mk_manifest_ctx {
 	struct kimage *image;
 	struct mk_instance *instance;
@@ -176,6 +346,10 @@ static int mk_manifest_chosen(void *fdt, void *data)
 	int ret;
 
 	ret = mk_manifest_add_pool_cpus(fdt, ctx->instance);
+	if (ret)
+		return ret;
+
+	ret = mk_manifest_add_note(fdt, image);
 	if (ret)
 		return ret;
 

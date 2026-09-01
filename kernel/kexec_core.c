@@ -1772,6 +1772,8 @@ int multikernel_kexec_by_id(int mk_id)
 	if (mk_image->mk_ipi) {
 		instance->ipi_phys = mk_image->mk_ipi;
 		instance->ipi_data = phys_to_virt(mk_image->mk_ipi);
+		instance->ipi_pages =
+			PAGE_ALIGN(sizeof(struct mk_shared_data)) >> PAGE_SHIFT;
 	}
 
 	/*

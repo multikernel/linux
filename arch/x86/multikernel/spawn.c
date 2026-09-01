@@ -19,6 +19,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/sort.h>
 #include <linux/compiler.h>
 #include <linux/iopoll.h>
 #include <linux/delay.h>
@@ -1502,6 +1503,63 @@ static bool mk_ident_pgtable_in_range(struct mk_ident_pgtable *pgt,
 	}
 
 	return false;
+}
+
+static int mk_phys_addr_cmp(const void *a, const void *b)
+{
+	const u64 *x = a, *y = b;
+
+	return *x < *y ? -1 : *x > *y;
+}
+
+/**
+ * mk_pool_park_regions() - List the pool park set as physical ranges
+ * @pairs: filled with base,size pairs
+ * @max: capacity of @pairs in pairs
+ *
+ * The park page, the wake slot, and every pool page table page,
+ * sorted and coalesced: the memory a fenced or parked CPU still
+ * executes and watches, which must never be handed to another
+ * kernel's page allocator.
+ *
+ * Returns the number of pairs used, 0 when no park area exists, or
+ * -E2BIG when @max is too small.
+ */
+int mk_pool_park_regions(u64 *pairs, int max)
+{
+	u64 page[MK_CTRL_PGTABLE_PAGES + 3];
+	unsigned int n = 0, i;
+	int out = 0;
+
+	if (!mk_pool)
+		return 0;
+
+	guard(mutex)(&mk_pool->park_lock);
+
+	if (!mk_pool->arch.slot)
+		return 0;
+
+	page[n++] = mk_pool->arch.park_phys;
+	page[n++] = mk_pool->arch.slot_phys;
+	page[n++] = mk_pool->arch.slot_phys + PAGE_SIZE;
+	for (i = 0; i < mk_pool->arch.pgt->next_page; i++)
+		page[n++] = virt_to_phys(mk_pool->arch.pgt->pages[i]);
+
+	sort(page, n, sizeof(*page), mk_phys_addr_cmp, NULL);
+
+	for (i = 0; i < n; i++) {
+		if (out && pairs[2 * (out - 1)] + pairs[2 * out - 1] == page[i]) {
+			pairs[2 * out - 1] += PAGE_SIZE;
+			continue;
+		}
+		if (out == max)
+			return -E2BIG;
+		pairs[2 * out] = page[i];
+		pairs[2 * out + 1] = PAGE_SIZE;
+		out++;
+	}
+
+	return out;
 }
 
 /**
