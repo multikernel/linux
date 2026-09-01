@@ -505,6 +505,13 @@ enum mk_instance_state {
 extern struct mk_instance *mk_self;
 
 /**
+ * The host instance: this spawn's record of the kernel that spawned
+ * it, or NULL in the host itself. "Is this the host" is a pointer
+ * test against it.
+ */
+extern struct mk_instance *host_instance;
+
+/**
  * Memory region wrapper
  *
  * This wraps a struct resource with gen_pool_chunk for memory pool management.

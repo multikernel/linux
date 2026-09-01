@@ -38,6 +38,10 @@
 struct mk_instance *mk_self;
 EXPORT_SYMBOL_GPL(mk_self);
 
+/* This spawn's record of the kernel that spawned it, NULL in the host */
+struct mk_instance *host_instance;
+EXPORT_SYMBOL_GPL(host_instance);
+
 /**
  * mk_dt_extract_instance_info() - Extract instance ID and name from DTB
  * @dtb_data: Device tree blob data
@@ -291,54 +295,55 @@ static int __init mk_restore_instance_ipi(struct mk_instance *instance)
 	return 0;
 }
 
-static struct mk_instance * __init mk_restore_host_instance(void)
+static int __init mk_restore_host_instance(void)
 {
-	struct mk_instance *host_instance;
+	struct mk_instance *hi;
 	phys_addr_t host_ipi_phys;
 	u32 host_ipi_pages;
 	size_t host_ipi_size;
 
 	if (!mk_chosen_ring("host-ipi", &host_ipi_phys, &host_ipi_pages)) {
 		pr_warn("No host IPI buffer in the boot tree (spawn won't be able to send to host)\n");
-		return NULL;
+		return -ENOENT;
 	}
 	host_ipi_size = (size_t)host_ipi_pages << PAGE_SHIFT;
 
-	host_instance = mk_instance_alloc(0, "host");
-	if (!host_instance)
-		return NULL;
+	hi = mk_instance_alloc(0, "host");
+	if (!hi)
+		return -ENOMEM;
 
 	/*
 	 * The host's owned CPU set is unknown here; ring its doorbell on
 	 * physical CPU 0 without pretending we know what it owns.
 	 */
-	host_instance->ipi_target = 0;
+	hi->ipi_target = 0;
 
-	host_instance->ipi_data = memremap(host_ipi_phys, host_ipi_size, MEMREMAP_WB);
-	if (!host_instance->ipi_data) {
+	hi->ipi_data = memremap(host_ipi_phys, host_ipi_size, MEMREMAP_WB);
+	if (!hi->ipi_data) {
 		pr_err("Failed to map host IPI buffer at 0x%llx\n",
 		       (unsigned long long)host_ipi_phys);
 		goto err_free;
 	}
-	host_instance->ipi_phys = host_ipi_phys;
-	host_instance->ipi_pages = host_ipi_pages;
+	hi->ipi_phys = host_ipi_phys;
+	hi->ipi_pages = host_ipi_pages;
 
-	if (mk_instance_publish(host_instance)) {
-		memunmap(host_instance->ipi_data);
+	if (mk_instance_publish(hi)) {
+		memunmap(hi->ipi_data);
 		goto err_free;
 	}
-	/* The parent is running, or this kernel would not be */
-	mk_instance_set_state(host_instance, MK_STATE_ACTIVE);
+	/* The host is running, or this kernel would not be */
+	mk_instance_set_state(hi, MK_STATE_ACTIVE);
+	host_instance = hi;
 
 	pr_info("Restored host IPI buffer: phys=0x%llx, pages=%u\n",
 		(unsigned long long)host_ipi_phys, host_ipi_pages);
 	pr_info("Registered host instance (ID 0) for spawn→host communication\n");
 
-	return host_instance;
+	return 0;
 
 err_free:
-	mk_instance_free(host_instance);
-	return NULL;
+	mk_instance_free(hi);
+	return -ENOMEM;
 }
 
 /**
@@ -356,7 +361,7 @@ int __init mk_instance_restore_from_manifest(void)
 	int dtb_len;
 	int ret, cpu;
 	char cpus_buf[256];
-	struct mk_instance *instance, *host_instance;
+	struct mk_instance *instance;
 	struct mk_dt_config config;
 	int instance_id;
 	const char *instance_name;
@@ -469,8 +474,7 @@ int __init mk_instance_restore_from_manifest(void)
 
 	mk_self = instance;
 
-	host_instance = mk_restore_host_instance();
-	if (!host_instance)
+	if (mk_restore_host_instance())
 		pr_warn("Failed to restore host instance (spawn→host communication unavailable)\n");
 
 	pr_info("Successfully restored multikernel self instance %d ('%s') from the boot tree (%d bytes)\n",

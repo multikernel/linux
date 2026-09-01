@@ -1709,9 +1709,38 @@ int multikernel_halt_by_id(int mk_id)
  *
  * Returns: 0 on success, negative error code on failure
  */
+/*
+ * Build the set of physical CPUs a force halt should NMI. For a child
+ * it is exactly what the child owns. For the parent we do not know the
+ * split between the parent's own CPUs and its free pool, and do not
+ * need to: every CPU this kernel does not own is a target, and one
+ * already parked in the pool absorbs the extra NMI harmlessly.
+ */
+static int mk_force_halt_targets(struct mk_instance *instance,
+				 struct mk_cpu_set *targets)
+{
+	int cpu;
+
+	if (instance != host_instance)
+		return mk_cpu_set_copy(targets, instance->cpus);
+
+	for_each_possible_cpu(cpu) {
+		mk_phys_cpu_t phys = arch_cpu_physical_id(cpu);
+		int ret;
+
+		if (mk_cpu_set_contains(mk_self->cpus, phys))
+			continue;
+		ret = mk_cpu_set_add(targets, phys);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 int multikernel_force_halt_by_id(int mk_id)
 {
 	struct mk_instance *instance;
+	struct mk_cpu_set *targets;
 	mk_phys_cpu_t phys_cpu;
 	unsigned int i;
 	int cpu_count = 0;
@@ -1721,11 +1750,17 @@ int multikernel_force_halt_by_id(int mk_id)
 	if (!instance)
 		return -ENOENT;
 
+	if (instance == mk_self) {
+		pr_err("Cannot force halt this kernel (id %d)\n", mk_id);
+		mk_instance_put(instance);
+		return -EINVAL;
+	}
+
 	/*
 	 * LOADED is allowed for the retry case: a previous halt already
 	 * settled the state, but a CPU that missed its NMI is still
 	 * running the old image and kexec refuses to reload it. Without
-	 * a rerun the instance is stuck for good.
+	 * a rerun the instance is stuck for good. The parent is ACTIVE.
 	 */
 	if (instance->state != MK_STATE_ACTIVE &&
 	    instance->state != MK_STATE_LOADED) {
@@ -1735,10 +1770,19 @@ int multikernel_force_halt_by_id(int mk_id)
 		return -EINVAL;
 	}
 
-	if (mk_cpu_set_empty(instance->cpus)) {
-		pr_err("Instance %d has no CPUs assigned\n", mk_id);
+	targets = mk_cpu_set_alloc();
+	if (!targets) {
 		mk_instance_put(instance);
-		return -EINVAL;
+		return -ENOMEM;
+	}
+	ret = mk_force_halt_targets(instance, targets);
+	if (!ret && mk_cpu_set_empty(targets))
+		ret = -EINVAL;
+	if (ret) {
+		pr_err("Instance %d: no force-halt targets: %d\n", mk_id, ret);
+		mk_cpu_set_free(targets);
+		mk_instance_put(instance);
+		return ret;
 	}
 
 	pr_info("Force halting multikernel instance %d via NMI\n", mk_id);
@@ -1747,20 +1791,24 @@ int multikernel_force_halt_by_id(int mk_id)
 	if (ret)
 		pr_err("Failed to arm force-halt marker: %d (sending NMI anyway)\n", ret);
 
-	/* Send NMI to each CPU in the instance */
-	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
+	mk_cpu_set_for_each(i, phys_cpu, targets) {
 		mk_force_stop_cpu(phys_cpu);
 		cpu_count++;
 	}
+	mk_cpu_set_free(targets);
 
 	pr_info("Sent NMI to %d CPUs in instance %d\n", cpu_count, mk_id);
 
 	/*
-	 * The NMI handler parks each CPU on the instance's context. Wait
-	 * for them to arrive before reporting the instance re-spawnable,
-	 * exactly as the graceful path does after its shutdown ACK.
+	 * A child instance parks on its own context, so wait for it to
+	 * settle exactly as the graceful path does. Fencing the host has
+	 * no equivalent settle yet: confirming each fenced CPU reached
+	 * the park loop, and recording it in host_instance->cpus_on_slot
+	 * as the gate for a foreign baseline, is the foreign-slot check
+	 * added next.
 	 */
-	mk_instance_settle_halted(instance);
+	if (instance != host_instance)
+		mk_instance_settle_halted(instance);
 	mk_instance_put(instance);
 	return 0;
 }
