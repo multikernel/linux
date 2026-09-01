@@ -104,6 +104,9 @@ struct mk_ipi_ring {
 /* The spawn boot tree's fixed budget, shared by allocator and writer */
 #define MK_MANIFEST_SIZE SZ_16K
 
+/* Presence table capacity, in CPUs (see mk_cpu_rank) */
+#define MK_PARKED_MAX 512
+
 /* Shared memory structures - per-instance design */
 struct mk_shared_data {
 	struct mk_ipi_ring ring;  /* IPI message ring buffer */
@@ -115,6 +118,17 @@ struct mk_shared_data {
 	 * CPUs the first one missed.
 	 */
 	u32 force_halt;
+	/*
+	 * Parked-CPU presence, indexed by mk_cpu_rank() (a CPU's position
+	 * in the machine's sorted physical-id list, dense so x2APIC ids
+	 * need no room). A CPU sets its byte in mk_park_cpu() as it enters
+	 * the pool park loop; the kernel that armed a force halt reads it
+	 * to confirm each target actually parked (versus never taking the
+	 * NMI), the proof a fence needs that the dead peer's own state
+	 * cannot give. Each CPU owns one byte, so no atomics; cleared with
+	 * the struct on re-exec.
+	 */
+	u8 parked[MK_PARKED_MAX];
 };
 
 /* Function pointer type for IPI callbacks */
@@ -502,6 +516,8 @@ enum mk_instance_state {
  * In the host kernel its id is 0; in a spawn kernel it is the
  * spawned instance's id (1, 2, etc.).
  */
+int mk_cpu_rank(mk_phys_cpu_t phys);
+
 extern struct mk_instance *mk_self;
 
 /**

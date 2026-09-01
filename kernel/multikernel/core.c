@@ -8,6 +8,7 @@
 #include <linux/cpumask.h>
 #include <linux/cpu.h>
 #include <linux/delay.h>
+#include <linux/iopoll.h>
 #include <linux/io.h>
 #include <linux/kexec.h>
 #include <linux/multikernel.h>
@@ -1737,6 +1738,87 @@ static int mk_force_halt_targets(struct mk_instance *instance,
 	return 0;
 }
 
+/*
+ * A CPU's dense index into the presence table: its rank in the sorted
+ * list of every possible physical CPU id. Both the parking CPU and the
+ * kernel confirming the fence compute it from the same cpu_possible
+ * set, so they agree without sharing an APIC-id-to-slot map, and the
+ * table stays CPU-count sized whatever the ids are.
+ */
+int mk_cpu_rank(mk_phys_cpu_t phys)
+{
+	int cpu, rank = 0;
+
+	for_each_possible_cpu(cpu)
+		if (arch_cpu_physical_id(cpu) < phys)
+			rank++;
+	return rank;
+}
+EXPORT_SYMBOL_GPL(mk_cpu_rank);
+
+/* How many fence targets have not yet recorded presence */
+static int mk_fence_missing(struct mk_instance *instance,
+			    struct mk_cpu_set *targets)
+{
+	struct mk_shared_data *sd = instance->ipi_data;
+	mk_phys_cpu_t phys;
+	unsigned int i;
+	int missing = 0;
+
+	mk_cpu_set_for_each(i, phys, targets) {
+		int rank = mk_cpu_rank(phys);
+
+		if (rank >= MK_PARKED_MAX || !READ_ONCE(sd->parked[rank]))
+			missing++;
+	}
+	return missing;
+}
+
+/*
+ * After NMIing the fence targets, confirm each reached the park loop
+ * by the presence byte it sets there, and record the arrivals in
+ * cpus_on_slot. A target still missing after the timeout never took
+ * the NMI (wedged in NMI context) and leaves the fence incomplete:
+ * -ETIMEDOUT, so no foreign baseline claims a machine with a CPU
+ * possibly still running the dead host.
+ */
+static int mk_confirm_fenced(struct mk_instance *instance,
+			     struct mk_cpu_set *targets)
+{
+	struct mk_shared_data *sd = instance->ipi_data;
+	mk_phys_cpu_t phys;
+	unsigned int i;
+	int missing, ret;
+
+	if (!sd)
+		return -ENODEV;
+
+	if (!instance->cpus_on_slot) {
+		instance->cpus_on_slot = mk_cpu_set_alloc();
+		if (!instance->cpus_on_slot)
+			return -ENOMEM;
+	}
+
+	ret = read_poll_timeout(mk_fence_missing, missing, !missing,
+				20 * USEC_PER_MSEC, 5 * USEC_PER_SEC, false,
+				instance, targets);
+
+	mk_cpu_set_for_each(i, phys, targets) {
+		int rank = mk_cpu_rank(phys);
+
+		if (rank < MK_PARKED_MAX && READ_ONCE(sd->parked[rank]))
+			mk_cpu_set_add(instance->cpus_on_slot, phys);
+	}
+
+	if (ret)
+		pr_err("Fence incomplete: %d of the host's CPUs never parked\n",
+		       missing);
+	else
+		pr_info("Host fenced: %u CPUs confirmed parked\n",
+			mk_cpu_set_count(instance->cpus_on_slot));
+	return ret;
+}
+
 int multikernel_force_halt_by_id(int mk_id)
 {
 	struct mk_instance *instance;
@@ -1795,22 +1877,27 @@ int multikernel_force_halt_by_id(int mk_id)
 		mk_force_stop_cpu(phys_cpu);
 		cpu_count++;
 	}
-	mk_cpu_set_free(targets);
 
 	pr_info("Sent NMI to %d CPUs in instance %d\n", cpu_count, mk_id);
 
 	/*
 	 * A child instance parks on its own context, so wait for it to
 	 * settle exactly as the graceful path does. Fencing the host has
-	 * no equivalent settle yet: confirming each fenced CPU reached
-	 * the park loop, and recording it in host_instance->cpus_on_slot
-	 * as the gate for a foreign baseline, is the foreign-slot check
-	 * added next.
+	 * no such settle: confirm each target actually reached the park
+	 * loop through the presence it records in the shared area, and
+	 * record the ones that did in cpus_on_slot, the gate a later
+	 * foreign baseline checks. A target that never parks fails the
+	 * fence, so a baseline cannot claim a machine with a CPU still
+	 * running the dead host.
 	 */
-	if (instance != host_instance)
+	if (instance == host_instance)
+		ret = mk_confirm_fenced(instance, targets);
+	else
 		mk_instance_settle_halted(instance);
+
+	mk_cpu_set_free(targets);
 	mk_instance_put(instance);
-	return 0;
+	return ret;
 }
 
 static int __init multikernel_init(void)

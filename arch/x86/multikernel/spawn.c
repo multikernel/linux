@@ -1630,6 +1630,28 @@ int mk_pool_park_teardown(void)
 }
 
 /*
+ * Announce arrival before parking, so a kernel that fenced us can tell
+ * we stopped safely here rather than still running its image. Written
+ * on this kernel's own mappings, before any switch to a park page
+ * table, and on every park path so the record never depends on a later
+ * re-NMI reaching an already-parked CPU.
+ */
+static void mk_mark_parked(void)
+{
+	int rank;
+
+	if (!mk_self || !mk_self->ipi_data)
+		return;
+
+	rank = mk_cpu_rank(read_apic_id());
+	if (rank < MK_PARKED_MAX) {
+		WRITE_ONCE(mk_self->ipi_data->parked[rank], 1);
+		/* Presence visible before the CPU vanishes into HLT */
+		smp_wmb();
+	}
+}
+
+/*
  * Park this offlined pool CPU. On the host, wait in the pool park area
  * watching the host slot; on a spawn kernel returning a CPU to the
  * host, wait on our own instance context like any pool CPU of this
@@ -1638,6 +1660,8 @@ int mk_pool_park_teardown(void)
 void mk_pool_park_cpu(void)
 {
 	mk_pool_park_fn park;
+
+	mk_mark_parked();
 
 	if (mk_pool && mk_pool->arch.slot) {
 		park = (mk_pool_park_fn)mk_pool->arch.park_va;
@@ -1678,6 +1702,8 @@ void mk_park_cpu(void)
 		       &ctx->self_phys, ctx->park_phys, ctx->park_cr3);
 		return;
 	}
+
+	mk_mark_parked();
 
 	park = (mk_pool_park_fn)__va(ctx->park_phys);
 	park(ctx->park_cr3, virt_to_phys(ctx), read_apic_id(),
