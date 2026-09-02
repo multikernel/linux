@@ -153,6 +153,7 @@ static void mk_instance_release(struct kref *kref)
 	mk_instance_return_platform_devices(instance);
 	mk_instance_free_memory(instance);
 
+	kfree(instance->host_tree);
 	mk_cpu_set_free(instance->cpus);
 	kfree(instance->name);
 	kfree(instance);
@@ -271,6 +272,7 @@ void mk_instance_free(struct mk_instance *instance)
 		list_del(&plat_dev->list);
 		kfree(plat_dev);
 	}
+	kfree(instance->host_tree);
 	mk_cpu_set_free(instance->cpus);
 	kfree(instance->name);
 	kfree(instance);

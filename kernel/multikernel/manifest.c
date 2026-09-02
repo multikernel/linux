@@ -84,12 +84,14 @@ out:
 }
 
 /*
- * Collect every CPU the instance might receive through hotplug later:
- * the unassigned pool plus every other kernel's CPUs (the host's and
- * other instances'), minus the instance's own (those are already in its
- * DTB). The spawn kernel can only online a CPU whose physical ID it
- * enumerated at boot, so the whole pool must be in its topology from
- * the start.
+ * The host tree a spawn boots with: the multikernel,host-tree node of
+ * its /chosen. User space hands it over at instance-create (the
+ * machine's CPUs, RAM and PCI devices as the loader sees them); a spawn
+ * created without one gets a node this kernel makes, naming only the
+ * CPUs the spawn might receive through hotplug later: the unassigned
+ * pool plus every other kernel's CPUs, minus the spawn's own. The spawn
+ * enumerates its possible CPUs from the node's cpus property, since it
+ * can only online a CPU whose physical ID it registered at boot.
  */
 static int mk_phys_cpu_cmp(const void *a, const void *b)
 {
@@ -98,29 +100,18 @@ static int mk_phys_cpu_cmp(const void *a, const void *b)
 	return *x < *y ? -1 : *x > *y;
 }
 
-static int mk_manifest_add_pool_cpus(void *fdt, struct mk_instance *target)
+static int mk_manifest_collect_cpus(struct mk_instance *target,
+				    struct mk_cpu_set *pool)
 {
-	struct mk_cpu_set *pool;
 	struct mk_instance *other;
 	mk_phys_cpu_t id;
-	fdt64_t *cells;
-	unsigned int i, count;
+	unsigned int i;
 	int ret = 0;
-
-	pool = mk_cpu_set_alloc();
-	if (!pool)
-		return -ENOMEM;
 
 	mutex_lock(&mk_instance_mutex);
 	list_for_each_entry(other, &mk_instance_list, list) {
 		if (other == target)
 			continue;
-		/*
-		 * Include the host's own CPUs (mk_self) too: a backup must
-		 * enumerate every machine CPU to fence the host after a
-		 * crash. This costs a larger possible map in every spawn;
-		 * gating it to backup instances is a later refinement.
-		 */
 		mk_cpu_set_for_each(i, id, other->cpus) {
 			ret = mk_cpu_set_add(pool, id);
 			if (ret)
@@ -138,43 +129,73 @@ static int mk_manifest_add_pool_cpus(void *fdt, struct mk_instance *target)
 	}
 	mutex_unlock(&mk_instance_mutex);
 
-	count = mk_cpu_set_count(pool);
-	if (ret || count == 0)
-		goto out;
-
-	cells = kmalloc_array(count, sizeof(*cells), GFP_KERNEL);
-	if (!cells) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
 	/*
 	 * The spawn assigns logical CPU ids in this list's order, and the
 	 * pool set's insertion order churns with every instance create,
 	 * delete and pool resize. Sort so a spawn's numbering does not
 	 * depend on the host's operation history.
 	 */
-	sort(pool->ids, count, sizeof(*pool->ids), mk_phys_cpu_cmp, NULL);
+	if (!ret)
+		sort(pool->ids, mk_cpu_set_count(pool), sizeof(*pool->ids),
+		     mk_phys_cpu_cmp, NULL);
+	return ret;
+}
+
+static int mk_manifest_add_host_tree(void *fdt, struct mk_instance *target)
+{
+	struct mk_cpu_set *pool;
+	fdt64_t *cells;
+	mk_phys_cpu_t id;
+	unsigned int i, count;
+	int ret;
+
+	if (target->host_tree)
+		return mk_dt_emit_host_tree(fdt, target);
+
+	pool = mk_cpu_set_alloc();
+	if (!pool)
+		return -ENOMEM;
+	ret = mk_manifest_collect_cpus(target, pool);
+	if (ret)
+		goto out;
+	count = mk_cpu_set_count(pool);
+	cells = kmalloc_array(count + 1, sizeof(*cells), GFP_KERNEL);
+	if (!cells) {
+		ret = -ENOMEM;
+		goto out;
+	}
 	mk_cpu_set_for_each(i, id, pool)
 		cells[i] = cpu_to_fdt64(id);
 
-	ret = fdt_property(fdt, "multikernel,pool-cpus", cells, count * sizeof(*cells));
+	ret = fdt_begin_node(fdt, "multikernel,host-tree");
+	if (!ret && count)
+		ret = fdt_property(fdt, "cpus", cells, count * sizeof(*cells));
+	if (!ret)
+		ret = fdt_end_node(fdt);
 	kfree(cells);
 out:
 	mk_cpu_set_free(pool);
 	return ret;
 }
 
-#define MK_NOTE_PAIRS 80
+/*
+ * The memory the takeover machinery itself lives in, which a backup
+ * must never treat as free after fencing the host: both ends' message
+ * rings, each image's boot tree page, and the pool park set. Fenced
+ * CPUs execute the park page and spin watching the slot on the pool
+ * page table, and mk_has_pending_shutdown() reads the IPI area for as
+ * long as the backup runs. Published as (base, size) pairs.
+ */
+#define MK_RESERVED_PAIRS 80
 
-struct mk_note_ranges {
+struct mk_reserved_ranges {
 	u64 *pair;
 	int n;
 };
 
-static int mk_note_add(struct mk_note_ranges *r, u64 base, u64 size)
+static int mk_reserved_add(struct mk_reserved_ranges *r, u64 base, u64 size)
 {
-	if (r->n == MK_NOTE_PAIRS)
+	if (r->n == MK_RESERVED_PAIRS)
 		return -E2BIG;
 	r->pair[2 * r->n] = base;
 	r->pair[2 * r->n + 1] = size;
@@ -182,92 +203,31 @@ static int mk_note_add(struct mk_note_ranges *r, u64 base, u64 size)
 	return 0;
 }
 
-static int mk_note_add_res(struct resource *res, void *arg)
+static int mk_manifest_add_reserved(void *fdt, struct kimage *image)
 {
-	return mk_note_add(arg, res->start, resource_size(res));
-}
-
-static int mk_note_emit_reg(void *fdt, const char *name, u64 base, u64 size)
-{
-	fdt64_t reg[2] = { cpu_to_fdt64(base), cpu_to_fdt64(size) };
-	char node[40];
-	int ret;
-
-	snprintf(node, sizeof(node), "%s@%llx", name, base);
-	ret = fdt_begin_node(fdt, node);
-	if (!ret && !strcmp(name, "memory"))
-		ret = fdt_property_string(fdt, "device_type", "memory");
-	if (!ret)
-		ret = fdt_property(fdt, "reg", reg, sizeof(reg));
-	if (!ret)
-		ret = fdt_end_node(fdt);
-	return ret;
-}
-
-/*
- * The takeover note: the host's own device tree, compiled at spawn
- * exec time and embedded verbatim in the spawn's boot tree. The spawn
- * never interprets it; it sits in /proc/device-tree like a sealed
- * note until the host stops answering, when the backup's user space
- * reads it and drives the takeover: every memory@ range minus its own
- * RAM minus /reserved-memory is takeable, and the fenced CPUs wait at
- * multikernel,pool-slot. /reserved-memory is the memory the takeover
- * machinery itself lives in (both ends' message rings, boot tree
- * pages, the pool park set): claiming it would corrupt the slot the
- * fenced CPUs spin on and the ring the backup still reads.
- */
-static int mk_note_build(void *fdt, size_t size, struct kimage *image,
-			 const void *pool_tree, size_t pool_tree_len)
-{
-	struct mk_note_ranges r;
+	struct mk_reserved_ranges r;
 	struct mk_instance *other;
-	int ret, i;
+	fdt64_t *cells;
+	int ret = 0, i;
 
-	r.pair = kmalloc_array(2 * MK_NOTE_PAIRS, sizeof(*r.pair),
+	r.pair = kmalloc_array(2 * MK_RESERVED_PAIRS, sizeof(*r.pair),
 			       GFP_KERNEL);
 	if (!r.pair)
 		return -ENOMEM;
-
-	ret = fdt_create(fdt, size);
-	if (!ret)
-		ret = fdt_finish_reservemap(fdt);
-	if (!ret)
-		ret = fdt_begin_node(fdt, "");
-	if (!ret)
-		ret = fdt_property_string(fdt, "compatible",
-					  "multikernel-host-v1");
-	if (!ret)
-		ret = fdt_property_u32(fdt, "#address-cells", 2);
-	if (!ret)
-		ret = fdt_property_u32(fdt, "#size-cells", 2);
-	if (!ret && mk_pool && mk_pool->arch.slot_phys)
-		ret = fdt_property_u64(fdt, "multikernel,pool-slot",
-				       mk_pool->arch.slot_phys);
-	if (ret)
-		goto out;
-
-	/* The machine's RAM, before any kernel's view of it */
 	r.n = 0;
-	ret = walk_system_ram_res(0, (u64)-1, &r, mk_note_add_res);
-	for (i = 0; i < r.n && !ret; i++)
-		ret = mk_note_emit_reg(fdt, "memory", r.pair[2 * i],
-				       r.pair[2 * i + 1]);
-	if (ret)
-		goto out;
 
-	r.n = 0;
 	if (mk_self->ipi_data)
-		ret = mk_note_add(&r, mk_self->ipi_phys,
-				  (u64)mk_self->ipi_pages << PAGE_SHIFT);
+		ret = mk_reserved_add(&r, mk_self->ipi_phys,
+				      (u64)mk_self->ipi_pages << PAGE_SHIFT);
 	/*
 	 * This image's ring and boot tree; the instance record points
 	 * at them only after finalization, so take them from the image.
 	 */
 	if (!ret && image->mk_ipi)
-		ret = mk_note_add(&r, image->mk_ipi,
-				  PAGE_ALIGN(sizeof(struct mk_shared_data)));
+		ret = mk_reserved_add(&r, image->mk_ipi,
+				      PAGE_ALIGN(sizeof(struct mk_shared_data)));
 	if (!ret && image->mk_manifest)
-		ret = mk_note_add(&r, image->mk_manifest, MK_MANIFEST_SIZE);
+		ret = mk_reserved_add(&r, image->mk_manifest, MK_MANIFEST_SIZE);
 
 	mutex_lock(&mk_instance_mutex);
 	list_for_each_entry(other, &mk_instance_list, list) {
@@ -275,16 +235,16 @@ static int mk_note_build(void *fdt, size_t size, struct kimage *image,
 			break;
 		if (other == mk_self || !other->ipi_data)
 			continue;
-		ret = mk_note_add(&r, other->ipi_phys,
-				  (u64)other->ipi_pages << PAGE_SHIFT);
+		ret = mk_reserved_add(&r, other->ipi_phys,
+				      (u64)other->ipi_pages << PAGE_SHIFT);
 		if (!ret && other->kimage && other->kimage->mk_manifest)
-			ret = mk_note_add(&r, other->kimage->mk_manifest,
-					  MK_MANIFEST_SIZE);
+			ret = mk_reserved_add(&r, other->kimage->mk_manifest,
+					      MK_MANIFEST_SIZE);
 	}
 	mutex_unlock(&mk_instance_mutex);
 	if (!ret) {
 		int pairs = mk_pool_park_regions(r.pair + 2 * r.n,
-						 MK_NOTE_PAIRS - r.n);
+						 MK_RESERVED_PAIRS - r.n);
 
 		if (pairs < 0)
 			ret = pairs;
@@ -294,68 +254,13 @@ static int mk_note_build(void *fdt, size_t size, struct kimage *image,
 	if (ret)
 		goto out;
 
-	if (pool_tree) {
-		ret = fdt_property(fdt, "multikernel,pool-tree", pool_tree,
-				   pool_tree_len);
-		if (ret)
-			goto out;
-	}
-
-	ret = fdt_begin_node(fdt, "reserved-memory");
-	if (!ret)
-		ret = fdt_property_u32(fdt, "#address-cells", 2);
-	if (!ret)
-		ret = fdt_property_u32(fdt, "#size-cells", 2);
-	if (!ret)
-		ret = fdt_property(fdt, "ranges", NULL, 0);
-	for (i = 0; i < r.n && !ret; i++)
-		ret = mk_note_emit_reg(fdt, "region", r.pair[2 * i],
-				       r.pair[2 * i + 1]);
-	if (!ret)
-		ret = fdt_end_node(fdt);	/* /reserved-memory */
-	if (!ret)
-		ret = fdt_end_node(fdt);	/* root */
-	if (!ret)
-		ret = fdt_finish(fdt);
+	cells = (fdt64_t *)r.pair;
+	for (i = 0; i < 2 * r.n; i++)
+		cells[i] = cpu_to_fdt64(r.pair[i]);
+	ret = fdt_property(fdt, "multikernel,reserved-memory", cells,
+			   2 * r.n * sizeof(*cells));
 out:
 	kfree(r.pair);
-	return ret;
-}
-
-#define MK_NOTE_MAX (MK_MANIFEST_SIZE - SZ_4K)
-
-static int mk_manifest_add_note(void *fdt, struct kimage *image)
-{
-	void *note, *pool_tree = NULL;
-	size_t pool_tree_len = 0;
-	int ret;
-
-	note = kmalloc(MK_NOTE_MAX, GFP_KERNEL);
-	if (!note)
-		return -ENOMEM;
-
-	/*
-	 * The host's own generated device tree rides along for richer
-	 * takeover (CPU membership, chunk layout, device inventory). It
-	 * is an extra, not a requirement: a pool tree too large for the
-	 * note drops out rather than failing the exec.
-	 */
-	if (mk_dt_generate_instance_dtb(mk_self, &pool_tree, &pool_tree_len))
-		pool_tree = NULL;
-
-	ret = mk_note_build(note, MK_NOTE_MAX, image, pool_tree,
-			    pool_tree_len);
-	if (ret == -FDT_ERR_NOSPACE && pool_tree) {
-		pr_warn("Pool tree (%zu bytes) too large for the takeover note, omitted\n",
-			pool_tree_len);
-		ret = mk_note_build(note, MK_NOTE_MAX, image, NULL, 0);
-	}
-	if (!ret)
-		ret = fdt_property(fdt, "multikernel,host-tree", note,
-				   fdt_totalsize(note));
-
-	kfree(pool_tree);
-	kfree(note);
 	return ret;
 }
 
@@ -370,11 +275,7 @@ static int mk_manifest_chosen(void *fdt, void *data)
 	struct kimage *image = ctx->image;
 	int ret;
 
-	ret = mk_manifest_add_pool_cpus(fdt, ctx->instance);
-	if (ret)
-		return ret;
-
-	ret = mk_manifest_add_note(fdt, image);
+	ret = mk_manifest_add_reserved(fdt, image);
 	if (ret)
 		return ret;
 
@@ -410,7 +311,8 @@ static int mk_manifest_chosen(void *fdt, void *data)
 			return ret;
 	}
 
-	return 0;
+	/* A node's properties precede its subnodes: the host tree closes /chosen */
+	return mk_manifest_add_host_tree(fdt, ctx->instance);
 }
 
 /**

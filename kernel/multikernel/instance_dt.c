@@ -91,6 +91,23 @@ static int mk_dt_extract_instance_info(const void *dtb_data, size_t dtb_size,
 }
 
 static void __init mk_register_cpus_from(struct device_node *np,
+					 const char *prop);
+
+/* The host tree is the multikernel,host-tree node of /chosen; cpus names every machine CPU. */
+static void __init mk_register_cpus_from_host_tree(void)
+{
+	struct device_node *np;
+
+	np = of_get_child_by_name(of_chosen, "multikernel,host-tree");
+	if (!np)
+		return;
+	pr_info("multikernel: host tree names %d CPUs\n",
+		of_property_count_u64_elems(np, "cpus"));
+	mk_register_cpus_from(np, "cpus");
+	of_node_put(np);
+}
+
+static void __init mk_register_cpus_from(struct device_node *np,
 					 const char *prop)
 {
 	int i, n = of_property_count_u64_elems(np, prop);
@@ -123,14 +140,15 @@ void __init mk_register_cpus_from_manifest(void)
 	}
 
 	/*
-	 * Register the rest of the pool so those CPUs can be hot-added
-	 * later: the topology rejects post-boot APIC IDs it did not see
-	 * during enumeration. They are registered present and pruned from
-	 * the present mask in mk_restore_instance_cpus(), which keeps a logical
-	 * CPU assigned to each and avoids the hot-pluggable-APIC checks.
+	 * Register every other CPU the host tree names so they can be
+	 * hot-added later: the topology rejects post-boot APIC IDs it did
+	 * not see during enumeration. They are registered present and
+	 * pruned from the present mask in mk_restore_instance_cpus(), which
+	 * keeps a logical CPU assigned to each and avoids the
+	 * hot-pluggable-APIC checks.
 	 */
 	if (of_chosen)
-		mk_register_cpus_from(of_chosen, "multikernel,pool-cpus");
+		mk_register_cpus_from_host_tree();
 }
 
 /*

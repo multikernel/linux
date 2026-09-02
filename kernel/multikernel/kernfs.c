@@ -222,8 +222,8 @@ static ssize_t root_device_tree_write(struct kernfs_open_file *of, char *buf, si
  * @name: Instance name
  * @id: Instance ID (or -1 for auto-allocation)
  * @fdt: Device tree containing the DTB resources node
+ * @chosen_node: Offset of the chosen node in the FDT, or negative for none
  * @resources_node: Offset of the resources node in the FDT
- * @dtb_size: Size of the full DTB (for storage)
  *
  * Creates a multikernel instance by parsing resources directly from a resources node.
  * This is used by overlay instance-create operations where the resources are directly
@@ -235,7 +235,7 @@ static ssize_t root_device_tree_write(struct kernfs_open_file *of, char *buf, si
  * Returns 0 on success, negative error code on failure.
  */
 int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
-				      int resources_node)
+				int chosen_node, int resources_node)
 {
 	struct mk_instance *instance;
 	struct kernfs_node *kn;
@@ -252,6 +252,12 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 	if (ret) {
 		pr_err("Failed to parse resources for instance '%s': %d\n", name, ret);
 		goto err_free_config;
+	}
+
+	if (chosen_node >= 0) {
+		ret = mk_dt_parse_chosen(fdt, chosen_node, instance);
+		if (ret)
+			goto err_free_config;
 	}
 
 	kn = kernfs_create_dir(mk_instances_kn, name, 0755, instance);

@@ -20,11 +20,14 @@ void mk_instance_free(struct mk_instance *instance);
 extern struct kernfs_node *mk_root_kn;
 extern struct kernfs_node *mk_instances_kn;
 int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
-				      int resources_node);
+				int chosen_node, int resources_node);
 struct mk_instance *mk_instance_find_by_name(const char *name);
 int mk_instance_destroy(struct mk_instance *instance);
 
 /* dts.c */
+int mk_dt_parse_chosen(const void *fdt, int chosen_node,
+		       struct mk_instance *instance);
+int mk_dt_emit_host_tree(void *fdt, const struct mk_instance *instance);
 int mk_dt_parse_resources(const void *fdt, int resources_node,
 			  const char *instance_name, struct mk_dt_config *config);
 int mk_dt_emit_boot_tree(struct mk_instance *instance, void *fdt, size_t size,

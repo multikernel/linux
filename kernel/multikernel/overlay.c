@@ -232,7 +232,8 @@ static struct kernfs_ops mk_overlay_new_ops = {
  *   fragment@2 {
  *     target-path = "/instances";		the instance namespace
  *     __overlay__ {
- *       instance-create { instance-name = "db"; id = <N>; resources { ... }; };
+ *       instance-create { instance-name = "db"; id = <N>; resources { ... };
+ *                         chosen { multikernel,host-tree { ... }; }; };
  *       instance-remove { instance-name = "db"; };
  *     };
  *   };
@@ -972,7 +973,7 @@ static int mk_overlay_op_instance_create(struct mk_overlay_tx *tx,
 {
 	const char *instance_name;
 	const fdt32_t *id_prop;
-	int resources_node;
+	int resources_node, chosen_node;
 	int instance_id;
 	int len, ret;
 
@@ -995,6 +996,8 @@ static int mk_overlay_op_instance_create(struct mk_overlay_tx *tx,
 		       tx->id);
 		return -EINVAL;
 	}
+	/* The boot handoff user space asks for, copied into /chosen at exec */
+	chosen_node = fdt_subnode_offset(fdt, op_node, "chosen");
 
 	mutex_lock(&mk_instance_mutex);
 
@@ -1015,7 +1018,7 @@ static int mk_overlay_op_instance_create(struct mk_overlay_tx *tx,
 	pr_info("Overlay tx%d: Creating instance '%s'\n", tx->id, instance_name);
 
 	ret = mk_create_instance_from_dtb(instance_name, instance_id, fdt,
-					  resources_node);
+					  chosen_node, resources_node);
 	mutex_unlock(&mk_instance_mutex);
 
 	if (ret) {

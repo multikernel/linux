@@ -1581,9 +1581,131 @@ static int mk_dt_emit_tree(struct mk_instance *instance, void *fdt,
 	return ret;
 }
 
+/* Write @node of @src, properties then subnodes, into the tree open on @fdt. */
+static int mk_dt_copy_node(const void *src, int node, void *fdt)
+{
+	int prop, sub, ret;
+
+	fdt_for_each_property_offset(prop, src, node) {
+		const char *name;
+		const void *val;
+		int len;
+
+		val = fdt_getprop_by_offset(src, prop, &name, &len);
+		if (!val)
+			return -EINVAL;
+		ret = fdt_property(fdt, name, val, len);
+		if (ret)
+			return ret;
+	}
+	fdt_for_each_subnode(sub, src, node) {
+		ret = fdt_begin_node(fdt, fdt_get_name(src, sub, NULL));
+		if (!ret)
+			ret = mk_dt_copy_node(src, sub, fdt);
+		if (!ret)
+			ret = fdt_end_node(fdt);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+/* Keep @node of @src as a tree of its own, rooted at the node's contents. */
+static int mk_dt_store_host_tree(const void *src, int node,
+				 struct mk_instance *instance)
+{
+	size_t size = SZ_1K;
+	void *fdt;
+	int ret;
+
+	for (;;) {
+		fdt = kmalloc(size, GFP_KERNEL);
+		if (!fdt)
+			return -ENOMEM;
+		ret = fdt_create(fdt, size);
+		if (!ret)
+			ret = fdt_finish_reservemap(fdt);
+		if (!ret)
+			ret = fdt_begin_node(fdt, "");
+		if (!ret)
+			ret = mk_dt_copy_node(src, node, fdt);
+		if (!ret)
+			ret = fdt_end_node(fdt);
+		if (!ret)
+			ret = fdt_finish(fdt);
+		if (!ret)
+			break;
+		kfree(fdt);
+		if (ret != -FDT_ERR_NOSPACE || size >= MK_HOST_TREE_MAX)
+			return -EINVAL;
+		size *= 2;
+	}
+	fdt_pack(fdt);
+
+	kfree(instance->host_tree);
+	instance->host_tree = fdt;
+	instance->host_tree_len = fdt_totalsize(fdt);
+	return 0;
+}
+
+/*
+ * The boot handoff user space asked for: a chosen node holding a
+ * multikernel,host-tree subtree, which the spawn boots with under its
+ * own /chosen.
+ */
+int mk_dt_parse_chosen(const void *fdt, int chosen_node,
+		       struct mk_instance *instance)
+{
+	int node;
+
+	if (fdt_first_property_offset(fdt, chosen_node) >= 0) {
+		pr_err("Instance '%s': chosen carries properties; only a multikernel,host-tree node is accepted\n",
+		       instance->name);
+		return -EINVAL;
+	}
+	fdt_for_each_subnode(node, fdt, chosen_node) {
+		const char *name = fdt_get_name(fdt, node, NULL);
+		int ret;
+
+		if (!name || strcmp(name, "multikernel,host-tree")) {
+			pr_err("Instance '%s': unsupported chosen node '%s'\n",
+			       instance->name, name ? name : "?");
+			return -EINVAL;
+		}
+		ret = mk_dt_store_host_tree(fdt, node, instance);
+		if (ret) {
+			pr_err("Instance '%s': cannot keep multikernel,host-tree (limit %d bytes): %d\n",
+			       instance->name, MK_HOST_TREE_MAX, ret);
+			return ret;
+		}
+	}
+	return 0;
+}
+
+/* The stored host tree, as the multikernel,host-tree node of an open /chosen. */
+int mk_dt_emit_host_tree(void *fdt, const struct mk_instance *instance)
+{
+	int ret;
+
+	ret = fdt_begin_node(fdt, "multikernel,host-tree");
+	if (!ret)
+		ret = mk_dt_copy_node(instance->host_tree, 0, fdt);
+	if (!ret)
+		ret = fdt_end_node(fdt);
+	return ret;
+}
+
+static int mk_dt_emit_requested_chosen(void *fdt, void *data)
+{
+	return mk_dt_emit_host_tree(fdt, data);
+}
+
 static int mk_dt_emit_instance(struct mk_instance *instance, void *fdt,
 			       size_t size)
 {
+	if (instance->host_tree)
+		return mk_dt_emit_tree(instance, fdt, size,
+				       mk_dt_emit_requested_chosen, instance);
 	return mk_dt_emit_tree(instance, fdt, size, NULL, NULL);
 }
 

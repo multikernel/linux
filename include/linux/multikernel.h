@@ -103,6 +103,8 @@ struct mk_ipi_ring {
 
 /* The spawn boot tree's fixed budget, shared by allocator and writer */
 #define MK_MANIFEST_SIZE SZ_16K
+/* Room the manifest leaves for a user-provided host tree */
+#define MK_HOST_TREE_MAX SZ_8K
 
 /* Presence table capacity, in CPUs (see mk_cpu_rank) */
 #define MK_PARKED_MAX 512
@@ -693,6 +695,18 @@ struct mk_instance {
 	 * Always empty where firmware holds parked CPUs.
 	 */
 	struct mk_cpu_set *cpus_on_slot;
+
+	/*
+	 * The host tree user space handed over in the instance-create
+	 * overlay's chosen node: the machine's CPUs, RAM and PCI devices as
+	 * the loader sees them, kept as a small device tree whose root is
+	 * the multikernel,host-tree node. Emitted under the spawn's boot
+	 * /chosen; the spawn enumerates its possible CPUs from its cpus
+	 * property, and a backup's user space reads the rest after fencing
+	 * the host. NULL when not given.
+	 */
+	void *host_tree;
+	size_t host_tree_len;
 
 	/* Sysfs representation */
 	struct kernfs_node *kn;            /* Kernfs node for this instance */
