@@ -141,6 +141,30 @@ cleanup:
 	instance->platform_devices_valid = false;
 }
 
+/*
+ * While a backup that will take a core of this kernel is active, a CPU
+ * that stops here saves its registers for it; a plain park needs none.
+ */
+static atomic_t mk_dump_backups = ATOMIC_INIT(0);
+
+bool mk_crash_notes_wanted(void)
+{
+	return atomic_read(&mk_dump_backups) > 0;
+}
+EXPORT_SYMBOL_GPL(mk_crash_notes_wanted);
+
+static void mk_instance_track_dump(struct mk_instance *instance,
+				   enum mk_instance_state old,
+				   enum mk_instance_state new)
+{
+	if (!instance->dumps_host)
+		return;
+	if (new == MK_STATE_ACTIVE)
+		atomic_inc(&mk_dump_backups);
+	else if (old == MK_STATE_ACTIVE)
+		atomic_dec(&mk_dump_backups);
+}
+
 static void mk_instance_release(struct kref *kref)
 {
 	struct mk_instance *instance = container_of(kref, struct mk_instance, refcount);
@@ -153,6 +177,7 @@ static void mk_instance_release(struct kref *kref)
 	mk_instance_return_platform_devices(instance);
 	mk_instance_free_memory(instance);
 
+	mk_instance_track_dump(instance, instance->state, MK_STATE_READY);
 	kfree(instance->host_tree);
 	mk_cpu_set_free(instance->cpus);
 	kfree(instance->name);
@@ -290,6 +315,7 @@ void mk_instance_set_state(struct mk_instance *instance,
 		return;
 
 	instance->state = state;
+	mk_instance_track_dump(instance, old_state, state);
 	pr_debug("Instance %d (%s) state: %s -> %s\n",
 		 instance->id, instance->name,
 		 mk_state_to_string(old_state),

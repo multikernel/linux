@@ -1645,6 +1645,8 @@ static int mk_dt_store_host_tree(const void *src, int node,
 	kfree(instance->host_tree);
 	instance->host_tree = fdt;
 	instance->host_tree_len = fdt_totalsize(fdt);
+	/* A backup that will take a core of us says so with this node. */
+	instance->dumps_host = fdt_subnode_offset(fdt, 0, "vmcore") >= 0;
 	return 0;
 }
 

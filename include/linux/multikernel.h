@@ -707,6 +707,7 @@ struct mk_instance {
 	 */
 	void *host_tree;
 	size_t host_tree_len;
+	bool dumps_host;		/* its host tree carries a vmcore node */
 
 	/* Sysfs representation */
 	struct kernfs_node *kn;            /* Kernfs node for this instance */
@@ -914,6 +915,7 @@ bool multikernel_allow_emergency_restart(void);
 int multikernel_halt_by_id(int mk_id);
 int multikernel_force_halt_by_id(int mk_id);
 bool mk_has_pending_shutdown(void);
+bool mk_crash_notes_wanted(void);
 
 /* Instance lookup and reference counting */
 struct mk_instance *mk_instance_find(int mk_id);
@@ -946,6 +948,11 @@ static inline int multikernel_halt_by_id(int mk_id)
 {
 	return -ENODEV;
 }
+static inline bool mk_crash_notes_wanted(void)
+{
+	return false;
+}
+
 static inline int multikernel_force_halt_by_id(int mk_id)
 {
 	return -ENODEV;

@@ -22,6 +22,7 @@
 #include <linux/cpu.h>
 #include <linux/gfp.h>
 #include <linux/kexec.h>
+#include <linux/crash_core.h>
 
 #include <asm/mtrr.h>
 #include <asm/tlbflush.h>
@@ -120,6 +121,17 @@
 static atomic_t stopping_cpu = ATOMIC_INIT(-1);
 static bool smp_no_nmi_ipi = false;
 
+/*
+ * A backup kernel that will take a core of this one has no crash kernel
+ * to save our state for it. Record the interrupted registers the way
+ * kdump would, only while such a backup is armed.
+ */
+static void mk_save_stop_regs(struct pt_regs *regs)
+{
+	if (mk_crash_notes_wanted())
+		crash_save_cpu(regs, raw_smp_processor_id());
+}
+
 static int smp_stop_nmi_callback(unsigned int val, struct pt_regs *regs)
 {
 	int cpu = raw_smp_processor_id();
@@ -143,6 +155,7 @@ static int smp_stop_nmi_callback(unsigned int val, struct pt_regs *regs)
 		}
 	}
 
+	mk_save_stop_regs(regs);
 	cpu_emergency_disable_virtualization();
 	stop_this_cpu(NULL);
 
@@ -172,6 +185,7 @@ DEFINE_IDTENTRY_SYSVEC(sysvec_reboot)
 		}
 	}
 
+	mk_save_stop_regs(regs);
 	cpu_emergency_disable_virtualization();
 	stop_this_cpu(NULL);
 }
@@ -389,6 +403,7 @@ static int mk_stop_nmi_callback(unsigned int val, struct pt_regs *regs)
 	pr_emerg("CPU %d: Forcible shutdown via NMI (instance %d)\n",
 		 smp_processor_id(), mk_self ? mk_self->id : -1);
 
+	mk_save_stop_regs(regs);
 	cpu_emergency_disable_virtualization();
 	mk_enter_pool_state(NULL);
 	return NMI_HANDLED; /* unreachable */
