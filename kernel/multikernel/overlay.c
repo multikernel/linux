@@ -26,6 +26,8 @@
 #include <linux/multikernel.h>
 #include "internal.h"
 
+#define MK_OVERLAY_MAX_SIZE (1024 * 1024)
+
 /*
  * Parse a cpu@N node's reg property into a physical CPU ID. Accepts either
  * one 64-bit cell or one 32-bit cell.
@@ -194,8 +196,14 @@ static struct kernfs_ops tx_dtbo_ops = {
 	.read = tx_dtbo_read,
 };
 
+/*
+ * Without atomic_write_len kernfs hands the handler one page per write,
+ * and a large overlay would be parsed truncated and then rejected on the
+ * next chunk for its non-zero offset.
+ */
 static struct kernfs_ops mk_overlay_new_ops = {
 	.write = mk_overlay_new_write,
+	.atomic_write_len = MK_OVERLAY_MAX_SIZE,
 };
 
 /*
@@ -1482,11 +1490,6 @@ static ssize_t mk_overlay_new_write(struct kernfs_open_file *of, char *buf,
 	if (nbytes == 0)
 		return -EINVAL;
 
-	if (nbytes > 1024 * 1024) { /* 1MB limit */
-		pr_err("Overlay blob too large: %zu bytes\n", nbytes);
-		return -EFBIG;
-	}
-
 	dtbo_copy = kmalloc(nbytes, GFP_KERNEL);
 	if (!dtbo_copy)
 		return -ENOMEM;
@@ -1496,6 +1499,12 @@ static ssize_t mk_overlay_new_write(struct kernfs_open_file *of, char *buf,
 	ret = fdt_check_header(dtbo_copy);
 	if (ret != 0) {
 		pr_err("Invalid overlay FDT header: %d\n", ret);
+		kfree(dtbo_copy);
+		return -EINVAL;
+	}
+	if (fdt_totalsize(dtbo_copy) > nbytes) {
+		pr_err("Overlay blob truncated: header says %u bytes, got %zu\n",
+		       fdt_totalsize(dtbo_copy), nbytes);
 		kfree(dtbo_copy);
 		return -EINVAL;
 	}
