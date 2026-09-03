@@ -848,7 +848,7 @@ void mk_dt_print_config(const struct mk_dt_config *config)
 }
 
 #define MK_DT_FDT_MIN_SIZE	SZ_4K
-#define MK_DT_FDT_MAX_SIZE	SZ_64K
+#define MK_DT_FDT_MAX_SIZE	MK_MANIFEST_SIZE
 
 static int mk_dt_emit_cpu_prop(void *fdt, const char *name,
 			       const struct mk_cpu_set *set)

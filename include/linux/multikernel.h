@@ -102,9 +102,9 @@ struct mk_ipi_ring {
 };
 
 /* The spawn boot tree's fixed budget, shared by allocator and writer */
-#define MK_MANIFEST_SIZE SZ_16K
+#define MK_MANIFEST_SIZE SZ_256K
 /* Room the manifest leaves for a user-provided host tree */
-#define MK_HOST_TREE_MAX SZ_8K
+#define MK_HOST_TREE_MAX SZ_128K
 
 /* Presence table capacity, in CPUs (see mk_cpu_rank) */
 #define MK_PARKED_MAX 512
