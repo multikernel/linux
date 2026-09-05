@@ -1537,7 +1537,7 @@ void __noreturn native_play_dead(void)
 	if (cpu_feature_enabled(X86_FEATURE_KERNEL_IBRS))
 		__update_spec_ctrl(0);
 
-	if (cpu_departing(smp_processor_id()))
+	if (IS_ENABLED(CONFIG_MULTIKERNEL) && cpu_departing(smp_processor_id()))
 		multikernel_play_dead();
 
 	play_dead_common();

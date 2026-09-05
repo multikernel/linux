@@ -23,6 +23,7 @@ struct mk_instance;
 struct mk_spawn_context;
 struct mk_ident_pgtable;
 
+#ifdef CONFIG_MULTIKERNEL
 /* Per-instance spawn state, carved from the control block on first spawn */
 struct mk_instance_arch {
 	struct mk_spawn_context *spawn_ctx;
@@ -49,6 +50,7 @@ struct mk_pool_arch {
 	struct mk_ident_pgtable *pgt;
 	unsigned long cr3;
 };
+#endif
 
 /*
  * Physical CPU IDs are APIC IDs, widened to the generic u64 type. The
