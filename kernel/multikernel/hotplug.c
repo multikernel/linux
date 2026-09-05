@@ -1151,6 +1151,21 @@ int mk_pool_device_add(u16 domain, u8 bus, u8 devfn, const char *alias)
 	return 0;
 }
 
+int mk_pool_device_spare(u16 domain, u8 bus, u8 devfn, char *reason, size_t len)
+{
+	struct pci_dev *pdev;
+	int ret;
+
+	pdev = pci_get_domain_bus_and_slot(domain, bus, devfn);
+	if (!pdev)
+		return -ENODEV;
+	ret = mk_iommu_spare(pdev, reason, len);
+	if (ret >= 0)
+		mk_root_set_pci_spared(domain, bus, devfn, ret == 0);
+	pci_dev_put(pdev);
+	return ret < 0 ? ret : 0;
+}
+
 /**
  * mk_pool_device_remove - Take a free pool PCI device back into this kernel
  * @domain: PCI domain
@@ -1170,6 +1185,17 @@ int mk_pool_device_remove(u16 domain, u8 bus, u8 devfn,
 		pr_err("Multikernel hotplug: device %04x:%02x:%02x.%x is not free in the pool\n",
 		       domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
 		return -EBUSY;
+	}
+
+	/* The host driver about to bind wants remapped interrupts again. */
+	if (mk_root_pci_spared(domain, bus, devfn)) {
+		struct pci_dev *pdev = pci_get_domain_bus_and_slot(domain, bus, devfn);
+
+		if (pdev) {
+			mk_iommu_restore(pdev);
+			pci_dev_put(pdev);
+		}
+		mk_root_set_pci_spared(domain, bus, devfn, false);
 	}
 
 	ret = mk_do_device_add(domain, bus, devfn, driver_override, flags);

@@ -565,6 +565,8 @@ struct mk_pci_device {
 	u8 bus;            /* PCI bus number */
 	u8 slot;           /* PCI slot number */
 	u8 func;           /* PCI function number */
+	bool iommu_spare;  /* Asked to leave its remapping unit unused */
+	bool iommu_spared; /* Its remapping unit is unused on its account */
 	struct list_head list;  /* Link to device list */
 };
 

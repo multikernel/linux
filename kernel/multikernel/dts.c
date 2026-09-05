@@ -264,7 +264,7 @@ static int mk_dt_add_pci_device(const void *source_fdt, int dev_node,
 {
 	const fdt32_t *vendor_prop, *device_prop;
 	struct mk_pci_device *pci_dev;
-	const char *node_name, *alias;
+	const char *node_name, *alias, *iommu;
 	int len;
 
 	node_name = fdt_get_name(source_fdt, dev_node, NULL);
@@ -298,6 +298,13 @@ static int mk_dt_add_pci_device(const void *source_fdt, int dev_node,
 	alias = mk_dt_node_alias(source_fdt, dev_node);
 	if (alias)
 		strscpy(pci_dev->alias, alias, sizeof(pci_dev->alias));
+	iommu = fdt_getprop(source_fdt, dev_node, "iommu", NULL);
+	if (iommu && strcmp(iommu, "spare")) {
+		pr_err("Device '%s': unknown iommu request '%s'\n", device_name, iommu);
+		kfree(pci_dev);
+		return -EINVAL;
+	}
+	pci_dev->iommu_spare = iommu != NULL;
 
 	list_add_tail(&pci_dev->list, &config->pci_devices);
 	config->pci_device_count++;
@@ -1124,6 +1131,10 @@ static int mk_dt_emit_pci_bus(struct mk_instance *instance,
 			ret = fdt_property_u32(fdt, "vendor-id", dev->vendor);
 		if (!ret)
 			ret = fdt_property_u32(fdt, "device-id", dev->device);
+		if (!ret && dev->iommu_spared)
+			ret = fdt_property_string(fdt, "iommu", "spared");
+		else if (!ret && mk_iommu_remapping_active())
+			ret = fdt_property_string(fdt, "iommu", "remapped");
 		if (!ret)
 			ret = fdt_end_node(fdt);
 		if (ret)

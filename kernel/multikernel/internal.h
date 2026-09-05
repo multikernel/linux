@@ -57,6 +57,15 @@ int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_le
 int mk_pool_cpu_add(mk_phys_cpu_t cpu_id);
 int mk_pool_cpu_remove(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags);
 int mk_pool_device_add(u16 domain, u8 bus, u8 devfn, const char *alias);
+/* After the devices of a transaction moved: spare the unit behind one that asked. */
+int mk_pool_device_spare(u16 domain, u8 bus, u8 devfn, char *reason, size_t len);
+int mk_root_set_pci_spared(u16 domain, u8 bus, u8 devfn, bool spared);
+bool mk_root_pci_spared(u16 domain, u8 bus, u8 devfn);
+/* 0: the unit is spared; 1: nothing blocks plain interrupts; <0: refused, reason filled. */
+struct pci_dev;
+int mk_iommu_spare(struct pci_dev *pdev, char *reason, size_t len);
+void mk_iommu_restore(struct pci_dev *pdev);
+bool mk_iommu_remapping_active(void);
 int mk_pool_device_remove(u16 domain, u8 bus, u8 devfn,
 			  const char *driver_override, u32 flags);
 

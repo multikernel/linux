@@ -66,6 +66,7 @@ struct mk_overlay_tx {
 	enum mk_overlay_tx_status status;
 	char target_path[128];           /* Target path of the first fragment */
 	char resources[256];             /* Affected resources description */
+	char reason[192];                /* Why it failed, for the reason file */
 	void *dtbo_data;                 /* Copy of original overlay blob */
 	size_t dtbo_size;                /* Size of overlay blob */
 	struct kernfs_node *dir_kn;      /* Kernfs directory node */
@@ -118,6 +119,18 @@ static int tx_id_seq_show(struct seq_file *sf, void *v)
 	if (!tx)
 		return -EINVAL;
 	seq_printf(sf, "%d\n", tx->id);
+	return 0;
+}
+
+/* tx_XXX/reason */
+static int tx_reason_seq_show(struct seq_file *sf, void *v)
+{
+	struct kernfs_open_file *of = sf->private;
+	struct mk_overlay_tx *tx = of->kn->priv;
+
+	if (!tx)
+		return -EINVAL;
+	seq_printf(sf, "%s\n", tx->reason);
 	return 0;
 }
 
@@ -194,6 +207,10 @@ static struct kernfs_ops tx_resources_ops = {
 
 static struct kernfs_ops tx_dtbo_ops = {
 	.read = tx_dtbo_read,
+};
+
+static struct kernfs_ops tx_reason_ops = {
+	.seq_show = tx_reason_seq_show,
 };
 
 /*
@@ -893,7 +910,7 @@ static int mk_overlay_op_device(struct mk_overlay_tx *tx, const void *fdt,
 
 	fdt_for_each_subnode(item_node, fdt, op_node) {
 		const char *name = fdt_get_name(fdt, item_node, NULL);
-		const char *driver, *alias;
+		const char *driver, *alias, *iommu;
 		u16 domain;
 		u8 bus, devfn;
 		u32 flags;
@@ -910,6 +927,13 @@ static int mk_overlay_op_device(struct mk_overlay_tx *tx, const void *fdt,
 		driver = fdt_getprop(fdt, item_node, "driver", &len);
 		alias = fdt_getprop(fdt, item_node, "alias", &len);
 		flags = mk_overlay_parse_u32(fdt, item_node, "flags");
+		iommu = fdt_getprop(fdt, item_node, "iommu", &len);
+		if (iommu && strcmp(iommu, "spare")) {
+			snprintf(tx->reason, sizeof(tx->reason),
+				 "%s: unknown iommu request '%s'", name, iommu);
+			pr_err("%s tx%d: %s\n", verb, tx->id, tx->reason);
+			return -EINVAL;
+		}
 
 		if (target->kind == MK_OVERLAY_TARGET_POOL)
 			pr_info("%s tx%d: %cdevice %04x:%02x:%02x.%x %s %s\n",
@@ -937,9 +961,35 @@ static int mk_overlay_op_device(struct mk_overlay_tx *tx, const void *fdt,
 						    domain, bus, devfn);
 
 		if (ret < 0) {
-			pr_err("Failed to move device %04x:%02x:%02x.%x: %d\n",
-			       domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn),
-			       ret);
+			snprintf(tx->reason, sizeof(tx->reason),
+				 "cannot move device %04x:%02x:%02x.%x: %s",
+				 domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn),
+				 ret == -EBUSY || ret == -ENOENT ?
+				 "not free in the pool" : "error");
+			pr_err("%s tx%d: %s (%d)\n", verb, tx->id, tx->reason, ret);
+			return ret;
+		}
+	}
+
+	if (target->kind != MK_OVERLAY_TARGET_POOL || !give)
+		return 0;
+
+	/* Units can be spared only once every device of the operation has left this kernel. */
+	fdt_for_each_subnode(item_node, fdt, op_node) {
+		const char *name = fdt_get_name(fdt, item_node, NULL);
+		u16 domain;
+		u8 bus, devfn;
+		int len;
+
+		if (!name || strncmp(name, "pci@", 4) ||
+		    !fdt_getprop(fdt, item_node, "iommu", &len))
+			continue;
+		ret = mk_overlay_parse_pci_id(fdt, item_node, name, &domain, &bus, &devfn);
+		if (ret)
+			return ret;
+		ret = mk_pool_device_spare(domain, bus, devfn, tx->reason, sizeof(tx->reason));
+		if (ret < 0) {
+			pr_err("%s tx%d: %s\n", verb, tx->id, tx->reason);
 			return ret;
 		}
 	}
@@ -1375,6 +1425,12 @@ static int mk_overlay_create_tx_files(struct mk_overlay_tx *tx)
 	if (IS_ERR(kn))
 		return PTR_ERR(kn);
 
+	kn = __kernfs_create_file(tx->dir_kn, "reason", 0444,
+				  GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, 0,
+				  &tx_reason_ops, tx, NULL, NULL);
+	if (IS_ERR(kn))
+		return PTR_ERR(kn);
+
 	return 0;
 }
 
@@ -1412,6 +1468,8 @@ static int mk_overlay_apply(const void *dtbo_data, size_t dtbo_size)
 	if (ret < 0) {
 		pr_err("Failed to apply overlay transaction %d: %d\n", tx->id, ret);
 		tx->status = MK_OVERLAY_TX_FAILED;
+		if (!tx->reason[0])
+			snprintf(tx->reason, sizeof(tx->reason), "failed: %d", ret);
 		/* Continue to create sysfs entry so user can see failure */
 	} else {
 		tx->status = MK_OVERLAY_TX_APPLIED;

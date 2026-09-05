@@ -1155,6 +1155,7 @@ static inline void qi_desc_dev_iotlb_pasid(u16 sid, u16 pfsid, u32 pasid,
 #define context_pdts(pds)	(((pds) & 0x7) << 9)
 
 struct dmar_drhd_unit *dmar_find_matched_drhd_unit(struct pci_dev *dev);
+void intel_iommu_set_translation(struct intel_iommu *iommu, bool on);
 
 int dmar_enable_qi(struct intel_iommu *iommu);
 void dmar_disable_qi(struct intel_iommu *iommu);

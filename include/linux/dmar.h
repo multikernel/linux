@@ -46,6 +46,9 @@ struct dmar_drhd_unit {
 	u8	ignored:1; 		/* ignore drhd		*/
 	u8	include_all:1;
 	u8	gfx_dedicated:1;	/* graphic dedicated	*/
+	u8	spared:1;		/* left unused for a multikernel spawn */
+	u8	spared_te:1;		/* translation was on when spared */
+	int	spared_count;		/* devices handed over behind it */
 	struct intel_iommu *iommu;
 };
 
@@ -66,6 +69,20 @@ struct dmar_pci_notify_info {
 
 extern struct rw_semaphore dmar_global_lock;
 extern struct list_head dmar_drhd_units;
+
+#if IS_ENABLED(CONFIG_INTEL_IOMMU) && IS_ENABLED(CONFIG_IRQ_REMAP)
+/*
+ * Leave a remapping unit unused so the devices behind it deliver
+ * compatibility-format interrupts, which a multikernel spawn kernel that
+ * owns no remapping table can compose.
+ */
+bool dmar_remapping_active(void);
+struct dmar_drhd_unit *dmar_unit_for_pci_dev(struct pci_dev *pdev);
+bool dmar_unit_serves_legacy(struct dmar_drhd_unit *dmaru);
+int dmar_unit_walk(struct dmar_drhd_unit *dmaru, int (*cb)(struct pci_dev *, void *), void *arg);
+int dmar_unit_spare(struct dmar_drhd_unit *dmaru);
+void dmar_unit_restore(struct dmar_drhd_unit *dmaru);
+#endif
 
 #define for_each_drhd_unit(drhd)					\
 	list_for_each_entry_rcu(drhd, &dmar_drhd_units, list,		\

@@ -978,6 +978,16 @@ static void iommu_disable_translation(struct intel_iommu *iommu)
 	raw_spin_unlock_irqrestore(&iommu->register_lock, flag);
 }
 
+#ifdef CONFIG_MULTIKERNEL
+void intel_iommu_set_translation(struct intel_iommu *iommu, bool on)
+{
+	if (on)
+		iommu_enable_translation(iommu);
+	else
+		iommu_disable_translation(iommu);
+}
+#endif
+
 static void disable_dmar_iommu(struct intel_iommu *iommu)
 {
 	/*

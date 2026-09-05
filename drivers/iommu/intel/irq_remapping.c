@@ -1603,3 +1603,103 @@ int dmar_ir_hotplug(struct dmar_drhd_unit *dmaru, bool insert)
 
 	return ret;
 }
+
+#ifdef CONFIG_MULTIKERNEL
+/*
+ * A remapping unit spared for a multikernel spawn: with remapping off on
+ * the unit, the devices behind it deliver compatibility-format interrupts
+ * untouched, which is all a spawn kernel without a table can compose.
+ * Only a unit that serves nothing this kernel still drives may be spared.
+ */
+bool dmar_remapping_active(void)
+{
+	return irq_remapping_enabled;
+}
+
+struct dmar_drhd_unit *dmar_unit_for_pci_dev(struct pci_dev *pdev)
+{
+	return dmar_find_matched_drhd_unit(pdev);
+}
+
+bool dmar_unit_serves_legacy(struct dmar_drhd_unit *dmaru)
+{
+	int i;
+
+	if (dmaru->include_all)
+		return true;
+	for (i = 0; i < MAX_IO_APICS; i++)
+		if (ir_ioapic[i].iommu && ir_ioapic[i].iommu == dmaru->iommu)
+			return true;
+	for (i = 0; i < MAX_HPET_TBS; i++)
+		if (ir_hpet[i].iommu && ir_hpet[i].iommu == dmaru->iommu)
+			return true;
+	return false;
+}
+
+/*
+ * Every PCI function the unit covers: the scope entries themselves and,
+ * for a bridge among them, everything below it. The scopes are collected
+ * under RCU and walked outside it, since a bus walk sleeps.
+ */
+int dmar_unit_walk(struct dmar_drhd_unit *dmaru, int (*cb)(struct pci_dev *, void *), void *arg)
+{
+	struct pci_dev **scopes;
+	struct device *tmp;
+	int i, n = 0, ret = 0;
+
+	scopes = kcalloc(dmaru->devices_cnt, sizeof(*scopes), GFP_KERNEL);
+	if (!scopes)
+		return -ENOMEM;
+
+	rcu_read_lock();
+	for_each_active_dev_scope(dmaru->devices, dmaru->devices_cnt, i, tmp)
+		if (dev_is_pci(tmp))
+			scopes[n++] = pci_dev_get(to_pci_dev(tmp));
+	rcu_read_unlock();
+
+	for (i = 0; i < n; i++) {
+		if (!ret)
+			ret = cb(scopes[i], arg);
+		if (!ret && scopes[i]->subordinate)
+			pci_walk_bus(scopes[i]->subordinate, cb, arg);
+		pci_dev_put(scopes[i]);
+	}
+	kfree(scopes);
+	return ret;
+}
+
+int dmar_unit_spare(struct dmar_drhd_unit *dmaru)
+{
+	struct intel_iommu *iommu = dmaru->iommu;
+
+	if (!iommu)
+		return -ENODEV;
+	if (dmaru->spared)
+		return 0;
+	if (irq_remapping_enabled && iommu->ir_table)
+		iommu_disable_irq_remapping(iommu);
+	dmaru->spared_te = !!(iommu->gcmd & DMA_GCMD_TE);
+	if (dmaru->spared_te)
+		intel_iommu_set_translation(iommu, false);
+	dmaru->spared = 1;
+	pr_info("DMAR: unit at 0x%llx spared for a multikernel spawn\n",
+		dmaru->reg_base_addr);
+	return 0;
+}
+
+void dmar_unit_restore(struct dmar_drhd_unit *dmaru)
+{
+	struct intel_iommu *iommu = dmaru->iommu;
+
+	if (!dmaru->spared || !iommu)
+		return;
+	if (dmaru->spared_te)
+		intel_iommu_set_translation(iommu, true);
+	if (irq_remapping_enabled && iommu->ir_table) {
+		iommu_set_irq_remapping(iommu, eim_mode);
+		iommu_enable_irq_remapping(iommu);
+	}
+	dmaru->spared = 0;
+	pr_info("DMAR: unit at 0x%llx back in use\n", dmaru->reg_base_addr);
+}
+#endif

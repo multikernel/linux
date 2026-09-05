@@ -239,7 +239,7 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 
 		if (strcmp(device_type, "pci") == 0) {
 			struct mk_pci_device *pci_dev;
-			const char *pci_id_str;
+			const char *pci_id_str, *iommu;
 			const fdt32_t *vendor_prop, *device_prop;
 			unsigned int domain, bus, slot, func;
 
@@ -279,6 +279,14 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 			alias = mk_dt_node_alias(fdt, dev_node);
 			if (alias)
 				strscpy(pci_dev->alias, alias, sizeof(pci_dev->alias));
+			iommu = fdt_getprop(fdt, dev_node, "iommu", &len);
+			if (iommu && strcmp(iommu, "spare")) {
+				pr_err("PCI device '%s': unknown iommu request '%s'\n",
+				       dev_name, iommu);
+				kfree(pci_dev);
+				return -EINVAL;
+			}
+			pci_dev->iommu_spare = iommu != NULL;
 			pci_dev->vendor = (u16)fdt32_to_cpu(*vendor_prop);
 			pci_dev->device = (u16)fdt32_to_cpu(*device_prop);
 			pci_dev->domain = (u16)domain;
@@ -399,6 +407,7 @@ static int mk_baseline_initialize_devices(struct list_head *pci_list)
 			pr_warn("PCI device %04x:%04x@%04x:%02x:%02x.%x not moved into the pool: %d\n",
 				pci_dev->vendor, pci_dev->device, pci_dev->domain,
 				pci_dev->bus, pci_dev->slot, pci_dev->func, ret);
+			pci_dev->iommu_spare = false;
 			failed++;
 			continue;
 		}
@@ -410,6 +419,22 @@ static int mk_baseline_initialize_devices(struct list_head *pci_list)
 		pr_warn("Failed to move %d PCI devices into the pool\n", failed);
 
 	pr_info("Moved %d PCI devices into the multikernel pool\n", moved);
+
+	/* Units can be spared only once every device of the baseline has left this kernel. */
+	list_for_each_entry(pci_dev, pci_list, list) {
+		char reason[160];
+		u8 devfn = PCI_DEVFN(pci_dev->slot, pci_dev->func);
+
+		if (!pci_dev->iommu_spare)
+			continue;
+		ret = mk_pool_device_spare(pci_dev->domain, pci_dev->bus, devfn,
+					   reason, sizeof(reason));
+		if (ret) {
+			pr_err("%s\n", reason);
+			mk_pool_device_remove(pci_dev->domain, pci_dev->bus, devfn, NULL, 0);
+			return -EBUSY;
+		}
+	}
 
 	return 0;
 }

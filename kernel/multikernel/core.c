@@ -1044,6 +1044,36 @@ int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn, const char *alias)
 	return 0;
 }
 
+static struct mk_pci_device *mk_root_find_pci_device(u16 domain, u8 bus, u8 devfn)
+{
+	struct mk_pci_device *self_dev;
+
+	if (!mk_self || !mk_self->pci_devices_valid)
+		return NULL;
+	list_for_each_entry(self_dev, &mk_self->pci_devices, list)
+		if (self_dev->domain == domain && self_dev->bus == bus &&
+		    self_dev->slot == PCI_SLOT(devfn) && self_dev->func == PCI_FUNC(devfn))
+			return self_dev;
+	return NULL;
+}
+
+int mk_root_set_pci_spared(u16 domain, u8 bus, u8 devfn, bool spared)
+{
+	struct mk_pci_device *self_dev = mk_root_find_pci_device(domain, bus, devfn);
+
+	if (!self_dev)
+		return -ENOENT;
+	self_dev->iommu_spared = spared;
+	return 0;
+}
+
+bool mk_root_pci_spared(u16 domain, u8 bus, u8 devfn)
+{
+	struct mk_pci_device *self_dev = mk_root_find_pci_device(domain, bus, devfn);
+
+	return self_dev && self_dev->iommu_spared;
+}
+
 /**
  * mk_root_del_pci_device - Drop a PCI device from the root pool list
  * @domain: PCI domain
