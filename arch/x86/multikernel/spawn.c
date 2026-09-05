@@ -1598,6 +1598,11 @@ int mk_pool_park_regions(u64 *pairs, int max)
 	return out;
 }
 
+phys_addr_t mk_pool_park_slot(void)
+{
+	return mk_pool ? mk_pool->arch.slot_phys : 0;
+}
+
 /**
  * mk_pool_park_uses() - Does the pool park area live in this range?
  * @start: Physical base of the range

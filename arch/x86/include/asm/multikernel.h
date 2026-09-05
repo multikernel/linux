@@ -195,9 +195,6 @@ void mk_set_spawn_context(struct mk_spawn_context *ctx,
 int mk_spawn_cpu(struct mk_instance *instance, int cpu,
 		 struct mk_spawn_context *ctx);
 
-/* The pool park set (park page, slot, page tables) as base,size pairs */
-int mk_pool_park_regions(u64 *pairs, int max);
-
 /* Initialize boot context tracking in spawn kernel */
 void mk_init_boot_context(phys_addr_t ctx_phys);
 

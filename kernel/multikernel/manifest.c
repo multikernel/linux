@@ -273,6 +273,7 @@ static int mk_manifest_chosen(void *fdt, void *data)
 {
 	struct mk_manifest_ctx *ctx = data;
 	struct kimage *image = ctx->image;
+	phys_addr_t slot;
 	int ret;
 
 	ret = mk_manifest_add_reserved(fdt, image);
@@ -293,9 +294,9 @@ static int mk_manifest_chosen(void *fdt, void *data)
 	 * Where this host's pool CPUs park. A backup adopts this as its
 	 * own pool slot after fencing, to wake the fenced CPUs from it.
 	 */
-	if (mk_pool && mk_pool->arch.slot_phys) {
-		ret = fdt_property_u64(fdt, "multikernel,pool-slot",
-				       mk_pool->arch.slot_phys);
+	slot = mk_pool_park_slot();
+	if (slot) {
+		ret = fdt_property_u64(fdt, "multikernel,pool-slot", slot);
 		if (ret)
 			return ret;
 	}

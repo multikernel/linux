@@ -472,6 +472,10 @@ int mk_pool_park_setup(void);
 int mk_arch_pool_chunk_added(phys_addr_t start, size_t size);
 bool mk_pool_park_uses(phys_addr_t start, size_t size);
 int mk_pool_park_teardown(void);
+/* The pool park set (park page, slot, page tables) as base,size pairs */
+int mk_pool_park_regions(u64 *pairs, int max);
+/* The slot pool CPUs watch, 0 when there is none */
+phys_addr_t mk_pool_park_slot(void);
 #else
 static inline int mk_pool_park_setup(void)
 {
@@ -489,6 +493,16 @@ static inline bool mk_pool_park_uses(phys_addr_t start, size_t size)
 }
 
 static inline int mk_pool_park_teardown(void)
+{
+	return 0;
+}
+
+static inline int mk_pool_park_regions(u64 *pairs, int max)
+{
+	return 0;
+}
+
+static inline phys_addr_t mk_pool_park_slot(void)
 {
 	return 0;
 }
