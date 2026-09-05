@@ -13,7 +13,10 @@ config ARCH_HAS_MK_HOST_PARK
 config MULTIKERNEL
 	bool "Multikernel support"
 	depends on ARCH_SUPPORTS_MULTIKERNEL
+	depends on CONTIG_ALLOC
 	depends on KEXEC_CORE
+	depends on MEMORY_HOTPLUG
+	depends on MEMORY_HOTREMOVE
 	select LIBFDT
 	select OF_DYNAMIC if OF
 	help
