@@ -34,10 +34,18 @@ static inline void kexec_unlock(void)
 #ifdef CONFIG_KEXEC_FILE
 #include <linux/purgatory.h>
 void kimage_file_post_load_cleanup(struct kimage *image);
+void kimage_file_free_cmdline(struct kimage *image);
+const char *kimage_file_cmdline(struct kimage *image, unsigned long *len);
 extern char kexec_purgatory[];
 extern size_t kexec_purgatory_size;
 #else /* CONFIG_KEXEC_FILE */
 static inline void kimage_file_post_load_cleanup(struct kimage *image) { }
+static inline void kimage_file_free_cmdline(struct kimage *image) { }
+static inline const char *kimage_file_cmdline(struct kimage *image,
+					      unsigned long *len)
+{
+	return NULL;
+}
 #endif /* CONFIG_KEXEC_FILE */
 
 struct kexec_buf;

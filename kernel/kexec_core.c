@@ -686,8 +686,7 @@ void kimage_free(struct kimage *image)
 	 * error occurred much later after buffer allocation.
 	 */
 	if (image->file_mode) {
-		kfree(image->cmdline_buf);
-		image->cmdline_buf = NULL;
+		kimage_file_free_cmdline(image);
 		kimage_file_post_load_cleanup(image);
 	}
 
@@ -1280,13 +1279,12 @@ static int kimage_proc_show(struct seq_file *m, void *v)
 				image->mk_id, type_name, image->start, image->nr_segments,
 				image->file_mode ? "file" : "sys");
 
-			if (image->file_mode && image->cmdline_buf && image->cmdline_buf_len > 0) {
-				unsigned long len = image->cmdline_buf_len;
+			if (image->file_mode) {
+				unsigned long len;
+				const char *cmdline = kimage_file_cmdline(image, &len);
 
-				if (len > 0 && image->cmdline_buf[len - 1] == '\0')
-					len--;
-				if (len > 0)
-					seq_printf(m, "\"%.*s\"", (int)len, image->cmdline_buf);
+				if (cmdline)
+					seq_printf(m, "\"%.*s\"", (int)len, cmdline);
 			}
 			seq_printf(m, "\n");
 		}

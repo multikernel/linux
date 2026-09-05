@@ -100,6 +100,27 @@ int kexec_image_post_load_cleanup_default(struct kimage *image)
 	return image->fops->cleanup(image->image_loader_data);
 }
 
+void kimage_file_free_cmdline(struct kimage *image)
+{
+	kfree(image->cmdline_buf);
+	image->cmdline_buf = NULL;
+}
+
+/* The command line without its terminating NUL, or NULL if there is none */
+const char *kimage_file_cmdline(struct kimage *image, unsigned long *len)
+{
+	unsigned long n = image->cmdline_buf_len;
+
+	if (!image->cmdline_buf || !n)
+		return NULL;
+	if (image->cmdline_buf[n - 1] == '\0')
+		n--;
+	if (!n)
+		return NULL;
+	*len = n;
+	return image->cmdline_buf;
+}
+
 /*
  * Free up memory used by kernel, initrd, and command line. This is temporary
  * memory allocation which is not needed any more after these buffers have
