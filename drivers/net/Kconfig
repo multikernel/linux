@@ -439,6 +439,16 @@ config TUN_VNET_CROSS_LE
 	  Unless you have a little-endian system hosting a big-endian virtual
 	  machine with a legacy virtio NIC, you should say N.
 
+config MK_VNET
+	tristate "Multikernel virtio-net backend"
+	depends on MULTIKERNEL
+	select VHOST_RING
+	help
+	  Serves the virtio-net devices of multikernel app-kernels from
+	  this kernel. Each device becomes a host netdev peered with the
+	  app-kernel's interface the way a veth pair is, with the frames
+	  moving through the app-kernel's virtqueues in shared memory.
+
 config VETH
 	tristate "Virtual ethernet pair device"
 	select PAGE_POOL
