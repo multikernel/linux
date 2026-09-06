@@ -99,3 +99,8 @@ static inline void mk_of_pci_take_back(u16 domain, u8 bus, u8 devfn)
 phys_addr_t mk_manifest_phys(void);
 
 #endif /* _KERNEL_MULTIKERNEL_INTERNAL_H */
+
+/* Host-side virtio device model (virtio_host.c) */
+int mk_virtio_host_create(struct mk_instance *instance);
+void mk_virtio_host_destroy(struct mk_instance *instance);
+void mk_virtio_host_stop_all(struct mk_instance *instance);

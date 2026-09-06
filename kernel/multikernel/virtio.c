@@ -56,13 +56,14 @@ int mk_virtio_table_alloc(struct mk_instance *instance)
 	}
 
 	instance->virtio_table = table;
-	return 0;
+	return mk_virtio_host_create(instance);
 }
 
 void mk_virtio_devices_free(struct mk_instance *instance)
 {
 	struct mk_virtio_dev *vdev, *tmp;
 
+	mk_virtio_host_destroy(instance);
 	list_for_each_entry_safe(vdev, tmp, &instance->virtio_devices, list) {
 		list_del(&vdev->list);
 		kfree(vdev);
@@ -77,6 +78,9 @@ void mk_virtio_table_reset(struct mk_instance *instance)
 
 	if (!table)
 		return;
+
+	/* The spawn that negotiated these is gone */
+	mk_virtio_host_stop_all(instance);
 
 	for (i = 0; i < table->num_devices; i++) {
 		struct mk_virtio_entry *e = (void *)table + MK_VIRTIO_ENTRY_OFFSET(i);

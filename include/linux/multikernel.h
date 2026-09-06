@@ -668,6 +668,7 @@ struct mk_instance {
 	struct list_head virtio_devices;     /* struct mk_virtio_dev, served by the host */
 	int virtio_device_count;
 	void *virtio_table;                  /* struct mk_virtio_table in the control block */
+	struct mk_virtio_host *virtio_host;  /* device model state, host side */
 
 	/* IPI communication buffer */
 	struct mk_shared_data *ipi_data; /* IPI shared memory buffer (virtual address) */
@@ -1105,6 +1106,45 @@ int mk_virtio_table_alloc(struct mk_instance *instance);
 void mk_virtio_table_reset(struct mk_instance *instance);
 int mk_virtio_emit_nodes(struct mk_instance *instance, void *fdt);
 void mk_virtio_devices_free(struct mk_instance *instance);
+
+/*
+ * Host-side device model. A backend module serves one virtio device id
+ * for every instance entry that names it. bind runs when the entry
+ * exists, start when the driver reached DRIVER_OK with its queues
+ * enabled, stop on reset, exec, or teardown, kick from hardirq for a
+ * queue the driver rang. The device model writes @features into the
+ * entry before bind; bind fills the config space.
+ */
+struct mk_virtio_hdev;
+struct mk_virtio_host;
+
+struct mk_virtio_backend {
+	u32 device_id;
+	const char *name;
+	u64 features;
+	int (*bind)(struct mk_virtio_hdev *hdev);
+	void (*unbind)(struct mk_virtio_hdev *hdev);
+	int (*start)(struct mk_virtio_hdev *hdev);
+	void (*stop)(struct mk_virtio_hdev *hdev);
+	void (*kick)(struct mk_virtio_hdev *hdev, unsigned int queue);
+	struct list_head list;
+};
+
+struct mk_virtio_hdev {
+	struct mk_instance *instance;
+	struct mk_virtio_entry *entry;
+	unsigned int index;
+	const struct mk_virtio_backend *backend;
+	void *priv;
+	bool started;
+};
+
+struct vhost_iotlb;
+
+int mk_virtio_register_backend(struct mk_virtio_backend *backend);
+void mk_virtio_unregister_backend(struct mk_virtio_backend *backend);
+void mk_virtio_hdev_call(struct mk_virtio_hdev *hdev, unsigned int queue);
+struct vhost_iotlb *mk_virtio_hdev_iotlb(struct mk_virtio_hdev *hdev);
 
 void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
 			     size_t align);

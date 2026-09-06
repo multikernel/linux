@@ -19,6 +19,7 @@ config MULTIKERNEL
 	depends on MEMORY_HOTREMOVE
 	select LIBFDT
 	select OF_DYNAMIC if OF
+	select VHOST_IOTLB
 	help
 	  Enable multikernel support, which allows running multiple kernel
 	  instances simultaneously with resource isolation and inter-kernel
