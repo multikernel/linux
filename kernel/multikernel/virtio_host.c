@@ -9,7 +9,6 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
-#include <linux/vhost_iotlb.h>
 #include <linux/virtio_config.h>
 #include <linux/workqueue.h>
 #include <linux/multikernel.h>
@@ -138,34 +137,6 @@ void mk_virtio_hdev_call(struct mk_virtio_hdev *hdev, unsigned int queue)
 	mk_doorbell_ring(cpu);
 }
 EXPORT_SYMBOL_GPL(mk_virtio_hdev_call);
-
-struct vhost_iotlb *mk_virtio_hdev_iotlb(struct mk_virtio_hdev *hdev)
-{
-	struct mk_memory_region *region;
-	struct vhost_iotlb *iotlb;
-	int ret = 0;
-
-	iotlb = vhost_iotlb_alloc(0, 0);
-	if (!iotlb)
-		return ERR_PTR(-ENOMEM);
-
-	mutex_lock(&mk_instance_mutex);
-	list_for_each_entry(region, &hdev->instance->memory_regions, list) {
-		ret = vhost_iotlb_add_range(iotlb, region->res.start,
-					    region->res.end, region->res.start,
-					    VHOST_MAP_RW);
-		if (ret)
-			break;
-	}
-	mutex_unlock(&mk_instance_mutex);
-
-	if (ret) {
-		vhost_iotlb_free(iotlb);
-		return ERR_PTR(ret);
-	}
-	return iotlb;
-}
-EXPORT_SYMBOL_GPL(mk_virtio_hdev_iotlb);
 
 static const struct mk_virtio_backend *mk_virtio_find_backend(u32 device_id)
 {

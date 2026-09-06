@@ -1139,12 +1139,9 @@ struct mk_virtio_hdev {
 	bool started;
 };
 
-struct vhost_iotlb;
-
 int mk_virtio_register_backend(struct mk_virtio_backend *backend);
 void mk_virtio_unregister_backend(struct mk_virtio_backend *backend);
 void mk_virtio_hdev_call(struct mk_virtio_hdev *hdev, unsigned int queue);
-struct vhost_iotlb *mk_virtio_hdev_iotlb(struct mk_virtio_hdev *hdev);
 
 void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
 			     size_t align);

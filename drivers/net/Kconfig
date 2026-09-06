@@ -442,7 +442,6 @@ config TUN_VNET_CROSS_LE
 config MK_VNET
 	tristate "Multikernel virtio-net backend"
 	depends on MULTIKERNEL
-	select VHOST_RING
 	help
 	  Serves the virtio-net devices of multikernel app-kernels from
 	  this kernel. Each device becomes a host netdev peered with the
