@@ -10,6 +10,8 @@
 
 #ifndef __ASSEMBLY__
 
+#include <uapi/linux/multikernel_virtio.h>
+
 #include <linux/build_bug.h>
 #include <linux/stddef.h>
 #include <linux/types.h>
@@ -174,7 +176,8 @@ void __noreturn multikernel_play_dead(void);
  * one contiguous range the spawn kernel can reserve with a single call.
  */
 #define MK_CTRL_PGTABLE_PAGES	64
-#define MK_CTRL_BLOCK_SIZE	(SZ_16K + (3 + MK_CTRL_PGTABLE_PAGES) * PAGE_SIZE)
+#define MK_CTRL_BLOCK_SIZE	(SZ_16K + MK_VIRTIO_TABLE_SIZE + \
+				 (3 + MK_CTRL_PGTABLE_PAGES) * PAGE_SIZE)
 
 struct mk_ident_pgtable;
 

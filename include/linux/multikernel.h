@@ -587,6 +587,17 @@ struct mk_platform_device {
 	struct list_head list;                     /* Link to device list */
 };
 
+#define MK_VIRTIO_DEV_NAME_LEN 16
+
+/* A virtio device the host serves to an instance over shared memory */
+struct mk_virtio_dev {
+	u32 device_id;
+	u32 num_queues;
+	u32 queue_size;
+	char name[MK_VIRTIO_DEV_NAME_LEN];
+	struct list_head list;
+};
+
 /**
  * Complete multikernel device tree configuration
  *
@@ -615,6 +626,9 @@ struct mk_dt_config {
 	struct list_head platform_devices;   /* List of struct mk_platform_device */
 	int platform_device_count;           /* Number of platform devices */
 	bool platform_devices_valid;         /* Whether platform device list is valid */
+
+	struct list_head virtio_devices;     /* List of struct mk_virtio_dev */
+	int virtio_device_count;
 
 	/* Extensibility: Reserved fields for future use */
 	u32 reserved[6];                 /* Reduced due to added fields */
@@ -650,6 +664,10 @@ struct mk_instance {
 	struct list_head platform_devices;   /* List of struct mk_platform_device */
 	int platform_device_count;           /* Number of platform devices */
 	bool platform_devices_valid;         /* Whether platform device list is valid */
+
+	struct list_head virtio_devices;     /* struct mk_virtio_dev, served by the host */
+	int virtio_device_count;
+	void *virtio_table;                  /* struct mk_virtio_table in the control block */
 
 	/* IPI communication buffer */
 	struct mk_shared_data *ipi_data; /* IPI shared memory buffer (virtual address) */
@@ -1066,6 +1084,12 @@ int __init mk_instance_restore_from_manifest(void);
  *
  * Declared above with the CONFIG_MULTIKERNEL stubs.
  */
+
+/* Host-served virtio devices: table in the control block, boot tree nodes */
+int mk_virtio_table_alloc(struct mk_instance *instance);
+void mk_virtio_table_reset(struct mk_instance *instance);
+int mk_virtio_emit_nodes(struct mk_instance *instance, void *fdt);
+void mk_virtio_devices_free(struct mk_instance *instance);
 
 void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
 			     size_t align);

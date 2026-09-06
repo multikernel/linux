@@ -22,6 +22,7 @@
 #include <linux/cpumask.h>
 #if defined(CONFIG_X86) && defined(CONFIG_PCI_MMCONFIG)
 #include <asm/pci_x86.h>
+#include <uapi/linux/multikernel_virtio.h>
 #endif
 #include <linux/numa.h>
 #include <linux/multikernel.h>
@@ -75,15 +76,25 @@ void mk_dt_config_init(struct mk_dt_config *config)
 	INIT_LIST_HEAD(&config->platform_devices);
 	config->platform_device_count = 0;
 	config->platform_devices_valid = true;
+
+	INIT_LIST_HEAD(&config->virtio_devices);
+	config->virtio_device_count = 0;
 }
 
 void mk_dt_config_free(struct mk_dt_config *config)
 {
 	struct mk_pci_device *pci_dev, *tmp_pci;
 	struct mk_platform_device *plat_dev, *tmp_plat;
+	struct mk_virtio_dev *vdev, *tmp_vdev;
 
 	if (!config)
 		return;
+
+	list_for_each_entry_safe(vdev, tmp_vdev, &config->virtio_devices, list) {
+		list_del(&vdev->list);
+		kfree(vdev);
+	}
+	config->virtio_device_count = 0;
 
 	mk_cpu_set_free(config->cpus);
 	config->cpus = NULL;
@@ -491,6 +502,42 @@ static int mk_dt_parse_embedded_devices(const void *fdt, int resources_node,
 	return 0;
 }
 
+static int mk_dt_parse_virtio(const void *fdt, int resources_node,
+			      struct mk_dt_config *config)
+{
+	int virtio_node, node;
+
+	virtio_node = fdt_subnode_offset(fdt, resources_node, "virtio");
+	if (virtio_node < 0)
+		return 0;
+
+	fdt_for_each_subnode(node, fdt, virtio_node) {
+		const fdt32_t *id = fdt_getprop(fdt, node, "device-id", NULL);
+		const fdt32_t *queues = fdt_getprop(fdt, node, "queues", NULL);
+		const fdt32_t *size = fdt_getprop(fdt, node, "queue-size", NULL);
+		struct mk_virtio_dev *vdev;
+
+		if (!id || !queues)
+			return -EINVAL;
+		if (config->virtio_device_count == MK_VIRTIO_MAX_DEVICES)
+			return -E2BIG;
+		if (fdt32_to_cpu(*queues) == 0 ||
+		    fdt32_to_cpu(*queues) > MK_VIRTIO_MAX_QUEUES)
+			return -EINVAL;
+
+		vdev = kzalloc_obj(*vdev, GFP_KERNEL);
+		if (!vdev)
+			return -ENOMEM;
+		vdev->device_id = fdt32_to_cpu(*id);
+		vdev->num_queues = fdt32_to_cpu(*queues);
+		vdev->queue_size = size ? fdt32_to_cpu(*size) : 256;
+		strscpy(vdev->name, fdt_get_name(fdt, node, NULL), sizeof(vdev->name));
+		list_add_tail(&vdev->list, &config->virtio_devices);
+		config->virtio_device_count++;
+	}
+	return 0;
+}
+
 /*
  * An instance's devices are the child nodes of resources/devices, each
  * described in full. A device-names string list naming nodes of the
@@ -636,6 +683,13 @@ int mk_dt_parse_resources(const void *fdt, int resources_node,
 	ret = mk_dt_parse_devices(fdt, resources_node, config);
 	if (ret) {
 		pr_err("Failed to parse device resources for '%s': %d\n", instance_name, ret);
+		mk_dt_config_free(config);
+		return ret;
+	}
+
+	ret = mk_dt_parse_virtio(fdt, resources_node, config);
+	if (ret) {
+		pr_err("Failed to parse virtio devices for '%s': %d\n", instance_name, ret);
 		mk_dt_config_free(config);
 		return ret;
 	}

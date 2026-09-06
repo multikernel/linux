@@ -175,6 +175,7 @@ static void mk_instance_release(struct kref *kref)
 	mk_instance_return_all_cpus(instance);
 	mk_instance_return_pci_devices(instance);
 	mk_instance_return_platform_devices(instance);
+	mk_virtio_devices_free(instance);
 	mk_instance_free_memory(instance);
 
 	mk_instance_track_dump(instance, instance->state, MK_STATE_READY);
@@ -235,6 +236,7 @@ struct mk_instance *mk_instance_alloc(int id, const char *name)
 	INIT_LIST_HEAD(&instance->list);
 	INIT_LIST_HEAD(&instance->pci_devices);
 	INIT_LIST_HEAD(&instance->platform_devices);
+	INIT_LIST_HEAD(&instance->virtio_devices);
 	kref_init(&instance->refcount);
 
 	return instance;
@@ -297,6 +299,7 @@ void mk_instance_free(struct mk_instance *instance)
 		list_del(&plat_dev->list);
 		kfree(plat_dev);
 	}
+	mk_virtio_devices_free(instance);
 	kfree(instance->host_tree);
 	mk_cpu_set_free(instance->cpus);
 	kfree(instance->name);
@@ -827,6 +830,25 @@ static int mk_instance_reserve_platform_devices(struct mk_instance *instance,
 						     config->platform_device_count);
 }
 
+static int mk_instance_reserve_virtio_devices(struct mk_instance *instance,
+					      const struct mk_dt_config *config)
+{
+	struct mk_virtio_dev *vdev;
+
+	list_for_each_entry(vdev, &config->virtio_devices, list) {
+		struct mk_virtio_dev *copy = kmemdup(vdev, sizeof(*vdev), GFP_KERNEL);
+
+		if (!copy)
+			return -ENOMEM;
+		INIT_LIST_HEAD(&copy->list);
+		list_add_tail(&copy->list, &instance->virtio_devices);
+		instance->virtio_device_count++;
+	}
+	if (!instance->virtio_device_count)
+		return 0;
+	return mk_virtio_table_alloc(instance);
+}
+
 /**
  * mk_instance_add_pci_device - Add a single PCI device to an instance
  * @instance: Target instance
@@ -1328,6 +1350,13 @@ int mk_instance_reserve_resources(struct mk_instance *instance,
 		       instance->id, instance->name, ret);
 		/* Don't fail the whole operation for platform reservation failure */
 		pr_warn("Continuing without platform device assignment\n");
+	}
+
+	ret = mk_instance_reserve_virtio_devices(instance, config);
+	if (ret) {
+		pr_err("Failed to reserve virtio devices for instance %d (%s): %d\n",
+		       instance->id, instance->name, ret);
+		return ret;
 	}
 
 	return 0;
