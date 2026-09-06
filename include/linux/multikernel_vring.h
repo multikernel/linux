@@ -53,7 +53,7 @@ void mk_vring_cleanup(struct mk_vring *r);
 
 /* 1 with @c filled, 0 when the driver has posted nothing, negative if the ring is broken */
 int mk_vring_next(struct mk_vring *r, struct mk_vring_chain *c);
-/* Give back the last @n chains taken with mk_vring_next() and forget their used entries */
+/* Give back the last @n chains taken with mk_vring_next(), one used entry each */
 void mk_vring_unget(struct mk_vring *r, unsigned int n);
 
 void mk_vring_add_used(struct mk_vring *r, u16 head, u32 len);
@@ -64,17 +64,7 @@ bool mk_vring_need_call(struct mk_vring *r);
 bool mk_vring_enable_kick(struct mk_vring *r);
 void mk_vring_disable_kick(struct mk_vring *r);
 
-/* Byte @off into the readable part of the chain, and into the writable part */
+/* Read from byte @off of the chain's readable part */
 u32 mk_vring_copy_from(const struct mk_vring_chain *c, u32 off, void *dst, u32 len);
-u32 mk_vring_copy_to(const struct mk_vring_chain *c, u32 off, const void *src, u32 len);
-
-static inline u32 mk_vring_chain_writable(const struct mk_vring_chain *c)
-{
-	u32 i, len = 0;
-
-	for (i = c->nread; i < c->nsegs; i++)
-		len += c->segs[i].len;
-	return len;
-}
 
 #endif /* _LINUX_MULTIKERNEL_VRING_H */

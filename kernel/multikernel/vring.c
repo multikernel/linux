@@ -192,7 +192,7 @@ EXPORT_SYMBOL_GPL(mk_vring_next);
 void mk_vring_unget(struct mk_vring *r, unsigned int n)
 {
 	r->last_avail_idx -= n;
-	r->pending_used = 0;
+	r->pending_used -= n;
 }
 EXPORT_SYMBOL_GPL(mk_vring_unget);
 
@@ -264,12 +264,11 @@ void mk_vring_disable_kick(struct mk_vring *r)
 }
 EXPORT_SYMBOL_GPL(mk_vring_disable_kick);
 
-static u32 mk_vring_copy(const struct mk_vring_chain *c, u32 first, u32 last,
-			 u32 off, void *buf, u32 len, bool to_chain)
+u32 mk_vring_copy_from(const struct mk_vring_chain *c, u32 off, void *dst, u32 len)
 {
 	u32 i, done = 0;
 
-	for (i = first; i < last && done < len; i++) {
+	for (i = 0; i < c->nread && done < len; i++) {
 		const struct mk_vring_seg *s = &c->segs[i];
 		u32 n;
 
@@ -278,24 +277,10 @@ static u32 mk_vring_copy(const struct mk_vring_chain *c, u32 first, u32 last,
 			continue;
 		}
 		n = min(s->len - off, len - done);
-		if (to_chain)
-			memcpy(s->va + off, buf + done, n);
-		else
-			memcpy(buf + done, s->va + off, n);
+		memcpy(dst + done, s->va + off, n);
 		done += n;
 		off = 0;
 	}
 	return done;
 }
-
-u32 mk_vring_copy_from(const struct mk_vring_chain *c, u32 off, void *dst, u32 len)
-{
-	return mk_vring_copy(c, 0, c->nread, off, dst, len, false);
-}
 EXPORT_SYMBOL_GPL(mk_vring_copy_from);
-
-u32 mk_vring_copy_to(const struct mk_vring_chain *c, u32 off, const void *src, u32 len)
-{
-	return mk_vring_copy(c, c->nread, c->nsegs, off, (void *)src, len, true);
-}
-EXPORT_SYMBOL_GPL(mk_vring_copy_to);
