@@ -1085,6 +1085,21 @@ int __init mk_instance_restore_from_manifest(void);
  * Declared above with the CONFIG_MULTIKERNEL stubs.
  */
 
+/*
+ * A doorbell is a set of pending bits in shared memory plus the bare
+ * multikernel IPI. Every registered scan runs from the IPI handler, in
+ * hardirq context, whenever the doorbell CPU is rung.
+ */
+struct mk_doorbell {
+	struct list_head list;
+	void (*scan)(struct mk_doorbell *db);
+};
+
+void mk_doorbell_register(struct mk_doorbell *db);
+void mk_doorbell_unregister(struct mk_doorbell *db);
+void mk_doorbell_ring(mk_phys_cpu_t cpu);
+void mk_doorbell_scan_all(void);
+
 /* Host-served virtio devices: table in the control block, boot tree nodes */
 int mk_virtio_table_alloc(struct mk_instance *instance);
 void mk_virtio_table_reset(struct mk_instance *instance);

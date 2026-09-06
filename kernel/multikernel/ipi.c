@@ -329,6 +329,8 @@ advance_tail:
  */
 static void multikernel_interrupt_handler(void)
 {
+	mk_doorbell_scan_all();
+
 	if (!mk_self || !mk_self->ipi_data)
 		return;
 
