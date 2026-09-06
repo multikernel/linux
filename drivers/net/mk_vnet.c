@@ -7,9 +7,12 @@
  * eth0 the way a veth pair is: host transmit writes into the spawn's RX
  * ring, the spawn's transmits arrive through NAPI.
  */
+#include <linux/bpf.h>
 #include <linux/etherdevice.h>
+#include <linux/filter.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
+#include <net/xdp.h>
 #include <linux/vhost_iotlb.h>
 #include <linux/virtio_net.h>
 #include <linux/virtio_ring.h>
@@ -43,6 +46,8 @@ struct mk_vnet {
 	struct vhost_iotlb *iotlb;
 	spinlock_t iotlb_lock;		/* vringh needs one; the map is fixed after start */
 	spinlock_t rx_lock;		/* host transmit into the spawn's RX ring */
+	struct bpf_prog __rcu *xdp_prog;
+	struct xdp_rxq_info xdp_rxq;
 };
 
 /* The ring lives in instance memory the host also maps; refuse anything else */
@@ -102,10 +107,33 @@ static bool mk_vnet_notify_enable(struct mk_vnet_ring *ring)
 	return le16_to_cpu(READ_ONCE(*ring->avail_idx)) == last;
 }
 
+/*
+ * Write one frame into the buffer the driver posted at @head. The caller
+ * holds rx_lock and has taken the descriptor.
+ */
+static int mk_vnet_push(struct mk_vnet *vn, u16 head, const void *data, size_t len)
+{
+	struct virtio_net_hdr_mrg_rxbuf hdr = { .num_buffers = cpu_to_le16(1) };
+
+	if (vringh_kiov_length(&vn->rx.iov) < MK_VNET_HDR_LEN + len) {
+		vringh_complete_iotlb(&vn->rx.vrh, head, 0);
+		return -EMSGSIZE;
+	}
+	vringh_iov_push_iotlb(&vn->rx.vrh, &vn->rx.iov, &hdr, MK_VNET_HDR_LEN);
+	vringh_iov_push_iotlb(&vn->rx.vrh, &vn->rx.iov, data, len);
+	vringh_complete_iotlb(&vn->rx.vrh, head, MK_VNET_HDR_LEN + len);
+	return 0;
+}
+
+static void mk_vnet_call_if_needed(struct mk_vnet *vn)
+{
+	if (vringh_need_notify_iotlb(&vn->rx.vrh) > 0)
+		mk_virtio_hdev_call(vn->hdev, MK_VNET_RXQ);
+}
+
 static netdev_tx_t mk_vnet_xmit(struct sk_buff *skb, struct net_device *ndev)
 {
 	struct mk_vnet *vn = netdev_priv(ndev);
-	struct virtio_net_hdr_mrg_rxbuf hdr = { .num_buffers = cpu_to_le16(1) };
 	u16 head;
 	int ret;
 
@@ -125,15 +153,11 @@ static netdev_tx_t mk_vnet_xmit(struct sk_buff *skb, struct net_device *ndev)
 		ret = vringh_getdesc_iotlb(&vn->rx.vrh, NULL, &vn->rx.iov, &head,
 					   GFP_ATOMIC);
 	}
-	if (ret <= 0 || vringh_kiov_length(&vn->rx.iov) < MK_VNET_HDR_LEN + skb->len) {
+	if (ret <= 0 || mk_vnet_push(vn, head, skb->data, skb->len)) {
 		spin_unlock(&vn->rx_lock);
 		goto drop;
 	}
-	vringh_iov_push_iotlb(&vn->rx.vrh, &vn->rx.iov, &hdr, MK_VNET_HDR_LEN);
-	vringh_iov_push_iotlb(&vn->rx.vrh, &vn->rx.iov, skb->data, skb->len);
-	vringh_complete_iotlb(&vn->rx.vrh, head, MK_VNET_HDR_LEN + skb->len);
-	if (vringh_need_notify_iotlb(&vn->rx.vrh) > 0)
-		mk_virtio_hdev_call(vn->hdev, MK_VNET_RXQ);
+	mk_vnet_call_if_needed(vn);
 	spin_unlock(&vn->rx_lock);
 
 	dev_sw_netstats_tx_add(ndev, 1, skb->len);
@@ -145,47 +169,140 @@ drop:
 	return NETDEV_TX_OK;
 }
 
+/* Frames redirected here by an XDP program on another device, no skb involved */
+static int mk_vnet_xdp_xmit(struct net_device *ndev, int n, struct xdp_frame **frames,
+			    u32 flags)
+{
+	struct mk_vnet *vn = netdev_priv(ndev);
+	int i, sent = 0;
+
+	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
+		return -EINVAL;
+	if (!netif_carrier_ok(ndev))
+		return -ENETDOWN;
+
+	spin_lock(&vn->rx_lock);
+	for (i = 0; i < n; i++) {
+		struct xdp_frame *xdpf = frames[i];
+		u16 head;
+
+		if (xdp_frame_has_frags(xdpf))
+			break;
+		if (vringh_getdesc_iotlb(&vn->rx.vrh, NULL, &vn->rx.iov, &head,
+					 GFP_ATOMIC) <= 0)
+			break;
+		if (mk_vnet_push(vn, head, xdpf->data, xdpf->len))
+			break;
+		dev_sw_netstats_tx_add(ndev, 1, xdpf->len);
+		xdp_return_frame_rx_napi(xdpf);
+		sent++;
+	}
+	mk_vnet_call_if_needed(vn);
+	spin_unlock(&vn->rx_lock);
+	return sent;
+}
+
+/*
+ * One frame from the spawn's TX ring, as a page fragment with XDP headroom
+ * so an attached program can redirect it without a copy. Returns the
+ * fragment or NULL with the descriptor already completed.
+ */
+static void *mk_vnet_pull(struct mk_vnet *vn, struct napi_struct *napi,
+			  u16 head, size_t *lenp, size_t *truesizep)
+{
+	struct virtio_net_hdr_mrg_rxbuf hdr;
+	size_t len = vringh_kiov_length(&vn->tx.iov);
+	size_t truesize;
+	void *buf;
+
+	if (len < MK_VNET_HDR_LEN + ETH_HLEN) {
+		vn->ndev->stats.rx_length_errors++;
+		goto out;
+	}
+	len -= MK_VNET_HDR_LEN;
+	truesize = SKB_DATA_ALIGN(XDP_PACKET_HEADROOM + len) +
+		   SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
+	buf = napi_alloc_frag(truesize);
+	if (!buf) {
+		vn->ndev->stats.rx_dropped++;
+		goto out;
+	}
+	vringh_iov_pull_iotlb(&vn->tx.vrh, &vn->tx.iov, &hdr, MK_VNET_HDR_LEN);
+	vringh_iov_pull_iotlb(&vn->tx.vrh, &vn->tx.iov, buf + XDP_PACKET_HEADROOM, len);
+	vringh_complete_iotlb(&vn->tx.vrh, head, 0);
+	*lenp = len;
+	*truesizep = truesize;
+	return buf;
+out:
+	vringh_complete_iotlb(&vn->tx.vrh, head, 0);
+	return NULL;
+}
+
 static int mk_vnet_poll(struct napi_struct *napi, int budget)
 {
 	struct mk_vnet *vn = container_of(napi, struct mk_vnet, napi);
 	struct net_device *ndev = vn->ndev;
+	struct bpf_prog *prog;
+	bool redirected = false;
 	int done = 0;
 
+	rcu_read_lock();
+	prog = rcu_dereference(vn->xdp_prog);
 	while (done < budget) {
-		struct virtio_net_hdr_mrg_rxbuf hdr;
 		struct sk_buff *skb;
-		size_t len;
+		struct xdp_buff xdp;
+		size_t len, truesize;
+		void *buf;
 		u16 head;
-		int ret;
+		u32 act;
 
-		ret = vringh_getdesc_iotlb(&vn->tx.vrh, &vn->tx.iov, NULL, &head,
-					   GFP_ATOMIC);
-		if (ret <= 0)
+		if (vringh_getdesc_iotlb(&vn->tx.vrh, &vn->tx.iov, NULL, &head,
+					 GFP_ATOMIC) <= 0)
 			break;
-
-		len = vringh_kiov_length(&vn->tx.iov);
-		if (len < MK_VNET_HDR_LEN + ETH_HLEN) {
-			ndev->stats.rx_length_errors++;
-			vringh_complete_iotlb(&vn->tx.vrh, head, 0);
+		buf = mk_vnet_pull(vn, napi, head, &len, &truesize);
+		if (!buf)
 			continue;
-		}
-		len -= MK_VNET_HDR_LEN;
-
-		skb = napi_alloc_skb(napi, len);
-		if (!skb) {
-			ndev->stats.rx_dropped++;
-			vringh_complete_iotlb(&vn->tx.vrh, head, 0);
-			continue;
-		}
-		vringh_iov_pull_iotlb(&vn->tx.vrh, &vn->tx.iov, &hdr, MK_VNET_HDR_LEN);
-		vringh_iov_pull_iotlb(&vn->tx.vrh, &vn->tx.iov, skb_put(skb, len), len);
-		vringh_complete_iotlb(&vn->tx.vrh, head, 0);
-
-		skb->protocol = eth_type_trans(skb, ndev);
 		dev_sw_netstats_rx_add(ndev, len);
-		napi_gro_receive(napi, skb);
 		done++;
+
+		xdp_init_buff(&xdp, truesize, &vn->xdp_rxq);
+		xdp_prepare_buff(&xdp, buf, XDP_PACKET_HEADROOM, len, false);
+		act = prog ? bpf_prog_run_xdp(prog, &xdp) : XDP_PASS;
+		switch (act) {
+		case XDP_PASS:
+			skb = napi_build_skb(buf, truesize);
+			if (!skb) {
+				ndev->stats.rx_dropped++;
+				skb_free_frag(buf);
+				break;
+			}
+			skb_reserve(skb, xdp.data - buf);
+			skb_put(skb, xdp.data_end - xdp.data);
+			skb->protocol = eth_type_trans(skb, ndev);
+			napi_gro_receive(napi, skb);
+			break;
+		case XDP_REDIRECT:
+			if (xdp_do_redirect(ndev, &xdp, prog)) {
+				ndev->stats.rx_dropped++;
+				skb_free_frag(buf);
+			} else {
+				redirected = true;
+			}
+			break;
+		default:
+			bpf_warn_invalid_xdp_action(ndev, prog, act);
+			fallthrough;
+		case XDP_ABORTED:
+		case XDP_TX:
+		case XDP_DROP:
+			ndev->stats.rx_dropped++;
+			skb_free_frag(buf);
+			break;
+		}
 	}
+	rcu_read_unlock();
+	if (redirected)
+		xdp_do_flush();
 
 	if (vringh_need_notify_iotlb(&vn->tx.vrh) > 0)
 		mk_virtio_hdev_call(vn->hdev, MK_VNET_TXQ);
@@ -197,9 +314,26 @@ static int mk_vnet_poll(struct napi_struct *napi, int budget)
 	return done;
 }
 
+static int mk_vnet_bpf(struct net_device *ndev, struct netdev_bpf *bpf)
+{
+	struct mk_vnet *vn = netdev_priv(ndev);
+	struct bpf_prog *old;
+
+	if (bpf->command != XDP_SETUP_PROG)
+		return -EINVAL;
+	old = rcu_replace_pointer(vn->xdp_prog, bpf->prog, lockdep_rtnl_is_held());
+	if (old) {
+		synchronize_net();
+		bpf_prog_put(old);
+	}
+	return 0;
+}
+
 static const struct net_device_ops mk_vnet_ops = {
 	.ndo_start_xmit = mk_vnet_xmit,
 	.ndo_get_stats64 = dev_get_tstats64,
+	.ndo_bpf = mk_vnet_bpf,
+	.ndo_xdp_xmit = mk_vnet_xdp_xmit,
 };
 
 static int mk_vnet_bind(struct mk_virtio_hdev *hdev)
@@ -228,9 +362,16 @@ static int mk_vnet_bind(struct mk_virtio_hdev *hdev)
 	vringh_kiov_init(&vn->tx.iov, NULL, 0);
 	netif_napi_add(ndev, &vn->napi, mk_vnet_poll);
 	netif_carrier_off(ndev);
+	xdp_set_features_flag(ndev, NETDEV_XDP_ACT_BASIC | NETDEV_XDP_ACT_REDIRECT |
+				    NETDEV_XDP_ACT_NDO_XMIT);
 
-	ret = register_netdev(ndev);
+	ret = xdp_rxq_info_reg(&vn->xdp_rxq, ndev, 0, vn->napi.napi_id);
+	if (!ret)
+		ret = xdp_rxq_info_reg_mem_model(&vn->xdp_rxq, MEM_TYPE_PAGE_SHARED, NULL);
+	if (!ret)
+		ret = register_netdev(ndev);
 	if (ret) {
+		xdp_rxq_info_unreg(&vn->xdp_rxq);
 		free_netdev(ndev);
 		return ret;
 	}
@@ -245,6 +386,7 @@ static void mk_vnet_unbind(struct mk_virtio_hdev *hdev)
 	struct mk_vnet *vn = hdev->priv;
 
 	unregister_netdev(vn->ndev);
+	xdp_rxq_info_unreg(&vn->xdp_rxq);
 	free_netdev(vn->ndev);
 	hdev->priv = NULL;
 }
