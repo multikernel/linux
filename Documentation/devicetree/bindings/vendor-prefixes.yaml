@@ -1105,6 +1105,8 @@ patternProperties:
     description: Imagination Technologies Ltd. (formerly MIPS Technologies Inc.)
   "^multi-inno,.*":
     description: Multi-Inno Technology Co.,Ltd
+  "^multikernel,.*":
+    description: Multikernel Technologies, Inc.
   "^mundoreader,.*":
     description: Mundo Reader S.L.
   "^murata,.*":
