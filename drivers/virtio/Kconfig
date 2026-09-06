@@ -171,6 +171,16 @@ config VIRTIO_MMIO_CMDLINE_DEVICES
 
 	 If unsure, say 'N'.
 
+config VIRTIO_MULTIKERNEL
+	bool "Virtio transport over multikernel shared memory"
+	depends on MULTIKERNEL && OF
+	select VIRTIO
+	help
+	  Virtio devices served by another kernel on the same machine
+	  through a shared device table, for multikernel app-kernels.
+	  The device side is that kernel's in-kernel backends, reached
+	  through the multikernel IPI as the doorbell.
+
 config VIRTIO_DMA_SHARED_BUFFER
 	tristate
 	depends on DMA_SHARED_BUFFER
