@@ -3,6 +3,7 @@
  * Copyright (C) 2026 Multikernel Technologies, Inc. All rights reserved
  */
 #include <linux/kernel.h>
+#include <linux/libfdt.h>
 #include <linux/slab.h>
 #include <linux/multikernel.h>
 #include <uapi/linux/multikernel_virtio.h>
@@ -67,4 +68,64 @@ void mk_virtio_devices_free(struct mk_instance *instance)
 		kfree(vdev);
 	}
 	instance->virtio_device_count = 0;
+}
+
+void mk_virtio_table_reset(struct mk_instance *instance)
+{
+	struct mk_virtio_table *table = instance->virtio_table;
+	int i, q;
+
+	if (!table)
+		return;
+
+	for (i = 0; i < table->num_devices; i++) {
+		struct mk_virtio_entry *e = (void *)table + MK_VIRTIO_ENTRY_OFFSET(i);
+
+		e->driver_features = 0;
+		e->status = 0;
+		e->req_seq = 0;
+		e->ack_seq = 0;
+		e->kick_pending = 0;
+		e->call_pending = 0;
+		e->ctrl_pending = 0;
+		for (q = 0; q < MK_VIRTIO_MAX_QUEUES; q++) {
+			e->queues[q].desc = 0;
+			e->queues[q].avail = 0;
+			e->queues[q].used = 0;
+			e->queues[q].num = 0;
+			e->queues[q].enable = 0;
+			e->queues[q].call_cpu = 0;
+		}
+	}
+}
+
+int mk_virtio_emit_nodes(struct mk_instance *instance, void *fdt)
+{
+	struct mk_virtio_table *table = instance->virtio_table;
+	phys_addr_t base;
+	int i, ret;
+
+	if (!table)
+		return 0;
+
+	base = instance->ctrl_phys + ((void *)table - instance->ctrl_va);
+	for (i = 0; i < table->num_devices; i++) {
+		u64 phys = base + MK_VIRTIO_ENTRY_OFFSET(i);
+		fdt64_t reg[2] = { cpu_to_fdt64(phys), cpu_to_fdt64(MK_VIRTIO_ENTRY_SIZE) };
+		char name[32];
+
+		snprintf(name, sizeof(name), "virtio@%llx", phys);
+		ret = fdt_begin_node(fdt, name);
+		if (!ret)
+			ret = fdt_property_string(fdt, "compatible", "multikernel,virtio");
+		if (!ret)
+			ret = fdt_property(fdt, "reg", reg, sizeof(reg));
+		if (!ret)
+			ret = fdt_property_u64(fdt, "multikernel,table", base);
+		if (!ret)
+			ret = fdt_end_node(fdt);
+		if (ret)
+			return ret;
+	}
+	return 0;
 }

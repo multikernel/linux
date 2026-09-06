@@ -348,6 +348,7 @@ int mk_manifest_finalize(struct kimage *image)
 	}
 
 	ctx.instance = instance;
+	mk_virtio_table_reset(instance);
 	fdt = phys_to_virt(image->mk_manifest);
 	ret = mk_dt_emit_boot_tree(instance, fdt, MK_MANIFEST_SIZE, mk_manifest_chosen,
 				   &ctx);

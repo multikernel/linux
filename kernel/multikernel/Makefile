@@ -13,3 +13,4 @@ obj-$(CONFIG_DMABUF_HEAPS) += dma_heap.o
 CFLAGS_dts.o = -I $(srctree)/scripts/dtc/libfdt
 CFLAGS_overlay.o = -I $(srctree)/scripts/dtc/libfdt
 CFLAGS_baseline.o = -I $(srctree)/scripts/dtc/libfdt
+CFLAGS_virtio.o = -I $(srctree)/scripts/dtc/libfdt

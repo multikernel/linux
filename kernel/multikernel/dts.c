@@ -1618,6 +1618,8 @@ static int mk_dt_emit_tree(struct mk_instance *instance, void *fdt,
 			ret = mk_dt_emit_aliases(instance, fdt);
 			if (!ret)
 				ret = mk_dt_emit_host_bridges(instance, fdt);
+			if (!ret)
+				ret = mk_virtio_emit_nodes(instance, fdt);
 		}
 	}
 	if (!ret && chosen) {
