@@ -23,15 +23,50 @@
 #include <linux/libfdt.h>
 #include <linux/sort.h>
 #include <linux/multikernel.h>
+#include <linux/smp.h>
 
 #include "internal.h"
 
 /* Physical address of the manifest this kernel booted with, 0 if none */
 static phys_addr_t mk_manifest_fdt_phys;
+static phys_addr_t mk_manifest_entry_stub;
+static bool mk_spawn_kernel;
 
 phys_addr_t mk_manifest_phys(void)
 {
 	return mk_manifest_fdt_phys;
+}
+
+bool mk_is_spawn_kernel(void)
+{
+	return READ_ONCE(mk_spawn_kernel);
+}
+
+phys_addr_t mk_manifest_entry_stub_phys(void)
+{
+	return mk_manifest_entry_stub;
+}
+
+int mk_manifest_set_entry_stub(struct kimage *image, phys_addr_t entry)
+{
+	void *fdt;
+	int ret;
+
+	if (!image || !image->mk_manifest || !entry)
+		return -EINVAL;
+
+	fdt = phys_to_virt(image->mk_manifest);
+	ret = fdt_open_into(fdt, fdt, PAGE_SIZE);
+	if (!ret)
+		ret = fdt_setprop_u64(fdt, 0, MK_FDT_ENTRY_STUB, entry);
+	if (!ret)
+		ret = fdt_pack(fdt);
+	if (!ret)
+		return 0;
+
+	pr_err("multikernel: failed to publish entry stub: %s\n",
+	       fdt_strerror(ret));
+	return ret == -FDT_ERR_NOSPACE ? -E2BIG : -EINVAL;
 }
 
 /**
@@ -45,8 +80,13 @@ phys_addr_t mk_manifest_phys(void)
  */
 void __init mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 {
+	const fdt64_t *entry_stub;
 	void *fdt = NULL;
+	int len;
 	int err = 0;
+
+	/* A malformed spawn handoff must still never gain host-wide reset. */
+	WRITE_ONCE(mk_spawn_kernel, true);
 
 	pr_info("multikernel: processing manifest at 0x%llx (size: %llu)\n",
 		fdt_phys, fdt_len);
@@ -70,6 +110,16 @@ void __init mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 		pr_warn("multikernel: manifest (0x%llx) is incompatible with '%s': %d\n",
 			fdt_phys, MK_FDT_COMPATIBLE, err);
 		goto out;
+	}
+
+	entry_stub = fdt_getprop(fdt, 0, MK_FDT_ENTRY_STUB, &len);
+	if (entry_stub) {
+		if (len != sizeof(*entry_stub)) {
+			err = -EINVAL;
+			pr_warn("multikernel: manifest has invalid entry stub\n");
+			goto out;
+		}
+		mk_manifest_entry_stub = fdt64_to_cpu(*entry_stub);
 	}
 
 	mk_manifest_fdt_phys = fdt_phys;
@@ -273,6 +323,7 @@ static int mk_manifest_chosen(void *fdt, void *data)
 {
 	struct mk_manifest_ctx *ctx = data;
 	struct kimage *image = ctx->image;
+	mk_phys_cpu_t doorbell_cpu;
 	phys_addr_t slot;
 	int ret;
 
@@ -281,11 +332,15 @@ static int mk_manifest_chosen(void *fdt, void *data)
 		return ret;
 
 	if (mk_self->ipi_data) {
+		doorbell_cpu = arch_cpu_physical_id(get_boot_cpu_id());
 		ret = fdt_property_u64(fdt, "multikernel,host-ipi-buffer",
 				       mk_self->ipi_phys);
 		if (!ret)
 			ret = fdt_property_u32(fdt, "multikernel,host-ipi-pages",
 					       mk_self->ipi_pages);
+		if (!ret)
+			ret = fdt_property_u64(fdt, "multikernel,host-ipi-cpu",
+					       doorbell_cpu);
 		if (ret)
 			return ret;
 	}

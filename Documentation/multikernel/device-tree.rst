@@ -204,6 +204,7 @@ only the boot handoff knows::
         multikernel,ipi-pages = <65>;
         multikernel,host-ipi-buffer = <...>;        /* the host's ring */
         multikernel,host-ipi-pages = <...>;
+        multikernel,host-ipi-cpu = <...>;           /* physical doorbell CPU, u64 */
     };
 
 On x86 the ``SETUP_MULTIKERNEL`` setup_data entry points at the page and

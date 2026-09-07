@@ -23,6 +23,7 @@
 #include <linux/mmzone.h>
 #include <linux/multikernel.h>
 #include <linux/pci.h>
+#include "../kexec_internal.h"
 #include "internal.h"
 
 static const char mk_mem_resource_name[] = "System RAM (multikernel)";
@@ -1208,16 +1209,23 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	struct mk_instance *target_instance;
 	int ret;
 
+	if (!kexec_trylock())
+		return -EBUSY;
+
 	/* For self-removal, execute directly (we're in process context) */
 	if (instance_id == mk_self->id) {
 		if (mk_pool)
-			return mk_pool_cpu_add(cpu_id);
-		return mk_do_cpu_remove(cpu_id);
+			ret = mk_pool_cpu_add(cpu_id);
+		else
+			ret = mk_do_cpu_remove(cpu_id);
+		goto unlock;
 	}
 
 	target_instance = mk_instance_find(instance_id);
-	if (!target_instance)
-		return -ENODEV;
+	if (!target_instance) {
+		ret = -ENODEV;
+		goto unlock;
+	}
 
 	/* For non-running instances, return CPU to root using existing API */
 	if (target_instance->state != MK_STATE_ACTIVE) {
@@ -1290,6 +1298,8 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	ret = 0;
 out:
 	mk_instance_put(target_instance);
+unlock:
+	kexec_unlock();
 	return ret;
 }
 
@@ -1319,18 +1329,24 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 	struct mk_instance *target_instance;
 	int ret;
 
+	if (!kexec_trylock())
+		return -EBUSY;
+
 	/* For self-addition, execute directly (we're in process context) */
 	if (instance_id == mk_self->id) {
 		if (mk_pool)
-			return mk_pool_cpu_remove(cpu_id, numa_node, flags);
-		return mk_do_cpu_add(cpu_id, numa_node, flags);
+			ret = mk_pool_cpu_remove(cpu_id, numa_node, flags);
+		else
+			ret = mk_do_cpu_add(cpu_id, numa_node, flags);
+		goto unlock;
 	}
 
 	target_instance = mk_instance_find(instance_id);
 	if (!target_instance) {
 		pr_err("Multikernel hotplug: instance %d not found for CPU add\n",
 		       instance_id);
-		return -ENODEV;
+		ret = -ENODEV;
+		goto unlock;
 	}
 
 	/* For non-running instances, transfer CPU from root using existing API */
@@ -1351,6 +1367,11 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 		ret = -EBUSY;
 		goto out;
 	}
+
+	/* Reserve tracking before the remote kernel can start the CPU. */
+	ret = mk_cpu_set_reserve(target_instance->cpus, 1);
+	if (ret)
+		goto out;
 
 	/*
 	 * The CPU is parked on the host slot, where the spawn kernel's
@@ -1381,24 +1402,27 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 
 	ret = mk_msg_pending_wait(pending, 10000);
 	if (ret < 0) {
-		/*
-		 * Best effort: if the instance never picked the CPU up, it
-		 * is still parked on the instance context and comes home;
-		 * if the instance onlined it despite the error, nothing is
-		 * watching the context and this times out harmlessly.
-		 */
-		mk_repark_cpu_to_host(target_instance, cpu_id);
+		int park_ret;
+
+		park_ret = mk_repark_cpu_to_host(target_instance, cpu_id);
+		if (park_ret < 0) {
+			/* The request may have succeeded despite the lost ACK. */
+			WARN_ON_ONCE(mk_cpu_set_add(target_instance->cpus, cpu_id));
+			mk_cpu_set_del(mk_pool->cpus, cpu_id);
+			pr_err("Multikernel hotplug: CPU %llu ownership is uncertain; keeping it with instance %d\n",
+			       cpu_id, instance_id);
+		}
 		goto out;
 	}
 
-	if (mk_cpu_set_add(target_instance->cpus, cpu_id))
-		pr_warn("Multikernel hotplug: Failed to track CPU %llu in instance %d\n",
-			cpu_id, instance_id);
+	WARN_ON_ONCE(mk_cpu_set_add(target_instance->cpus, cpu_id));
 	mk_cpu_set_del(mk_pool->cpus, cpu_id);
 
 	ret = 0;
 out:
 	mk_instance_put(target_instance);
+unlock:
+	kexec_unlock();
 	return ret;
 }
 
@@ -1431,13 +1455,20 @@ int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
 	struct mk_instance *target_instance;
 	int ret;
 
+	if (!kexec_trylock())
+		return -EBUSY;
+
 	/* For self-addition, execute directly (we're in process context) */
-	if (instance_id == mk_self->id)
-		return mk_do_mem_add(start_pfn, nr_pages, numa_node, mem_type);
+	if (instance_id == mk_self->id) {
+		ret = mk_do_mem_add(start_pfn, nr_pages, numa_node, mem_type);
+		goto unlock;
+	}
 
 	target_instance = mk_instance_find(instance_id);
-	if (!target_instance)
-		return -ENODEV;
+	if (!target_instance) {
+		ret = -ENODEV;
+		goto unlock;
+	}
 
 	/* For non-running instances, allocate memory from pool and add to instance */
 	if (target_instance->state != MK_STATE_ACTIVE) {
@@ -1470,6 +1501,8 @@ int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
 					    (int)numa_node);
 out:
 	mk_instance_put(target_instance);
+unlock:
+	kexec_unlock();
 	return ret;
 }
 
@@ -1499,13 +1532,20 @@ int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages)
 	struct mk_instance *target_instance;
 	int ret;
 
+	if (!kexec_trylock())
+		return -EBUSY;
+
 	/* For self-removal, execute directly (we're in process context) */
-	if (instance_id == mk_self->id)
-		return mk_do_mem_remove(start_pfn, nr_pages);
+	if (instance_id == mk_self->id) {
+		ret = mk_do_mem_remove(start_pfn, nr_pages);
+		goto unlock;
+	}
 
 	target_instance = mk_instance_find(instance_id);
-	if (!target_instance)
-		return -ENODEV;
+	if (!target_instance) {
+		ret = -ENODEV;
+		goto unlock;
+	}
 
 	/* For non-running instances, just remove the memory region from the instance */
 	if (target_instance->state != MK_STATE_ACTIVE) {
@@ -1541,6 +1581,8 @@ int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages)
 					       PFN_PHYS(nr_pages));
 out:
 	mk_instance_put(target_instance);
+unlock:
+	kexec_unlock();
 	return ret;
 }
 
@@ -1575,6 +1617,9 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 	int ret;
 	u32 resource_id;
 
+	if (!kexec_trylock())
+		return -EBUSY;
+
 	if (driver_override)
 		strscpy(payload.driver_override, driver_override, sizeof(payload.driver_override));
 	else
@@ -1584,14 +1629,19 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 
 	if (instance_id == mk_self->id) {
 		if (mk_pool)
-			return mk_pool_device_remove(domain, bus, devfn,
-						     driver_override, flags);
-		return mk_do_device_add(domain, bus, devfn, driver_override, flags);
+			ret = mk_pool_device_remove(domain, bus, devfn,
+						    driver_override, flags);
+		else
+			ret = mk_do_device_add(domain, bus, devfn,
+					       driver_override, flags);
+		goto unlock;
 	}
 
 	target_instance = mk_instance_find(instance_id);
-	if (!target_instance)
-		return -ENODEV;
+	if (!target_instance) {
+		ret = -ENODEV;
+		goto unlock;
+	}
 
 	if (target_instance->state != MK_STATE_ACTIVE) {
 		ret = mk_instance_add_pci_device(target_instance, domain, bus, devfn);
@@ -1626,6 +1676,8 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 	ret = 0;
 out:
 	mk_instance_put(target_instance);
+unlock:
+	kexec_unlock();
 	return ret;
 }
 
@@ -1657,18 +1709,25 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 	int ret;
 	u32 resource_id;
 
+	if (!kexec_trylock())
+		return -EBUSY;
+
 	payload.driver_override[0] = '\0';
 	resource_id = (domain << 16) | (bus << 8) | devfn;
 
 	if (instance_id == mk_self->id) {
 		if (mk_pool)
-			return mk_pool_device_add(domain, bus, devfn, NULL);
-		return mk_do_device_remove(domain, bus, devfn);
+			ret = mk_pool_device_add(domain, bus, devfn, NULL);
+		else
+			ret = mk_do_device_remove(domain, bus, devfn);
+		goto unlock;
 	}
 
 	target_instance = mk_instance_find(instance_id);
-	if (!target_instance)
-		return -ENODEV;
+	if (!target_instance) {
+		ret = -ENODEV;
+		goto unlock;
+	}
 
 	if (target_instance->state != MK_STATE_ACTIVE) {
 		ret = mk_instance_remove_pci_device(target_instance, domain, bus, devfn);
@@ -1703,5 +1762,7 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 	ret = 0;
 out:
 	mk_instance_put(target_instance);
+unlock:
+	kexec_unlock();
 	return ret;
 }

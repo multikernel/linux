@@ -44,6 +44,8 @@ int mk_overlay_rmdir(struct kernfs_node *kn);
 
 /* ipi.c */
 int mk_arm_force_halt(struct mk_instance *instance);
+int mk_send_ipi_data_to_instance(struct mk_instance *instance, const void *data,
+				 size_t data_size, unsigned long type);
 
 /* hotplug.c */
 int mk_hotplug_init(void);

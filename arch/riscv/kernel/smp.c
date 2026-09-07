@@ -14,6 +14,7 @@
 #include <linux/module.h>
 #include <linux/kexec.h>
 #include <linux/kgdb.h>
+#include <linux/multikernel.h>
 #include <linux/percpu.h>
 #include <linux/profile.h>
 #include <linux/smp.h>
@@ -81,9 +82,21 @@ int riscv_hartid_to_cpuid(unsigned long hartid)
 
 static void ipi_stop(void)
 {
+	if (mk_is_spawn_kernel())
+		mk_enter_pool_state(NULL);
+
 	set_cpu_online(smp_processor_id(), false);
 	while (1)
 		wait_for_interrupt();
+}
+
+void __noreturn panic_smp_self_stop(void)
+{
+	if (mk_is_spawn_kernel())
+		mk_enter_pool_state(NULL);
+
+	for (;;)
+		cpu_relax();
 }
 
 #ifdef CONFIG_KEXEC_CORE
