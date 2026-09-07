@@ -1368,6 +1368,11 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 		goto out;
 	}
 
+	/* Reserve tracking before the remote kernel can start the CPU. */
+	ret = mk_cpu_set_reserve(target_instance->cpus, 1);
+	if (ret)
+		goto out;
+
 	/*
 	 * The CPU is parked on the host slot, where the spawn kernel's
 	 * secondary wakeup cannot reach it. Point it at the instance's
@@ -1397,19 +1402,20 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 
 	ret = mk_msg_pending_wait(pending, 10000);
 	if (ret < 0) {
-		/*
-		 * Best effort: if the instance never picked the CPU up, it
-		 * is still parked on the instance context and comes home;
-		 * if the instance onlined it despite the error, nothing is
-		 * watching the context and this times out harmlessly.
-		 */
-		mk_repark_cpu_to_host(target_instance, cpu_id);
+		int park_ret;
+
+		park_ret = mk_repark_cpu_to_host(target_instance, cpu_id);
+		if (park_ret < 0) {
+			/* The request may have succeeded despite the lost ACK. */
+			WARN_ON_ONCE(mk_cpu_set_add(target_instance->cpus, cpu_id));
+			mk_cpu_set_del(mk_pool->cpus, cpu_id);
+			pr_err("Multikernel hotplug: CPU %llu ownership is uncertain; keeping it with instance %d\n",
+			       cpu_id, instance_id);
+		}
 		goto out;
 	}
 
-	if (mk_cpu_set_add(target_instance->cpus, cpu_id))
-		pr_warn("Multikernel hotplug: Failed to track CPU %llu in instance %d\n",
-			cpu_id, instance_id);
+	WARN_ON_ONCE(mk_cpu_set_add(target_instance->cpus, cpu_id));
 	mk_cpu_set_del(mk_pool->cpus, cpu_id);
 
 	ret = 0;

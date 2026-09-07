@@ -218,5 +218,5 @@ int mk_repark_cpu_to_instance(struct mk_instance *instance,
 int mk_repark_cpu_to_host(struct mk_instance *instance,
 			  mk_phys_cpu_t phys_cpu)
 {
-	return 0;
+	return mk_riscv_hart_stopped(phys_cpu);
 }
