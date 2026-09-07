@@ -14,6 +14,7 @@
 #include <linux/multikernel.h>
 #include <linux/pci.h>
 #include <linux/vmalloc.h>
+#include "../kexec_internal.h"
 #include "internal.h"
 
 static void mk_instance_return_all_cpus(struct mk_instance *instance)
@@ -1592,17 +1593,23 @@ static int mk_instance_settle_halted(struct mk_instance *instance)
 {
 	int ret;
 
+	/* Serialize CPU-set inspection with resource moves and image teardown. */
+	while (!kexec_trylock())
+		msleep(20);
+
 	ret = mk_instance_confirm_parked(instance);
 	if (ret) {
 		pr_err("Instance %d (%s) reported halted before every CPU stopped\n",
 		       instance->id, instance->name);
-		return ret;
+		goto out;
 	}
 
 	pr_info("Instance %d (%s) halted, CPUs parking in pool\n",
 		instance->id, instance->name);
 	mk_instance_set_state(instance, MK_STATE_LOADED);
-	return 0;
+out:
+	kexec_unlock();
+	return ret;
 }
 
 struct mk_halted_work {
