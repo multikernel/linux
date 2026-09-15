@@ -171,6 +171,7 @@ static void mk_instance_release(struct kref *kref)
 
 	pr_info("Releasing multikernel instance %d (%s), returning resources to root\n",
 		instance->id, instance->name);
+	mk_ipi_endpoint_unregister(instance);
 
 	mk_instance_return_all_cpus(instance);
 	mk_instance_return_pci_devices(instance);
@@ -178,6 +179,8 @@ static void mk_instance_release(struct kref *kref)
 	mk_instance_free_memory(instance);
 
 	mk_instance_track_dump(instance, instance->state, MK_STATE_READY);
+	if (instance->halt_data)
+		memunmap(instance->halt_data);
 	kfree(instance->host_tree);
 	mk_cpu_set_free(instance->cpus);
 	kfree(instance->name);
@@ -231,6 +234,9 @@ struct mk_instance *mk_instance_alloc(int id, const char *name)
 
 	instance->state = MK_STATE_READY;
 	instance->ipi_target = MK_PHYS_CPU_INVALID;
+	raw_spin_lock_init(&instance->ipi_endpoint.tx_lock);
+	raw_spin_lock_init(&instance->ipi_endpoint.rx_lock);
+	INIT_LIST_HEAD(&instance->ipi_endpoint.rx_node);
 	INIT_LIST_HEAD(&instance->memory_regions);
 	INIT_LIST_HEAD(&instance->list);
 	INIT_LIST_HEAD(&instance->pci_devices);
@@ -297,6 +303,8 @@ void mk_instance_free(struct mk_instance *instance)
 		list_del(&plat_dev->list);
 		kfree(plat_dev);
 	}
+	if (instance->halt_data)
+		memunmap(instance->halt_data);
 	kfree(instance->host_tree);
 	mk_cpu_set_free(instance->cpus);
 	kfree(instance->name);
@@ -423,12 +431,25 @@ bool multikernel_allow_emergency_restart(void)
  */
 int mk_instance_confirm_parked(struct mk_instance *instance)
 {
+	struct mk_cpu_set *snapshot;
 	mk_phys_cpu_t phys_cpu;
 	unsigned int i;
 	int ret, failed = 0;
 
 	/* Empty until the instance first ran, so nothing of it is executing */
-	mk_cpu_set_for_each(i, phys_cpu, instance->cpus_on_slot) {
+	if (!instance->cpus_on_slot)
+		return 0;
+
+	snapshot = mk_cpu_set_alloc();
+	if (!snapshot)
+		return -ENOMEM;
+	ret = mk_cpu_set_copy(snapshot, instance->cpus_on_slot);
+	if (ret) {
+		mk_cpu_set_free(snapshot);
+		return ret;
+	}
+
+	mk_cpu_set_for_each(i, phys_cpu, snapshot) {
 		ret = mk_arch_confirm_parked(instance, phys_cpu);
 		if (ret) {
 			pr_err("Instance %d (%s): CPU %llu is not parked: %d\n",
@@ -436,6 +457,7 @@ int mk_instance_confirm_parked(struct mk_instance *instance)
 			failed++;
 		}
 	}
+	mk_cpu_set_free(snapshot);
 
 	return failed ? -EBUSY : 0;
 }
@@ -1542,7 +1564,12 @@ static void __noreturn mk_notify_down_and_park(int target_id, u32 subtype)
  */
 void __noreturn mk_halt_to_pool(void)
 {
-	mk_notify_down_and_park(0, MK_SYS_HALTED);
+	int parent_id;
+
+	if (!host_instance)
+		panic("multikernel: spawned kernel has no parent instance");
+	parent_id = READ_ONCE(host_instance->id);
+	mk_notify_down_and_park(parent_id, MK_SYS_HALTED);
 }
 
 static void mk_shutdown_work_fn(struct work_struct *work)
@@ -1717,7 +1744,7 @@ int multikernel_halt_by_id(int mk_id)
 	return ret;
 }
 
-/**
+/*
  * multikernel_force_halt_by_id - Forcible shutdown of a multikernel instance via NMI
  * @mk_id: Instance ID to halt
  *
@@ -1788,7 +1815,7 @@ EXPORT_SYMBOL_GPL(mk_cpu_rank);
 static int mk_fence_missing(struct mk_instance *instance,
 			    struct mk_cpu_set *targets)
 {
-	struct mk_shared_data *sd = instance->ipi_data;
+	struct mk_shared_data *sd = mk_instance_halt_data(instance);
 	mk_phys_cpu_t phys;
 	unsigned int i;
 	int missing = 0;
@@ -1813,7 +1840,7 @@ static int mk_fence_missing(struct mk_instance *instance,
 static int mk_confirm_fenced(struct mk_instance *instance,
 			     struct mk_cpu_set *targets)
 {
-	struct mk_shared_data *sd = instance->ipi_data;
+	struct mk_shared_data *sd = mk_instance_halt_data(instance);
 	mk_phys_cpu_t phys;
 	unsigned int i;
 	int missing, ret;
@@ -1847,22 +1874,20 @@ static int mk_confirm_fenced(struct mk_instance *instance,
 	return ret;
 }
 
-int multikernel_force_halt_by_id(int mk_id)
+static int __mk_instance_force_halt(struct mk_instance *instance,
+				    bool allow_loaded)
 {
-	struct mk_instance *instance;
 	struct mk_cpu_set *targets;
 	mk_phys_cpu_t phys_cpu;
 	unsigned int i;
 	int cpu_count = 0;
 	int ret;
 
-	instance = mk_instance_find(mk_id);
 	if (!instance)
-		return -ENOENT;
+		return -EINVAL;
 
 	if (instance == mk_self) {
-		pr_err("Cannot force halt this kernel (id %d)\n", mk_id);
-		mk_instance_put(instance);
+		pr_err("Cannot force halt this kernel (id %d)\n", instance->id);
 		return -EINVAL;
 	}
 
@@ -1873,29 +1898,27 @@ int multikernel_force_halt_by_id(int mk_id)
 	 * a rerun the instance is stuck for good. The parent is ACTIVE.
 	 */
 	if (instance->state != MK_STATE_ACTIVE &&
-	    instance->state != MK_STATE_LOADED) {
+	    (!allow_loaded || instance->state != MK_STATE_LOADED)) {
 		pr_err("Instance %d not running (state=%d), nothing to force halt\n",
-			mk_id, instance->state);
-		mk_instance_put(instance);
+			instance->id, instance->state);
 		return -EINVAL;
 	}
 
 	targets = mk_cpu_set_alloc();
-	if (!targets) {
-		mk_instance_put(instance);
+	if (!targets)
 		return -ENOMEM;
-	}
 	ret = mk_force_halt_targets(instance, targets);
 	if (!ret && mk_cpu_set_empty(targets))
 		ret = -EINVAL;
 	if (ret) {
-		pr_err("Instance %d: no force-halt targets: %d\n", mk_id, ret);
+		pr_err("Instance %d: no force-halt targets: %d\n",
+		       instance->id, ret);
 		mk_cpu_set_free(targets);
-		mk_instance_put(instance);
 		return ret;
 	}
 
-	pr_info("Force halting multikernel instance %d via NMI\n", mk_id);
+	pr_info("Force halting multikernel instance %d via NMI\n",
+		instance->id);
 
 	ret = mk_arm_force_halt(instance);
 	if (ret)
@@ -1906,7 +1929,8 @@ int multikernel_force_halt_by_id(int mk_id)
 		cpu_count++;
 	}
 
-	pr_info("Sent NMI to %d CPUs in instance %d\n", cpu_count, mk_id);
+	pr_info("Sent NMI to %d CPUs in instance %d\n",
+		cpu_count, instance->id);
 
 	/*
 	 * A child instance parks on its own context, so wait for it to
@@ -1918,12 +1942,59 @@ int multikernel_force_halt_by_id(int mk_id)
 	 * fence, so a baseline cannot claim a machine with a CPU still
 	 * running the dead host.
 	 */
-	if (instance == host_instance)
+	if (instance == host_instance) {
 		ret = mk_confirm_fenced(instance, targets);
-	else
-		mk_instance_settle_halted(instance);
+	} else {
+		ret = mk_instance_confirm_parked(instance);
+		if (ret)
+			pr_err("Instance %d CPUs did not park after force halt: %d\n",
+			       instance->id, ret);
+		else
+			mk_instance_settle_halted(instance);
+	}
 
 	mk_cpu_set_free(targets);
+	return ret;
+}
+
+int mk_instance_abort_spawn(struct mk_instance *instance)
+{
+	int ret;
+
+	mk_ipi_endpoint_close(instance);
+	ret = __mk_instance_force_halt(instance, true);
+	if (ret && instance)
+		mk_instance_set_state(instance, MK_STATE_FAILED);
+	return ret;
+}
+
+/**
+ * mk_instance_force_halt - Forcibly stop an instance via NMI
+ * @instance: Instance to stop
+ *
+ * Forces a spawn kernel's CPUs to stop by arming the persistent force-halt
+ * marker and sending NMIs directly to each CPU. The NMI handler checks the
+ * marker and parks the CPU if it is set.
+ *
+ * Use when: The spawn kernel is stuck/crashed and not responding to graceful
+ * shutdown, or when graceful shutdown has failed.
+ *
+ * Returns: 0 on success, negative error code on failure
+ */
+int mk_instance_force_halt(struct mk_instance *instance)
+{
+	return __mk_instance_force_halt(instance, false);
+}
+
+int multikernel_force_halt_by_id(int mk_id)
+{
+	struct mk_instance *instance;
+	int ret;
+
+	instance = mk_instance_find(mk_id);
+	if (!instance)
+		return -ENOENT;
+	ret = mk_instance_force_halt(instance);
 	mk_instance_put(instance);
 	return ret;
 }
@@ -1961,6 +2032,8 @@ static int __init multikernel_init(void)
 		mk_messaging_cleanup();
 		return ret;
 	}
+
+	mk_ipi_handlers_enable();
 
 	pr_info("Multikernel support initialized\n");
 	return 0;

@@ -21,6 +21,7 @@
 #include <linux/of_fdt.h>
 #include <linux/of_pci.h>
 #include <linux/sizes.h>
+#include <linux/smp.h>
 #include "internal.h"
 
 #define PROP_SUB_FDT "fdt"
@@ -41,6 +42,19 @@ EXPORT_SYMBOL_GPL(mk_self);
 /* This spawn's record of the kernel that spawned it, NULL in the host */
 struct mk_instance *host_instance;
 EXPORT_SYMBOL_GPL(host_instance);
+
+static void __init __noreturn mk_manifest_reject_and_park(int error)
+{
+	int ret;
+
+	ret = mk_arch_prepare_park();
+	if (ret || !mk_arch_park_ready())
+		panic("multikernel: rejected manifest before park path became ready");
+	pr_emerg("multikernel: parking CPUs after rejecting supplied manifest: %d\n",
+		 error);
+	smp_call_function(mk_enter_pool_state, NULL, 0);
+	mk_enter_pool_state(NULL);
+}
 
 /**
  * mk_dt_extract_instance_info() - Extract instance ID and name from DTB
@@ -211,6 +225,7 @@ static int __init mk_instance_alloc_ipi(struct mk_instance *instance)
 		       instance->id);
 		return -ENOMEM;
 	}
+	mk_shared_data_reset(instance->ipi_data);
 	instance->ipi_phys = virt_to_phys(instance->ipi_data);
 	instance->ipi_pages = (sizeof(struct mk_shared_data) + PAGE_SIZE - 1) / PAGE_SIZE;
 
@@ -297,6 +312,11 @@ static int __init mk_restore_instance_ipi(struct mk_instance *instance)
 		return 0;
 	}
 	ipi_size = (size_t)ipi_pages << PAGE_SHIFT;
+	if (ipi_size < sizeof(struct mk_shared_data)) {
+		pr_err("IPI buffer is too small: %zu < %zu\n", ipi_size,
+		       sizeof(struct mk_shared_data));
+		return -EPROTO;
+	}
 
 	instance->ipi_data = memremap(ipi_phys, ipi_size, MEMREMAP_WB);
 	if (!instance->ipi_data) {
@@ -316,38 +336,67 @@ static int __init mk_restore_instance_ipi(struct mk_instance *instance)
 static int __init mk_restore_host_instance(void)
 {
 	struct mk_instance *hi;
-	phys_addr_t host_ipi_phys;
-	u32 host_ipi_pages;
-	size_t host_ipi_size;
+	struct mk_shared_data *shared;
+	mk_phys_cpu_t parent_cpu;
+	phys_addr_t halt_phys;
+	size_t halt_size;
+	int parent_id;
+	u32 halt_pages;
+	int ret;
 
-	if (!mk_chosen_ring("host-ipi", &host_ipi_phys, &host_ipi_pages)) {
-		pr_warn("No host IPI buffer in the boot tree (spawn won't be able to send to host)\n");
+	if (!mk_self || !mk_self->ipi_data) {
+		pr_err("No parent/child IPI link in the boot tree\n");
 		return -ENOENT;
 	}
-	host_ipi_size = (size_t)host_ipi_pages << PAGE_SHIFT;
+	shared = mk_self->ipi_data;
+	parent_id = READ_ONCE(shared->parent_id);
+	parent_cpu = READ_ONCE(shared->parent_doorbell_cpu);
+	if (parent_id < 0 || parent_id == mk_self->id ||
+	    parent_cpu == MK_PHYS_CPU_INVALID)
+		return -EPROTO;
 
-	hi = mk_instance_alloc(0, "host");
+	hi = mk_instance_alloc(parent_id, "host");
 	if (!hi)
 		return -ENOMEM;
-
-	/*
-	 * The host's owned CPU set is unknown here; ring its doorbell on
-	 * physical CPU 0 without pretending we know what it owns.
-	 */
-	hi->ipi_target = 0;
-
-	hi->ipi_data = memremap(host_ipi_phys, host_ipi_size, MEMREMAP_WB);
-	if (!hi->ipi_data) {
-		pr_err("Failed to map host IPI buffer at 0x%llx\n",
-		       (unsigned long long)host_ipi_phys);
+	hi->ipi_target = parent_cpu;
+	ret = mk_cpu_set_add(hi->cpus, parent_cpu);
+	if (ret)
+		goto err_free;
+	if (!mk_chosen_ring("host-ipi", &halt_phys, &halt_pages)) {
+		pr_err("No host force-halt area in the boot tree\n");
+		ret = -EPROTO;
 		goto err_free;
 	}
-	hi->ipi_phys = host_ipi_phys;
-	hi->ipi_pages = host_ipi_pages;
-
-	if (mk_instance_publish(hi)) {
-		memunmap(hi->ipi_data);
+	halt_size = (size_t)halt_pages << PAGE_SHIFT;
+	if (halt_size < sizeof(struct mk_shared_data) ||
+	    halt_phys == mk_self->ipi_phys) {
+		pr_err("Invalid host force-halt area: phys=0x%llx, pages=%u\n",
+		       (unsigned long long)halt_phys, halt_pages);
+		ret = -EPROTO;
 		goto err_free;
+	}
+	hi->halt_data = memremap(halt_phys, halt_size, MEMREMAP_WB);
+	if (!hi->halt_data) {
+		pr_err("Failed to map host force-halt area at 0x%llx\n",
+		       (unsigned long long)halt_phys);
+		ret = -ENOMEM;
+		goto err_free;
+	}
+	hi->ipi_data = mk_self->ipi_data;
+	hi->ipi_phys = mk_self->ipi_phys;
+	hi->ipi_pages = mk_self->ipi_pages;
+
+	ret = mk_instance_publish(hi);
+	if (ret)
+		goto err_free;
+	ret = mk_ipi_endpoint_init(hi, false);
+	if (ret) {
+		mutex_lock(&mk_instance_mutex);
+		idr_remove(&mk_instance_idr, hi->id);
+		list_del(&hi->list);
+		mutex_unlock(&mk_instance_mutex);
+		mk_instance_free(hi);
+		return ret;
 	}
 	/* The host is running, or this kernel would not be */
 	mk_instance_set_state(hi, MK_STATE_ACTIVE);
@@ -363,15 +412,13 @@ static int __init mk_restore_host_instance(void)
 
 	host_instance = hi;
 
-	pr_info("Restored host IPI buffer: phys=0x%llx, pages=%u\n",
-		(unsigned long long)host_ipi_phys, host_ipi_pages);
-	pr_info("Registered host instance (ID 0) for spawn→host communication\n");
+	pr_info("Registered parent instance %d on duplex IPI link\n", parent_id);
 
 	return 0;
 
 err_free:
 	mk_instance_free(hi);
-	return -ENOMEM;
+	return ret;
 }
 
 /**
@@ -393,6 +440,9 @@ int __init mk_instance_restore_from_manifest(void)
 	struct mk_dt_config config;
 	int instance_id;
 	const char *instance_name;
+
+	if (mk_manifest_rejected())
+		mk_manifest_reject_and_park(-EPROTO);
 
 	if (!mk_manifest_phys()) {
 		pr_info("No manifest available for multikernel DTB restoration\n");
@@ -436,7 +486,7 @@ int __init mk_instance_restore_from_manifest(void)
 	dtb_virt = initial_boot_params;
 	if (!dtb_virt || !of_have_populated_dt()) {
 		pr_err("Boot device tree from the manifest was not unflattened\n");
-		return -ENOENT;
+		mk_manifest_reject_and_park(-ENOENT);
 	}
 	dtb_len = fdt_totalsize(dtb_virt);
 
@@ -445,7 +495,7 @@ int __init mk_instance_restore_from_manifest(void)
 	ret = mk_dt_extract_instance_info(dtb_virt, dtb_len, &instance_id, &instance_name);
 	if (ret) {
 		pr_err("Failed to extract instance info from DTB: %d\n", ret);
-		return ret;
+		mk_manifest_reject_and_park(ret);
 	}
 
 	pr_info("DTB contains instance ID %d, name '%s'\n", instance_id, instance_name);
@@ -494,26 +544,33 @@ int __init mk_instance_restore_from_manifest(void)
 	}
 
 	ret = mk_instance_publish(instance);
-	if (ret) {
-		if (instance->ipi_data)
-			memunmap(instance->ipi_data);
+	if (ret)
 		goto cleanup_instance;
-	}
 
 	mk_self = instance;
 
-	if (mk_restore_host_instance())
-		pr_warn("Failed to restore host instance (spawn→host communication unavailable)\n");
+	ret = mk_restore_host_instance();
+	if (ret)
+		mk_manifest_reject_and_park(ret);
 
+	ret = mk_arch_prepare_park();
+	if (ret)
+		mk_manifest_reject_and_park(ret);
+	if (!mk_arch_park_ready())
+		mk_manifest_reject_and_park(-EIO);
 	pr_info("Successfully restored multikernel self instance %d ('%s') from the boot tree (%d bytes)\n",
 		instance_id, instance_name, dtb_len);
 	mk_dt_config_free(&config);
 	return 0;
 
 cleanup_instance:
+	if (instance->ipi_data)
+		memunmap(instance->ipi_data);
 	mk_instance_free(instance);
 config_free:
 	mk_dt_config_free(&config);
+	if (ret)
+		mk_manifest_reject_and_park(ret);
 	return ret;
 }
 
@@ -533,6 +590,7 @@ early_initcall(mk_instance_restore_from_manifest);
  *
  * Returns: true if probing should proceed, false to skip entirely
  */
+#if IS_ENABLED(CONFIG_PCI)
 bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
 {
 	struct device_node *np;
@@ -550,6 +608,7 @@ bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
 	return available;
 }
 EXPORT_SYMBOL_GPL(mk_pci_should_probe);
+#endif /* CONFIG_PCI */
 
 /*
  * A netdev's alias is its interface name, the one the device had in the

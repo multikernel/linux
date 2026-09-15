@@ -16,6 +16,11 @@
 #include <linux/mutex.h>
 #include <linux/numa.h>
 #include <linux/sizes.h>
+#include <linux/spinlock.h>
+#include <linux/multikernel_abi.h>
+
+struct pci_bus;
+struct mk_instance;
 
 #ifdef CONFIG_MULTIKERNEL
 #include <asm/multikernel.h>
@@ -40,6 +45,7 @@ typedef u64 mk_phys_cpu_t;
 #define MK_PHYS_CPU_INVALID	(~(mk_phys_cpu_t)0)
 
 struct mk_cpu_set {
+	raw_spinlock_t lock;
 	unsigned int nr;	/* Entries in use */
 	unsigned int cap;	/* Allocated capacity */
 	mk_phys_cpu_t *ids;
@@ -55,25 +61,15 @@ bool mk_cpu_set_contains(const struct mk_cpu_set *set, mk_phys_cpu_t id);
 int mk_cpu_set_copy(struct mk_cpu_set *dst, const struct mk_cpu_set *src);
 int mk_cpu_set_format(char *buf, size_t size, const struct mk_cpu_set *set);
 
-static inline unsigned int mk_cpu_set_count(const struct mk_cpu_set *set)
-{
-	return set ? set->nr : 0;
-}
-
-static inline bool mk_cpu_set_empty(const struct mk_cpu_set *set)
-{
-	return mk_cpu_set_count(set) == 0;
-}
-
-static inline mk_phys_cpu_t mk_cpu_set_first(const struct mk_cpu_set *set)
-{
-	return mk_cpu_set_empty(set) ? MK_PHYS_CPU_INVALID : set->ids[0];
-}
+unsigned int mk_cpu_set_count(const struct mk_cpu_set *set);
+bool mk_cpu_set_empty(const struct mk_cpu_set *set);
+mk_phys_cpu_t mk_cpu_set_first(const struct mk_cpu_set *set);
+bool mk_cpu_set_get(const struct mk_cpu_set *set, unsigned int index,
+		    mk_phys_cpu_t *id);
 
 #define mk_cpu_set_for_each(i, id, set)					\
 	for ((i) = 0;							\
-	     (set) && (i) < (set)->nr &&				\
-	     (((id) = (set)->ids[(i)]), true);				\
+	     mk_cpu_set_get((set), (i), &(id));				\
 	     (i)++)
 
 /**
@@ -88,16 +84,15 @@ static inline mk_phys_cpu_t mk_cpu_set_first(const struct mk_cpu_set *set)
 
 /* Data structure for passing parameters via IPI */
 struct mk_ipi_data {
+	u32 ready;
 	u64 sender_cpu;          /* Physical ID of the CPU that sent this IPI */
-	unsigned int type;      /* User-defined type identifier */
+	unsigned int type;       /* User-defined type identifier */
 	size_t data_size;        /* Size of the data */
 	char buffer[MK_MAX_DATA_SIZE]; /* Actual data buffer */
 };
 
 /* IPI ring buffer for queuing messages */
 struct mk_ipi_ring {
-	atomic_t head;                          /* Producer index */
-	atomic_t tail;                          /* Consumer index */
 	struct mk_ipi_data entries[MK_IPI_RING_SIZE]; /* Ring buffer entries */
 };
 
@@ -109,9 +104,10 @@ struct mk_ipi_ring {
 /* Presence table capacity, in CPUs (see mk_cpu_rank) */
 #define MK_PARKED_MAX 512
 
-/* Shared memory structures - per-instance design */
+/* One duplex link per parent/child pair. Each ring has one kernel producer. */
 struct mk_shared_data {
-	struct mk_ipi_ring ring;  /* IPI message ring buffer */
+	struct mk_ipi_ring to_child;
+	struct mk_ipi_ring to_parent;
 	/*
 	 * Force-halt marker, host-owned. Armed before the host NMIs the
 	 * instance's CPUs and cleared with the rest of this struct when
@@ -131,6 +127,40 @@ struct mk_shared_data {
 	 * the struct on re-exec.
 	 */
 	u8 parked[MK_PARKED_MAX];
+	s32 parent_id;
+	s32 child_id;
+	u32 reserved;
+	u64 parent_doorbell_cpu;
+	u64 child_doorbell_cpu;
+};
+
+static inline void mk_ipi_ring_reset(struct mk_ipi_ring *ring)
+{
+	unsigned int i;
+
+	for (i = 0; i < MK_IPI_RING_SIZE; i++)
+		WRITE_ONCE(ring->entries[i].ready, 0);
+}
+
+static inline void mk_shared_data_reset(struct mk_shared_data *shared)
+{
+	mk_ipi_ring_reset(&shared->to_child);
+	mk_ipi_ring_reset(&shared->to_parent);
+	WRITE_ONCE(shared->force_halt, 0);
+}
+
+struct mk_ipi_endpoint {
+	struct mk_ipi_ring *tx;
+	struct mk_ipi_ring *rx;
+	raw_spinlock_t tx_lock;
+	raw_spinlock_t rx_lock;
+	u32 tx_head;
+	u32 rx_tail;
+	bool tx_enabled;
+	bool rx_dispatching;
+	bool parent_side;
+	bool registered;
+	struct list_head rx_node;
 };
 
 /* Function pointer type for IPI callbacks */
@@ -172,11 +202,18 @@ void multikernel_unregister_handler(struct mk_ipi_handler *handler);
  * Returns 0 on success, negative error code on failure
  */
 int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, unsigned long type);
+int multikernel_send_ipi_data_to_host(void *data, size_t data_size,
+				      unsigned long type);
 
 void generic_multikernel_interrupt(void);
 
-/* Discard everything queued in this kernel's ring (instance re-spawn) */
-void mk_ipi_ring_drop_pending(void);
+int mk_ipi_endpoint_init(struct mk_instance *instance, bool parent_side);
+void mk_ipi_endpoint_unregister(struct mk_instance *instance);
+void mk_ipi_endpoint_close(struct mk_instance *instance);
+void mk_ipi_link_reset(struct mk_instance *instance, int parent_id,
+		       int child_id, mk_phys_cpu_t parent_cpu,
+		       mk_phys_cpu_t child_cpu);
+void mk_ipi_handlers_enable(void);
 
 /*
  * Multikernel Messaging System
@@ -656,6 +693,11 @@ struct mk_instance {
 	phys_addr_t ipi_phys;           /* IPI buffer physical address */
 	u32 ipi_pages;                  /* IPI buffer size in pages */
 	/*
+	 * Separate host self area used when a spawn fences its parent.
+	 * NULL for ordinary child records, whose halt area is @ipi_data.
+	 */
+	struct mk_shared_data *halt_data;
+	/*
 	 * On a spawn's record of its host: the physical address of the
 	 * host's pool wake slot, where the host's CPUs park. A backup
 	 * adopts it after fencing to wake the fenced CPUs (in cpus_on_slot)
@@ -669,6 +711,7 @@ struct mk_instance {
 	 * explicitly so routing never masquerades as ownership in @cpus.
 	 */
 	mk_phys_cpu_t ipi_target;
+	struct mk_ipi_endpoint ipi_endpoint;
 
 	/* Kexec integration */
 	struct kimage *kimage;          /* Associated kimage object */
@@ -922,6 +965,7 @@ struct mk_instance *mk_instance_find(int mk_id);
 void mk_instance_put(struct mk_instance *instance);
 void mk_instance_set_state(struct mk_instance *instance,
 			   enum mk_instance_state state);
+int mk_instance_abort_spawn(struct mk_instance *instance);
 
 /* Kimage-based access to the instance memory pool */
 void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align);
@@ -936,6 +980,7 @@ void mk_register_cpus_from_manifest(void);
 
 /* Accept the manifest handed over at boot (spawn kernels) */
 void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len);
+bool mk_manifest_rejected(void);
 
 /* Build the manifest for a spawn (host, kexec path) */
 int mk_manifest_finalize(struct kimage *image);
@@ -991,6 +1036,11 @@ static inline void mk_register_cpus_from_manifest(void)
 static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 {
 }
+
+static inline bool mk_manifest_rejected(void)
+{
+	return false;
+}
 #endif
 
 /**
@@ -998,6 +1048,7 @@ static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
  */
 #define MK_DT_CONFIG_VERSION_1  1
 #define MK_DT_CONFIG_CURRENT    MK_DT_CONFIG_VERSION_1
+/* Bumped whenever the shared-memory layout or message semantics change. */
 #define MK_FDT_COMPATIBLE "multikernel-v1"
 
 /**
@@ -1014,8 +1065,6 @@ static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
  * These functions build the instance device tree into the manifest on
  * the host side, and restore an instance from it on the spawn side.
  */
-
-
 
 /**
  * mk_instance_restore_from_manifest() - Restore this instance from the manifest
@@ -1099,6 +1148,8 @@ void mk_arch_register_cpu(mk_phys_cpu_t phys_id);
 
 /* Park the calling CPU in the pool wait loop; never returns */
 void __noreturn mk_enter_pool_state(void *info);
+int __init mk_arch_prepare_park(void);
+bool mk_arch_park_ready(void);
 
 /*
  * Forcible stop of another instance's CPUs (NMI on x86, SDEI or

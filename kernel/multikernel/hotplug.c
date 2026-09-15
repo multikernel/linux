@@ -633,6 +633,7 @@ static int mk_handle_mem_remove(struct mk_mem_resource_payload *payload, u32 pay
  * PCI Device Hotplug Operations
  */
 
+#if IS_ENABLED(CONFIG_PCI)
 static int mk_do_device_add(u16 domain, u8 bus, u8 devfn,
 			    const char *driver_override, u32 flags)
 {
@@ -801,6 +802,19 @@ static int mk_do_device_remove(u16 domain, u8 bus, u8 devfn)
 
 	return 0;
 }
+
+#else /* CONFIG_PCI */
+static int mk_do_device_add(u16 domain, u8 bus, u8 devfn,
+			    const char *driver_override, u32 flags)
+{
+	return -ENODEV;
+}
+
+static int mk_do_device_remove(u16 domain, u8 bus, u8 devfn)
+{
+	return -ENODEV;
+}
+#endif /* CONFIG_PCI */
 
 struct mk_device_hotplug_work {
 	struct work_struct work;

@@ -609,6 +609,12 @@ void kimage_free(struct kimage *image)
 	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
 		unsigned long i;
 
+		/* Stop delivery before image-owned shared pages are returned. */
+#ifdef CONFIG_MULTIKERNEL
+		if (image->mk_instance)
+			mk_ipi_endpoint_unregister(image->mk_instance);
+#endif
+
 		for (i = 0; i < image->nr_segments; i++) {
 			void *virt_addr = phys_to_virt(image->segment[i].mem);
 
@@ -1701,6 +1707,12 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	instance = mk_image->mk_instance;
+	if (instance->state != MK_STATE_LOADED) {
+		pr_err("Multikernel instance %d is not loadable (state=%d)\n",
+		       mk_id, instance->state);
+		rc = -EINVAL;
+		goto unlock;
+	}
 	if (!mk_cpu_set_empty(instance->cpus)) {
 		mk_phys_cpu_t phys_cpu = mk_cpu_set_first(instance->cpus);
 
@@ -1755,10 +1767,11 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	rc = mk_manifest_finalize(mk_image);
-	if (rc)
-		pr_warn("Manifest finalization failed: %d\n", rc);
-	else
-		pr_info("Manifest finalized for multikernel instance\n");
+	if (rc) {
+		pr_err("Manifest finalization failed: %d\n", rc);
+		goto unlock;
+	}
+	pr_info("Manifest finalized for multikernel instance\n");
 
 	/*
 	 * Point at the ring this image actually carries. Every load
@@ -1775,31 +1788,35 @@ int multikernel_kexec_by_id(int mk_id)
 			PAGE_ALIGN(sizeof(struct mk_shared_data)) >> PAGE_SHIFT;
 	}
 
-	/*
-	 * Start the instance with an empty ring. It outlives the kernel
-	 * that was using it, so a new instance would otherwise inherit that
-	 * kernel's indices and any slot it left half written - which stalls
-	 * the reader, since an unpublished slot means "the sender is still
-	 * filling this one". Anything left in there was addressed to a
-	 * kernel that is gone.
-	 */
-	if (instance->ipi_data)
-		memset(instance->ipi_data, 0, sizeof(*instance->ipi_data));
-
-	/*
-	 * Same for the other direction: whatever the halted instance left
-	 * queued for us is addressed from a kernel that no longer exists,
-	 * and a slot it claimed but never published stalls our ring for
-	 * good.
-	 */
-	mk_ipi_ring_drop_pending();
-
-	rc = mk_arch_spawn_instance(mk_image, instance, cpu);
-	if (rc == 0) {
-		rc = mk_instance_set_kexec_active(mk_image->mk_id);
-		if (rc)
-			pr_warn("Failed to set instance %d as active: %d\n", mk_image->mk_id, rc);
+	/* Reset only this parent/child link, after the old child is parked. */
+	if (instance->ipi_data) {
+		mk_ipi_link_reset(instance, mk_self->id, mk_id,
+				  mk_cpu_set_first(mk_self->cpus),
+				  mk_cpu_set_first(instance->cpus));
 	}
+	rc = mk_arch_spawn_instance(mk_image, instance, cpu);
+	if (rc) {
+		mk_ipi_endpoint_close(instance);
+		goto unlock;
+	}
+
+	/*
+	 * The instance is running once its CPUs leave the park loop. Publish that
+	 * state before dropping the global kexec lock so another exec cannot race
+	 * this boot while the readiness handshake is pending.
+	 */
+	rc = mk_instance_set_kexec_active(mk_image->mk_id);
+	if (rc) {
+		int abort_ret = mk_instance_abort_spawn(instance);
+
+		if (abort_ret)
+			pr_crit("Instance %d activation abort failed: %d\n",
+				mk_id, abort_ret);
+		goto unlock;
+	}
+
+	kexec_unlock();
+	return 0;
 
 unlock:
 	kexec_unlock();

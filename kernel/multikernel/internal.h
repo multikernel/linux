@@ -16,6 +16,15 @@ struct mk_instance *mk_instance_alloc(int id, const char *name);
 int mk_instance_publish(struct mk_instance *instance);
 void mk_instance_free(struct mk_instance *instance);
 
+/* core.c */
+int mk_instance_force_halt(struct mk_instance *instance);
+
+/* ipi.c */
+int mk_send_ipi_data(struct mk_instance *instance, void *data,
+		     size_t data_size, unsigned long type);
+struct mk_shared_data *mk_instance_halt_data(struct mk_instance *instance);
+void mk_poll_ipi_messages(void);
+
 /* kernfs.c */
 extern struct kernfs_node *mk_root_kn;
 extern struct kernfs_node *mk_instances_kn;

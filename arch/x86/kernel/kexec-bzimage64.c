@@ -554,6 +554,11 @@ static void *bzImage64_load(struct kimage *image, char *kernel,
 				  .buf_max = ULONG_MAX, .top_down = true };
 
 	header = (struct setup_header *)(kernel + setup_hdr_offset);
+	if (image->type == KEXEC_TYPE_MULTIKERNEL &&
+	    !(header->xloadflags & XLF_MULTIKERNEL_IPI)) {
+		pr_err("Loaded kernel lacks the required shared transport layout\n");
+		return ERR_PTR(-EPROTONOSUPPORT);
+	}
 	setup_sects = header->setup_sects;
 	if (setup_sects == 0)
 		setup_sects = 4;
@@ -747,10 +752,29 @@ static void *bzImage64_load(struct kimage *image, char *kernel,
 
 	/* For multikernel, setup custom e820 map */
 	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
+#ifdef CONFIG_MULTIKERNEL
 		image->arch.mk_boot_params = bootparam_load_addr;
+
+		/*
+		 * setup_boot_parameters() copies the host subarchitecture.  A
+		 * spawn kernel must take the multikernel platform path instead.
+		 */
+		params->hdr.hardware_subarch = X86_SUBARCH_MULTIKERNEL;
+
+		/*
+		 * The spawn trampoline enters the compressed kernel directly,
+		 * bypassing purgatory.  The x86 boot protocol's 64-bit entry is
+		 * 0x200 bytes from the start of the protected-mode payload.
+		 */
+		image->arch.mk_kernel_entry = kernel_load_addr + 0x200;
+
 		ret = mk_e820_fill(image->mk_instance, params);
 		if (ret)
 			goto out_free_params;
+#else
+		ret = -EOPNOTSUPP;
+		goto out_free_params;
+#endif
 	}
 
 	/* Allocate loader specific data */

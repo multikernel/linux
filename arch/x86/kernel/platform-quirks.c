@@ -47,9 +47,9 @@ static void __init multikernel_setup_calibration(void)
 {
 	phys_addr_t ctx_phys = orig_boot_params -
 		offsetof(struct mk_spawn_context, bp);
-	struct mk_spawn_context *ctx = __va(ctx_phys);
+	struct mk_spawn_context *ctx = mk_validate_boot_context(ctx_phys);
 
-	if (ctx->self_phys != ctx_phys || !ctx->boot_tsc_khz)
+	if (!ctx || !ctx->boot_tsc_khz)
 		return;
 
 	multikernel_tsc_khz = ctx->boot_tsc_khz;

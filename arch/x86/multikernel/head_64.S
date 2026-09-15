@@ -16,6 +16,7 @@
 #include <linux/linkage.h>
 #include <linux/init.h>
 #include <linux/pgtable.h>
+#include <linux/multikernel_abi.h>
 #include <asm/segment.h>
 #include <asm/page.h>
 #include <asm/msr.h>
@@ -269,7 +270,7 @@ SYM_CODE_END(multikernel_secondary_startup)
 	.balign 4
 	.long	2f - 1f
 	.long	4f - 3f
-	.long	0x4d4b
+	.long	MK_VMLINUX_NOTE_TYPE
 1:	.asciz	"Linux"
 2:	.balign 4
 3:	.quad	multikernel_startup_64 - __START_KERNEL_map

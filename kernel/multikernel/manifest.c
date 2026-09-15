@@ -28,10 +28,16 @@
 
 /* Physical address of the manifest this kernel booted with, 0 if none */
 static phys_addr_t mk_manifest_fdt_phys;
+static bool mk_manifest_fdt_rejected;
 
 phys_addr_t mk_manifest_phys(void)
 {
 	return mk_manifest_fdt_phys;
+}
+
+bool mk_manifest_rejected(void)
+{
+	return READ_ONCE(mk_manifest_fdt_rejected);
 }
 
 /**
@@ -55,6 +61,7 @@ void __init mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 	if (!fdt) {
 		pr_warn("multikernel: failed to memremap manifest (0x%llx)\n",
 			fdt_phys);
+		err = -ENOMEM;
 		goto out;
 	}
 
@@ -73,14 +80,17 @@ void __init mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 	}
 
 	mk_manifest_fdt_phys = fdt_phys;
+	mk_manifest_fdt_rejected = false;
 
 	pr_info("multikernel: manifest accepted\n");
 
 out:
 	if (fdt)
 		early_memunmap(fdt, fdt_len);
-	if (err)
-		pr_warn("multikernel: ignoring invalid manifest\n");
+	if (err) {
+		mk_manifest_fdt_rejected = true;
+		pr_warn("multikernel: supplied manifest rejected: %d\n", err);
+	}
 }
 
 /*

@@ -62,12 +62,16 @@ struct elf_kernel_info {
 
 /*
  * Find multikernel entry point from PT_NOTE section.
- * Looks for note with name "Linux" and type 0x4d4b ('MK').
+ * The note type carries the generation; the descriptor remains one u64.
  */
-static unsigned long find_multikernel_entry_note(const void *buf, size_t len,
-						 const Elf64_Ehdr *ehdr)
+#define MK_VMLINUX_LEGACY_NOTE_TYPE	0x4d4b
+
+static int find_multikernel_entry_note(const void *buf, size_t len,
+				       const Elf64_Ehdr *ehdr,
+				       unsigned long *entry)
 {
 	const Elf64_Phdr *phdrs = buf + ehdr->e_phoff;
+	bool legacy = false;
 	int i;
 
 	for (i = 0; i < ehdr->e_phnum; i++) {
@@ -91,25 +95,34 @@ static unsigned long find_multikernel_entry_note(const void *buf, size_t len,
 			if (ptr + note_size > end)
 				break;
 
-			if (nhdr->n_type == 0x4d4b &&
-			    nhdr->n_namesz == 6 &&
+			if (nhdr->n_namesz == 6 &&
 			    nhdr->n_descsz == sizeof(u64) &&
 			    !memcmp(ptr + sizeof(*nhdr), "Linux", 6)) {
-				u64 entry = *(u64 *)(ptr + sizeof(*nhdr) +
-						     ALIGN(nhdr->n_namesz, 4));
-				pr_info("multikernel: entry=0x%llx\n", entry);
-				return entry;
+				const u64 *note_entry;
+
+				note_entry = ptr + sizeof(*nhdr) +
+					     ALIGN(nhdr->n_namesz, 4);
+				if (nhdr->n_type == MK_VMLINUX_NOTE_TYPE) {
+					*entry = *note_entry;
+					pr_info("multikernel: entry=0x%llx\n",
+						*note_entry);
+					return 0;
+				}
+				if (nhdr->n_type == MK_VMLINUX_LEGACY_NOTE_TYPE)
+					legacy = true;
 			}
 			ptr += note_size;
 		}
 	}
-	return 0;
+	return legacy ? -EPROTONOSUPPORT : -ENOENT;
 }
 
 /*
  * Parse ELF kernel and extract key information
  */
-static int kexec_parse_elf_kernel(const void *kernel_buf, unsigned long kernel_len,
+static int kexec_parse_elf_kernel(const void *kernel_buf,
+				  unsigned long kernel_len,
+				  bool multikernel,
 				  struct elf_kernel_info *info)
 {
 	const Elf64_Ehdr *ehdr;
@@ -159,13 +172,24 @@ static int kexec_parse_elf_kernel(const void *kernel_buf, unsigned long kernel_l
 	 * PT_NOTE contains physical offset from load base, not virtual address.
 	 * This is the canonical way and survives symbol stripping.
 	 */
-	info->multikernel_entry = find_multikernel_entry_note(kernel_buf, kernel_len, ehdr);
-	if (!info->multikernel_entry) {
-		pr_err("multikernel_startup_64 entry offset not found in PT_NOTE\n");
-		return -ENOEXEC;
-	}
+	info->multikernel_entry = 0;
+	if (multikernel) {
+		int ret;
 
-	pr_info("Multikernel entry offset: 0x%lx\n", info->multikernel_entry);
+		ret = find_multikernel_entry_note(kernel_buf, kernel_len, ehdr,
+						  &info->multikernel_entry);
+		if (ret == -EPROTONOSUPPORT)
+			pr_err("legacy vmlinux note type 0x%x is incompatible; expected 0x%x\n",
+			       MK_VMLINUX_LEGACY_NOTE_TYPE, MK_VMLINUX_NOTE_TYPE);
+		else if (ret)
+			pr_err("multikernel ABI note type 0x%x not found\n",
+			       MK_VMLINUX_NOTE_TYPE);
+		if (ret)
+			return ret == -ENOENT ? -ENOEXEC : ret;
+
+		pr_info("Multikernel entry offset: 0x%lx\n",
+			info->multikernel_entry);
+	}
 
 	/* Find lowest load address and calculate total memory needed */
 	phdr = (const Elf64_Phdr *)(kernel_buf + ehdr->e_phoff);
@@ -326,12 +350,13 @@ static void *vmlinux_load(struct kimage *image, char *kernel,
 				  .top_down = true };
 	struct kexec_buf pbuf = { .image = image, .buf_min = MIN_PURGATORY_ADDR,
 				  .buf_max = ULONG_MAX, .top_down = true };
+	bool multikernel = image->type == KEXEC_TYPE_MULTIKERNEL;
 	int ret;
 
 	pr_info("Loading ELF vmlinux (type=%d)\n", image->type);
 
 	/* Parse ELF headers */
-	ret = kexec_parse_elf_kernel(kernel, kernel_len, &elf_info);
+	ret = kexec_parse_elf_kernel(kernel, kernel_len, multikernel, &elf_info);
 	if (ret) {
 		pr_err("Failed to parse ELF kernel: %d\n", ret);
 		return ERR_PTR(ret);
@@ -531,12 +556,17 @@ static void *vmlinux_load(struct kimage *image, char *kernel,
 
 	/* For multikernel, setup custom e820 map */
 	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
+#ifdef CONFIG_MULTIKERNEL
 		ret = mk_e820_fill(image->mk_instance, params);
 		if (ret) {
 			kvfree(ldata->kernel_buf);
 			kfree(ldata);
 			goto out_free_params;
 		}
+#else
+		ret = -EOPNOTSUPP;
+		goto out_free_params;
+#endif
 	}
 
 	ldata->bootparams_buf = params;

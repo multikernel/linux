@@ -337,6 +337,17 @@ static struct tty_driver *mktty_spawn_driver;
 static struct mktty_spawn_state mktty_spawn;
 static struct mk_ipi_handler *mktty_spawn_handler;
 static struct console mktty_spawn_console;
+
+static int mktty_spawn_parent_id(void)
+{
+	if (!mk_self)
+		return -ENODEV;
+	if (mk_self->id == 0)
+		return 0;
+	if (!host_instance)
+		return -ENODEV;
+	return READ_ONCE(host_instance->id);
+}
 static bool mktty_console_registered;
 
 static int mktty_spawn_activate(struct tty_port *port, struct tty_struct *tty)
@@ -376,11 +387,14 @@ static ssize_t mktty_spawn_write(struct tty_struct *tty, const u8 *buf,
 				 size_t count)
 {
 	struct mktty_message *msg;
-	size_t sent = 0, chunk;
-	int ret;
+	size_t sent = 0, chunk, msg_size;
+	int ret, parent_id;
 
 	if (tty->index != 0)
 		return -ENODEV;
+	parent_id = mktty_spawn_parent_id();
+	if (parent_id < 0)
+		return parent_id;
 
 	msg = kmalloc(sizeof(*msg), GFP_KERNEL);
 	if (!msg)
@@ -393,10 +407,10 @@ static ssize_t mktty_spawn_write(struct tty_struct *tty, const u8 *buf,
 		msg->len = chunk;
 		msg->reserved = 0;
 		memcpy(msg->data, buf + sent, chunk);
+		msg_size = sizeof(*msg) - MKTTY_MAX_DATA + chunk;
 
-		ret = multikernel_send_ipi_data(0, msg,
-				sizeof(*msg) - MKTTY_MAX_DATA + chunk,
-				MKTTY_IPI_TYPE);
+		ret = multikernel_send_ipi_data(parent_id, msg, msg_size,
+						MKTTY_IPI_TYPE);
 		if (ret < 0) {
 			kfree(msg);
 			return sent > 0 ? sent : ret;
@@ -445,12 +459,16 @@ static struct mktty_message mktty_console_msg;
 static DEFINE_SPINLOCK(mktty_console_lock);
 
 static void mktty_spawn_console_write(struct console *con, const char *s,
-				      unsigned int count)
+				       unsigned int count)
 {
 	unsigned long flags;
-	size_t chunk;
+	size_t chunk, msg_size;
+	int parent_id;
 
 	spin_lock_irqsave(&mktty_console_lock, flags);
+	parent_id = mktty_spawn_parent_id();
+	if (parent_id < 0)
+		goto out;
 	while (count > 0) {
 		chunk = min_t(size_t, count, MKTTY_MAX_DATA);
 		mktty_console_msg.type = MKTTY_MSG_OUTPUT;
@@ -458,13 +476,14 @@ static void mktty_spawn_console_write(struct console *con, const char *s,
 		mktty_console_msg.len = chunk;
 		mktty_console_msg.reserved = 0;
 		memcpy(mktty_console_msg.data, s, chunk);
+		msg_size = sizeof(mktty_console_msg) - MKTTY_MAX_DATA + chunk;
 
-		multikernel_send_ipi_data(0, &mktty_console_msg,
-				sizeof(mktty_console_msg) - MKTTY_MAX_DATA + chunk,
-				MKTTY_IPI_TYPE);
+		(void)multikernel_send_ipi_data_to_host(&mktty_console_msg,
+						       msg_size, MKTTY_IPI_TYPE);
 		s += chunk;
 		count -= chunk;
 	}
+out:
 	spin_unlock_irqrestore(&mktty_console_lock, flags);
 }
 
