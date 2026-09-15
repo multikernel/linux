@@ -17,6 +17,7 @@ config MULTIKERNEL
 	depends on KEXEC_CORE
 	depends on MEMORY_HOTPLUG
 	depends on MEMORY_HOTREMOVE
+	depends on OF
 	select LIBFDT
 	select OF_DYNAMIC if OF
 	help
@@ -32,4 +33,7 @@ config MULTIKERNEL
 	  - A manifest handed to each spawn kernel on multikernel's own
 	    boot channel, describing its resources and message rings
 
+	  SR-IOV VF assignment additionally requires PCI_IOV and an active
+	  hardware IOMMU with isolated interrupt delivery. Assignment fails
+	  closed when those isolation facilities are unavailable.
 	  If unsure, say N.

@@ -10,12 +10,18 @@
 #include <linux/kobject.h>
 #include <linux/kernfs.h>
 #include <linux/ioport.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/cpumask.h>
 #include <linux/genalloc.h>
-#include <linux/mutex.h>
 #include <linux/numa.h>
 #include <linux/sizes.h>
+#include <linux/spinlock.h>
+#include <linux/multikernel_abi.h>
+#include <linux/rwsem.h>
+
+struct pci_bus;
+struct mk_instance;
 
 #ifdef CONFIG_MULTIKERNEL
 #include <asm/multikernel.h>
@@ -40,6 +46,7 @@ typedef u64 mk_phys_cpu_t;
 #define MK_PHYS_CPU_INVALID	(~(mk_phys_cpu_t)0)
 
 struct mk_cpu_set {
+	raw_spinlock_t lock;
 	unsigned int nr;	/* Entries in use */
 	unsigned int cap;	/* Allocated capacity */
 	mk_phys_cpu_t *ids;
@@ -54,26 +61,18 @@ bool mk_cpu_set_del(struct mk_cpu_set *set, mk_phys_cpu_t id);
 bool mk_cpu_set_contains(const struct mk_cpu_set *set, mk_phys_cpu_t id);
 int mk_cpu_set_copy(struct mk_cpu_set *dst, const struct mk_cpu_set *src);
 int mk_cpu_set_format(char *buf, size_t size, const struct mk_cpu_set *set);
+unsigned int mk_cpu_set_count(const struct mk_cpu_set *set);
+bool mk_cpu_set_empty(const struct mk_cpu_set *set);
+mk_phys_cpu_t mk_cpu_set_first(const struct mk_cpu_set *set);
+bool mk_cpu_set_get(const struct mk_cpu_set *set, unsigned int index,
+		    mk_phys_cpu_t *id);
 
-static inline unsigned int mk_cpu_set_count(const struct mk_cpu_set *set)
-{
-	return set ? set->nr : 0;
-}
-
-static inline bool mk_cpu_set_empty(const struct mk_cpu_set *set)
-{
-	return mk_cpu_set_count(set) == 0;
-}
-
-static inline mk_phys_cpu_t mk_cpu_set_first(const struct mk_cpu_set *set)
-{
-	return mk_cpu_set_empty(set) ? MK_PHYS_CPU_INVALID : set->ids[0];
-}
+void mk_cpu_transaction_lock(void);
+void mk_cpu_transaction_unlock(void);
 
 #define mk_cpu_set_for_each(i, id, set)					\
 	for ((i) = 0;							\
-	     (set) && (i) < (set)->nr &&				\
-	     (((id) = (set)->ids[(i)]), true);				\
+	     mk_cpu_set_get((set), (i), &(id));				\
 	     (i)++)
 
 /**
@@ -86,20 +85,119 @@ static inline mk_phys_cpu_t mk_cpu_set_first(const struct mk_cpu_set *set)
 /* IPI ring buffer size - must be power of 2 for efficient modulo */
 #define MK_IPI_RING_SIZE 64
 
+#define MK_REPLY_SLOTS		16
+#define MK_REPLY_STATE_BITS	3
+#define MK_IRQ_MAILBOX_SLOTS	256
+#define MK_IRQ_MAILBOX_WORDS	(MK_IRQ_MAILBOX_SLOTS / 64)
+#define MK_IRQ_MAILBOX_SLOT_INVALID	((u32)~0U)
+#define MK_IRQ_MAILBOX_PENDING_MASK	0x3fffffffULL
+#define MK_IRQ_MAILBOX_CONSUMING	0x40000000ULL
+#define MK_IRQ_MAILBOX_MASKED		0x80000000ULL
+#define MK_IRQ_MAILBOX_GENERATION_SHIFT	32
+
+enum mk_reply_state {
+	MK_REPLY_FREE = 0,
+	MK_REPLY_RESERVED,
+	MK_REPLY_WRITING,
+	MK_REPLY_EXECUTING,
+	MK_REPLY_COMMITTED,
+	MK_REPLY_READY,
+	MK_REPLY_ABANDONED,
+};
+
+enum mk_reply_kind {
+	MK_REPLY_PCI_CFG = 1,
+	MK_REPLY_PCI_IRQ,
+	MK_REPLY_PCI_RESET,
+};
+
+struct mk_reply_slot {
+	atomic64_t state_generation;
+	u64 request_id;
+	u32 kind;
+	s32 status;
+	u32 value;
+	u32 reserved;
+};
+
+struct mk_reply_table {
+	struct mk_reply_slot slots[MK_REPLY_SLOTS];
+	atomic_t late_replies;
+	atomic_t cancelled_slots;
+	atomic_t atomic_timeouts;
+	atomic_t indeterminate_timeouts;
+	atomic_t occupied_failures;
+};
+
+struct mk_reply_handle {
+	u32 slot;
+	u32 kind;
+	u64 request_id;
+	u64 generation;
+};
+
 /* Data structure for passing parameters via IPI */
 struct mk_ipi_data {
+	u32 ready;
 	u64 sender_cpu;          /* Physical ID of the CPU that sent this IPI */
-	unsigned int type;      /* User-defined type identifier */
+	s32 sender_instance_id;  /* Receiver-authenticated duplex peer */
+	unsigned int type;       /* User-defined type identifier */
 	size_t data_size;        /* Size of the data */
 	char buffer[MK_MAX_DATA_SIZE]; /* Actual data buffer */
 };
 
 /* IPI ring buffer for queuing messages */
 struct mk_ipi_ring {
-	atomic_t head;                          /* Producer index */
-	atomic_t tail;                          /* Consumer index */
 	struct mk_ipi_data entries[MK_IPI_RING_SIZE]; /* Ring buffer entries */
+	atomic_t full_failures;
 };
+
+struct mk_irq_mailbox_entry {
+	atomic64_t pending_generation;
+	u64 lifecycle_epoch;
+	u32 lifecycle_generation;
+	u32 device_id;
+	u32 local_irq;
+	u16 vector;
+	u16 reserved;
+};
+
+struct mk_irq_mailbox {
+	atomic64_t pending_bitmap[MK_IRQ_MAILBOX_WORDS];
+	struct mk_irq_mailbox_entry entries[MK_IRQ_MAILBOX_SLOTS];
+	atomic_t next_generation;
+	atomic_t recorded;
+	atomic_t coalesced;
+	atomic_t masked_deferred;
+	atomic_t stale;
+	atomic_t dispatch_failed;
+	atomic_t saturated;
+};
+
+static inline u64 mk_irq_mailbox_token(u32 generation, u32 pending)
+{
+	return (u64)generation << MK_IRQ_MAILBOX_GENERATION_SHIFT | pending;
+}
+
+static inline u32 mk_irq_mailbox_generation(u64 token)
+{
+	return token >> MK_IRQ_MAILBOX_GENERATION_SHIFT;
+}
+
+static inline u32 mk_irq_mailbox_pending(u64 token)
+{
+	return token & MK_IRQ_MAILBOX_PENDING_MASK;
+}
+
+static inline bool mk_irq_mailbox_masked(u64 token)
+{
+	return token & MK_IRQ_MAILBOX_MASKED;
+}
+
+static inline bool mk_irq_mailbox_consuming(u64 token)
+{
+	return token & MK_IRQ_MAILBOX_CONSUMING;
+}
 
 /* The spawn boot tree's fixed budget, shared by allocator and writer */
 #define MK_MANIFEST_SIZE SZ_256K
@@ -109,9 +207,10 @@ struct mk_ipi_ring {
 /* Presence table capacity, in CPUs (see mk_cpu_rank) */
 #define MK_PARKED_MAX 512
 
-/* Shared memory structures - per-instance design */
+/* One duplex link per parent/child pair. Each ring has one kernel producer. */
 struct mk_shared_data {
-	struct mk_ipi_ring ring;  /* IPI message ring buffer */
+	struct mk_ipi_ring to_child;
+	struct mk_ipi_ring to_parent;
 	/*
 	 * Force-halt marker, host-owned. Armed before the host NMIs the
 	 * instance's CPUs and cleared with the rest of this struct when
@@ -131,6 +230,97 @@ struct mk_shared_data {
 	 * the struct on re-exec.
 	 */
 	u8 parked[MK_PARKED_MAX];
+	s32 parent_id;
+	s32 child_id;
+	u32 reserved;
+	u64 parent_doorbell_cpu;
+	u64 child_doorbell_cpu;
+	/* Changes on every launch; zero means the link has not been launched. */
+	u64 spawn_epoch;
+	/* Generation-tagged synchronous replies, independent of ring progress. */
+	struct mk_reply_table replies;
+	struct mk_irq_mailbox irq_mailbox;
+};
+
+static inline void mk_reply_table_reset(struct mk_reply_table *table)
+{
+	unsigned int i;
+
+	for (i = 0; i < MK_REPLY_SLOTS; i++) {
+		atomic64_set(&table->slots[i].state_generation, MK_REPLY_FREE);
+		WRITE_ONCE(table->slots[i].request_id, 0);
+		WRITE_ONCE(table->slots[i].kind, 0);
+		WRITE_ONCE(table->slots[i].status, 0);
+		WRITE_ONCE(table->slots[i].value, 0);
+	}
+	atomic_set(&table->late_replies, 0);
+	atomic_set(&table->cancelled_slots, 0);
+	atomic_set(&table->atomic_timeouts, 0);
+	atomic_set(&table->indeterminate_timeouts, 0);
+	atomic_set(&table->occupied_failures, 0);
+}
+
+static inline void mk_ipi_ring_reset(struct mk_ipi_ring *ring)
+{
+	unsigned int i;
+
+	for (i = 0; i < MK_IPI_RING_SIZE; i++)
+		WRITE_ONCE(ring->entries[i].ready, 0);
+	atomic_set(&ring->full_failures, 0);
+}
+
+static inline void mk_irq_mailbox_reset(struct mk_irq_mailbox *mailbox)
+{
+	unsigned int i;
+
+	for (i = 0; i < MK_IRQ_MAILBOX_WORDS; i++)
+		atomic64_set(&mailbox->pending_bitmap[i], 0);
+	for (i = 0; i < MK_IRQ_MAILBOX_SLOTS; i++) {
+		struct mk_irq_mailbox_entry *entry = &mailbox->entries[i];
+
+		atomic64_set(&entry->pending_generation, 0);
+		WRITE_ONCE(entry->lifecycle_epoch, 0);
+		WRITE_ONCE(entry->lifecycle_generation, 0);
+		WRITE_ONCE(entry->device_id, 0);
+		WRITE_ONCE(entry->local_irq, 0);
+		WRITE_ONCE(entry->vector, 0);
+		WRITE_ONCE(entry->reserved, 0);
+	}
+	atomic_set(&mailbox->next_generation, 0);
+	atomic_set(&mailbox->recorded, 0);
+	atomic_set(&mailbox->coalesced, 0);
+	atomic_set(&mailbox->masked_deferred, 0);
+	atomic_set(&mailbox->stale, 0);
+	atomic_set(&mailbox->dispatch_failed, 0);
+	atomic_set(&mailbox->saturated, 0);
+}
+
+static inline void mk_shared_data_reset(struct mk_shared_data *shared)
+{
+	unsigned int i;
+
+	mk_ipi_ring_reset(&shared->to_child);
+	mk_ipi_ring_reset(&shared->to_parent);
+	WRITE_ONCE(shared->force_halt, 0);
+	for (i = 0; i < MK_PARKED_MAX; i++)
+		WRITE_ONCE(shared->parked[i], 0);
+	mk_reply_table_reset(&shared->replies);
+	mk_irq_mailbox_reset(&shared->irq_mailbox);
+}
+
+struct mk_ipi_endpoint {
+	struct mk_instance *peer;
+	struct mk_ipi_ring *tx;
+	struct mk_ipi_ring *rx;
+	raw_spinlock_t tx_lock;
+	raw_spinlock_t rx_lock;
+	u32 tx_head;
+	u32 rx_tail;
+	bool tx_enabled;
+	bool rx_dispatching;
+	bool parent_side;
+	bool registered;
+	struct list_head rx_node;
 };
 
 /* Function pointer type for IPI callbacks */
@@ -166,17 +356,42 @@ void multikernel_unregister_handler(struct mk_ipi_handler *handler);
  * @data_size: Size of data
  * @type: User-defined type identifier
  *
- * This function copies the data to per-CPU storage and sends an IPI
- * to the target CPU.
+ * This process-context API looks up the instance by ID, copies the data to
+ * its endpoint, and sends an IPI to the target CPU. Atomic callers with a
+ * lifetime-stable instance must use multikernel_send_ipi_data_to_host().
  *
  * Returns 0 on success, negative error code on failure
  */
 int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, unsigned long type);
+int multikernel_send_ipi_data_to_host(void *data, size_t data_size,
+				      unsigned long type);
 
 void generic_multikernel_interrupt(void);
 
-/* Discard everything queued in this kernel's ring (instance re-spawn) */
-void mk_ipi_ring_drop_pending(void);
+int mk_ipi_endpoint_init(struct mk_instance *instance, bool parent_side);
+void mk_ipi_endpoint_unregister(struct mk_instance *instance);
+void mk_ipi_endpoint_close(struct mk_instance *instance);
+void mk_ipi_link_reset(struct mk_instance *instance, int parent_id,
+		       int child_id, mk_phys_cpu_t parent_cpu,
+		       mk_phys_cpu_t child_cpu);
+void mk_ipi_handlers_enable(void);
+int mk_reply_reserve(struct mk_shared_data *shared, u32 kind, u64 request_id,
+		     struct mk_reply_handle *reply);
+int mk_reply_claim(struct mk_instance *instance,
+		   const struct mk_reply_handle *reply);
+int mk_reply_begin_execute(struct mk_instance *instance,
+			   const struct mk_reply_handle *reply);
+int mk_reply_publish(struct mk_instance *instance,
+		     const struct mk_reply_handle *reply, s32 status, u32 value);
+int mk_reply_wait_atomic(struct mk_shared_data *shared,
+			 struct mk_reply_handle *reply, unsigned int timeout_us,
+			 s32 *status, u32 *value);
+int mk_reply_wait(struct mk_shared_data *shared,
+		  struct mk_reply_handle *reply, unsigned int timeout_ms,
+		  s32 *status, u32 *value);
+void mk_reply_release(struct mk_shared_data *shared,
+		      struct mk_reply_handle *reply);
+void mk_reply_scan(struct mk_shared_data *shared);
 
 /*
  * Multikernel Messaging System
@@ -192,6 +407,7 @@ void mk_ipi_ring_drop_pending(void);
 #define MK_MSG_SYSTEM       0x3000
 #define MK_MSG_USER         0x4000
 #define MK_MSG_NETWORK      0x5000
+#define MK_MSG_PCI          0x6000
 
 /* I/O interrupt forwarding subtypes */
 #define MK_IO_IRQ_FORWARD   (MK_MSG_IO + 1)
@@ -219,6 +435,14 @@ void mk_ipi_ring_drop_pending(void);
 #define MK_NET_VSOCK_PKT    (MK_MSG_NETWORK + 1)  /* vsock packet */
 #define MK_NET_DATA_READY   (MK_MSG_NETWORK + 2)  /* Data available notification */
 
+/* Host-mediated PCI control-plane subtypes */
+#define MK_PCI_CFG_REQUEST  (MK_MSG_PCI + 1)
+#define MK_PCI_CFG_RESPONSE (MK_MSG_PCI + 2)
+#define MK_PCI_IRQ_REQUEST  (MK_MSG_PCI + 3)
+#define MK_PCI_IRQ_RESPONSE (MK_MSG_PCI + 4)
+#define MK_PCI_RESET_REQUEST  (MK_MSG_PCI + 5)
+#define MK_PCI_RESET_RESPONSE (MK_MSG_PCI + 6)
+
 /**
  * Core message structure
  */
@@ -240,6 +464,85 @@ struct mk_io_irq_payload {
 	u32 vector;             /* Interrupt vector */
 	u32 device_id;          /* Device identifier (optional) */
 	u32 flags;              /* Control flags (priority, etc.) */
+	u32 lifecycle_generation;
+	u32 reserved;
+	u64 lifecycle_epoch;
+};
+
+#define MK_PCI_IRQ_ID(domain, bus, devfn) \
+	(((u32)(domain) << 16) | ((u32)(bus) << 8) | (u32)(devfn))
+#define MK_PCI_IRQ_ID_DOMAIN(id)	((u16)((id) >> 16))
+#define MK_PCI_IRQ_ID_BUS(id)		((u8)((id) >> 8))
+#define MK_PCI_IRQ_ID_DEVFN(id)		((u8)(id))
+
+struct mk_pci_cfg_request {
+	u64 request_id;
+	u64 lifecycle_epoch;
+	s32 sender_instance_id;
+	u16 domain;
+	u8 bus;
+	u8 devfn;
+	u16 reg;
+	u8 len;
+	u8 write;
+	u32 value;
+	u32 reply_slot;
+	u32 reply_reserved;
+	u64 reply_generation;
+};
+
+struct mk_pci_cfg_response {
+	u64 request_id;
+	s32 status;
+	u32 value;
+};
+
+enum mk_pci_irq_operation {
+	MK_PCI_IRQ_SETUP = 1,
+	MK_PCI_IRQ_RESTORE_BEGIN,
+	MK_PCI_IRQ_BIND,
+	MK_PCI_IRQ_COMMIT,
+	MK_PCI_IRQ_ACTIVATE,
+	MK_PCI_IRQ_TEARDOWN,
+};
+
+enum mk_pci_msi_lifecycle {
+	MK_PCI_MSI_IDLE = 0,
+	MK_PCI_MSI_PREPARED,
+	MK_PCI_MSI_COMMITTED,
+	MK_PCI_MSI_ACTIVE,
+	MK_PCI_MSI_FAILED,
+};
+
+struct mk_pci_irq_request {
+	u64 request_id;
+	s32 sender_instance_id;
+	u16 domain;
+	u8 bus;
+	u8 devfn;
+	u16 operation;
+	u16 vector;
+	u16 nr_vectors;
+	u8 msix;
+	u8 reserved;
+	u32 local_irq;
+	u32 reply_slot;
+	u32 lifecycle_generation;
+	u64 reply_generation;
+	u64 lifecycle_epoch;
+};
+
+struct mk_pci_reset_request {
+	u64 request_id;
+	s32 sender_instance_id;
+	u16 domain;
+	u8 bus;
+	u8 devfn;
+	u32 reset_generation;
+	u32 reply_slot;
+	u32 reserved;
+	u64 reply_generation;
+	u64 lifecycle_epoch;
 };
 
 /* IRQ control flags */
@@ -309,7 +612,8 @@ struct mk_shutdown_payload {
  * Message handler callback type
  */
 typedef void (*mk_msg_handler_t)(u32 msg_type, u32 subtype,
-				 void *payload, u32 payload_len, void *ctx);
+				 void *payload, u32 payload_len,
+				 s32 sender_instance_id, void *ctx);
 
 /* Opaque type for pending message tracking */
 struct mk_pending_msg;
@@ -319,17 +623,23 @@ struct mk_pending_msg;
  */
 
 /**
- * mk_send_message - Send a message to another CPU
+ * mk_send_message - Send a message to another CPU from process context
  * @instance_id: Target multikernel instance ID
  * @msg_type: Message type identifier
  * @subtype: Message subtype
  * @payload: Pointer to payload data (can be NULL)
  * @payload_len: Length of payload data
  *
+ * This ID-based API may sleep while looking up the target instance. Atomic
+ * callers with a lifetime-stable instance must use
+ * mk_send_message_to_instance().
+ *
  * Returns 0 on success, negative error code on failure
  */
 int mk_send_message(int instance_id, u32 msg_type, u32 subtype,
 		    void *payload, u32 payload_len);
+int mk_send_message_to_instance(struct mk_instance *instance, u32 msg_type,
+				u32 subtype, void *payload, u32 payload_len);
 
 /**
  * mk_register_msg_handler - Register handler for specific message type
@@ -445,7 +755,7 @@ size_t mk_pool_total_bytes(void);
 size_t mk_pool_avail_bytes(void);
 bool mk_pool_empty(void);
 int mk_pool_for_each_chunk(int (*fn)(struct mk_pool_chunk *, void *), void *data);
-bool mk_pool_cpus_returned(void);
+int mk_pool_park_teardown(void);
 
 /**
  * struct mk_pool_chunk_range - a pool chunk copied out of the chunk list
@@ -471,7 +781,7 @@ int mk_pool_snapshot_chunks(struct mk_pool_chunk_range *out, int max);
 int mk_pool_park_setup(void);
 int mk_arch_pool_chunk_added(phys_addr_t start, size_t size);
 bool mk_pool_park_uses(phys_addr_t start, size_t size);
-int mk_pool_park_teardown(void);
+int mk_arch_pool_park_teardown(void);
 #else
 static inline int mk_pool_park_setup(void)
 {
@@ -488,7 +798,7 @@ static inline bool mk_pool_park_uses(phys_addr_t start, size_t size)
 	return false;
 }
 
-static inline int mk_pool_park_teardown(void)
+static inline int mk_arch_pool_park_teardown(void)
 {
 	return 0;
 }
@@ -548,6 +858,13 @@ struct mk_memory_region {
  * Format: vendor:device@domain:bus:slot.func
  */
 #define MK_PCI_ALIAS_LEN 32	/* Devicetree spec: alias names are at most 31 chars */
+#define MK_PCI_RESOURCE_COUNT 6
+
+struct mk_pci_resource {
+	u64 start;
+	u64 end;
+	u64 flags;
+};
 
 /*
  * A PCI host bridge as the instance device tree describes it: the
@@ -565,6 +882,8 @@ struct mk_pci_device {
 	u8 bus;            /* PCI bus number */
 	u8 slot;           /* PCI slot number */
 	u8 func;           /* PCI function number */
+	struct mk_pci_resource resources[MK_PCI_RESOURCE_COUNT];
+	bool resources_valid;
 	struct list_head list;  /* Link to device list */
 };
 
@@ -630,6 +949,8 @@ struct mk_instance {
 	int id;                         /* Kernel-assigned instance ID */
 	char *name;                     /* User-provided instance name */
 	enum mk_instance_state state;   /* Current state */
+	/* Serializes memory topology changes with PCI assignment leases. */
+	struct mutex resource_mutex;
 
 	/* Resource management - list of reserved memory regions */
 	struct list_head memory_regions;  /* List of struct mk_memory_region */
@@ -640,11 +961,18 @@ struct mk_instance {
 
 	/* CPU resources */
 	struct mk_cpu_set *cpus;         /* Set of assigned physical CPU IDs */
+	/* Pins the CPU selected for control messages and forwarded IRQs. */
+	struct rw_semaphore control_route_sem;
+	raw_spinlock_t control_route_lock;
+	mk_phys_cpu_t irq_route_cpu;
+	struct delayed_work irq_retry_work;
 
 	/* PCI device resources */
 	struct list_head pci_devices;    /* List of struct mk_pci_device */
 	int pci_device_count;            /* Number of PCI devices */
 	bool pci_devices_valid;          /* Whether PCI device list is valid */
+	/* Host-only live PCI assignment leases (private elements). */
+	struct list_head pci_assignments;
 
 	/* Platform device resources */
 	struct list_head platform_devices;   /* List of struct mk_platform_device */
@@ -655,6 +983,11 @@ struct mk_instance {
 	struct mk_shared_data *ipi_data; /* IPI shared memory buffer (virtual address) */
 	phys_addr_t ipi_phys;           /* IPI buffer physical address */
 	u32 ipi_pages;                  /* IPI buffer size in pages */
+	/*
+	 * Separate host self area used when a spawn fences its parent.
+	 * NULL for ordinary child records, whose halt area is @ipi_data.
+	 */
+	struct mk_shared_data *halt_data;
 	/*
 	 * On a spawn's record of its host: the physical address of the
 	 * host's pool wake slot, where the host's CPUs park. A backup
@@ -669,6 +1002,7 @@ struct mk_instance {
 	 * explicitly so routing never masquerades as ownership in @cpus.
 	 */
 	mk_phys_cpu_t ipi_target;
+	struct mk_ipi_endpoint ipi_endpoint;
 
 	/* Kexec integration */
 	struct kimage *kimage;          /* Associated kimage object */
@@ -718,6 +1052,24 @@ struct mk_instance {
 	/* Reference counting */
 	struct kref refcount;           /* Reference count for cleanup */
 };
+
+static inline mk_phys_cpu_t
+mk_instance_irq_route_load(const struct mk_instance *instance)
+{
+	/* Pair with the release store that publishes route changes. */
+	return smp_load_acquire(&instance->irq_route_cpu);
+}
+
+static inline void mk_instance_irq_route_store(struct mk_instance *instance,
+					       mk_phys_cpu_t target)
+{
+	unsigned long flags;
+
+	/* Publish the route after its associated control state. */
+	raw_spin_lock_irqsave(&instance->control_route_lock, flags);
+	smp_store_release(&instance->irq_route_cpu, target);
+	raw_spin_unlock_irqrestore(&instance->control_route_lock, flags);
+}
 
 /**
  * Device Tree Parsing Functions
@@ -842,14 +1194,14 @@ struct mk_instance *mk_instance_get(struct mk_instance *instance);
 void __noreturn mk_halt_to_pool(void);
 
 /**
- * mk_instance_reserve_resources() - Reserve CPU and memory resources for instance
- * @instance: Instance to reserve resources for
- * @config: Device tree configuration with memory size and CPU assignment
+ * mk_instance_reserve_resources() - Atomically reserve instance resources
+ * @instance: Empty instance to populate
+ * @config: Parsed memory, CPU, PCI, and platform resource configuration
  *
- * Allocates the specified memory size from the multikernel pool, creates
- * memory regions, and copies CPU assignment.
+ * Reserves every configured resource class or returns all resources acquired
+ * by the attempt. A failure never leaves a partially populated instance.
  *
- * Returns 0 on success, negative error code on failure.
+ * Returns: 0 on success, negative error code on failure
  */
 int mk_instance_reserve_resources(struct mk_instance *instance,
 				  const struct mk_dt_config *config);
@@ -886,21 +1238,6 @@ void mk_instance_mem_free(struct mk_instance *instance, void *virt_addr, size_t 
 const char *mk_state_to_string(enum mk_instance_state state);
 enum mk_instance_state mk_string_to_state(const char *str);
 
-/**
- * Kexec Integration Functions
- *
- * These functions bridge the gap between the sysfs instance management
- * and the kexec multikernel system.
- */
-
-/**
- * mk_instance_set_kexec_active() - Mark instance as active for kexec
- * @mk_id: Multikernel ID from kexec system
- *
- * Returns 0 on success, negative error code on failure.
- */
-int mk_instance_set_kexec_active(int mk_id);
-
 /*
  * The declarations below are referenced from always-built code (kexec,
  * PCI and platform device probing, SMP setup), so they carry stubs for
@@ -922,13 +1259,40 @@ struct mk_instance *mk_instance_find(int mk_id);
 void mk_instance_put(struct mk_instance *instance);
 void mk_instance_set_state(struct mk_instance *instance,
 			   enum mk_instance_state state);
+void mk_instance_mark_failed(struct mk_instance *instance);
+int mk_instance_abort_spawn(struct mk_instance *instance);
 
 /* Kimage-based access to the instance memory pool */
 void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align);
 void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size);
 
-/* Device probe filtering against the instance's allowlist */
+/* Device filtering against the current kernel's boot tree */
 bool mk_pci_should_probe(struct pci_bus *bus, int devfn);
+bool mk_pci_get_assigned_identity_bdf(unsigned int domain, unsigned int bus,
+				      unsigned int devfn, u16 *vendor,
+				      u16 *device);
+#if defined(CONFIG_X86) && defined(CONFIG_PCI)
+bool mk_pci_controlled(struct pci_dev *dev);
+int mk_pci_reset_flr(struct pci_dev *dev);
+#else
+static inline bool mk_pci_controlled(struct pci_dev *dev) { return false; }
+static inline int mk_pci_reset_flr(struct pci_dev *dev) { return -EOPNOTSUPP; }
+#endif
+#if defined(CONFIG_X86) && defined(CONFIG_PCI) && defined(CONFIG_PCI_MSI)
+bool mk_pci_msi_controlled(struct pci_dev *dev);
+int mk_pci_msi_prepare(struct pci_dev *dev, int nvec, int type);
+int mk_pci_msi_activate(struct pci_dev *dev);
+int mk_pci_msi_restore(struct pci_dev *dev);
+int mk_pci_msi_teardown(struct pci_dev *dev);
+void mk_pci_irq_mailbox_drain(struct mk_shared_data *shared);
+#else
+static inline bool mk_pci_msi_controlled(struct pci_dev *dev) { return false; }
+static inline int mk_pci_msi_prepare(struct pci_dev *dev, int nvec, int type) { return 0; }
+static inline int mk_pci_msi_activate(struct pci_dev *dev) { return 0; }
+static inline int mk_pci_msi_restore(struct pci_dev *dev) { return 0; }
+static inline int mk_pci_msi_teardown(struct pci_dev *dev) { return 0; }
+static inline void mk_pci_irq_mailbox_drain(struct mk_shared_data *shared) { }
+#endif
 bool mk_platform_device_allowed(const char *name, const char *hid);
 
 /* Early CPU registration from the manifest (spawn kernels) */
@@ -936,9 +1300,18 @@ void mk_register_cpus_from_manifest(void);
 
 /* Accept the manifest handed over at boot (spawn kernels) */
 void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len);
+bool mk_manifest_rejected(void);
 
 /* Build the manifest for a spawn (host, kexec path) */
 int mk_manifest_finalize(struct kimage *image);
+#ifdef CONFIG_PCI
+int mk_pci_prepare_instance_start(struct mk_instance *instance);
+#else
+static inline int mk_pci_prepare_instance_start(struct mk_instance *instance)
+{
+	return 0;
+}
+#endif
 #else
 static inline bool multikernel_allow_emergency_restart(void)
 {
@@ -952,6 +1325,15 @@ static inline bool mk_crash_notes_wanted(void)
 {
 	return false;
 }
+
+static inline bool mk_pci_controlled(struct pci_dev *dev) { return false; }
+static inline int mk_pci_reset_flr(struct pci_dev *dev) { return -EOPNOTSUPP; }
+static inline bool mk_pci_msi_controlled(struct pci_dev *dev) { return false; }
+static inline int mk_pci_msi_prepare(struct pci_dev *dev, int nvec, int type) { return 0; }
+static inline int mk_pci_msi_activate(struct pci_dev *dev) { return 0; }
+static inline int mk_pci_msi_restore(struct pci_dev *dev) { return 0; }
+static inline int mk_pci_msi_teardown(struct pci_dev *dev) { return 0; }
+static inline void mk_pci_irq_mailbox_drain(struct mk_shared_data *shared) { }
 
 static inline int multikernel_force_halt_by_id(int mk_id)
 {
@@ -981,6 +1363,14 @@ static inline bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
 {
 	return true;
 }
+
+static inline bool
+mk_pci_get_assigned_identity_bdf(unsigned int domain, unsigned int bus,
+				 unsigned int devfn, u16 *vendor, u16 *device)
+{
+	return false;
+}
+
 static inline bool mk_platform_device_allowed(const char *name, const char *hid)
 {
 	return true;
@@ -991,6 +1381,11 @@ static inline void mk_register_cpus_from_manifest(void)
 static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 {
 }
+
+static inline bool mk_manifest_rejected(void)
+{
+	return false;
+}
 #endif
 
 /**
@@ -998,6 +1393,7 @@ static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
  */
 #define MK_DT_CONFIG_VERSION_1  1
 #define MK_DT_CONFIG_CURRENT    MK_DT_CONFIG_VERSION_1
+/* Bumped whenever the shared-memory layout or message semantics change. */
 #define MK_FDT_COMPATIBLE "multikernel-v1"
 
 /**
@@ -1014,8 +1410,6 @@ static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
  * These functions build the instance device tree into the manifest on
  * the host side, and restore an instance from it on the spawn side.
  */
-
-
 
 /**
  * mk_instance_restore_from_manifest() - Restore this instance from the manifest
@@ -1034,7 +1428,7 @@ int __init mk_instance_restore_from_manifest(void);
  */
 
 /**
- * PCI Device Enforcement Functions
+ * PCI Device Filtering Functions
  */
 
 /**
@@ -1042,13 +1436,24 @@ int __init mk_instance_restore_from_manifest(void);
  * @bus: PCI bus
  * @devfn: PCI device/function number
  *
- * Called BEFORE any PCI config space reads to determine if probing
- * should proceed. This prevents config space accesses to devices
- * that are not in the whitelist, avoiding hardware conflicts on bare metal.
+ * Returns: true if probing should proceed, false to skip entirely.
+ */
+
+/**
+ * mk_pci_get_assigned_identity_bdf() - Identify an assigned PCI function
+ * @domain: PCI domain number
+ * @bus: PCI bus number
+ * @devfn: PCI device/function number
+ * @vendor: optional assigned vendor ID output
+ * @device: optional assigned device ID output
  *
- * Returns: true if probing should proceed, false to skip entirely
+ * The raw x86 PCI configuration wrappers use this BDF-only lookup before
+ * reaching their hardware backend. Spawn kernels accept exact functions
+ * recorded in their boot tree; a host kernel without a parent keeps normal
+ * PCI discovery. A privileged spawn kernel can bypass these wrappers, so the
+ * check prevents accidental access rather than isolating a hostile kernel.
  *
- * Declared above with the CONFIG_MULTIKERNEL stubs.
+ * Returns: true for an exact assignment match, false otherwise.
  */
 
 /**
@@ -1099,6 +1504,8 @@ void mk_arch_register_cpu(mk_phys_cpu_t phys_id);
 
 /* Park the calling CPU in the pool wait loop; never returns */
 void __noreturn mk_enter_pool_state(void *info);
+int __init mk_arch_prepare_park(void);
+bool mk_arch_park_ready(void);
 
 /*
  * Forcible stop of another instance's CPUs (NMI on x86, SDEI or

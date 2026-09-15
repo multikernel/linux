@@ -10,6 +10,7 @@
 
 #include <linux/export.h>
 #include <linux/irq.h>
+#include <linux/multikernel.h>
 
 #include "msi.h"
 
@@ -122,6 +123,8 @@ EXPORT_SYMBOL(pci_enable_msix_range);
 bool pci_msix_can_alloc_dyn(struct pci_dev *dev)
 {
 	if (!dev->msix_cap)
+		return false;
+	if (mk_pci_msi_controlled(dev))
 		return false;
 
 	return pci_msi_domain_supports(dev, MSI_FLAG_PCI_MSIX_ALLOC_DYN, DENY_LEGACY);
@@ -388,6 +391,12 @@ EXPORT_SYMBOL(pci_free_irq_vectors);
  */
 void pci_restore_msi_state(struct pci_dev *dev)
 {
+	if (mk_pci_msi_controlled(dev)) {
+		if (mk_pci_msi_restore(dev))
+			pr_err("Failed to restore host-owned MSI vectors for %s\n",
+			       pci_name(dev));
+		return;
+	}
 	__pci_restore_msi_state(dev);
 	__pci_restore_msix_state(dev);
 }

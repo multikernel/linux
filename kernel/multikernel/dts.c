@@ -19,6 +19,7 @@
 #include <linux/ioport.h>
 #include <linux/sizes.h>
 #include <linux/pci.h>
+#include <linux/hex.h>
 #include <linux/cpumask.h>
 #if defined(CONFIG_X86) && defined(CONFIG_PCI_MMCONFIG)
 #include <asm/pci_x86.h>
@@ -27,6 +28,48 @@
 #include <linux/multikernel.h>
 
 #include "internal.h"
+
+static int mk_pci_parse_hex(const char *str, size_t digits, u32 *value)
+{
+	size_t i;
+	u32 parsed = 0;
+
+	for (i = 0; i < digits; i++) {
+		int digit = hex_to_bin(str[i]);
+
+		if (digit < 0)
+			return -EINVAL;
+		parsed = (parsed << 4) | digit;
+	}
+
+	*value = parsed;
+	return 0;
+}
+
+int mk_pci_parse_bdf(const char *pci_id, int len, u16 *domain, u8 *bus,
+		     u8 *slot, u8 *func)
+{
+	u32 parsed_domain, parsed_bus, parsed_slot, parsed_func;
+
+	if (len != (int)sizeof("0000:00:00.0") || pci_id[12] != '\0' ||
+	    pci_id[4] != ':' || pci_id[7] != ':' || pci_id[10] != '.')
+		return -EINVAL;
+
+	if (mk_pci_parse_hex(pci_id, 4, &parsed_domain) ||
+	    mk_pci_parse_hex(pci_id + 5, 2, &parsed_bus) ||
+	    mk_pci_parse_hex(pci_id + 8, 2, &parsed_slot) ||
+	    mk_pci_parse_hex(pci_id + 11, 1, &parsed_func))
+		return -EINVAL;
+	if (parsed_domain > U16_MAX || parsed_bus > U8_MAX ||
+	    parsed_slot > 31 || parsed_func > 7)
+		return -ERANGE;
+
+	*domain = (u16)parsed_domain;
+	*bus = (u8)parsed_bus;
+	*slot = (u8)parsed_slot;
+	*func = (u8)parsed_func;
+	return 0;
+}
 
 /**
  * mk_dt_node_alias() - Find the /aliases entry naming a node
@@ -263,9 +306,12 @@ static int mk_dt_add_pci_device(const void *source_fdt, int dev_node,
 				unsigned int func)
 {
 	const fdt32_t *vendor_prop, *device_prop;
+	const fdt64_t *resources_prop;
+	struct mk_pci_device *existing;
 	struct mk_pci_device *pci_dev;
 	const char *node_name, *alias;
-	int len;
+	u32 vendor, device;
+	int len, i;
 
 	node_name = fdt_get_name(source_fdt, dev_node, NULL);
 
@@ -282,6 +328,16 @@ static int mk_dt_add_pci_device(const void *source_fdt, int dev_node,
 		       device_name, node_name ? node_name : "<unnamed>");
 		return -EINVAL;
 	}
+	vendor = fdt32_to_cpu(*vendor_prop);
+	device = fdt32_to_cpu(*device_prop);
+	if (vendor > U16_MAX || device > U16_MAX || domain > U16_MAX ||
+	    bus > U8_MAX || slot > 31 || func > 7)
+		return -ERANGE;
+	list_for_each_entry(existing, &config->pci_devices, list) {
+		if (existing->domain == domain && existing->bus == bus &&
+		    existing->slot == slot && existing->func == func)
+			return -EEXIST;
+	}
 
 	pci_dev = kzalloc(sizeof(*pci_dev), GFP_KERNEL);
 	if (!pci_dev) {
@@ -289,8 +345,8 @@ static int mk_dt_add_pci_device(const void *source_fdt, int dev_node,
 		return -ENOMEM;
 	}
 
-	pci_dev->vendor = (u16)fdt32_to_cpu(*vendor_prop);
-	pci_dev->device = (u16)fdt32_to_cpu(*device_prop);
+	pci_dev->vendor = (u16)vendor;
+	pci_dev->device = (u16)device;
 	pci_dev->domain = (u16)domain;
 	pci_dev->bus = (u8)bus;
 	pci_dev->slot = (u8)slot;
@@ -298,6 +354,28 @@ static int mk_dt_add_pci_device(const void *source_fdt, int dev_node,
 	alias = mk_dt_node_alias(source_fdt, dev_node);
 	if (alias)
 		strscpy(pci_dev->alias, alias, sizeof(pci_dev->alias));
+	resources_prop = fdt_getprop(source_fdt, dev_node, "bar-resources", &len);
+	if (resources_prop) {
+		if (len != MK_PCI_RESOURCE_COUNT * 3 * sizeof(*resources_prop)) {
+			kfree(pci_dev);
+			return -EINVAL;
+		}
+		for (i = 0; i < MK_PCI_RESOURCE_COUNT; i++) {
+			u64 start = fdt64_to_cpu(resources_prop[i * 3]);
+			u64 end = fdt64_to_cpu(resources_prop[i * 3 + 1]);
+			u64 flags = fdt64_to_cpu(resources_prop[i * 3 + 2]);
+
+			if ((start || end) &&
+			    (end < start || !(flags & (IORESOURCE_IO | IORESOURCE_MEM)))) {
+				kfree(pci_dev);
+				return -EINVAL;
+			}
+			pci_dev->resources[i].start = start;
+			pci_dev->resources[i].end = end;
+			pci_dev->resources[i].flags = flags;
+		}
+		pci_dev->resources_valid = true;
+	}
 
 	list_add_tail(&pci_dev->list, &config->pci_devices);
 	config->pci_device_count++;
@@ -313,9 +391,10 @@ static int mk_dt_parse_single_pci_device(const void *source_fdt, int dev_node,
 					 struct mk_dt_config *config,
 					 const char *device_name)
 {
-	unsigned int domain, bus, slot, func;
+	u16 domain;
+	u8 bus, slot, func;
 	const char *pci_id_str;
-	int len;
+	int len, ret;
 
 	pci_id_str = fdt_getprop(source_fdt, dev_node, "pci-id", &len);
 	if (!pci_id_str) {
@@ -323,11 +402,9 @@ static int mk_dt_parse_single_pci_device(const void *source_fdt, int dev_node,
 		return -EINVAL;
 	}
 
-	if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
-		pr_err("Invalid pci-id format: '%s' (expected domain:bus:slot.func)\n",
-		       pci_id_str);
-		return -EINVAL;
-	}
+	ret = mk_pci_parse_bdf(pci_id_str, len, &domain, &bus, &slot, &func);
+	if (ret)
+		return ret;
 
 	return mk_dt_add_pci_device(source_fdt, dev_node, config, device_name,
 				    domain, bus, slot, func);
@@ -1096,6 +1173,44 @@ static struct pci_bus *mk_dt_bus_toward(struct pci_bus *parent, u16 domain,
 	return bus;
 }
 
+static int mk_dt_emit_pci_resources(void *fdt,
+				    const struct mk_pci_device *device)
+{
+	fdt64_t resources[MK_PCI_RESOURCE_COUNT * 3];
+	struct pci_dev *live_dev = NULL;
+	int i, ret;
+
+	if (!device->resources_valid) {
+		live_dev = pci_get_domain_bus_and_slot(device->domain, device->bus,
+						       PCI_DEVFN(device->slot,
+								 device->func));
+		if (!live_dev)
+			return -ENODEV;
+	}
+
+	for (i = 0; i < MK_PCI_RESOURCE_COUNT; i++) {
+		u64 start, end, flags;
+
+		if (live_dev) {
+			start = pci_resource_start(live_dev, i);
+			end = pci_resource_end(live_dev, i);
+			flags = pci_resource_flags(live_dev, i);
+		} else {
+			start = device->resources[i].start;
+			end = device->resources[i].end;
+			flags = device->resources[i].flags;
+		}
+		resources[i * 3] = cpu_to_fdt64(start);
+		resources[i * 3 + 1] = cpu_to_fdt64(end);
+		resources[i * 3 + 2] = cpu_to_fdt64(flags);
+	}
+
+	if (live_dev)
+		pci_dev_put(live_dev);
+	ret = fdt_property(fdt, "bar-resources", resources, sizeof(resources));
+	return ret;
+}
+
 /*
  * Describe what @instance owns below @bus: its devices on this bus as
  * leaves, and one bridge node, recursed into, per child bus that leads
@@ -1124,6 +1239,8 @@ static int mk_dt_emit_pci_bus(struct mk_instance *instance,
 			ret = fdt_property_u32(fdt, "vendor-id", dev->vendor);
 		if (!ret)
 			ret = fdt_property_u32(fdt, "device-id", dev->device);
+		if (!ret)
+			ret = mk_dt_emit_pci_resources(fdt, dev);
 		if (!ret)
 			ret = fdt_end_node(fdt);
 		if (ret)

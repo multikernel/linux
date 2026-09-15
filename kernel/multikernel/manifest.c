@@ -28,10 +28,16 @@
 
 /* Physical address of the manifest this kernel booted with, 0 if none */
 static phys_addr_t mk_manifest_fdt_phys;
+static bool mk_manifest_fdt_rejected;
 
 phys_addr_t mk_manifest_phys(void)
 {
 	return mk_manifest_fdt_phys;
+}
+
+bool mk_manifest_rejected(void)
+{
+	return READ_ONCE(mk_manifest_fdt_rejected);
 }
 
 /**
@@ -55,6 +61,7 @@ void __init mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 	if (!fdt) {
 		pr_warn("multikernel: failed to memremap manifest (0x%llx)\n",
 			fdt_phys);
+		err = -ENOMEM;
 		goto out;
 	}
 
@@ -73,14 +80,17 @@ void __init mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 	}
 
 	mk_manifest_fdt_phys = fdt_phys;
+	mk_manifest_fdt_rejected = false;
 
 	pr_info("multikernel: manifest accepted\n");
 
 out:
 	if (fdt)
 		early_memunmap(fdt, fdt_len);
-	if (err)
-		pr_warn("multikernel: ignoring invalid manifest\n");
+	if (err) {
+		mk_manifest_fdt_rejected = true;
+		pr_warn("multikernel: supplied manifest rejected: %d\n", err);
+	}
 }
 
 /*
@@ -108,7 +118,7 @@ static int mk_manifest_collect_cpus(struct mk_instance *target,
 	unsigned int i;
 	int ret = 0;
 
-	mutex_lock(&mk_instance_mutex);
+	lockdep_assert_held(&mk_instance_mutex);
 	list_for_each_entry(other, &mk_instance_list, list) {
 		if (other == target)
 			continue;
@@ -127,7 +137,6 @@ static int mk_manifest_collect_cpus(struct mk_instance *target,
 				break;
 		}
 	}
-	mutex_unlock(&mk_instance_mutex);
 
 	/*
 	 * The spawn assigns logical CPU ids in this list's order, and the
@@ -229,7 +238,7 @@ static int mk_manifest_add_reserved(void *fdt, struct kimage *image)
 	if (!ret && image->mk_manifest)
 		ret = mk_reserved_add(&r, image->mk_manifest, MK_MANIFEST_SIZE);
 
-	mutex_lock(&mk_instance_mutex);
+	lockdep_assert_held(&mk_instance_mutex);
 	list_for_each_entry(other, &mk_instance_list, list) {
 		if (ret)
 			break;
@@ -241,7 +250,6 @@ static int mk_manifest_add_reserved(void *fdt, struct kimage *image)
 			ret = mk_reserved_add(&r, other->kimage->mk_manifest,
 					      MK_MANIFEST_SIZE);
 	}
-	mutex_unlock(&mk_instance_mutex);
 	if (!ret) {
 		int pairs = mk_pool_park_regions(r.pair + 2 * r.n,
 						 MK_RESERVED_PAIRS - r.n);
@@ -341,8 +349,12 @@ int mk_manifest_finalize(struct kimage *image)
 		return -EINVAL;
 	}
 
-	instance = mk_instance_find(image->mk_id);
-	if (!instance) {
+	/*
+	 * A multikernel image owns an instance reference until kimage_free().
+	 * Reuse it here so callers may retain the established instance locks.
+	 */
+	instance = image->mk_instance;
+	if (!instance || instance->id != image->mk_id) {
 		pr_err("Target multikernel instance %d not found\n", image->mk_id);
 		return -ENOENT;
 	}
@@ -354,12 +366,10 @@ int mk_manifest_finalize(struct kimage *image)
 	if (ret) {
 		pr_err("Failed to write the boot tree for instance %d: %d\n",
 		       image->mk_id, ret);
-		mk_instance_put(instance);
 		return ret == -FDT_ERR_NOSPACE ? -ENOSPC : ret;
 	}
 
 	pr_info("multikernel: boot tree for instance %d written (%u bytes)\n",
 		image->mk_id, fdt_totalsize(fdt));
-	mk_instance_put(instance);
 	return 0;
 }

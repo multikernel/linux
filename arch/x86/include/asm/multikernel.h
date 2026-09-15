@@ -11,6 +11,7 @@
 #ifndef __ASSEMBLY__
 
 #include <linux/build_bug.h>
+#include <linux/init.h>
 #include <linux/stddef.h>
 #include <linux/types.h>
 #include <linux/cpumask.h>
@@ -127,7 +128,7 @@ struct mk_spawn_context {
 	u32 target_apic_id;		/* Target CPU's APIC ID */
 	u32 flags;			/* MK_SPAWN_F_* flags */
 	u32 ready;			/* Signal flag */
-	u32 reserved;			/* Padding for alignment */
+	u32 abi_magic;			/* Host/spawn generation marker */
 	/* Keep all existing context offsets unchanged. */
 	struct boot_params bp;		/* Standard x86 boot params */
 	/* Optional boot data belongs after boot_params, in the zeroed tail. */
@@ -198,7 +199,8 @@ int mk_spawn_cpu(struct mk_instance *instance, int cpu,
 /* The pool park set (park page, slot, page tables) as base,size pairs */
 int mk_pool_park_regions(u64 *pairs, int max);
 
-/* Initialize boot context tracking in spawn kernel */
+/* Validate and initialize boot context tracking in spawn kernel */
+struct mk_spawn_context *mk_validate_boot_context(phys_addr_t ctx_phys);
 void mk_init_boot_context(phys_addr_t ctx_phys);
 
 
@@ -221,6 +223,11 @@ int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 int multikernel_restore_ap(unsigned int cpu, unsigned long cr3,
 			   unsigned long gs_base, unsigned long stack,
 			   unsigned long entry);
+#if defined(CONFIG_MULTIKERNEL) && defined(CONFIG_PCI)
+void __init x86_multikernel_pci_platform_init(void);
+#else
+static inline void x86_multikernel_pci_platform_init(void) { }
+#endif
 
 /* NMI on an offline pool CPU: honor a pending force halt */
 #ifdef CONFIG_MULTIKERNEL
