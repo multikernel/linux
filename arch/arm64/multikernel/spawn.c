@@ -11,14 +11,18 @@
 
 #define pr_fmt(fmt) "mk_spawn: " fmt
 
+#include <linux/arm_sdei.h>
 #include <linux/errno.h>
 #include <linux/init.h>
 #include <linux/iopoll.h>
 #include <linux/irqflags.h>
 #include <linux/kexec.h>
 #include <linux/multikernel.h>
+#include <linux/panic.h>
 #include <linux/psci.h>
 #include <asm/cacheflush.h>
+#include <asm/cpu_ops.h>
+#include <asm/daifflags.h>
 #include <asm/smp.h>
 #include <uapi/linux/psci.h>
 
@@ -33,11 +37,49 @@ void __init mk_arch_register_cpu(mk_phys_cpu_t phys_id)
 {
 }
 
+/*
+ * Return the calling CPU to firmware. The boot CPU is no exception: the
+ * host's CPUs are on, so it is never the last one firmware knows about.
+ */
 void __noreturn mk_enter_pool_state(void *info)
 {
-	local_irq_disable();
+	unsigned int cpu = smp_processor_id();
+	const struct cpu_operations *ops = get_cpu_ops(cpu);
+
+	local_daif_mask();
+	sdei_mask_local_cpu();
+
+	if (ops && ops->cpu_die)
+		ops->cpu_die(cpu);
+
+	pr_crit("CPU%u could not be turned off, the host cannot reuse it\n", cpu);
 	cpu_park_loop();
 }
+
+void mk_spawn_machine_halt(void)
+{
+	if (mk_spawned())
+		mk_halt_to_pool();
+}
+
+void mk_spawn_stop_this_cpu(void)
+{
+	if (mk_spawned())
+		mk_enter_pool_state(NULL);
+}
+
+/*
+ * A panicked spawn kernel spinning in the panic loop holds its CPUs
+ * hostage. "Reboot on panic" is mk_spawn_machine_halt() here, which
+ * notifies the host and turns the CPUs off, so make it the default.
+ */
+static int __init mk_spawn_reboot_init(void)
+{
+	if (mk_spawned() && !panic_timeout)
+		panic_timeout = -1;
+	return 0;
+}
+core_initcall(mk_spawn_reboot_init);
 
 void mk_force_stop_cpu(mk_phys_cpu_t phys_cpu)
 {

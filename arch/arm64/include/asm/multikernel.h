@@ -7,6 +7,7 @@
 #include <asm/page-def.h>
 #include <asm/smp_plat.h>
 
+#ifdef CONFIG_MULTIKERNEL
 /*
  * Pool CPUs are held by firmware in the PSCI OFF state and started with
  * CPU_ON, so an instance needs no trampoline, park page or page tables:
@@ -19,6 +20,7 @@ struct mk_instance_arch {
 
 struct mk_pool_arch {
 };
+#endif
 
 /* Physical CPU IDs are MPIDR affinity values, as in the logical map */
 static inline u64 arch_cpu_physical_id(int cpu)
@@ -30,6 +32,24 @@ static inline int arch_cpu_from_physical_id(u64 phys_id)
 {
 	return get_logical_index(phys_id);
 }
+
+/*
+ * The ways down of a spawn kernel. Stock arm64 leaves stopped CPUs in a
+ * WFI loop inside the kernel image, which the host is about to overwrite;
+ * a spawn returns them to firmware instead. Both return on a host.
+ */
+#ifdef CONFIG_MULTIKERNEL
+void mk_spawn_machine_halt(void);
+void mk_spawn_stop_this_cpu(void);
+#else
+static inline void mk_spawn_machine_halt(void)
+{
+}
+
+static inline void mk_spawn_stop_this_cpu(void)
+{
+}
+#endif
 
 /* Control block: the boot device tree, reserved from the spawn's allocator */
 #define MK_BOOT_DTB_SIZE	SZ_64K

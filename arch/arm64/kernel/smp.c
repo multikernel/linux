@@ -45,6 +45,7 @@
 #include <asm/daifflags.h>
 #include <asm/kvm_mmu.h>
 #include <asm/mmu_context.h>
+#include <asm/multikernel.h>
 #include <asm/numa.h>
 #include <asm/processor.h>
 #include <asm/smp_plat.h>
@@ -867,6 +868,7 @@ static void __noreturn local_cpu_stop(unsigned int cpu)
 
 	local_daif_mask();
 	sdei_mask_local_cpu();
+	mk_spawn_stop_this_cpu();
 	cpu_park_loop();
 }
 

@@ -952,6 +952,9 @@ void mk_register_cpus_from_manifest(void);
 /* Accept the manifest handed over at boot (spawn kernels) */
 void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len);
 
+/* True in a kernel another kernel spawned, i.e. one that booted with a manifest */
+bool mk_spawned(void);
+
 /* Build the manifest for a spawn (host, kexec path) */
 int mk_manifest_finalize(struct kimage *image);
 #else
@@ -1005,6 +1008,10 @@ static inline void mk_register_cpus_from_manifest(void)
 }
 static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 {
+}
+static inline bool mk_spawned(void)
+{
+	return false;
 }
 #endif
 
