@@ -21,6 +21,7 @@
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/vmalloc.h>
+#include <asm/multikernel.h>
 
 const struct kexec_file_ops * const kexec_file_loaders[] = {
 	&kexec_image_ops,
@@ -174,6 +175,12 @@ int load_other_segments(struct kimage *image,
 	kbuf.bufsz = dtb_len;
 	kbuf.mem = KEXEC_BUF_MEM_UNKNOWN;
 	kbuf.memsz = dtb_len;
+	/*
+	 * A multikernel instance does not boot from this tree but from one
+	 * rebuilt in its place on every spawn. Leave room for that.
+	 */
+	if (image->type == KEXEC_TYPE_MULTIKERNEL)
+		kbuf.memsz = max(dtb_len, MK_BOOT_DTB_SIZE);
 	/* not across 2MB boundary */
 	kbuf.buf_align = SZ_2M;
 	kbuf.buf_max = ULONG_MAX;
