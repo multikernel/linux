@@ -214,22 +214,46 @@ static int psci_0_2_cpu_off(u32 state)
 	return __psci_cpu_off(PSCI_0_2_FN_CPU_OFF, state);
 }
 
-static int __psci_cpu_on(u32 fn, unsigned long cpuid, unsigned long entry_point)
+static int __psci_cpu_on(u32 fn, unsigned long cpuid, unsigned long entry_point,
+			 unsigned long context_id)
 {
 	int err;
 
-	err = invoke_psci_fn(fn, cpuid, entry_point, 0);
+	err = invoke_psci_fn(fn, cpuid, entry_point, context_id);
 	return psci_to_linux_errno(err);
 }
 
 static int psci_0_1_cpu_on(unsigned long cpuid, unsigned long entry_point)
 {
-	return __psci_cpu_on(psci_0_1_function_ids.cpu_on, cpuid, entry_point);
+	return __psci_cpu_on(psci_0_1_function_ids.cpu_on, cpuid, entry_point, 0);
 }
 
 static int psci_0_2_cpu_on(unsigned long cpuid, unsigned long entry_point)
 {
-	return __psci_cpu_on(PSCI_FN_NATIVE(0_2, CPU_ON), cpuid, entry_point);
+	return __psci_cpu_on(PSCI_FN_NATIVE(0_2, CPU_ON), cpuid, entry_point, 0);
+}
+
+/**
+ * psci_cpu_on_context - CPU_ON with a caller-chosen context ID
+ * @cpuid: MPIDR of the CPU to start
+ * @entry_point: physical address it starts executing at
+ * @context_id: value it finds in x0 (r0) there
+ *
+ * The secondary boot path has no use for the context ID and passes 0.
+ * Starting a CPU on a different kernel image does: the boot protocol
+ * wants the device tree address in that register.
+ */
+int psci_cpu_on_context(unsigned long cpuid, unsigned long entry_point,
+			unsigned long context_id)
+{
+	u32 fn = PSCI_FN_NATIVE(0_2, CPU_ON);
+
+	if (!psci_ops.cpu_on)
+		return -EOPNOTSUPP;
+	if (psci_ops.cpu_on == psci_0_1_cpu_on)
+		fn = psci_0_1_function_ids.cpu_on;
+
+	return __psci_cpu_on(fn, cpuid, entry_point, context_id);
 }
 
 static int __psci_migrate(u32 fn, unsigned long cpuid)
