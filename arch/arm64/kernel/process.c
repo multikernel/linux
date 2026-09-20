@@ -52,6 +52,7 @@
 #include <asm/gcs.h>
 #include <asm/mmu_context.h>
 #include <asm/mte.h>
+#include <asm/multikernel.h>
 #include <asm/processor.h>
 #include <asm/pointer_auth.h>
 #include <asm/stacktrace.h>
@@ -98,6 +99,7 @@ void machine_shutdown(void)
  */
 void machine_halt(void)
 {
+	mk_spawn_machine_halt();
 	local_irq_disable();
 	smp_send_stop();
 	while (1);
@@ -111,6 +113,7 @@ void machine_halt(void)
  */
 void machine_power_off(void)
 {
+	mk_spawn_machine_halt();
 	local_irq_disable();
 	smp_send_stop();
 	do_kernel_power_off();
@@ -127,6 +130,8 @@ void machine_power_off(void)
  */
 void machine_restart(char *cmd)
 {
+	mk_spawn_machine_halt();
+
 	/* Disable interrupts first */
 	local_irq_disable();
 	smp_send_stop();
