@@ -116,16 +116,28 @@ static void mk_clean_to_poc(phys_addr_t start, size_t size)
 	dcache_clean_inval_poc(va, va + size);
 }
 
-static void mk_clean_image_to_poc(struct kimage *image,
-				  struct mk_instance *instance)
+/*
+ * Everything the new kernel reads before its MMU is on is a segment: the
+ * Image and the device tree. The manifest and the message ring are only
+ * touched with the caches on, where both kernels see the same memory.
+ */
+static void mk_clean_image_to_poc(struct kimage *image)
 {
 	unsigned long i;
 
 	for (i = 0; i < image->nr_segments; i++)
 		mk_clean_to_poc(image->segment[i].mem, image->segment[i].memsz);
+}
 
-	if (instance->ctrl_va)
-		mk_clean_to_poc(instance->ctrl_phys, MK_CTRL_BLOCK_SIZE);
+/*
+ * The tree the loader left in the device tree segment is a copy of this
+ * kernel's own with a new /chosen: it names every CPU, all of memory and
+ * every device. A spawn booting from it would take the machine from
+ * under the host.
+ */
+static int mk_build_boot_dtb(struct kimage *image, struct mk_instance *instance)
+{
+	return -EOPNOTSUPP;
 }
 
 /**
@@ -162,7 +174,14 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 	if (ret)
 		return ret;
 
-	mk_clean_image_to_poc(image, instance);
+	ret = mk_build_boot_dtb(image, instance);
+	if (ret) {
+		pr_err("No boot device tree for instance %d: %d\n",
+		       instance->id, ret);
+		return ret;
+	}
+
+	mk_clean_image_to_poc(image);
 
 	guard(mutex)(&mk_pool->park_lock);
 
@@ -202,8 +221,6 @@ int mk_arch_release_instance(struct mk_instance *instance)
 
 	mk_cpu_set_free(instance->cpus_on_slot);
 	instance->cpus_on_slot = NULL;
-	instance->arch.dtb = NULL;
-	instance->arch.dtb_phys = 0;
 	return 0;
 }
 
