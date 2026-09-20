@@ -34,6 +34,11 @@ phys_addr_t mk_manifest_phys(void)
 	return mk_manifest_fdt_phys;
 }
 
+bool mk_spawned(void)
+{
+	return mk_manifest_fdt_phys != 0;
+}
+
 /**
  * mk_manifest_populate() - Accept the manifest handed over at boot
  * @fdt_phys: Physical address of the manifest FDT
