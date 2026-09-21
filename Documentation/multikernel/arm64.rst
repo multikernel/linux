@@ -15,8 +15,8 @@ Requirements
 - PSCI 0.2 or later (``CPU_ON``, ``CPU_OFF``, ``AFFINITY_INFO``), as any
   SBSA server and QEMU's ``virt`` machine have. Spin-table platforms are
   not supported.
-- A GICv3. MSIs for PCI devices of an instance need its ITS; systems with
-  more than one ITS are not supported for that yet.
+- A GICv3. MSIs for PCI devices of an instance need an ITS behind those
+  devices; a machine may have any number of them.
 - ``CONFIG_MULTIKERNEL=y``, which on arm64 needs ``CONFIG_KEXEC_FILE`` and
   ``CONFIG_HOTPLUG_CPU``. An instance is loaded from an ``Image`` file with
   ``kexec_file_load()``, not from a ``vmlinux``.
@@ -114,10 +114,14 @@ Platform devices
 PCI devices
     The root buses above an instance's devices appear as
     ``pci-host-ecam-generic`` bridges with the devices as their only
-    children. INTx is not available. MSIs go through the host's ITS: the
-    boot tree has a ``multikernel,gic-v3-its`` node whose ``reg`` is the
-    ITS's doorbell, the spawn asks the host over the message ring to map
-    each vector, and the host drops the mappings when the instance halts.
+    children. INTx is not available. MSIs go through the host's ITSs: the
+    boot tree has a ``multikernel,gic-v3-its`` node, the spawn asks the
+    host over the message ring to map each vector, and the host answers
+    with the LPI that will arrive and the doorbell address to program into
+    the device. The host picks the ITS behind each device, so nothing about
+    the machine's ITSs appears in the tree. It drops the mappings when the
+    instance halts. A root bus with no ITS behind it gets no ``msi-map``,
+    and its devices no interrupts.
     Unbind the host's driver before the instance is started, and bind it
     again once the instance is stopped if the host should use the device.
 
@@ -125,7 +129,8 @@ IOMMU
     The SMMU stays with the host and is not described to a spawn, which
     hands physical addresses to its devices. While an instance runs, each
     of its PCI devices behind an SMMU is attached to a domain that maps
-    exactly the instance's memory, and the MSI doorbell, onto itself. It
+    exactly the instance's memory, and the doorbell of the ITS behind that
+    device, onto itself. It
     follows memory that is added or removed at run time. A device without
     an IOMMU has unrestricted DMA.
 

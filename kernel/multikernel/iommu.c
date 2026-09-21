@@ -9,11 +9,12 @@
  * instance can reach all of the host.
  *
  * So while an instance runs, each of its devices is attached to a domain
- * of its own that maps the instance's memory grant onto itself, and the
- * MSI doorbell with it. The device works untranslated, and cannot reach
- * anything else. The domain follows the grant as memory is added and
- * removed, and goes away when the instance halts, which returns the
- * device to the host's default domain for a host driver to bind.
+ * of its own that maps the instance's memory grant onto itself, and with
+ * it the MSI doorbell of the ITS behind that device. The device works
+ * untranslated, and cannot reach anything else. The domain follows the
+ * grant as memory is added and removed, and goes away when the instance
+ * halts, which returns the device to the host's default domain for a host
+ * driver to bind.
  *
  * A device without an IOMMU is left alone: its DMA is unrestricted, as
  * it always was.
@@ -56,8 +57,9 @@ static void mk_iommu_free_dev(struct mk_iommu_dev *d)
 }
 
 static int mk_iommu_contain_dev(struct mk_instance *instance,
-				struct pci_dev *pdev, phys_addr_t doorbell)
+				struct pci_dev *pdev)
 {
+	phys_addr_t doorbell = mk_msi_proxy_doorbell(pdev);
 	struct mk_memory_region *region;
 	struct mk_iommu_dev *d;
 	int ret;
@@ -123,7 +125,6 @@ err:
  */
 int mk_iommu_contain(struct mk_instance *instance)
 {
-	phys_addr_t doorbell = mk_msi_proxy_doorbell();
 	struct mk_pci_device *mine;
 	int ret = 0;
 
@@ -142,7 +143,7 @@ int mk_iommu_contain(struct mk_instance *instance)
 			continue;
 
 		if (device_iommu_mapped(&pdev->dev))
-			ret = mk_iommu_contain_dev(instance, pdev, doorbell);
+			ret = mk_iommu_contain_dev(instance, pdev);
 		else
 			pr_info_once("%s has no IOMMU, DMA of instance devices is unrestricted\n",
 				     pci_name(pdev));
