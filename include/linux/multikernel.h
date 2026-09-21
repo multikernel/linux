@@ -175,6 +175,13 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 
 void generic_multikernel_interrupt(void);
 
+/* Drain the message ring where the doorbell interrupt cannot be taken */
+void mk_ipi_poll(void);
+
+struct mk_instance;
+int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
+				 size_t data_size, unsigned long type);
+
 /*
  * Spawn side of MK_IO_MSI_MAP: returns the interrupt number or -errno and
  * sets @doorbell. A NULL @doorbell sends the request without waiting for
@@ -410,6 +417,15 @@ struct mk_pending_msg;
  */
 int mk_send_message(int instance_id, u32 msg_type, u32 subtype,
 		    void *payload, u32 payload_len);
+
+/*
+ * The same for a caller that holds a reference to @instance. Looking an
+ * instance up by ID sleeps; this does not, so it is the one to use with
+ * interrupts off.
+ */
+struct mk_instance;
+int mk_send_message_to(struct mk_instance *instance, u32 msg_type, u32 subtype,
+		       void *payload, u32 payload_len);
 
 /**
  * mk_register_msg_handler - Register handler for specific message type
