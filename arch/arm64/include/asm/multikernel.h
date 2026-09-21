@@ -64,6 +64,16 @@ static inline void mk_foreign_cpu_stop(void)
 #endif
 
 /*
+ * Ask the host to route a device's MSI to one of this kernel's CPUs, for
+ * the instance's MSI domain (irq-gic-v3-its-mk.c). Returns the interrupt
+ * number or -errno and sets @doorbell; a NULL @doorbell does not wait.
+ */
+#ifdef CONFIG_MULTIKERNEL_ITS_PROXY
+int mk_msi_proxy_map(u32 domain, u32 rid, u32 event, u32 nvecs,
+		     u64 phys_cpu, phys_addr_t *doorbell);
+#endif
+
+/*
  * Room for an instance's boot device tree, a segment of its kimage: the
  * manifest (MK_MANIFEST_SIZE) with the arm64 boot nodes on top. The tree
  * is rebuilt in place on every spawn, as the memory grant can have
