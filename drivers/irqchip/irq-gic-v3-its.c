@@ -176,6 +176,7 @@ struct its_device {
 	u32			nr_ites;
 	u32			device_id;
 	bool			shared;
+	void			*foreign;	/* owner, when mapped for another kernel */
 };
 
 static struct {
@@ -3601,6 +3602,12 @@ static int its_msi_prepare(struct irq_domain *domain, struct device *dev,
 
 	mutex_lock(&its->dev_alloc_lock);
 	its_dev = its_find_device(its, dev_id);
+	if (its_dev && its_dev->foreign) {
+		/* Mapped for another kernel, which is not an alias to share with */
+		its_dev = NULL;
+		err = -EBUSY;
+		goto out;
+	}
 	if (its_dev) {
 		/*
 		 * We already have seen this ID, probably through
@@ -3770,6 +3777,150 @@ static void its_irq_domain_free(struct irq_domain *domain, unsigned int virq,
 
 	irq_domain_free_irqs_parent(domain, virq, nr_irqs);
 }
+
+#ifdef CONFIG_MULTIKERNEL_ITS_PROXY
+/*
+ * LPIs on behalf of another kernel.
+ *
+ * An ITS has one command queue, so a kernel that multikernel spawned on
+ * some of the machine's CPUs cannot map the MSIs of its devices itself.
+ * This kernel does it for it: the events of such a device are mapped to
+ * LPIs from this kernel's allocator and routed to the collection of a
+ * CPU the other kernel runs on. That collection is the one this kernel
+ * mapped for the CPU before it gave it away, and its redistributor still
+ * uses this kernel's LPI tables, which is why the configuration byte is
+ * written here as well. No Linux interrupt exists for these LPIs on this
+ * side: they never reach one of this kernel's CPU interfaces.
+ *
+ * @owner keeps the devices of different kernels apart and names what
+ * its_foreign_release() tears down.
+ */
+static struct its_node *its_foreign_node(void)
+{
+	if (!list_is_singular(&its_nodes))
+		return NULL;
+	return list_first_entry(&its_nodes, struct its_node, entry);
+}
+
+static void its_foreign_config(struct its_device *dev, u32 event, bool enable)
+{
+	u8 *cfg = gic_rdists->prop_table_va +
+		  dev->event_map.lpi_base + event - 8192;
+
+	*cfg = lpi_prop_prio | LPI_PROP_GROUP1 | (enable ? LPI_PROP_ENABLED : 0);
+
+	if (gic_rdists->flags & RDIST_FLAGS_PROPBASE_NEEDS_FLUSHING)
+		gic_flush_dcache_to_poc(cfg, sizeof(*cfg));
+	else
+		dsb(ishst);
+	its_send_inv(dev, event);
+}
+
+/* A collection is only mapped for a CPU that has been online here */
+static struct its_collection *its_foreign_collection(struct its_node *its,
+						     unsigned int cpu)
+{
+	if (cpu >= nr_cpu_ids || !cpu_possible(cpu) ||
+	    its->collections[cpu].col_id != cpu ||
+	    (cpu && !its->collections[cpu].target_address))
+		return NULL;
+	return &its->collections[cpu];
+}
+
+/**
+ * its_foreign_map - Route a device's event to a CPU of another kernel
+ * @owner: the other kernel, as the caller names it
+ * @dev_id: DeviceID as the ITS sees it
+ * @event: event (MSI data) to map
+ * @nvecs: events the device will use at most, fixed by the first call
+ * @cpu: this kernel's number of the CPU to deliver to
+ *
+ * Mapping an event that is mapped already moves it to @cpu.
+ *
+ * Returns the LPI, which is the INTID the other kernel takes on @cpu,
+ * or a negative error code.
+ */
+int its_foreign_map(void *owner, u32 dev_id, u32 event, u32 nvecs,
+		    unsigned int cpu)
+{
+	struct its_node *its = its_foreign_node();
+	struct its_collection *col;
+	struct its_device *dev;
+
+	if (!its)
+		return -ENODEV;
+	col = its_foreign_collection(its, cpu);
+	if (!col)
+		return -EINVAL;
+
+	guard(mutex)(&its->dev_alloc_lock);
+
+	dev = its_find_device(its, dev_id);
+	if (dev && dev->foreign != owner)
+		return -EBUSY;
+	if (!dev) {
+		dev = its_create_device(its, dev_id,
+					roundup_pow_of_two(max(nvecs, 1U)), true);
+		if (!dev)
+			return -ENOMEM;
+		dev->foreign = owner;
+	}
+	if (event >= dev->event_map.nr_lpis)
+		return -ERANGE;
+
+	dev->event_map.col_map[event] = cpu;
+	if (test_and_set_bit(event, dev->event_map.lpi_map)) {
+		its_send_movi(dev, col, event);
+	} else {
+		its_send_mapti(dev, dev->event_map.lpi_base + event, event);
+		its_foreign_config(dev, event, true);
+	}
+	return dev->event_map.lpi_base + event;
+}
+
+/**
+ * its_foreign_release - Drop everything mapped for another kernel
+ * @owner: the other kernel, as given to its_foreign_map()
+ *
+ * For when that kernel is gone or about to be started afresh, whether it
+ * shut down in order or not: nothing of it must keep raising LPIs.
+ */
+void its_foreign_release(void *owner)
+{
+	struct its_node *its = its_foreign_node();
+	struct its_device *dev, *tmp;
+	unsigned int event;
+
+	if (!its)
+		return;
+
+	guard(mutex)(&its->dev_alloc_lock);
+
+	list_for_each_entry_safe(dev, tmp, &its->its_device_list, entry) {
+		if (dev->foreign != owner)
+			continue;
+
+		for_each_set_bit(event, dev->event_map.lpi_map,
+				 dev->event_map.nr_lpis) {
+			its_foreign_config(dev, event, false);
+			its_send_discard(dev, event);
+		}
+
+		its_lpi_free(dev->event_map.lpi_map, dev->event_map.lpi_base,
+			     dev->event_map.nr_lpis);
+		its_send_mapd(dev, 0);
+		its_free_device(dev);
+	}
+}
+
+/* Where a device of another kernel writes its MSIs: 0 without a usable ITS */
+phys_addr_t its_foreign_doorbell(void)
+{
+	struct its_node *its = its_foreign_node();
+
+	return its ? its->phys_base + GITS_TRANSLATER : 0;
+}
+#endif
 
 static const struct irq_domain_ops its_domain_ops = {
 	.select			= msi_lib_irq_domain_select,
