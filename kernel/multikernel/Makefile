@@ -9,6 +9,7 @@ obj-$(CONFIG_PCI) += pciback.o
 ifdef CONFIG_PCI
 obj-$(CONFIG_OF) += pcifront.o
 endif
+obj-$(CONFIG_MULTIKERNEL_ITS_PROXY) += its_proxy.o
 
 # DMA-BUF heap for multikernel memory allocation
 obj-$(CONFIG_DMABUF_HEAPS) += dma_heap.o
