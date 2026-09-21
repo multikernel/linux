@@ -64,6 +64,14 @@ enum ipi_msg_type {
 	 */
 	IPI_CPU_BACKTRACE = NR_IPI,
 	IPI_KGDB_ROUNDUP,
+	/*
+	 * The multikernel doorbell goes to CPUs of other kernels, which
+	 * makes its SGI number ABI between them. All eight non-secure SGIs
+	 * are taken, so with CONFIG_MULTIKERNEL it has the one of the KGDB
+	 * roundup, which can do without: the generic roundup needs no IPI
+	 * of its own.
+	 */
+	IPI_MULTIKERNEL = IPI_KGDB_ROUNDUP,
 	MAX_IPI
 };
 
