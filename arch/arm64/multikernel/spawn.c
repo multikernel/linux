@@ -17,7 +17,9 @@
 #include <linux/iopoll.h>
 #include <linux/irqflags.h>
 #include <linux/kexec.h>
+#include <linux/libfdt.h>
 #include <linux/multikernel.h>
+#include <linux/of_fdt.h>
 #include <linux/panic.h>
 #include <linux/psci.h>
 #include <asm/cacheflush.h>
@@ -25,6 +27,8 @@
 #include <asm/daifflags.h>
 #include <asm/smp.h>
 #include <uapi/linux/psci.h>
+
+#include "internal.h"
 
 /* A halting kernel acknowledges first and turns its CPUs off afterwards */
 #define MK_CPU_OFF_TIMEOUT_US	USEC_PER_SEC
@@ -35,6 +39,15 @@ void mk_arch_send_ipi(mk_phys_cpu_t phys_cpu)
 
 void __init mk_arch_register_cpu(mk_phys_cpu_t phys_id)
 {
+}
+
+void __init mk_spawn_accept_boot_tree(phys_addr_t dt_phys)
+{
+	if (!initial_boot_params ||
+	    !of_flat_dt_is_compatible(of_get_flat_dt_root(), MK_FDT_COMPATIBLE))
+		return;
+
+	mk_manifest_populate(dt_phys, fdt_totalsize(initial_boot_params));
 }
 
 /*
@@ -127,17 +140,6 @@ static void mk_clean_image_to_poc(struct kimage *image)
 
 	for (i = 0; i < image->nr_segments; i++)
 		mk_clean_to_poc(image->segment[i].mem, image->segment[i].memsz);
-}
-
-/*
- * The tree the loader left in the device tree segment is a copy of this
- * kernel's own with a new /chosen: it names every CPU, all of memory and
- * every device. A spawn booting from it would take the machine from
- * under the host.
- */
-static int mk_build_boot_dtb(struct kimage *image, struct mk_instance *instance)
-{
-	return -EOPNOTSUPP;
 }
 
 /**
