@@ -643,6 +643,8 @@ int gic_v3_send_sgi_to_mpidr(u64 mpidr, unsigned int sgi);
 int its_foreign_map(void *owner, struct irq_domain *domain, u32 dev_id,
 		    u32 event, u32 nvecs, unsigned int cpu,
 		    phys_addr_t *doorbell);
+int its_foreign_move(void *owner, struct irq_domain *domain, u32 dev_id,
+		     u32 event, unsigned int cpu);
 void its_foreign_release(void *owner);
 phys_addr_t its_foreign_doorbell(struct irq_domain *domain);
 int its_init(struct fwnode_handle *handle, struct rdists *rdists,

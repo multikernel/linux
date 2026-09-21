@@ -3800,11 +3800,19 @@ static const struct irq_domain_ops its_domain_ops = {
  * written here as well. No Linux interrupt exists for these LPIs on this
  * side: they never reach one of this kernel's CPU interfaces.
  *
+ * Mapping sleeps. Moving a mapped event must not, because the other kernel
+ * waits for it with interrupts off, like this kernel's own its_set_affinity()
+ * waits for its MOVI; it may run in this kernel's interrupt handlers.
+ * its_foreign_lock is what such a move holds against the device going away
+ * under it.
+ *
  * @owner keeps the devices of different kernels apart and names what
  * its_foreign_release() tears down. The ITS is the one behind the device,
  * named by the device's MSI domain: a machine has one per socket or more,
  * each with DeviceIDs, collections and a doorbell of its own.
  */
+static DEFINE_RAW_SPINLOCK(its_foreign_lock);
+
 static struct its_node *its_foreign_its(struct irq_domain *domain)
 {
 	if (!domain || domain->ops != &its_domain_ops)
@@ -3843,6 +3851,44 @@ static struct its_collection *its_foreign_collection(struct its_node *its,
 		return NULL;
 
 	return &its->collections[cpu];
+}
+
+/**
+ * its_foreign_move - Move a mapped event to another CPU of the other kernel
+ * @owner: the other kernel, as given to its_foreign_map()
+ * @domain: MSI domain of the device
+ * @dev_id: DeviceID as that ITS sees it
+ * @event: event to move, which its_foreign_map() has mapped
+ * @cpu: this kernel's number of the CPU to deliver to
+ *
+ * Returns once the ITS has moved the event, pending state included, so the
+ * CPU it came from may go away. Safe in any context.
+ *
+ * Returns 0 or a negative error code.
+ */
+int its_foreign_move(void *owner, struct irq_domain *domain, u32 dev_id,
+		     u32 event, unsigned int cpu)
+{
+	struct its_node *its = its_foreign_its(domain);
+	struct its_collection *col;
+	struct its_device *dev;
+
+	if (!its)
+		return -ENODEV;
+	col = its_foreign_collection(its, cpu);
+	if (!col)
+		return -EINVAL;
+
+	guard(raw_spinlock_irqsave)(&its_foreign_lock);
+
+	dev = its_find_device(its, dev_id);
+	if (!dev || dev->foreign != owner || event >= dev->event_map.nr_lpis ||
+	    !test_bit(event, dev->event_map.lpi_map))
+		return -ENOENT;
+
+	dev->event_map.col_map[event] = cpu;
+	its_send_movi(dev, col, event);
+	return 0;
 }
 
 /**
@@ -3889,12 +3935,15 @@ int its_foreign_map(void *owner, struct irq_domain *domain, u32 dev_id,
 	if (event >= dev->event_map.nr_lpis)
 		return -ERANGE;
 
-	dev->event_map.col_map[event] = cpu;
-	if (test_and_set_bit(event, dev->event_map.lpi_map)) {
-		its_send_movi(dev, col, event);
-	} else {
-		its_send_mapti(dev, dev->event_map.lpi_base + event, event);
-		its_foreign_config(dev, event, true);
+	scoped_guard(raw_spinlock_irqsave, &its_foreign_lock) {
+		dev->event_map.col_map[event] = cpu;
+		if (test_and_set_bit(event, dev->event_map.lpi_map)) {
+			its_send_movi(dev, col, event);
+		} else {
+			its_send_mapti(dev, dev->event_map.lpi_base + event,
+				       event);
+			its_foreign_config(dev, event, true);
+		}
 	}
 	*doorbell = its->get_msi_base(dev);
 	return dev->event_map.lpi_base + event;
@@ -3910,6 +3959,10 @@ static void its_foreign_release_on(struct its_node *its, void *owner)
 	list_for_each_entry_safe(dev, tmp, &its->its_device_list, entry) {
 		if (dev->foreign != owner)
 			continue;
+
+		/* No move finds the device from here on, and none is under way */
+		scoped_guard(raw_spinlock_irqsave, &its_foreign_lock)
+			dev->foreign = NULL;
 
 		for_each_set_bit(event, dev->event_map.lpi_map,
 				 dev->event_map.nr_lpis) {
