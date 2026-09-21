@@ -40,12 +40,16 @@ off, instead of leaving them in a WFI loop inside an image the host is
 about to overwrite. The host learns that a CPU has left from
 ``AFFINITY_INFO``, and refuses to load a new image over one that has not.
 
-**Force halt** sends the stop IPI to each CPU of the instance. A spawn
-kernel booted with ``irqchip.gicv3_pseudo_nmi=1`` (and built with
-``CONFIG_ARM64_PSEUDO_NMI``) takes it as an NMI, so it reaches a CPU that
-spins with interrupts masked. Without pseudo-NMIs it is an ordinary
-interrupt and such a CPU stays out of reach; the instance then cannot be
-started again until the machine is rebooted. SDEI is not used yet.
+**Force halt** sends the stop IPI to each CPU of the instance. PSCI has no
+call to turn another CPU off, so the CPU has to take that interrupt and
+turn itself off, and a CPU that spins with interrupts masked only takes it
+as a pseudo-NMI. A spawn kernel therefore has to be built with
+``CONFIG_ARM64_PSEUDO_NMI`` and booted with ``irqchip.gicv3_pseudo_nmi=1``;
+``kerf load`` appends the parameter to every spawn's command line. Without
+it such a CPU stays out of reach, and the instance cannot be started again
+until the machine is rebooted: the host refuses to load an image over a
+CPU that is still on. Pseudo-NMIs do not reach a CPU that has masked all
+exceptions. SDEI is not used yet.
 
 The Boot Tree
 =============
