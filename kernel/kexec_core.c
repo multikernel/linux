@@ -1795,7 +1795,7 @@ int multikernel_kexec_by_id(int mk_id)
 	mk_ipi_ring_drop_pending();
 
 	/* A previous run that died without a word left its MSIs routed */
-	mk_msi_proxy_release(instance);
+	mk_arch_msi_release(instance);
 
 	rc = mk_iommu_contain(instance);
 	if (rc) {

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-only
+// SPDX-License-Identifier: GPL-2.0
 /*
  * MSIs for an instance's PCI devices, through the host's ITS.
  *
@@ -26,6 +26,27 @@
 #include <linux/workqueue.h>
 
 #define MK_MSI_TIMEOUT_MS	5000
+
+/*
+ * MSI routing request. Where MSIs go through a translation unit only one
+ * kernel can program (a GICv3 ITS), a spawn asks the kernel that owns it.
+ * @rid is the device as the spawn sees it on its PCI bus, @event the MSI
+ * data it will write. The answer names the interrupt that will arrive and
+ * the address to write @event to, which depends on the unit behind the
+ * device when the machine has several. Mapping an event again moves it to
+ * @phys_cpu, and everything is dropped by the host when the instance is
+ * started or torn down, so there is no unmap.
+ */
+struct mk_io_msi_payload {
+	u32 domain;             /* PCI domain */
+	u32 rid;                /* bus << 8 | devfn */
+	u32 event;
+	u32 nvecs;              /* Events the device may use, fixed by the first request */
+	u64 phys_cpu;           /* Target CPU, one of the sender's */
+	u64 doorbell;           /* ACK: address the device writes the event to */
+	int result;             /* ACK: interrupt number (LPI INTID), or -errno */
+	int sender_instance_id;
+};
 
 struct mk_msi_work {
 	struct work_struct work;
@@ -169,7 +190,7 @@ static void mk_msi_msg_handler(u32 msg_type, u32 subtype, void *payload,
  * Returns the interrupt number (0 when not waiting) or a negative error.
  */
 int mk_msi_proxy_map(u32 domain, u32 rid, u32 event, u32 nvecs,
-		     mk_phys_cpu_t phys_cpu, phys_addr_t *doorbell)
+		     u64 phys_cpu, phys_addr_t *doorbell)
 {
 	struct mk_io_msi_payload req = {
 		.domain = domain,
@@ -215,12 +236,12 @@ int mk_msi_proxy_map(u32 domain, u32 rid, u32 event, u32 nvecs,
 	return ret;
 }
 
-void mk_msi_proxy_release(struct mk_instance *instance)
+void mk_arch_msi_release(struct mk_instance *instance)
 {
 	its_foreign_release(instance);
 }
 
-phys_addr_t mk_msi_proxy_doorbell(struct pci_dev *pdev)
+phys_addr_t mk_arch_msi_doorbell(struct pci_dev *pdev)
 {
 	return its_foreign_doorbell(dev_get_msi_domain(&pdev->dev));
 }

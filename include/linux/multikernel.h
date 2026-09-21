@@ -183,35 +183,6 @@ int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
 				 size_t data_size, unsigned long type);
 
 /*
- * Spawn side of MK_IO_MSI_MAP: returns the interrupt number or -errno and
- * sets @doorbell. A NULL @doorbell sends the request without waiting for
- * the answer, for a context that cannot sleep.
- */
-int mk_msi_proxy_map(u32 domain, u32 rid, u32 event, u32 nvecs,
-		     mk_phys_cpu_t phys_cpu, phys_addr_t *doorbell);
-
-/*
- * Host side: drop every MSI routed for @instance. Its kernel is gone or
- * about to be started afresh, in order or not, and its devices may be
- * bound here next.
- */
-struct mk_instance;
-struct pci_dev;
-#ifdef CONFIG_MULTIKERNEL_ITS_PROXY
-void mk_msi_proxy_release(struct mk_instance *instance);
-/* The address @pdev writes its MSIs to when an instance owns it, 0 if none */
-phys_addr_t mk_msi_proxy_doorbell(struct pci_dev *pdev);
-#else
-static inline void mk_msi_proxy_release(struct mk_instance *instance)
-{
-}
-static inline phys_addr_t mk_msi_proxy_doorbell(struct pci_dev *pdev)
-{
-	return 0;
-}
-#endif
-
-/*
  * Host side: keep the DMA of an instance's PCI devices inside its memory
  * while it runs, where the devices sit behind an IOMMU.
  */
@@ -262,6 +233,7 @@ void mk_ipi_ring_drop_pending(void);
 #define MK_IO_IRQ_BALANCE   (MK_MSG_IO + 2)
 #define MK_IO_IRQ_MASK      (MK_MSG_IO + 3)
 #define MK_IO_IRQ_UNMASK    (MK_MSG_IO + 4)
+/* MSI routing through the host, where the arch needs it: payload is the arch's */
 #define MK_IO_MSI_MAP       (MK_MSG_IO + 5)  /* Route a device's MSI to one of my CPUs */
 #define MK_IO_MSI_ACK       (MK_MSG_IO + 6)  /* Answer: the interrupt number, or an error */
 
@@ -355,27 +327,6 @@ struct mk_device_resource_payload {
 /* Device flags */
 #define MK_DEVICE_BIND_VFIO     0x01  /* Bind to VFIO driver */
 #define MK_DEVICE_BIND_STUB     0x02  /* Bind to pci-stub driver */
-
-/*
- * MSI routing request. Where MSIs go through a translation unit only one
- * kernel can program (a GICv3 ITS), a spawn asks the kernel that owns it.
- * @rid is the device as the spawn sees it on its PCI bus, @event the MSI
- * data it will write. The answer names the interrupt that will arrive and
- * the address to write @event to, which depends on the unit behind the
- * device when the machine has several. Mapping an event again moves it to
- * @phys_cpu, and everything is dropped by the host when the instance is
- * started or torn down, so there is no unmap.
- */
-struct mk_io_msi_payload {
-	u32 domain;             /* PCI domain */
-	u32 rid;                /* bus << 8 | devfn */
-	u32 event;
-	u32 nvecs;              /* Events the device may use, fixed by the first request */
-	u64 phys_cpu;           /* Target CPU, one of the sender's */
-	u64 doorbell;           /* ACK: address the device writes the event to */
-	int result;             /* ACK: interrupt number (LPI INTID), or -errno */
-	int sender_instance_id;
-};
 
 /* Resource operation response/ACK */
 struct mk_resource_ack {
@@ -1207,6 +1158,8 @@ void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
  *  - CONFIG_ARCH_HAS_MK_HOST_PARK and the pool park functions declared
  *    with the pool chunk API above, for architectures that park CPUs in
  *    software rather than in firmware.
+ *  - CONFIG_ARCH_HAS_MK_MSI_PROXY and the two functions below, for
+ *    architectures where an instance cannot route its own MSIs.
  */
 
 /* Doorbell for the message ring: IPI a CPU owned by another kernel */
@@ -1253,5 +1206,26 @@ int mk_repark_instance_to_host(struct mk_instance *instance);
 /* Move one parked CPU between the host pool and a live instance */
 int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
 int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
+
+/*
+ * MSIs that the host has to route for an instance (a GICv3 ITS has one
+ * command queue). The generic code only needs to know when to let go and
+ * what an IOMMU in front of a device has to let through.
+ */
+#ifdef CONFIG_ARCH_HAS_MK_MSI_PROXY
+/* Drop every MSI routed for @instance: it halted, or is about to be started */
+void mk_arch_msi_release(struct mk_instance *instance);
+/* The address @pdev writes its MSIs to when an instance owns it, 0 if none */
+phys_addr_t mk_arch_msi_doorbell(struct pci_dev *pdev);
+#else
+static inline void mk_arch_msi_release(struct mk_instance *instance)
+{
+}
+
+static inline phys_addr_t mk_arch_msi_doorbell(struct pci_dev *pdev)
+{
+	return 0;
+}
+#endif
 
 #endif /* _LINUX_MULTIKERNEL_H */

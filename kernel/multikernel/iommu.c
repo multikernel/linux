@@ -59,7 +59,7 @@ static void mk_iommu_free_dev(struct mk_iommu_dev *d)
 static int mk_iommu_contain_dev(struct mk_instance *instance,
 				struct pci_dev *pdev)
 {
-	phys_addr_t doorbell = mk_msi_proxy_doorbell(pdev);
+	phys_addr_t doorbell = mk_arch_msi_doorbell(pdev);
 	struct mk_memory_region *region;
 	struct mk_iommu_dev *d;
 	int ret;
