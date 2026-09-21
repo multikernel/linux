@@ -167,32 +167,6 @@ static int mk_dtb_add_chosen(void *fdt, const void *loader_fdt)
 	return fdt_setprop_u32(fdt, to, "linux,pci-probe-only", 1);
 }
 
-/*
- * The generic code describes the root buses above the instance's PCI
- * devices, with their ECAM window. That makes each of them an ordinary
- * ECAM host bridge, so name the driver for it.
- */
-static int mk_dtb_name_pci_bridges(void *fdt)
-{
-	static const char compatible[] =
-		MK_PCI_HOST_BRIDGE "\0pci-host-ecam-generic";
-	int node, ret;
-
-	for (node = fdt_node_offset_by_compatible(fdt, -1, MK_PCI_HOST_BRIDGE);
-	     node >= 0;
-	     node = fdt_node_offset_by_compatible(fdt, node, MK_PCI_HOST_BRIDGE)) {
-		if (!fdt_getprop(fdt, node, "reg", NULL)) {
-			pr_warn("A PCI root bus of the instance has no ECAM window\n");
-			continue;
-		}
-		ret = fdt_setprop(fdt, node, "compatible", compatible,
-				  sizeof(compatible));
-		if (ret)
-			return ret;
-	}
-	return 0;
-}
-
 static struct kexec_segment *mk_dtb_segment(struct kimage *image)
 {
 	unsigned long i;
@@ -237,7 +211,7 @@ int mk_build_boot_dtb(struct kimage *image, struct mk_instance *instance)
 	if (!ret)
 		ret = mk_dtb_add_devices(fdt, instance);
 	if (!ret)
-		ret = mk_dtb_name_pci_bridges(fdt);
+		ret = mk_dtb_add_pci(fdt);
 	if (!ret)
 		ret = fdt_pack(fdt);
 	if (ret) {
