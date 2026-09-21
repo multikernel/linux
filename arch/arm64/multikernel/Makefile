@@ -3,4 +3,5 @@
 # Makefile for multikernel spawn support
 #
 
-obj-y += spawn.o
+obj-y += spawn.o dtb.o dtb_of.o
+obj-$(CONFIG_ACPI) += dtb_acpi.o

@@ -54,6 +54,7 @@
 #include <asm/efi.h>
 #include <asm/xen/hypervisor.h>
 #include <asm/mmu_context.h>
+#include <asm/multikernel.h>
 
 static int num_standard_resources;
 static struct resource *standard_resources;
@@ -290,6 +291,7 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
 	early_ioremap_init();
 
 	setup_machine_fdt(__fdt_pointer);
+	mk_spawn_accept_boot_tree(__fdt_pointer);
 
 	/*
 	 * Initialise the static keys early as they may be enabled by the

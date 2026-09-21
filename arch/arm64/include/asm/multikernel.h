@@ -39,7 +39,14 @@ static inline int arch_cpu_from_physical_id(u64 phys_id)
 #ifdef CONFIG_MULTIKERNEL
 void mk_spawn_machine_halt(void);
 void mk_spawn_stop_this_cpu(void);
+
+/* The boot tree is the manifest when another kernel wrote it */
+void mk_spawn_accept_boot_tree(phys_addr_t dt_phys);
 #else
+static inline void mk_spawn_accept_boot_tree(phys_addr_t dt_phys)
+{
+}
+
 static inline void mk_spawn_machine_halt(void)
 {
 }
@@ -50,11 +57,12 @@ static inline void mk_spawn_stop_this_cpu(void)
 #endif
 
 /*
- * Room for an instance's boot device tree, a segment of its kimage. The
- * tree is rebuilt in place on every spawn, as the memory grant can have
+ * Room for an instance's boot device tree, a segment of its kimage: the
+ * manifest (MK_MANIFEST_SIZE) with the arm64 boot nodes on top. The tree
+ * is rebuilt in place on every spawn, as the memory grant can have
  * changed since the load.
  */
-#define MK_BOOT_DTB_SIZE	SZ_64K
+#define MK_BOOT_DTB_SIZE	SZ_512K
 
 /* Nothing of arm64's lives in the control block, so it is never allocated */
 #define MK_CTRL_BLOCK_SIZE	PAGE_SIZE
