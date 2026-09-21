@@ -80,6 +80,8 @@ static DEFINE_PER_CPU_READ_MOSTLY(struct ipi_descs, pcpu_ipi_desc);
 static bool percpu_ipi_descs __ro_after_init;
 
 static bool crash_stop;
+/* Set once this kernel starts stopping its own CPUs */
+static unsigned long stop_in_progress;
 
 static void ipi_setup(int cpu);
 
@@ -960,6 +962,16 @@ void kgdb_roundup_cpus(void)
 #endif
 
 /*
+ * SGIs cross kernel boundaries, so with multikernel a stop IPI that this
+ * kernel did not send itself comes from another kernel.
+ */
+static bool ipi_cpu_stop_is_foreign(void)
+{
+	return IS_ENABLED(CONFIG_MULTIKERNEL) &&
+	       !READ_ONCE(stop_in_progress) && !crash_stop;
+}
+
+/*
  * Main handler for inter-processor interrupts
  */
 static void do_handle_IPI(int ipinr)
@@ -980,6 +992,10 @@ static void do_handle_IPI(int ipinr)
 
 	case IPI_CPU_STOP:
 	case IPI_CPU_STOP_NMI:
+		if (ipi_cpu_stop_is_foreign()) {
+			mk_foreign_cpu_stop();
+			break;
+		}
 		if (IS_ENABLED(CONFIG_KEXEC_CORE) && crash_stop) {
 			ipi_cpu_crash_stop(cpu, get_irq_regs());
 			unreachable();
@@ -1196,7 +1212,6 @@ static inline unsigned int num_other_online_cpus(void)
 
 void smp_send_stop(void)
 {
-	static unsigned long stop_in_progress;
 	static cpumask_t mask;
 	unsigned long timeout;
 
