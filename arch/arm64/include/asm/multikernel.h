@@ -40,6 +40,9 @@ static inline int arch_cpu_from_physical_id(u64 phys_id)
 void mk_spawn_machine_halt(void);
 void mk_spawn_stop_this_cpu(void);
 
+/* A stop IPI from another kernel: its force halt, or not ours to obey */
+void mk_foreign_cpu_stop(void);
+
 /* The boot tree is the manifest when another kernel wrote it */
 void mk_spawn_accept_boot_tree(phys_addr_t dt_phys);
 #else
@@ -52,6 +55,10 @@ static inline void mk_spawn_machine_halt(void)
 }
 
 static inline void mk_spawn_stop_this_cpu(void)
+{
+}
+
+static inline void mk_foreign_cpu_stop(void)
 {
 }
 #endif
