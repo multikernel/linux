@@ -9,6 +9,8 @@ struct kimage;
 struct mk_instance;
 
 /* GIC interrupt specifier cells, as in dt-bindings/interrupt-controller/arm-gic.h */
+#define MK_PCI_HOST_BRIDGE	"multikernel,pci-host-bridge"
+
 #define MK_GIC_PPI		1
 #define MK_GIC_PHANDLE		1
 
