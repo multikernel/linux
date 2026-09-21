@@ -64,13 +64,15 @@ static inline void mk_foreign_cpu_stop(void)
 #endif
 
 /*
- * Ask the host to route a device's MSI to one of this kernel's CPUs, for
- * the instance's MSI domain (irq-gic-v3-its-mk.c). Returns the interrupt
- * number or -errno and sets @doorbell; a NULL @doorbell does not wait.
+ * Ask the host to route a device's MSI to one of this kernel's CPUs, and to
+ * move it to another later, for the instance's MSI domain
+ * (irq-gic-v3-its-mk.c). Mapping sleeps; moving works in any context and
+ * is done when it returns.
  */
 #ifdef CONFIG_MULTIKERNEL_ITS_PROXY
-int mk_msi_proxy_map(u32 domain, u32 rid, u32 event, u32 nvecs,
-		     u64 phys_cpu, phys_addr_t *doorbell);
+int mk_msi_proxy_map(u32 domain, u32 rid, u32 event, u64 phys_cpu,
+		     phys_addr_t *doorbell);
+int mk_msi_proxy_move(u32 domain, u32 rid, u32 event, u64 phys_cpu);
 #endif
 
 /*

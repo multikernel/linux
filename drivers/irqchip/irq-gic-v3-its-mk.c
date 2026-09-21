@@ -56,27 +56,31 @@ static void mk_its_nop(struct irq_data *d)
 {
 }
 
-/* @doorbell NULL: an event that is mapped already moves, and nobody waits */
-static int mk_its_route(struct mk_its_irq *irq, unsigned int cpu,
-			phys_addr_t *doorbell)
-{
-	struct mk_its_device *dev = irq->dev;
-
-	return mk_msi_proxy_map(dev->domain, dev->rid, irq->event, dev->nvecs,
-				cpu_logical_map(cpu), doorbell);
-}
-
-/* Called with the descriptor locked: the move is sent, not waited for */
+/*
+ * Called with the descriptor locked, and by a CPU on its way out that is
+ * turned off right after. Like the ITS driver's own, the move is complete
+ * when this returns: the host has sent the MOVI, which takes a pending
+ * interrupt along.
+ */
 static int mk_its_set_affinity(struct irq_data *d, const struct cpumask *mask,
 			       bool force)
 {
-	unsigned int cpu = cpumask_first_and(mask, cpu_online_mask);
+	const struct cpumask *now = irq_data_get_effective_affinity_mask(d);
+	struct mk_its_irq *irq = irq_data_get_irq_chip_data(d);
+	unsigned int cpu;
 	int ret;
 
+	/* Stay where it is if that is allowed: a move is a round trip to the host */
+	cpu = cpumask_first_and_and(now, mask, cpu_online_mask);
+	if (cpu < nr_cpu_ids)
+		return IRQ_SET_MASK_OK_DONE;
+
+	cpu = cpumask_first_and(mask, cpu_online_mask);
 	if (cpu >= nr_cpu_ids)
 		return -EINVAL;
 
-	ret = mk_its_route(irq_data_get_irq_chip_data(d), cpu, NULL);
+	ret = mk_msi_proxy_move(irq->dev->domain, irq->dev->rid, irq->event,
+				cpu_logical_map(cpu));
 	if (ret)
 		return ret;
 
@@ -159,7 +163,8 @@ static int mk_its_alloc_one(struct irq_domain *domain, unsigned int virq,
 	irq->dev = mdev;
 	irq->event = event;
 
-	lpi = mk_its_route(irq, cpu, &irq->doorbell);
+	lpi = mk_msi_proxy_map(mdev->domain, mdev->rid, event,
+			       cpu_logical_map(cpu), &irq->doorbell);
 	if (lpi < 0) {
 		kfree(irq);
 		return lpi;

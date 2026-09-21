@@ -236,6 +236,7 @@ void mk_ipi_ring_drop_pending(void);
 /* MSI routing through the host, where the arch needs it: payload is the arch's */
 #define MK_IO_MSI_MAP       (MK_MSG_IO + 5)  /* Route a device's MSI to one of my CPUs */
 #define MK_IO_MSI_ACK       (MK_MSG_IO + 6)  /* Answer: the interrupt number, or an error */
+#define MK_IO_MSI_MOVE      (MK_MSG_IO + 7)  /* Move a routed MSI to another of my CPUs */
 
 /* Resource management subtypes */
 #define MK_RES_CPU_ADD      (MK_MSG_RESOURCE + 1)
