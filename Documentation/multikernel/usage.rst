@@ -66,6 +66,13 @@ Workflow
    ``device-remove``, and destroy the instance with ``instance-remove``
    once it is stopped.
 
+Architectures
+=============
+
+x86-64 and arm64 are supported. ``arm64.rst`` describes what differs on
+arm64: how CPUs are held and started, the boot tree, interrupts, and what
+a device needs to be given to an instance.
+
 Instance States
 ===============
 
