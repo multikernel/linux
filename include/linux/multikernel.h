@@ -175,9 +175,13 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 
 void generic_multikernel_interrupt(void);
 
-/* Spawn side of MK_IO_MSI_MAP: returns the interrupt number or -errno; @wait false when atomic */
+/*
+ * Spawn side of MK_IO_MSI_MAP: returns the interrupt number or -errno and
+ * sets @doorbell. A NULL @doorbell sends the request without waiting for
+ * the answer, for a context that cannot sleep.
+ */
 int mk_msi_proxy_map(u32 domain, u32 rid, u32 event, u32 nvecs,
-		     mk_phys_cpu_t phys_cpu, bool wait);
+		     mk_phys_cpu_t phys_cpu, phys_addr_t *doorbell);
 
 /*
  * Host side: drop every MSI routed for @instance. Its kernel is gone or
@@ -185,15 +189,16 @@ int mk_msi_proxy_map(u32 domain, u32 rid, u32 event, u32 nvecs,
  * bound here next.
  */
 struct mk_instance;
+struct pci_dev;
 #ifdef CONFIG_MULTIKERNEL_ITS_PROXY
 void mk_msi_proxy_release(struct mk_instance *instance);
-/* The address an instance's devices write their MSIs to, 0 if none */
-phys_addr_t mk_msi_proxy_doorbell(void);
+/* The address @pdev writes its MSIs to when an instance owns it, 0 if none */
+phys_addr_t mk_msi_proxy_doorbell(struct pci_dev *pdev);
 #else
 static inline void mk_msi_proxy_release(struct mk_instance *instance)
 {
 }
-static inline phys_addr_t mk_msi_proxy_doorbell(void)
+static inline phys_addr_t mk_msi_proxy_doorbell(struct pci_dev *pdev)
 {
 	return 0;
 }
@@ -348,9 +353,11 @@ struct mk_device_resource_payload {
  * MSI routing request. Where MSIs go through a translation unit only one
  * kernel can program (a GICv3 ITS), a spawn asks the kernel that owns it.
  * @rid is the device as the spawn sees it on its PCI bus, @event the MSI
- * data it will write. Mapping an event again moves it to @phys_cpu, and
- * everything is dropped by the host when the instance is started or torn
- * down, so there is no unmap.
+ * data it will write. The answer names the interrupt that will arrive and
+ * the address to write @event to, which depends on the unit behind the
+ * device when the machine has several. Mapping an event again moves it to
+ * @phys_cpu, and everything is dropped by the host when the instance is
+ * started or torn down, so there is no unmap.
  */
 struct mk_io_msi_payload {
 	u32 domain;             /* PCI domain */
@@ -358,6 +365,7 @@ struct mk_io_msi_payload {
 	u32 event;
 	u32 nvecs;              /* Events the device may use, fixed by the first request */
 	u64 phys_cpu;           /* Target CPU, one of the sender's */
+	u64 doorbell;           /* ACK: address the device writes the event to */
 	int result;             /* ACK: interrupt number (LPI INTID), or -errno */
 	int sender_instance_id;
 };
