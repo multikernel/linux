@@ -33,3 +33,7 @@ config MULTIKERNEL
 	    boot channel, describing its resources and message rings
 
 	  If unsure, say N.
+
+# Map the MSIs of an instance's PCI devices through the host's ITS
+config MULTIKERNEL_ITS_PROXY
+	def_bool MULTIKERNEL && ARM_GIC_V3_ITS && PCI_MSI
