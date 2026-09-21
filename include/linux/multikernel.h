@@ -187,8 +187,42 @@ int mk_msi_proxy_map(u32 domain, u32 rid, u32 event, u32 nvecs,
 struct mk_instance;
 #ifdef CONFIG_MULTIKERNEL_ITS_PROXY
 void mk_msi_proxy_release(struct mk_instance *instance);
+/* The address an instance's devices write their MSIs to, 0 if none */
+phys_addr_t mk_msi_proxy_doorbell(void);
 #else
 static inline void mk_msi_proxy_release(struct mk_instance *instance)
+{
+}
+static inline phys_addr_t mk_msi_proxy_doorbell(void)
+{
+	return 0;
+}
+#endif
+
+/*
+ * Host side: keep the DMA of an instance's PCI devices inside its memory
+ * while it runs, where the devices sit behind an IOMMU.
+ */
+#ifdef CONFIG_MULTIKERNEL_IOMMU
+int mk_iommu_contain(struct mk_instance *instance);
+void mk_iommu_release(struct mk_instance *instance);
+int mk_iommu_map(struct mk_instance *instance, phys_addr_t start, size_t size);
+void mk_iommu_unmap(struct mk_instance *instance, phys_addr_t start, size_t size);
+#else
+static inline int mk_iommu_contain(struct mk_instance *instance)
+{
+	return 0;
+}
+static inline void mk_iommu_release(struct mk_instance *instance)
+{
+}
+static inline int mk_iommu_map(struct mk_instance *instance,
+			       phys_addr_t start, size_t size)
+{
+	return 0;
+}
+static inline void mk_iommu_unmap(struct mk_instance *instance,
+				  phys_addr_t start, size_t size)
 {
 }
 #endif
