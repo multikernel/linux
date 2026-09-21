@@ -2036,6 +2036,8 @@ int pci_setup_device(struct pci_dev *dev)
 	err = pci_set_of_node(dev);
 	if (err)
 		return err;
+	/* Known before the first write: sizing the BARs is one */
+	dev->foreign = mk_pci_foreign(dev);
 	pci_set_acpi_fwnode(dev);
 
 	pci_dev_assign_slot(dev);
