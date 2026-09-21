@@ -207,6 +207,8 @@ int mk_build_boot_dtb(struct kimage *image, struct mk_instance *instance)
 		ret = acpi_disabled ? mk_dtb_add_platform_of(fdt) :
 				      mk_dtb_add_platform_acpi(fdt);
 	if (!ret)
+		ret = mk_dtb_add_devices(fdt, instance);
+	if (!ret)
 		ret = fdt_pack(fdt);
 	if (ret) {
 		pr_err("Instance %d: %s\n", instance->id, fdt_strerror(ret));
