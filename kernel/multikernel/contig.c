@@ -5,16 +5,17 @@
  * hold pinned kernel allocations), ZONE_MOVABLE before ZONE_NORMAL.
  */
 #include <linux/gfp.h>
+#include <linux/memory.h>
 #include <linux/mm.h>
 #include <linux/mmzone.h>
 #include <linux/page-isolation.h>
 
 #include "internal.h"
 
-static struct page *mk_contig_try_zone(struct zone *zone, unsigned long nr_pages)
+static struct page *mk_contig_try_zone(struct zone *zone, unsigned long nr_pages,
+				       unsigned long align_pages)
 {
 	unsigned long start_pfn, end_pfn, candidate;
-	unsigned long align_pages = pageblock_nr_pages;
 
 	if (!populated_zone(zone))
 		return NULL;
@@ -39,7 +40,8 @@ static struct page *mk_contig_try_zone(struct zone *zone, unsigned long nr_pages
 	return NULL;
 }
 
-struct page *mk_alloc_contig_pages(unsigned long nr_pages, int node)
+static struct page *mk_contig_try_nodes(unsigned long nr_pages, int node,
+					unsigned long align_pages)
 {
 	static const enum zone_type zone_order[] = { ZONE_MOVABLE, ZONE_NORMAL };
 	int nid, i;
@@ -54,12 +56,32 @@ struct page *mk_alloc_contig_pages(unsigned long nr_pages, int node)
 			struct page *pages;
 
 			pages = mk_contig_try_zone(&pgdat->node_zones[zone_order[i]],
-						   nr_pages);
+						   nr_pages, align_pages);
 			if (pages)
 				return pages;
 		}
 	}
 	return NULL;
+}
+
+/*
+ * A running instance takes more memory through memory hotplug, which only
+ * adds whole memory blocks at block-aligned addresses. Instances are carved
+ * from the start of a chunk and grow upwards, so a chunk that starts on a
+ * block boundary keeps block-sized growth aligned. That is worth preferring
+ * but not worth failing for: a chunk that only fits elsewhere still serves
+ * instances that are sized once and never grow.
+ */
+struct page *mk_alloc_contig_pages(unsigned long nr_pages, int node)
+{
+	unsigned long block_pages = PHYS_PFN(memory_block_size_bytes());
+	struct page *pages = NULL;
+
+	if (nr_pages >= block_pages)
+		pages = mk_contig_try_nodes(nr_pages, node, block_pages);
+	if (!pages)
+		pages = mk_contig_try_nodes(nr_pages, node, pageblock_nr_pages);
+	return pages;
 }
 
 void mk_free_contig_pages(struct page *pages, unsigned long nr_pages)
