@@ -19,6 +19,7 @@
 #include <linux/profile.h>
 #include <linux/errno.h>
 #include <linux/mm.h>
+#include <linux/multikernel.h>
 #include <linux/err.h>
 #include <linux/cpu.h>
 #include <linux/smp.h>
@@ -822,7 +823,11 @@ static const char *ipi_types[MAX_IPI] __tracepoint_string = {
 	[IPI_TIMER]		= "Timer broadcast interrupts",
 	[IPI_IRQ_WORK]		= "IRQ work interrupts",
 	[IPI_CPU_BACKTRACE]	= "CPU backtrace interrupts",
+#ifdef CONFIG_MULTIKERNEL
+	[IPI_MULTIKERNEL]	= "Multikernel doorbell interrupts",
+#else
 	[IPI_KGDB_ROUNDUP]	= "KGDB roundup interrupts",
+#endif
 };
 
 static void smp_cross_call(const struct cpumask *target, unsigned int ipinr);
@@ -938,7 +943,7 @@ void arch_trigger_cpumask_backtrace(const cpumask_t *mask, int exclude_cpu)
 	nmi_trigger_cpumask_backtrace(mask, exclude_cpu, arm64_backtrace_ipi);
 }
 
-#ifdef CONFIG_KGDB
+#if defined(CONFIG_KGDB) && !defined(CONFIG_MULTIKERNEL)
 void kgdb_roundup_cpus(void)
 {
 	int this_cpu = raw_smp_processor_id();
@@ -1004,7 +1009,10 @@ static void do_handle_IPI(int ipinr)
 		break;
 
 	case IPI_KGDB_ROUNDUP:
-		kgdb_nmicallback(cpu, get_irq_regs());
+		if (IS_ENABLED(CONFIG_MULTIKERNEL))
+			generic_multikernel_interrupt();
+		else
+			kgdb_nmicallback(cpu, get_irq_regs());
 		break;
 
 	default:
@@ -1038,8 +1046,10 @@ static bool ipi_should_be_nmi(enum ipi_msg_type ipi)
 	switch (ipi) {
 	case IPI_CPU_STOP_NMI:
 	case IPI_CPU_BACKTRACE:
-	case IPI_KGDB_ROUNDUP:
 		return true;
+	case IPI_KGDB_ROUNDUP:
+		/* The doorbell drains a message ring, which is no NMI work */
+		return !IS_ENABLED(CONFIG_MULTIKERNEL);
 	default:
 		return false;
 	}
