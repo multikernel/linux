@@ -1455,16 +1455,29 @@ int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
 		goto out;
 	}
 
+	/* Its devices must reach the memory by the time the instance uses it */
+	ret = mk_iommu_map(target_instance, PFN_PHYS(start_pfn),
+			   PFN_PHYS(nr_pages));
+	if (ret < 0) {
+		mk_msg_pending_wait(pending, 0);
+		goto out;
+	}
+
 	ret = mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_MEM_ADD,
 			      &payload, sizeof(payload));
 	if (ret < 0) {
 		mk_msg_pending_wait(pending, 0);  /* Immediate cleanup */
+		mk_iommu_unmap(target_instance, PFN_PHYS(start_pfn),
+			       PFN_PHYS(nr_pages));
 		goto out;
 	}
 
 	ret = mk_msg_pending_wait(pending, 10000);
-	if (ret < 0)
+	if (ret < 0) {
+		mk_iommu_unmap(target_instance, PFN_PHYS(start_pfn),
+			       PFN_PHYS(nr_pages));
 		goto out;
+	}
 
 	ret = mk_instance_add_memory_region(target_instance, PFN_PHYS(nr_pages),
 					    (int)numa_node);
@@ -1534,6 +1547,8 @@ int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages)
 	ret = mk_msg_pending_wait(pending, 10000);
 	if (ret < 0)
 		goto out;
+
+	mk_iommu_unmap(target_instance, PFN_PHYS(start_pfn), PFN_PHYS(nr_pages));
 
 	/* Update root kernel's view of instance memory after successful IPI */
 	ret = mk_instance_remove_memory_region(target_instance,

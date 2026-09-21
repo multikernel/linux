@@ -167,6 +167,11 @@ void mk_msi_proxy_release(struct mk_instance *instance)
 	its_foreign_release(instance);
 }
 
+phys_addr_t mk_msi_proxy_doorbell(void)
+{
+	return its_foreign_doorbell();
+}
+
 static int __init mk_msi_proxy_init(void)
 {
 	return mk_register_msg_handler(MK_MSG_IO, mk_msi_msg_handler, NULL);

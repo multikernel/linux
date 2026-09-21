@@ -13,8 +13,10 @@
 
 #define pr_fmt(fmt) "mk_dtb: " fmt
 
+#include <linux/dma-map-ops.h>
 #include <linux/irqchip/arm-gic-v3.h>
 #include <linux/libfdt.h>
+#include <linux/pci.h>
 #include <linux/sizes.h>
 
 #include "internal.h"
@@ -61,6 +63,28 @@ static int mk_dtb_set_msi_map(void *fdt, int node, u32 phandle)
 	return 0;
 }
 
+/*
+ * Devices inherit DMA coherency from their host bridge node, and a tree
+ * that does not say so makes every device behind it non-coherent. Ask a
+ * device on the host's side of the same root bus.
+ */
+static bool mk_dtb_root_bus_coherent(void *fdt, int node)
+{
+	const fdt32_t *domain = fdt_getprop(fdt, node, "linux,pci-domain", NULL);
+	const fdt32_t *range = fdt_getprop(fdt, node, "bus-range", NULL);
+	struct pci_bus *bus;
+	struct pci_dev *pdev;
+
+	if (!range)
+		return false;
+
+	bus = pci_find_bus(domain ? fdt32_to_cpu(*domain) : 0,
+			   fdt32_to_cpu(range[0]));
+	pdev = bus ? list_first_entry_or_null(&bus->devices, struct pci_dev,
+					      bus_list) : NULL;
+	return pdev && dev_is_dma_coherent(&pdev->dev);
+}
+
 int mk_dtb_add_pci(void *fdt)
 {
 	static const char compatible[] =
@@ -92,6 +116,8 @@ int mk_dtb_add_pci(void *fdt)
 				  sizeof(compatible));
 		if (!ret && msi)
 			ret = mk_dtb_set_msi_map(fdt, node, phandle);
+		if (!ret && mk_dtb_root_bus_coherent(fdt, node))
+			ret = fdt_setprop_empty(fdt, node, "dma-coherent");
 		if (ret)
 			return ret;
 	}
