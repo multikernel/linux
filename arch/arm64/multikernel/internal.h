@@ -27,6 +27,9 @@ int mk_dtb_copy_of_node(void *fdt, struct device_node *np);
 /* Granted platform devices, and the SPIs the GIC node grants with them */
 int mk_dtb_add_devices(void *fdt, struct mk_instance *instance);
 
+/* The driver and the MSI controller for the instance's PCI root buses */
+int mk_dtb_add_pci(void *fdt);
+
 /*
  * The part of the machine every kernel drives for itself: PSCI, the arch
  * timer and the interrupt controller. Taken from whichever description
