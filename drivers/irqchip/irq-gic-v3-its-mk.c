@@ -5,9 +5,11 @@
  * The ITS belongs to the kernel that spawned this one, so this is what
  * is left of an ITS driver when someone else runs the command queue: an
  * MSI parent domain on top of the GIC's LPI range that asks the host to
- * map each event (mk_msi_proxy_map()) and is told which LPI will arrive.
- * The device is programmed from here as usual, with the ITS's doorbell
- * as the address and the event as the data.
+ * map each event (mk_msi_proxy_map()) and is told which LPI will arrive
+ * and where the device has to write the event. That address comes with
+ * every answer rather than with the device tree, because a machine can
+ * have several ITSs and only the host knows which one sits behind a
+ * device. The device is programmed from here as usual.
  *
  * The redistributors of this kernel's CPUs still run on the host's LPI
  * tables, which the host enabled before it gave the CPUs away and which
@@ -24,7 +26,6 @@
 #include <linux/msi.h>
 #include <linux/multikernel.h>
 #include <linux/of.h>
-#include <linux/of_address.h>
 #include <linux/of_irq.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
@@ -48,20 +49,21 @@ struct mk_its_device {
 struct mk_its_irq {
 	struct mk_its_device *dev;
 	u32 event;
+	phys_addr_t doorbell;
 };
-
-static phys_addr_t mk_its_doorbell;
 
 static void mk_its_nop(struct irq_data *d)
 {
 }
 
-static int mk_its_route(struct mk_its_irq *irq, unsigned int cpu, bool wait)
+/* @doorbell NULL: an event that is mapped already moves, and nobody waits */
+static int mk_its_route(struct mk_its_irq *irq, unsigned int cpu,
+			phys_addr_t *doorbell)
 {
 	struct mk_its_device *dev = irq->dev;
 
 	return mk_msi_proxy_map(dev->domain, dev->rid, irq->event, dev->nvecs,
-				cpu_logical_map(cpu), wait);
+				cpu_logical_map(cpu), doorbell);
 }
 
 /* Called with the descriptor locked: the move is sent, not waited for */
@@ -74,7 +76,7 @@ static int mk_its_set_affinity(struct irq_data *d, const struct cpumask *mask,
 	if (cpu >= nr_cpu_ids)
 		return -EINVAL;
 
-	ret = mk_its_route(irq_data_get_irq_chip_data(d), cpu, false);
+	ret = mk_its_route(irq_data_get_irq_chip_data(d), cpu, NULL);
 	if (ret)
 		return ret;
 
@@ -86,8 +88,8 @@ static void mk_its_compose_msi_msg(struct irq_data *d, struct msi_msg *msg)
 {
 	struct mk_its_irq *irq = irq_data_get_irq_chip_data(d);
 
-	msg->address_lo = lower_32_bits(mk_its_doorbell);
-	msg->address_hi = upper_32_bits(mk_its_doorbell);
+	msg->address_lo = lower_32_bits(irq->doorbell);
+	msg->address_hi = upper_32_bits(irq->doorbell);
 	msg->data = irq->event;
 }
 
@@ -157,7 +159,7 @@ static int mk_its_alloc_one(struct irq_domain *domain, unsigned int virq,
 	irq->dev = mdev;
 	irq->event = event;
 
-	lpi = mk_its_route(irq, cpu, true);
+	lpi = mk_its_route(irq, cpu, &irq->doorbell);
 	if (lpi < 0) {
 		kfree(irq);
 		return lpi;
@@ -238,7 +240,6 @@ static int __init mk_its_init(void)
 		.host_data	= &mk_its_msi_info,
 	};
 	struct device_node *np, *gic;
-	struct resource res;
 	int ret = -ENODEV;
 
 	np = of_find_compatible_node(NULL, NULL, MK_ITS_COMPATIBLE);
@@ -249,9 +250,8 @@ static int __init mk_its_init(void)
 	info.parent = gic ? irq_find_host(gic) : NULL;
 	of_node_put(gic);
 
-	if (!info.parent || of_address_to_resource(np, 0, &res))
+	if (!info.parent)
 		goto out;
-	mk_its_doorbell = res.start;
 
 	info.fwnode = of_fwnode_handle(np);
 	ret = msi_create_parent_irq_domain(&info, &gic_v3_its_msi_parent_ops) ?
@@ -260,8 +260,7 @@ out:
 	if (ret)
 		pr_err("%pOF: no MSI domain: %d\n", np, ret);
 	else
-		pr_info("MSIs through the host's ITS, doorbell %pa\n",
-			&mk_its_doorbell);
+		pr_info("MSIs through the host's ITS\n");
 	of_node_put(np);
 	return ret;
 }

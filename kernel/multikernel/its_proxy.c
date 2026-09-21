@@ -16,7 +16,9 @@
 
 #define pr_fmt(fmt) "mk_its: " fmt
 
+#include <linux/completion.h>
 #include <linux/irqchip/arm-gic-v3.h>
+#include <linux/irqdomain.h>
 #include <linux/msi.h>
 #include <linux/multikernel.h>
 #include <linux/pci.h>
@@ -30,6 +32,20 @@ struct mk_msi_work {
 	struct mk_io_msi_payload req;
 };
 
+/*
+ * A request this kernel waits on. The answer is more than a result code,
+ * so it is kept here until the waiter picks it up.
+ */
+struct mk_msi_request {
+	struct list_head list;
+	u64 key;
+	struct completion done;
+	struct mk_io_msi_payload answer;
+};
+
+static LIST_HEAD(mk_msi_requests);
+static DEFINE_SPINLOCK(mk_msi_requests_lock);
+
 static u64 mk_msi_key(const struct mk_io_msi_payload *p)
 {
 	return (u64)p->domain << 48 | (u64)p->rid << 32 | p->event;
@@ -37,9 +53,11 @@ static u64 mk_msi_key(const struct mk_io_msi_payload *p)
 
 /* Only a device the instance was given, only a CPU it owns */
 static int mk_msi_map_for(struct mk_instance *instance,
-			  const struct mk_io_msi_payload *req)
+			  struct mk_io_msi_payload *req)
 {
+	struct irq_domain *msi_domain;
 	struct mk_pci_device *mine;
+	phys_addr_t doorbell = 0;
 	struct pci_dev *pdev;
 	bool owned = false;
 	int cpu, ret;
@@ -63,11 +81,14 @@ static int mk_msi_map_for(struct mk_instance *instance,
 	if (!pdev)
 		return -ENODEV;
 
-	ret = its_foreign_map(instance,
-			      pci_msi_domain_get_msi_rid(dev_get_msi_domain(&pdev->dev),
-							 pdev),
-			      req->event, req->nvecs, cpu);
+	/* The device's MSI domain names the ITS behind it, of possibly several */
+	msi_domain = dev_get_msi_domain(&pdev->dev);
+	ret = its_foreign_map(instance, msi_domain,
+			      pci_msi_domain_get_msi_rid(msi_domain, pdev),
+			      req->event, req->nvecs, cpu, &doorbell);
 	pci_dev_put(pdev);
+	if (ret >= 0)
+		req->doorbell = doorbell;
 	return ret;
 }
 
@@ -94,6 +115,22 @@ static void mk_msi_map_work(struct work_struct *work)
 	kfree(w);
 }
 
+static void mk_msi_answer(const struct mk_io_msi_payload *answer)
+{
+	struct mk_msi_request *r;
+	unsigned long flags;
+
+	spin_lock_irqsave(&mk_msi_requests_lock, flags);
+	list_for_each_entry(r, &mk_msi_requests, list) {
+		if (r->key == mk_msi_key(answer)) {
+			r->answer = *answer;
+			complete(&r->done);
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&mk_msi_requests_lock, flags);
+}
+
 static void mk_msi_msg_handler(u32 msg_type, u32 subtype, void *payload,
 			       u32 payload_len, void *ctx)
 {
@@ -113,8 +150,7 @@ static void mk_msi_msg_handler(u32 msg_type, u32 subtype, void *payload,
 		schedule_work(&w->work);
 		break;
 	case MK_IO_MSI_ACK:
-		mk_msg_pending_complete(MK_MSG_IO, MK_IO_MSI_MAP, mk_msi_key(p),
-					p->result);
+		mk_msi_answer(p);
 		break;
 	}
 }
@@ -126,13 +162,14 @@ static void mk_msi_msg_handler(u32 msg_type, u32 subtype, void *payload,
  * @event: MSI data the device will write
  * @nvecs: events the device may use
  * @phys_cpu: target, one of this kernel's CPUs
- * @wait: wait for the answer; false moves an event that is mapped
- *	  already, from a context that cannot sleep
+ * @doorbell: set to the address to write @event to. NULL moves an event
+ *	      that is mapped already without waiting for the answer, from a
+ *	      context that cannot sleep
  *
  * Returns the interrupt number (0 when not waiting) or a negative error.
  */
 int mk_msi_proxy_map(u32 domain, u32 rid, u32 event, u32 nvecs,
-		     mk_phys_cpu_t phys_cpu, bool wait)
+		     mk_phys_cpu_t phys_cpu, phys_addr_t *doorbell)
 {
 	struct mk_io_msi_payload req = {
 		.domain = domain,
@@ -142,24 +179,40 @@ int mk_msi_proxy_map(u32 domain, u32 rid, u32 event, u32 nvecs,
 		.phys_cpu = phys_cpu,
 		.sender_instance_id = mk_self->id,
 	};
-	struct mk_pending_msg *pending = NULL;
+	struct mk_msi_request *r;
+	unsigned long flags;
 	int ret;
 
-	if (wait) {
-		pending = mk_msg_pending_add(MK_MSG_IO, MK_IO_MSI_MAP,
-					     mk_msi_key(&req));
-		if (!pending)
-			return -ENOMEM;
-	}
+	if (!doorbell)
+		return mk_send_message(0, MK_MSG_IO, MK_IO_MSI_MAP, &req,
+				       sizeof(req));
+
+	r = kzalloc_obj(*r);
+	if (!r)
+		return -ENOMEM;
+	r->key = mk_msi_key(&req);
+	init_completion(&r->done);
+
+	spin_lock_irqsave(&mk_msi_requests_lock, flags);
+	list_add(&r->list, &mk_msi_requests);
+	spin_unlock_irqrestore(&mk_msi_requests_lock, flags);
 
 	ret = mk_send_message(0, MK_MSG_IO, MK_IO_MSI_MAP, &req, sizeof(req));
-	if (!wait)
-		return ret;
-	if (ret < 0) {
-		mk_msg_pending_wait(pending, 0);
-		return ret;
+	if (!ret && !wait_for_completion_timeout(&r->done,
+						 msecs_to_jiffies(MK_MSI_TIMEOUT_MS)))
+		ret = -ETIMEDOUT;
+
+	/* Off the list before the answer is read: a late one must not land in it */
+	spin_lock_irqsave(&mk_msi_requests_lock, flags);
+	list_del(&r->list);
+	spin_unlock_irqrestore(&mk_msi_requests_lock, flags);
+
+	if (!ret) {
+		ret = r->answer.result;
+		*doorbell = r->answer.doorbell;
 	}
-	return mk_msg_pending_wait(pending, MK_MSI_TIMEOUT_MS);
+	kfree(r);
+	return ret;
 }
 
 void mk_msi_proxy_release(struct mk_instance *instance)
@@ -167,9 +220,9 @@ void mk_msi_proxy_release(struct mk_instance *instance)
 	its_foreign_release(instance);
 }
 
-phys_addr_t mk_msi_proxy_doorbell(void)
+phys_addr_t mk_msi_proxy_doorbell(struct pci_dev *pdev)
 {
-	return its_foreign_doorbell();
+	return its_foreign_doorbell(dev_get_msi_domain(&pdev->dev));
 }
 
 static int __init mk_msi_proxy_init(void)
