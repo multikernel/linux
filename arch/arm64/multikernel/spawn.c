@@ -105,8 +105,39 @@ static int __init mk_spawn_reboot_init(void)
 }
 core_initcall(mk_spawn_reboot_init);
 
+/*
+ * PSCI cannot turn another CPU off, so a kernel that no longer answers
+ * is stopped in band, with the stop IPI its own smp_send_stop() would
+ * use. It is sent as IPI_CPU_STOP_NMI: a kernel running with pseudo-NMIs
+ * takes that one even with interrupts masked, and to any other kernel it
+ * is an ordinary SGI, which a CPU spinning with interrupts off never
+ * sees. Without SDEI that is as far as force goes on arm64.
+ */
 void mk_force_stop_cpu(mk_phys_cpu_t phys_cpu)
 {
+	int ret = gic_v3_send_sgi_to_mpidr(phys_cpu, IPI_CPU_STOP_NMI);
+
+	if (ret)
+		pr_err("No stop SGI to CPU 0x%llx: %d\n", phys_cpu, ret);
+}
+
+/*
+ * The receiving end. A force halt is announced in the shared ring area
+ * before the SGIs go out, and only a kernel this one has a relationship
+ * with can write there; a stop from anyone else is ignored, the way x86
+ * drops a stop NMI it did not ask for. Obeying means leaving for good:
+ * the CPU is turned off, in a host that is being fenced as well.
+ */
+void mk_foreign_cpu_stop(void)
+{
+	if (!mk_has_pending_shutdown()) {
+		pr_warn_ratelimited("CPU%u: ignoring a stop IPI from another kernel\n",
+				    smp_processor_id());
+		return;
+	}
+
+	set_cpu_online(smp_processor_id(), false);
+	mk_enter_pool_state(NULL);
 }
 
 static struct mk_cpu_set *mk_started_set(struct mk_instance *instance)
