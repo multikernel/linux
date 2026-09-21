@@ -638,6 +638,7 @@ struct irq_domain;
 struct fwnode_handle;
 int __init its_lpi_memreserve_init(void);
 int its_cpu_init(void);
+int gic_v3_send_sgi_to_mpidr(u64 mpidr, unsigned int sgi);
 int its_init(struct fwnode_handle *handle, struct rdists *rdists,
 	     struct irq_domain *domain, u8 irq_prio);
 int mbi_init(struct fwnode_handle *fwnode, struct irq_domain *parent);

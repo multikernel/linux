@@ -1401,6 +1401,32 @@ static void gic_ipi_send_mask(struct irq_data *d, const struct cpumask *mask)
 	isb();
 }
 
+/**
+ * gic_v3_send_sgi_to_mpidr - Send an SGI to a CPU named by its affinity
+ * @mpidr: MPIDR affinity of the target
+ * @sgi: SGI number
+ *
+ * gic_ipi_send_mask() reaches the CPUs of this kernel, by logical number.
+ * SGIs are delivered to a redistributor by affinity, though, so they
+ * cross to a CPU that another kernel image runs on just as well.
+ *
+ * Returns 0, or a negative error code if the SGI cannot be sent.
+ */
+int gic_v3_send_sgi_to_mpidr(u64 mpidr, unsigned int sgi)
+{
+	if (!gic_data.domain)
+		return -ENODEV;
+	if (sgi >= SGI_NR)
+		return -EINVAL;
+	if (MPIDR_AFFINITY_LEVEL(mpidr, 0) >= 16 && !gic_data.has_rss)
+		return -ERANGE;
+
+	dsb(ishst);
+	gic_send_sgi(MPIDR_TO_SGI_CLUSTER_ID(mpidr), BIT(mpidr & 0xf), sgi);
+	isb();
+	return 0;
+}
+
 static void __init gic_smp_init(void)
 {
 	struct irq_fwspec sgi_fwspec = {
