@@ -3778,6 +3778,14 @@ static void its_irq_domain_free(struct irq_domain *domain, unsigned int virq,
 	irq_domain_free_irqs_parent(domain, virq, nr_irqs);
 }
 
+static const struct irq_domain_ops its_domain_ops = {
+	.select			= msi_lib_irq_domain_select,
+	.alloc			= its_irq_domain_alloc,
+	.free			= its_irq_domain_free,
+	.activate		= its_irq_domain_activate,
+	.deactivate		= its_irq_domain_deactivate,
+};
+
 #ifdef CONFIG_MULTIKERNEL_ITS_PROXY
 /*
  * LPIs on behalf of another kernel.
@@ -3793,13 +3801,15 @@ static void its_irq_domain_free(struct irq_domain *domain, unsigned int virq,
  * side: they never reach one of this kernel's CPU interfaces.
  *
  * @owner keeps the devices of different kernels apart and names what
- * its_foreign_release() tears down.
+ * its_foreign_release() tears down. The ITS is the one behind the device,
+ * named by the device's MSI domain: a machine has one per socket or more,
+ * each with DeviceIDs, collections and a doorbell of its own.
  */
-static struct its_node *its_foreign_node(void)
+static struct its_node *its_foreign_its(struct irq_domain *domain)
 {
-	if (!list_is_singular(&its_nodes))
+	if (!domain || domain->ops != &its_domain_ops)
 		return NULL;
-	return list_first_entry(&its_nodes, struct its_node, entry);
+	return msi_get_domain_info(domain)->data;
 }
 
 static void its_foreign_config(struct its_device *dev, u32 event, bool enable)
@@ -3816,7 +3826,10 @@ static void its_foreign_config(struct its_device *dev, u32 event, bool enable)
 	its_send_inv(dev, event);
 }
 
-/* A collection is only mapped for a CPU that has been online here */
+/*
+ * A collection is only mapped for a CPU that has been online here, and an
+ * ITS with erratum 23144 only reaches the CPUs of its own node.
+ */
 static struct its_collection *its_foreign_collection(struct its_node *its,
 						     unsigned int cpu)
 {
@@ -3824,26 +3837,34 @@ static struct its_collection *its_foreign_collection(struct its_node *its,
 	    its->collections[cpu].col_id != cpu ||
 	    (cpu && !its->collections[cpu].target_address))
 		return NULL;
+
+	if ((its->flags & ITS_FLAGS_WORKAROUND_CAVIUM_23144) &&
+	    its->numa_node != NUMA_NO_NODE && cpu_to_node(cpu) != its->numa_node)
+		return NULL;
+
 	return &its->collections[cpu];
 }
 
 /**
  * its_foreign_map - Route a device's event to a CPU of another kernel
  * @owner: the other kernel, as the caller names it
- * @dev_id: DeviceID as the ITS sees it
+ * @domain: MSI domain of the device, which names the ITS behind it
+ * @dev_id: DeviceID as that ITS sees it
  * @event: event (MSI data) to map
  * @nvecs: events the device will use at most, fixed by the first call
  * @cpu: this kernel's number of the CPU to deliver to
+ * @doorbell: set to the address the device has to write the event to
  *
  * Mapping an event that is mapped already moves it to @cpu.
  *
  * Returns the LPI, which is the INTID the other kernel takes on @cpu,
  * or a negative error code.
  */
-int its_foreign_map(void *owner, u32 dev_id, u32 event, u32 nvecs,
-		    unsigned int cpu)
+int its_foreign_map(void *owner, struct irq_domain *domain, u32 dev_id,
+		    u32 event, u32 nvecs, unsigned int cpu,
+		    phys_addr_t *doorbell)
 {
-	struct its_node *its = its_foreign_node();
+	struct its_node *its = its_foreign_its(domain);
 	struct its_collection *col;
 	struct its_device *dev;
 
@@ -3875,24 +3896,14 @@ int its_foreign_map(void *owner, u32 dev_id, u32 event, u32 nvecs,
 		its_send_mapti(dev, dev->event_map.lpi_base + event, event);
 		its_foreign_config(dev, event, true);
 	}
+	*doorbell = its->get_msi_base(dev);
 	return dev->event_map.lpi_base + event;
 }
 
-/**
- * its_foreign_release - Drop everything mapped for another kernel
- * @owner: the other kernel, as given to its_foreign_map()
- *
- * For when that kernel is gone or about to be started afresh, whether it
- * shut down in order or not: nothing of it must keep raising LPIs.
- */
-void its_foreign_release(void *owner)
+static void its_foreign_release_on(struct its_node *its, void *owner)
 {
-	struct its_node *its = its_foreign_node();
 	struct its_device *dev, *tmp;
 	unsigned int event;
-
-	if (!its)
-		return;
 
 	guard(mutex)(&its->dev_alloc_lock);
 
@@ -3913,22 +3924,33 @@ void its_foreign_release(void *owner)
 	}
 }
 
-/* Where a device of another kernel writes its MSIs: 0 without a usable ITS */
-phys_addr_t its_foreign_doorbell(void)
+/**
+ * its_foreign_release - Drop everything mapped for another kernel
+ * @owner: the other kernel, as given to its_foreign_map()
+ *
+ * For when that kernel is gone or about to be started afresh, whether it
+ * shut down in order or not: nothing of it must keep raising LPIs.
+ */
+void its_foreign_release(void *owner)
 {
-	struct its_node *its = its_foreign_node();
+	struct its_node *its;
+
+	/* ITSs are only ever added, and that during boot */
+	list_for_each_entry(its, &its_nodes, entry)
+		its_foreign_release_on(its, owner);
+}
+
+/*
+ * The doorbell of the ITS behind a device with MSI domain @domain, which
+ * an IOMMU in front of the device has to let through. 0 if there is none.
+ */
+phys_addr_t its_foreign_doorbell(struct irq_domain *domain)
+{
+	struct its_node *its = its_foreign_its(domain);
 
 	return its ? its->phys_base + GITS_TRANSLATER : 0;
 }
 #endif
-
-static const struct irq_domain_ops its_domain_ops = {
-	.select			= msi_lib_irq_domain_select,
-	.alloc			= its_irq_domain_alloc,
-	.free			= its_irq_domain_free,
-	.activate		= its_irq_domain_activate,
-	.deactivate		= its_irq_domain_deactivate,
-};
 
 /*
  * This is insane.
