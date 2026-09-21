@@ -368,7 +368,7 @@ void pci_bus_add_device(struct pci_dev *dev)
 	 */
 	pm_runtime_enable(&dev->dev);
 
-	if (!dn || of_device_is_available(dn))
+	if ((!dn || of_device_is_available(dn)) && !dev->foreign)
 		pci_dev_allow_binding(dev);
 
 	device_initial_probe(&dev->dev);
