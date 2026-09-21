@@ -10,6 +10,10 @@ config ARCH_SUPPORTS_MULTIKERNEL
 config ARCH_HAS_MK_HOST_PARK
 	bool
 
+# The arch routes the MSIs of an instance's devices on the instance's behalf
+config ARCH_HAS_MK_MSI_PROXY
+	bool
+
 config MULTIKERNEL
 	bool "Multikernel support"
 	depends on ARCH_SUPPORTS_MULTIKERNEL
@@ -34,9 +38,6 @@ config MULTIKERNEL
 
 	  If unsure, say N.
 
-# Map the MSIs of an instance's PCI devices through the host's ITS
-config MULTIKERNEL_ITS_PROXY
-	def_bool MULTIKERNEL && ARM_GIC_V3_ITS && PCI_MSI
 
 # Confine the DMA of an instance's PCI devices to its memory. x86 runs
 # them without an IOMMU so far.
