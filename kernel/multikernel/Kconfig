@@ -37,3 +37,8 @@ config MULTIKERNEL
 # Map the MSIs of an instance's PCI devices through the host's ITS
 config MULTIKERNEL_ITS_PROXY
 	def_bool MULTIKERNEL && ARM_GIC_V3_ITS && PCI_MSI
+
+# Confine the DMA of an instance's PCI devices to its memory. x86 runs
+# them without an IOMMU so far.
+config MULTIKERNEL_IOMMU
+	def_bool MULTIKERNEL && IOMMU_API && PCI && ARM64
