@@ -20,6 +20,7 @@
 #include <linux/sizes.h>
 #include <linux/pci.h>
 #include <linux/cpumask.h>
+#include <linux/pci-ecam.h>
 #if defined(CONFIG_X86) && defined(CONFIG_PCI_MMCONFIG)
 #include <asm/pci_x86.h>
 #endif
@@ -1224,6 +1225,18 @@ static u64 mk_dt_bridge_ecam(struct pci_bus *root, u64 *size)
 
 	*size = (u64)(root->busn_res.end - root->busn_res.start + 1) << 20;
 	return cfg->address + ((u64)root->busn_res.start << 20);
+#elif defined(CONFIG_PCI_ECAM)
+	struct pci_config_window *cfg = root->sysdata;
+
+	/* Only a bridge on the generic ECAM accessors keeps its window there */
+	if (root->ops != &pci_generic_ecam_ops.pci_ops ||
+	    cfg->busr.start > root->busn_res.start ||
+	    cfg->busr.end < root->busn_res.end)
+		return 0;
+
+	*size = (u64)(root->busn_res.end - root->busn_res.start + 1) << 20;
+	return cfg->res.start +
+	       ((u64)(root->busn_res.start - cfg->busr.start) << 20);
 #else
 	return 0;
 #endif
@@ -1281,7 +1294,7 @@ static int mk_dt_emit_one_host_bridge(struct mk_instance *instance,
 
 	resource_list_for_each_entry(entry, &bridge->windows) {
 		const struct resource *res = entry->res;
-		u64 pci_addr, size;
+		u64 pci_addr, cpu_addr, size;
 
 		if (resource_type(res) != IORESOURCE_IO &&
 		    resource_type(res) != IORESOURCE_MEM)
@@ -1295,11 +1308,21 @@ static int mk_dt_emit_one_host_bridge(struct mk_instance *instance,
 
 		pci_addr = res->start - entry->offset;
 		size = resource_size(res);
+
+		/*
+		 * Where I/O space is memory mapped, an I/O resource holds
+		 * logical port numbers, not the CPU address of the window.
+		 */
+		cpu_addr = res->start;
+		if (resource_type(res) == IORESOURCE_IO &&
+		    pci_pio_to_address(res->start) != (phys_addr_t)OF_BAD_ADDR)
+			cpu_addr = pci_pio_to_address(res->start);
+
 		ranges[cells++] = cpu_to_fdt32(mk_dt_window_flags(res));
 		ranges[cells++] = cpu_to_fdt32(upper_32_bits(pci_addr));
 		ranges[cells++] = cpu_to_fdt32(lower_32_bits(pci_addr));
-		ranges[cells++] = cpu_to_fdt32(upper_32_bits(res->start));
-		ranges[cells++] = cpu_to_fdt32(lower_32_bits(res->start));
+		ranges[cells++] = cpu_to_fdt32(upper_32_bits(cpu_addr));
+		ranges[cells++] = cpu_to_fdt32(lower_32_bits(cpu_addr));
 		ranges[cells++] = cpu_to_fdt32(upper_32_bits(size));
 		ranges[cells++] = cpu_to_fdt32(lower_32_bits(size));
 	}
