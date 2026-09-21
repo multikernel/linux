@@ -15,6 +15,7 @@
 #include <linux/errno.h>
 #include <linux/init.h>
 #include <linux/iopoll.h>
+#include <linux/irqchip/arm-gic-v3.h>
 #include <linux/irqflags.h>
 #include <linux/kexec.h>
 #include <linux/libfdt.h>
@@ -33,8 +34,18 @@
 /* A halting kernel acknowledges first and turns its CPUs off afterwards */
 #define MK_CPU_OFF_TIMEOUT_US	USEC_PER_SEC
 
+/*
+ * Ring the doorbell of a CPU that another kernel runs on. There is no
+ * foreign doorbell to filter on the receiving side: all it does is
+ * drain this kernel's own ring, which such a sender cannot have filled.
+ */
 void mk_arch_send_ipi(mk_phys_cpu_t phys_cpu)
 {
+	int ret = gic_v3_send_sgi_to_mpidr(phys_cpu, IPI_MULTIKERNEL);
+
+	if (ret)
+		pr_err_ratelimited("No doorbell SGI to CPU 0x%llx: %d\n",
+				   phys_cpu, ret);
 }
 
 void __init mk_arch_register_cpu(mk_phys_cpu_t phys_id)
