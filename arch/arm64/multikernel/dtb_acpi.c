@@ -11,14 +11,14 @@
 #define pr_fmt(fmt) "mk_dtb: " fmt
 
 #include <linux/acpi.h>
+#include <linux/io.h>
 #include <linux/irq.h>
+#include <linux/irqchip/arm-gic-v3.h>
 #include <linux/libfdt.h>
 #include <linux/psci.h>
 
 #include "internal.h"
 
-/* A redistributor frame pair per CPU, where the MADT has no GICR entries */
-#define MK_GICR_PER_CPU_SIZE	(2 * SZ_64K)
 #define MK_GICR_MAX_REGIONS	256
 
 static int mk_dtb_add_psci(void *fdt)
@@ -97,8 +97,27 @@ struct mk_gic_frames {
 	u64 reg[2 * (1 + MK_GICR_MAX_REGIONS)];	/* distributor first */
 	int nr_gicr;
 	int nr_gicc;
+	u32 gicr_size;
 	bool have_gicd;
 };
+
+static int mk_gic_set_frame_size(struct mk_gic_frames *f)
+{
+	void __iomem *dist;
+	u32 arch;
+
+	dist = ioremap(f->reg[0], SZ_64K);
+	if (!dist)
+		return -FDT_ERR_NOSPACE;
+
+	arch = readl_relaxed(dist + GICD_PIDR2) & GIC_PIDR2_ARCH_MASK;
+	iounmap(dist);
+	if (arch != GIC_PIDR2_ARCH_GICv3 && arch != GIC_PIDR2_ARCH_GICv4)
+		return -FDT_ERR_BADVALUE;
+
+	f->gicr_size = arch == GIC_PIDR2_ARCH_GICv4 ? 4 * SZ_64K : 2 * SZ_64K;
+	return 0;
+}
 
 /*
  * Redistributors are described either as GICR regions or, without any,
@@ -146,7 +165,7 @@ static void mk_gic_collect(struct acpi_table_madt *madt,
 			if (!gicc->gicr_base_address)
 				continue;
 			gicr[0] = gicc->gicr_base_address;
-			gicr[1] = MK_GICR_PER_CPU_SIZE;
+			gicr[1] = f->gicr_size;
 			f->nr_gicr++;
 		}
 	}
@@ -171,9 +190,16 @@ static int mk_dtb_add_gic(void *fdt)
 
 	mk_gic_collect((void *)table, f, ACPI_MADT_TYPE_GENERIC_DISTRIBUTOR);
 	mk_gic_collect((void *)table, f, ACPI_MADT_TYPE_GENERIC_REDISTRIBUTOR);
-	if (!f->nr_gicr)
-		mk_gic_collect((void *)table, f, ACPI_MADT_TYPE_GENERIC_INTERRUPT);
+	if (f->have_gicd && !f->nr_gicr) {
+		ret = mk_gic_set_frame_size(f);
+		if (!ret)
+			mk_gic_collect((void *)table, f, ACPI_MADT_TYPE_GENERIC_INTERRUPT);
+	} else {
+		ret = 0;
+	}
 	acpi_put_table(table);
+	if (ret)
+		goto out;
 
 	if (!f->have_gicd || !f->nr_gicr) {
 		pr_err("The MADT describes no usable GICv3\n");
