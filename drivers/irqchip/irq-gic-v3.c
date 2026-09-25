@@ -50,6 +50,7 @@ static struct cpumask broken_rdists __read_mostly __maybe_unused;
 struct redist_region {
 	void __iomem		*redist_base;
 	phys_addr_t		phys_base;
+	resource_size_t		size;
 	bool			single_redist;
 };
 
@@ -1080,6 +1081,10 @@ static int gic_iterate_rdists(int (*fn)(struct redist_region *, void __iomem *))
 				if (typer & GICR_TYPER_VLPIS)
 					ptr += SZ_64K * 2; /* Skip VLPI_base + reserved page */
 			}
+			/* A DT region may describe one frame without its Last bit set. */
+			if (ptr - gic_data.redist_regions[i].redist_base >=
+			    gic_data.redist_regions[i].size)
+				break;
 		} while (!(typer & GICR_TYPER_LAST));
 	}
 
@@ -2333,6 +2338,7 @@ static int __init gic_of_init(struct device_node *node, struct device_node *pare
 			goto out_unmap_rdist;
 		}
 		rdist_regs[i].phys_base = res.start;
+		rdist_regs[i].size = resource_size(&res);
 	}
 
 	if (of_property_read_u64(node, "redistributor-stride", &redist_stride))
@@ -2378,12 +2384,14 @@ static struct
 } acpi_data __initdata;
 
 static void __init
-gic_acpi_register_redist(phys_addr_t phys_base, void __iomem *redist_base)
+gic_acpi_register_redist(phys_addr_t phys_base, void __iomem *redist_base,
+			 resource_size_t size)
 {
 	static int count = 0;
 
 	acpi_data.redist_regs[count].phys_base = phys_base;
 	acpi_data.redist_regs[count].redist_base = redist_base;
+	acpi_data.redist_regs[count].size = size;
 	acpi_data.redist_regs[count].single_redist = acpi_data.single_redist;
 	count++;
 }
@@ -2408,7 +2416,7 @@ gic_acpi_parse_madt_redist(union acpi_subtable_headers *header,
 
 	gic_request_region(redist->base_address, redist->length, "GICR");
 
-	gic_acpi_register_redist(redist->base_address, redist_base);
+	gic_acpi_register_redist(redist->base_address, redist_base, redist->length);
 	return 0;
 }
 
@@ -2450,7 +2458,7 @@ gic_acpi_parse_madt_gicc(union acpi_subtable_headers *header,
 	    (gicc->flags & ACPI_MADT_GICC_NON_COHERENT))
 		gic_data.rdists.flags |= RDIST_FLAGS_FORCE_NON_SHAREABLE;
 
-	gic_acpi_register_redist(gicc->gicr_base_address, redist_base);
+	gic_acpi_register_redist(gicc->gicr_base_address, redist_base, size);
 	return 0;
 }
 
