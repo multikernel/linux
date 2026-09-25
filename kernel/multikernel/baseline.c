@@ -193,10 +193,10 @@ static int mk_baseline_validate_cpus(const struct mk_cpu_set *requested)
 			return -ENODEV;
 		}
 
-		if (logical_cpu == 0 || phys_cpu_id == 0) {
-			pr_warn("Baseline includes boot CPU (phys %llu, logical %d) - "
-				"this may cause system instability\n",
-				phys_cpu_id, logical_cpu);
+		if (logical_cpu == 0) {
+			pr_err("Baseline CPU %llu is the boot CPU, which stays with this kernel\n",
+			       phys_cpu_id);
+			return -EINVAL;
 		}
 
 		validated++;

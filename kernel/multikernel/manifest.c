@@ -286,6 +286,10 @@ static int mk_manifest_chosen(void *fdt, void *data)
 		if (!ret)
 			ret = fdt_property_u32(fdt, "multikernel,host-ipi-pages",
 					       mk_self->ipi_pages);
+		/* The boot CPU can never join the pool, so it stays ours */
+		if (!ret)
+			ret = fdt_property_u64(fdt, "multikernel,host-ipi-cpu",
+					       arch_cpu_physical_id(0));
 		if (ret)
 			return ret;
 	}

@@ -319,8 +319,11 @@ static int __init mk_restore_host_instance(void)
 	phys_addr_t host_ipi_phys;
 	u32 host_ipi_pages;
 	size_t host_ipi_size;
+	u64 host_ipi_cpu;
 
-	if (!mk_chosen_ring("host-ipi", &host_ipi_phys, &host_ipi_pages)) {
+	if (!mk_chosen_ring("host-ipi", &host_ipi_phys, &host_ipi_pages) ||
+	    of_property_read_u64(of_chosen, "multikernel,host-ipi-cpu",
+				 &host_ipi_cpu)) {
 		pr_warn("No host IPI buffer in the boot tree (spawn won't be able to send to host)\n");
 		return -ENOENT;
 	}
@@ -330,11 +333,7 @@ static int __init mk_restore_host_instance(void)
 	if (!hi)
 		return -ENOMEM;
 
-	/*
-	 * The host's owned CPU set is unknown here; ring its doorbell on
-	 * physical CPU 0 without pretending we know what it owns.
-	 */
-	hi->ipi_target = 0;
+	hi->ipi_target = host_ipi_cpu;
 
 	hi->ipi_data = memremap(host_ipi_phys, host_ipi_size, MEMREMAP_WB);
 	if (!hi->ipi_data) {

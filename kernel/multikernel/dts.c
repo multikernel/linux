@@ -745,9 +745,6 @@ static int mk_dt_validate_cpus(const struct mk_dt_config *config)
 			mk_cpu_set_count(config->cpus), num_online_cpus());
 	}
 
-	if (mk_cpu_set_contains(config->cpus, 0))
-		pr_warn("Physical CPU ID 0 (boot CPU) assigned to multikernel instance - this may affect system stability\n");
-
 	return 0;
 }
 
