@@ -54,7 +54,7 @@ void machine_kexec_cleanup(struct kimage *kimage)
  */
 int machine_kexec_prepare(struct kimage *kimage)
 {
-	if (kimage->type != KEXEC_TYPE_CRASH && cpus_are_stuck_in_kernel()) {
+	if (kimage->type == KEXEC_TYPE_DEFAULT && cpus_are_stuck_in_kernel()) {
 		pr_err("Can't kexec: CPUs are stuck in the kernel.\n");
 		return -EBUSY;
 	}
@@ -112,6 +112,14 @@ int machine_kexec_post_load(struct kimage *kimage)
 		.trans_alloc_page	= kexec_page_alloc,
 		.trans_alloc_arg	= kimage,
 	};
+
+	/*
+	 * A multikernel image is loaded in place and never replaces this
+	 * kernel: no relocation code, no copy of the linear map. It is
+	 * copied in again and flushed on every spawn, not here.
+	 */
+	if (kimage->type == KEXEC_TYPE_MULTIKERNEL)
+		return 0;
 
 	/* If in place, relocation is not used, only flush next kernel */
 	if (kimage->head & IND_DONE) {

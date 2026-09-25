@@ -19,6 +19,7 @@
 #include <linux/profile.h>
 #include <linux/errno.h>
 #include <linux/mm.h>
+#include <linux/multikernel.h>
 #include <linux/err.h>
 #include <linux/cpu.h>
 #include <linux/smp.h>
@@ -45,6 +46,7 @@
 #include <asm/daifflags.h>
 #include <asm/kvm_mmu.h>
 #include <asm/mmu_context.h>
+#include <asm/multikernel.h>
 #include <asm/numa.h>
 #include <asm/processor.h>
 #include <asm/smp_plat.h>
@@ -78,6 +80,8 @@ static DEFINE_PER_CPU_READ_MOSTLY(struct ipi_descs, pcpu_ipi_desc);
 static bool percpu_ipi_descs __ro_after_init;
 
 static bool crash_stop;
+/* Set once this kernel starts stopping its own CPUs */
+static unsigned long stop_in_progress;
 
 static void ipi_setup(int cpu);
 
@@ -821,7 +825,11 @@ static const char *ipi_types[MAX_IPI] __tracepoint_string = {
 	[IPI_TIMER]		= "Timer broadcast interrupts",
 	[IPI_IRQ_WORK]		= "IRQ work interrupts",
 	[IPI_CPU_BACKTRACE]	= "CPU backtrace interrupts",
+#ifdef CONFIG_MULTIKERNEL
+	[IPI_MULTIKERNEL]	= "Multikernel doorbell interrupts",
+#else
 	[IPI_KGDB_ROUNDUP]	= "KGDB roundup interrupts",
+#endif
 };
 
 static void smp_cross_call(const struct cpumask *target, unsigned int ipinr);
@@ -867,6 +875,7 @@ static void __noreturn local_cpu_stop(unsigned int cpu)
 
 	local_daif_mask();
 	sdei_mask_local_cpu();
+	mk_spawn_stop_this_cpu();
 	cpu_park_loop();
 }
 
@@ -936,7 +945,7 @@ void arch_trigger_cpumask_backtrace(const cpumask_t *mask, int exclude_cpu)
 	nmi_trigger_cpumask_backtrace(mask, exclude_cpu, arm64_backtrace_ipi);
 }
 
-#ifdef CONFIG_KGDB
+#if defined(CONFIG_KGDB) && !defined(CONFIG_MULTIKERNEL)
 void kgdb_roundup_cpus(void)
 {
 	int this_cpu = raw_smp_processor_id();
@@ -951,6 +960,16 @@ void kgdb_roundup_cpus(void)
 	}
 }
 #endif
+
+/*
+ * SGIs cross kernel boundaries, so with multikernel a stop IPI that this
+ * kernel did not send itself comes from another kernel.
+ */
+static bool ipi_cpu_stop_is_foreign(void)
+{
+	return IS_ENABLED(CONFIG_MULTIKERNEL) &&
+	       !READ_ONCE(stop_in_progress) && !crash_stop;
+}
 
 /*
  * Main handler for inter-processor interrupts
@@ -973,6 +992,10 @@ static void do_handle_IPI(int ipinr)
 
 	case IPI_CPU_STOP:
 	case IPI_CPU_STOP_NMI:
+		if (ipi_cpu_stop_is_foreign()) {
+			mk_foreign_cpu_stop();
+			break;
+		}
 		if (IS_ENABLED(CONFIG_KEXEC_CORE) && crash_stop) {
 			ipi_cpu_crash_stop(cpu, get_irq_regs());
 			unreachable();
@@ -1002,7 +1025,10 @@ static void do_handle_IPI(int ipinr)
 		break;
 
 	case IPI_KGDB_ROUNDUP:
-		kgdb_nmicallback(cpu, get_irq_regs());
+		if (IS_ENABLED(CONFIG_MULTIKERNEL))
+			generic_multikernel_interrupt();
+		else
+			kgdb_nmicallback(cpu, get_irq_regs());
 		break;
 
 	default:
@@ -1036,8 +1062,10 @@ static bool ipi_should_be_nmi(enum ipi_msg_type ipi)
 	switch (ipi) {
 	case IPI_CPU_STOP_NMI:
 	case IPI_CPU_BACKTRACE:
-	case IPI_KGDB_ROUNDUP:
 		return true;
+	case IPI_KGDB_ROUNDUP:
+		/* The doorbell drains a message ring, which is no NMI work */
+		return !IS_ENABLED(CONFIG_MULTIKERNEL);
 	default:
 		return false;
 	}
@@ -1184,7 +1212,6 @@ static inline unsigned int num_other_online_cpus(void)
 
 void smp_send_stop(void)
 {
-	static unsigned long stop_in_progress;
 	static cpumask_t mask;
 	unsigned long timeout;
 

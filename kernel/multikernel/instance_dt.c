@@ -550,6 +550,27 @@ bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
 }
 EXPORT_SYMBOL_GPL(mk_pci_should_probe);
 
+/**
+ * mk_pci_foreign - Whether a PCI function this kernel sees is not its own
+ * @pdev: device being set up, its node attached
+ *
+ * A spawn kernel has to see the bridges above its devices, or it could not
+ * reach the buses behind them, but seeing is all. A port on the way down
+ * still belongs to the kernel that spawned this one: that kernel has a
+ * driver bound to it, and other kernels' devices may sit below it. In its
+ * tree a spawn tells the two apart by what the node says: one that names a
+ * device was given to it, a bridge on the way is described without one.
+ *
+ * Returns: true if the PCI core must leave the function alone
+ */
+bool mk_pci_foreign(const struct pci_dev *pdev)
+{
+	const struct device_node *np = pdev->dev.of_node;
+
+	return mk_manifest_phys() && !(np && of_property_present(np, "vendor-id"));
+}
+EXPORT_SYMBOL_GPL(mk_pci_foreign);
+
 /*
  * A netdev's alias is its interface name, the one the device had in the
  * kernel that gave it away, found from the node its device is bound to,

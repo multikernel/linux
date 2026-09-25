@@ -190,8 +190,9 @@ int mk_msg_pending_wait(struct mk_pending_msg *pending, unsigned long timeout_ms
  *
  * Returns 0 on success, negative error code on failure
  */
-int mk_send_message(int instance_id, u32 msg_type, u32 subtype,
-		    void *payload, u32 payload_len)
+static int mk_build_and_send(int instance_id, struct mk_instance *instance,
+			     u32 msg_type, u32 subtype, void *payload,
+			     u32 payload_len)
 {
 	struct mk_message *msg;
 	size_t total_size;
@@ -223,7 +224,12 @@ int mk_send_message(int instance_id, u32 msg_type, u32 subtype,
 		memcpy(msg->payload, payload, payload_len);
 
 	/* Send via IPI using the message type as IPI type */
-	ret = multikernel_send_ipi_data(instance_id, msg, total_size, msg_type);
+	if (instance)
+		ret = multikernel_send_ipi_data_to(instance, msg, total_size,
+						   msg_type);
+	else
+		ret = multikernel_send_ipi_data(instance_id, msg, total_size,
+						msg_type);
 
 	/* Clean up temporary buffer */
 	kfree(msg);
@@ -238,7 +244,22 @@ int mk_send_message(int instance_id, u32 msg_type, u32 subtype,
 
 	return 0;
 }
+
+int mk_send_message(int instance_id, u32 msg_type, u32 subtype,
+		    void *payload, u32 payload_len)
+{
+	return mk_build_and_send(instance_id, NULL, msg_type, subtype, payload,
+				 payload_len);
+}
 EXPORT_SYMBOL(mk_send_message);
+
+int mk_send_message_to(struct mk_instance *instance, u32 msg_type, u32 subtype,
+		       void *payload, u32 payload_len)
+{
+	return mk_build_and_send(instance->id, instance, msg_type, subtype,
+				 payload, payload_len);
+}
+EXPORT_SYMBOL(mk_send_message_to);
 
 /**
  * mk_register_msg_handler - Register handler for specific message type

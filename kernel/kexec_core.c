@@ -1794,7 +1794,19 @@ int multikernel_kexec_by_id(int mk_id)
 	 */
 	mk_ipi_ring_drop_pending();
 
+	/* A previous run that died without a word left its MSIs routed */
+	mk_arch_msi_release(instance);
+
+	rc = mk_iommu_contain(instance);
+	if (rc) {
+		pr_err("Instance %d: devices not confined to its memory: %d\n",
+		       mk_id, rc);
+		goto unlock;
+	}
+
 	rc = mk_arch_spawn_instance(mk_image, instance, cpu);
+	if (rc)
+		mk_iommu_release(instance);
 	if (rc == 0) {
 		rc = mk_instance_set_kexec_active(mk_image->mk_id);
 		if (rc)

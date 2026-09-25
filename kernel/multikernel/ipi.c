@@ -18,6 +18,8 @@
 static struct mk_ipi_handler *mk_handlers;
 static raw_spinlock_t mk_handlers_lock = __RAW_SPIN_LOCK_UNLOCKED(mk_handlers_lock);
 
+static DEFINE_RAW_SPINLOCK(mk_drain_lock);
+
 static void mk_ipi_drain_ring(void);
 
 /*
@@ -178,30 +180,43 @@ int mk_arm_force_halt(struct mk_instance *instance)
  */
 int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, unsigned long type)
 {
-	struct mk_ipi_data *slot;
 	struct mk_instance *instance = mk_instance_find(instance_id);
-	unsigned int head, next_head, tail;
-	mk_phys_cpu_t target;
+	int ret;
 
 	if (!instance)
 		return -EINVAL;
-	if (data_size > MK_MAX_DATA_SIZE) {
-		mk_instance_put(instance);
+
+	ret = multikernel_send_ipi_data_to(instance, data, data_size, type);
+	mk_instance_put(instance);
+	return ret;
+}
+
+/*
+ * The same for a caller that holds a reference to @instance. Looking an
+ * instance up by ID takes a mutex; this does not sleep, so it is the one
+ * to use with interrupts off.
+ */
+int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
+				 size_t data_size, unsigned long type)
+{
+	struct mk_ipi_data *slot;
+	int instance_id = instance->id;
+	unsigned int head, next_head, tail;
+	mk_phys_cpu_t target;
+
+	if (data_size > MK_MAX_DATA_SIZE)
 		return -EINVAL;
-	}
 
 	target = instance->ipi_target;
 	if (target == MK_PHYS_CPU_INVALID)
 		target = mk_cpu_set_first(instance->cpus);
 	if (target == MK_PHYS_CPU_INVALID) {
 		pr_err("Instance %d has no CPU to receive the IPI\n", instance_id);
-		mk_instance_put(instance);
 		return -ENODEV;
 	}
 
 	if (!mk_instance_ipi_area(instance)) {
 		pr_err("Multikernel IPI buffer not available for instance %d\n", instance_id);
-		mk_instance_put(instance);
 		return -ENODEV;
 	}
 
@@ -221,7 +236,6 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 			printk_deferred(KERN_WARNING
 					"multikernel: IPI ring full for instance %d (head=%u, tail=%u)\n",
 					instance_id, head, tail);
-			mk_instance_put(instance);
 			return -ENOSPC;
 		}
 
@@ -246,8 +260,6 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 	smp_store_release(&slot->data_size, data_size);
 
 	mk_arch_send_ipi(target);
-
-	mk_instance_put(instance);
 	return 0;
 }
 
@@ -329,6 +341,8 @@ advance_tail:
  */
 static void multikernel_interrupt_handler(void)
 {
+	unsigned long flags;
+
 	if (!mk_self || !mk_self->ipi_data)
 		return;
 
@@ -339,8 +353,28 @@ static void multikernel_interrupt_handler(void)
 	 * instance, so if it is ever left pending - its self-IPI lost while
 	 * the CPU was bringing its APIC up, say - every later queue attempt
 	 * is a no-op and the ring never drains again.
+	 *
+	 * The ring has one consumer at a time. That used to be implied by
+	 * the doorbell going to a single CPU; mk_ipi_poll() is a second way
+	 * in, so it is a lock now. Waiting for it rather than giving up
+	 * matters: a poller that is just leaving may not look again.
 	 */
+	raw_spin_lock_irqsave(&mk_drain_lock, flags);
 	mk_ipi_drain_ring();
+	raw_spin_unlock_irqrestore(&mk_drain_lock, flags);
+}
+
+/**
+ * mk_ipi_poll - Drain the message ring without waiting for the doorbell
+ *
+ * For a caller that waits for an answer where the doorbell interrupt
+ * cannot be taken: with interrupts off on the doorbell CPU, or while
+ * stop_machine() holds every CPU. Message handlers run in the caller's
+ * context, which they are fit for, as they normally run in the interrupt.
+ */
+void mk_ipi_poll(void)
+{
+	multikernel_interrupt_handler();
 }
 
 /**

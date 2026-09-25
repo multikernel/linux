@@ -175,6 +175,41 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 
 void generic_multikernel_interrupt(void);
 
+/* Drain the message ring where the doorbell interrupt cannot be taken */
+void mk_ipi_poll(void);
+
+struct mk_instance;
+int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
+				 size_t data_size, unsigned long type);
+
+/*
+ * Host side: keep the DMA of an instance's PCI devices inside its memory
+ * while it runs, where the devices sit behind an IOMMU.
+ */
+#ifdef CONFIG_MULTIKERNEL_IOMMU
+int mk_iommu_contain(struct mk_instance *instance);
+void mk_iommu_release(struct mk_instance *instance);
+int mk_iommu_map(struct mk_instance *instance, phys_addr_t start, size_t size);
+void mk_iommu_unmap(struct mk_instance *instance, phys_addr_t start, size_t size);
+#else
+static inline int mk_iommu_contain(struct mk_instance *instance)
+{
+	return 0;
+}
+static inline void mk_iommu_release(struct mk_instance *instance)
+{
+}
+static inline int mk_iommu_map(struct mk_instance *instance,
+			       phys_addr_t start, size_t size)
+{
+	return 0;
+}
+static inline void mk_iommu_unmap(struct mk_instance *instance,
+				  phys_addr_t start, size_t size)
+{
+}
+#endif
+
 /* Discard everything queued in this kernel's ring (instance re-spawn) */
 void mk_ipi_ring_drop_pending(void);
 
@@ -198,6 +233,10 @@ void mk_ipi_ring_drop_pending(void);
 #define MK_IO_IRQ_BALANCE   (MK_MSG_IO + 2)
 #define MK_IO_IRQ_MASK      (MK_MSG_IO + 3)
 #define MK_IO_IRQ_UNMASK    (MK_MSG_IO + 4)
+/* MSI routing through the host, where the arch needs it: payload is the arch's */
+#define MK_IO_MSI_MAP       (MK_MSG_IO + 5)  /* Route a device's MSI to one of my CPUs */
+#define MK_IO_MSI_ACK       (MK_MSG_IO + 6)  /* Answer: the interrupt number, or an error */
+#define MK_IO_MSI_MOVE      (MK_MSG_IO + 7)  /* Move a routed MSI to another of my CPUs */
 
 /* Resource management subtypes */
 #define MK_RES_CPU_ADD      (MK_MSG_RESOURCE + 1)
@@ -330,6 +369,15 @@ struct mk_pending_msg;
  */
 int mk_send_message(int instance_id, u32 msg_type, u32 subtype,
 		    void *payload, u32 payload_len);
+
+/*
+ * The same for a caller that holds a reference to @instance. Looking an
+ * instance up by ID sleeps; this does not, so it is the one to use with
+ * interrupts off.
+ */
+struct mk_instance;
+int mk_send_message_to(struct mk_instance *instance, u32 msg_type, u32 subtype,
+		       void *payload, u32 payload_len);
 
 /**
  * mk_register_msg_handler - Register handler for specific message type
@@ -700,13 +748,14 @@ struct mk_instance {
 	size_t ctrl_used;
 
 	/*
-	 * CPUs parked inside this instance's memory (its arch park area)
-	 * rather than in the host pool. They must be confirmed parked before
-	 * the image is rewritten and they pin the pool until they leave.
-	 * Membership is per CPU because it changes one CPU at a time:
-	 * hotplug moves CPUs in and out while the instance runs, and a
-	 * stopped instance can gain CPUs that still sit in the host pool.
-	 * Always empty where firmware holds parked CPUs.
+	 * CPUs the host pool cannot reach yet: parked inside this instance's
+	 * memory (its arch park area), or, where firmware holds parked CPUs,
+	 * handed to this instance's kernel and not seen off since. They must
+	 * be confirmed parked before the image is rewritten and they pin the
+	 * pool until they leave. Membership is per CPU because it changes one
+	 * CPU at a time: hotplug moves CPUs in and out while the instance
+	 * runs, and a stopped instance can gain CPUs that still sit in the
+	 * host pool.
 	 */
 	struct mk_cpu_set *cpus_on_slot;
 
@@ -943,6 +992,7 @@ void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size);
 
 /* Device probe filtering against the instance's allowlist */
 bool mk_pci_should_probe(struct pci_bus *bus, int devfn);
+bool mk_pci_foreign(const struct pci_dev *pdev);
 bool mk_platform_device_allowed(const char *name, const char *hid);
 
 /* Early CPU registration from the manifest (spawn kernels) */
@@ -950,6 +1000,9 @@ void mk_register_cpus_from_manifest(void);
 
 /* Accept the manifest handed over at boot (spawn kernels) */
 void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len);
+
+/* True in a kernel another kernel spawned, i.e. one that booted with a manifest */
+bool mk_spawned(void);
 
 /* Build the manifest for a spawn (host, kexec path) */
 int mk_manifest_finalize(struct kimage *image);
@@ -995,6 +1048,10 @@ static inline bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
 {
 	return true;
 }
+static inline bool mk_pci_foreign(const struct pci_dev *pdev)
+{
+	return false;
+}
 static inline bool mk_platform_device_allowed(const char *name, const char *hid)
 {
 	return true;
@@ -1004,6 +1061,10 @@ static inline void mk_register_cpus_from_manifest(void)
 }
 static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 {
+}
+static inline bool mk_spawned(void)
+{
+	return false;
 }
 #endif
 
@@ -1103,6 +1164,8 @@ void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
  *  - CONFIG_ARCH_HAS_MK_HOST_PARK and the pool park functions declared
  *    with the pool chunk API above, for architectures that park CPUs in
  *    software rather than in firmware.
+ *  - CONFIG_ARCH_HAS_MK_MSI_PROXY and the two functions below, for
+ *    architectures where an instance cannot route its own MSIs.
  */
 
 /* Doorbell for the message ring: IPI a CPU owned by another kernel */
@@ -1149,5 +1212,26 @@ int mk_repark_instance_to_host(struct mk_instance *instance);
 /* Move one parked CPU between the host pool and a live instance */
 int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
 int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
+
+/*
+ * MSIs that the host has to route for an instance (a GICv3 ITS has one
+ * command queue). The generic code only needs to know when to let go and
+ * what an IOMMU in front of a device has to let through.
+ */
+#ifdef CONFIG_ARCH_HAS_MK_MSI_PROXY
+/* Drop every MSI routed for @instance: it halted, or is about to be started */
+void mk_arch_msi_release(struct mk_instance *instance);
+/* The address @pdev writes its MSIs to when an instance owns it, 0 if none */
+phys_addr_t mk_arch_msi_doorbell(struct pci_dev *pdev);
+#else
+static inline void mk_arch_msi_release(struct mk_instance *instance)
+{
+}
+
+static inline phys_addr_t mk_arch_msi_doorbell(struct pci_dev *pdev)
+{
+	return 0;
+}
+#endif
 
 #endif /* _LINUX_MULTIKERNEL_H */

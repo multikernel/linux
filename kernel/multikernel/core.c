@@ -1565,6 +1565,8 @@ static void mk_instance_settle_halted(struct mk_instance *instance)
 {
 	pr_info("Instance %d (%s) halted, CPUs parking in pool\n",
 		instance->id, instance->name);
+	mk_arch_msi_release(instance);
+	mk_iommu_release(instance);
 	mk_instance_set_state(instance, MK_STATE_LOADED);
 }
 
@@ -1709,6 +1711,8 @@ int multikernel_halt_by_id(int mk_id)
 			pr_warn("Multikernel instance %d halted with CPUs unaccounted for\n",
 				mk_id);
 
+		mk_arch_msi_release(instance);
+		mk_iommu_release(instance);
 		mk_instance_set_state(instance, MK_STATE_LOADED);
 		pr_info("Multikernel instance %d halted (graceful)\n", mk_id);
 	}
