@@ -531,9 +531,6 @@ static int mktty_spawn_init(void)
 	driver->name = "mktty";
 	driver->type = TTY_DRIVER_TYPE_CONSOLE;
 	driver->init_termios = tty_std_termios;
-	driver->init_termios.c_iflag = 0;
-	driver->init_termios.c_oflag = 0;
-	driver->init_termios.c_lflag = 0;
 	driver->init_termios.c_cflag = B115200 | CS8 | CREAD | HUPCL | CLOCAL;
 	tty_set_operations(driver, &mktty_spawn_ops);
 	tty_port_link_device(&mktty_spawn.port, driver, 0);
