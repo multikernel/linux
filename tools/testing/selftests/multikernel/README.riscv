@@ -1,0 +1,82 @@
+.. SPDX-License-Identifier: GPL-2.0-only
+
+RISC-V lifecycle development checks
+==================================
+
+From this source tree, run with a native C compiler:
+
+  sh tools/testing/selftests/multikernel/manifest_hook_test.sh
+  sh tools/testing/selftests/multikernel/entry_test.sh
+  sh tools/testing/selftests/multikernel/boot_order_test.sh
+  sh tools/testing/selftests/multikernel/start_tracking_test.sh
+  sh tools/testing/selftests/multikernel/hsm_test.sh
+  sh tools/testing/selftests/multikernel/shutdown_test.sh
+
+These compile verbatim production functions against controlled kernel/firmware
+boundaries. Manifest checks use the in-tree libfdt. No RISC-V emulator, kernel
+boot or actual cache-coherence test is performed by these commands. They run
+from the source tree, not an installed kselftest bundle. CC and TMPDIR can be
+overridden; MK_SOURCE can select another compatible source tree.
+
+Checks cover preparation before /chosen emission, a tree larger than PAGE_SIZE,
+property-before-child ordering, allocation/mapping errors, all-hart tracking
+before priming, failed-release retention, sparse hart IDs, HSM error translation,
+bounded STOP_PENDING polling, and local machine halt/poweroff/restart routing.
+Boot ordering and early panic-notifier registration execute setup_arch up to
+sbi_init against controlled boundaries. Panic callbacks and crash shutdown are
+checked, but not the whole panic(), remote IPI path or SBI reset registration.
+The entry test substitutes instruction bytes: inspect entry.o separately for
+fence.i, relocations and a0/a1 preservation. Fake barriers check program order
+only, never hardware memory ordering.
+
+Entry lifetime and priming
+-------------------------
+
+The host prepares two adjacent control pages before generating the manifest:
+mutable entry data followed by immutable code. The stub starts with fence.i,
+finds the preceding data page using its own PC, loads image_entry, and jumps
+without changing a0 or a1. No relocation target is embedded in the copied code.
+The primary receives the boot DTB in a1. A secondary receives SBI boot data in
+a1; its Image entry is secondary_start_sbi, not the Image's primary entry.
+
+A fence.i in a newly copied stub alone is insufficient: its first instruction
+fetch may still see an earlier occupant of that physical page. Each assigned
+hart first runs mk_riscv_entry_fence_stop from immutable host text, fences and
+HART_STOPs. The host waits for STOPPED before using the copied stub. Pool entry
+also fences before HART_STOP. This depends on the host text remaining reserved
+and unchanged; it does not assume stopped harts accept remote fence requests.
+
+An opaque entry record would avoid a mutable entry immediate, but a1 then holds
+that record rather than the boot ABI's DTB/secondary data. Such a design must
+restore a1 and still solve the first-fetch problem if its code page is recycled.
+The current adjacent-page design preserves firmware-supplied a0/a1 directly.
+The secondary maps host-owned data with memremap, rather than assuming that a
+future no-map control reservation remains in the spawn's linear map.
+
+Not a runtime-ready stack
+-------------------------
+
+This architecture series must land together. It is not safe to advertise as a
+complete lifecycle implementation on this baseline. Shared resource serialization,
+uncertain ownership retention and shutdown state settlement remain prerequisites
+on master. In particular, a STOPPED snapshot does not cancel a queued remote
+start. A caller returning a hart to the pool must fence outstanding work first.
+The ACK reproducer/proposal is maintained separately; no wire policy is changed.
+
+#26 supplies the Image loader; #27 uses the manifest itself as the primary a1
+boot tree and emits assigned hart/intc nodes and control/boot-page reservations.
+Do not layer the obsolete July host-DTB clone on the modern persistent manifest.
+#28 supplies SBI doorbells and lifecycle
+notifications. No #28 message is sent from these local machine stop paths. Without
+that follow-up the host is not automatically notified about a voluntary stop.
+No #7 dependency is introduced. Existing ring resets are not a proof that work
+on surviving peers has drained or that old replies cannot cross a re-spawn.
+
+With panic_timeout=0 the spawn panic notifier stops immediately. A nonzero
+timeout follows the generic panic restart policy, but the spawn restart override
+still uses local HART_STOP, never host-wide reset. There is no parent notification
+in these local paths. Crash shutdown is guarded as well because crash kexec
+can run before notifiers. Host panic policy remains unchanged. HART_STOP failure
+leaves the hart in a local wait loop: host confirmation must fail and retain its
+resources. Fresh QEMU/OpenSBI, x86 concurrency, failure-injection and 50-cycle
+same/different-Image tests are still required after the dependencies are combined.

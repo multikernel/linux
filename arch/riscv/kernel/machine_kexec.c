@@ -5,6 +5,7 @@
  */
 
 #include <linux/kexec.h>
+#include <linux/multikernel.h>
 #include <asm/kexec.h>		/* For riscv_kexec_* symbol defines */
 #include <linux/smp.h>		/* For smp_send_stop () */
 #include <asm/cacheflush.h>	/* For local_flush_icache_all() */
@@ -123,6 +124,10 @@ void machine_shutdown(void)
 void
 machine_crash_shutdown(struct pt_regs *regs)
 {
+	/* Crash kexec can run before panic notifiers; keep a spawn contained. */
+	if (mk_spawned())
+		machine_halt();
+
 	local_irq_disable();
 
 	/* shutdown non-crashing cpus */

@@ -13,6 +13,9 @@
 #include <linux/init.h>
 #include <linux/mm.h>
 #include <linux/memblock.h>
+#include <linux/multikernel.h>
+#include <linux/libfdt.h>
+#include <linux/reboot.h>
 #include <linux/sched.h>
 #include <linux/console.h>
 #include <linux/of_fdt.h>
@@ -21,6 +24,7 @@
 #include <linux/efi.h>
 #include <linux/crash_dump.h>
 #include <linux/panic_notifier.h>
+#include <linux/panic.h>
 #include <linux/jump_label.h>
 #include <linux/gcd.h>
 
@@ -313,6 +317,20 @@ static void __init riscv_spinlock_init(void)
 
 extern void __init init_rt_signal_env(void);
 
+static int mk_spawn_panic_notify(struct notifier_block *nb, unsigned long event,
+				 void *data)
+{
+	/* Nonzero timeouts reach machine_restart(), which stops locally too. */
+	if (!panic_timeout)
+		machine_halt();
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block mk_spawn_panic_notifier = {
+	.notifier_call = mk_spawn_panic_notify,
+	.priority = INT_MAX,
+};
+
 void __init setup_arch(char **cmdline_p)
 {
 	parse_dtb();
@@ -321,6 +339,13 @@ void __init setup_arch(char **cmdline_p)
 	*cmdline_p = boot_command_line;
 
 	early_ioremap_setup();
+	/* The manifest itself is the boot DTB, before SBI reset registration. */
+	if (IS_ENABLED(CONFIG_MULTIKERNEL) && initial_boot_params &&
+	    of_flat_dt_is_compatible(of_get_flat_dt_root(), MK_FDT_COMPATIBLE))
+		mk_manifest_populate(dtb_early_pa, fdt_totalsize(initial_boot_params));
+	if (mk_spawned())
+		atomic_notifier_chain_register(&panic_notifier_list,
+					       &mk_spawn_panic_notifier);
 	sbi_init();
 	jump_label_init();
 	parse_early_param();
