@@ -44,6 +44,8 @@ Checks include:
 * Allocation/send failures, cancellation before/after completion, concurrent
   outstanding same-tuple requests, the last u64 ID and exhaustion are checked.
 * Voluntary HALTED and the uncorrelated sender retain their zero-ID behavior.
+* PCI add/remove ACKs match requester keys for domains 0x8000 and 0xffff;
+  signed promotion must not sign-extend the worker's u64 resource key.
 
 This is controlled interleaving, not a threaded race, kernel memory-ordering,
 transport-delay, boot or physical-runtime test. Pending entries must be removed
