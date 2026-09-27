@@ -48,7 +48,8 @@ int mk_arm_force_halt(struct mk_instance *instance);
 /* hotplug.c */
 int mk_hotplug_init(void);
 void mk_hotplug_cleanup(void);
-int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_len);
+int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_len,
+			 u64 msg_id);
 
 /*
  * Move primitives between this kernel and the pool it manages. Valid

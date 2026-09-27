@@ -1,84 +1,82 @@
 .. SPDX-License-Identifier: GPL-2.0-only
 
-ACK regression and characterization (development evidence)
-=========================================================
+ACK correlation checks
+======================
 
 From the repository root, with a host C compiler and awk:
 
   sh tools/testing/selftests/multikernel/ack_test.sh
-  sh tools/testing/selftests/multikernel/ack_test.sh regression
-  sh tools/testing/selftests/multikernel/ack_test.sh characterization
-  sh tools/testing/selftests/multikernel/ack_test.sh completion
 
-The completion mode isolates duplicate-result immutability (including after
-the waiter consumes its completion token), shutdown-operation validation and
-outer/inner message-family validation. It is not proof of request-ID matching.
+Optional modes: regression, characterization, completion, workers, failure.
+Each selected mode must exit 0; an invalid argument exits 2. CC and CFLAGS
+select the compiler and instrumentation, for example:
 
-At baseline 347841a29a940f0e4f0079ef51956d8cb4ddd3fe, the first two commands
-exit 1. Eight REGRESSION assertions fail; this is intentional evidence of
-missing safeguards, NOT an expected-failure wrapper or a passing test suite.
-The characterization-only command exits 0 with ten CHARACTERIZATION passes.
-An invalid argument exits 2. CC can select another host compiler.
+  CC=clang CFLAGS='-O1 -g -fsanitize=address -fno-omit-frame-pointer' \
+    sh tools/testing/selftests/multikernel/ack_test.sh
 
 What actually runs
 ------------------
 
-The script extracts complete definitions verbatim from the current checkout:
+The runner extracts complete definitions verbatim from the current checkout:
+pending allocation/ID/completion/wait/cancel, message encoder and dispatch,
+resource dispatch and all six receive handlers/workers, system dispatch and
+shutdown worker/notification/parking entry. The repository's tools/ list and
+error-pointer helpers are used. No alternate implementation of this logic is
+compiled. Production changes that break extraction fail compilation.
 
-* messaging.c: pending structure/list/lock, mk_msg_pending_add/complete/wait,
-  mk_send_message, handler structure and mk_message_type_ipi_callback.
-* hotplug.c: the complete mk_resource_msg_handler.
-* core.c: the complete mk_system_msg_handler and its work structures.
-* multikernel.h: complete message/IPI/payload types and protocol constants.
+Allocation, spinlocks, completions, transport, work scheduling, hardware
+mutation and final CPU parking are deterministic host boundaries. No real CPU,
+memory or PCI ownership transition occurs. The six sending resource helpers
+and multikernel_halt_by_id are checked by source review and kernel builds, not
+executed by this harness. Cancellation tests cover the pending/encoder APIs,
+not those callers' resource rollback behavior.
 
-The repository's tools/include/linux/list.h supplies the list implementation.
-Allocation, spinlocks, completions, transport and logging are host boundaries.
-The u64 alias uses kernel __u64 so production printk formats remain valid with
-host stdio; tools/ otherwise uses uint64_t, which is unsigned long on this host.
-Non-ACK resource requests and system work scheduling abort if reached. Their
-workers, ownership transitions and actual hotplug/parking are NOT simulated.
+Checks include:
 
-The stale tests register A, capture its ID from the real send encoder, time it
-out and free it, register/send B with the same tuple, and inject A's success ACK
-through both real dispatch layers. Only the transport is replaced. Request
-payloads are empty because no remote worker runs: this tests the encoder's ID,
-not request validation or the remote operation. ACK payloads are complete.
-The baseline encoder emits zero; the dispatch path discards even nonzero IDs.
+* Delayed CPU add/remove and shutdown ACK A cannot complete retry B.
+* IDs and type/operation/resource must all match; zero is not a pending ID.
+* Conflicting duplicates preserve the first result, even after the waiter
+  consumes its completion token. A wait that reported timeout stays timed out
+  if an ACK arrives before list removal.
+* Real workers retain IDs after the receive buffer is overwritten, echo both
+  zero and full-width nonzero IDs, preserve results and route replies to the
+  requester. Allocated-ID round trips pass through both real dispatch layers.
+* Allocation/send failures, cancellation before/after completion, concurrent
+  outstanding same-tuple requests, the last u64 ID and exhaustion are checked.
+* Voluntary HALTED and the uncorrelated sender retain their zero-ID behavior.
 
-The completion boundary consumes a completion token if present, including for
-a zero timeout; otherwise it immediately reports timeout. A single hook injects
-an ACK after timeout is decided but before pending removal. This is a controlled
-interleaving, NOT a real timer, threaded race test, kernel memory-ordering proof,
-transport-delay measurement or hardware/runtime qualification. Identical and
-conflicting duplicate replies are injected before the waiter reads the result.
+This is controlled interleaving, not a threaded race, kernel memory-ordering,
+transport-delay, boot or physical-runtime test. Pending entries must be removed
+and the lock released after wait/cancel. Sanitizers can check local memory use
+but do not qualify these substituted kernel boundaries.
 
-What the expectations mean
---------------------------
+Protocol limits
+---------------
 
-REGRESSION assertions specify the proposed safe behavior:
+The existing header and payload layouts are unchanged. Qualify matched-revision
+host/spawn kernels; differing configurations are allowed, mixed revisions are
+not qualified. Legacy zero-ID requests still execute and echo zero, but their
+replies cannot satisfy a new pending request. An old responder can execute a
+new request and return an unusable zero-ID ACK: rejecting it is not rollback.
 
-* Delayed A ACK must not complete B (CPU add, CPU remove, shutdown). Fix requires
-  distinct request identity carried through send/dispatch/worker/reply/matching.
-* A conflicting duplicate must preserve the first success/error. Fix requires
-  one terminal result under the pending lock, not just adding an ID comparison.
-* Zero and an unissued nonzero ID must not authorize a pending operation. These
-  are proposed correlation requirements, not existing wire promises. Rejecting
-  zero alone cannot fix stale replies; upgraded sends and echoed IDs are needed.
-* Shutdown ACK with a different operation must not complete shutdown. The
-  existing handler hardcodes MK_SYS_SHUTDOWN instead of checking ack.operation.
+IDs are unique only during one requester kernel lifetime. They are not peer
+authentication or session identity. Requester restart with surviving peers,
+queued work across restart, remote cancellation, CPU ownership recovery and
+safe image/ring reclamation require separate work. A shutdown ACK means the
+peer is about to park, not proof that all its CPUs have stopped.
 
-CHARACTERIZATION assertions cover existing tuple mismatch/short-ACK rejection,
-timeout cleanup, late ACK with no pending entry, the timeout/removal boundary,
-identical duplicates and propagation of a matching error. They do not establish
-safe correlation. Removing tuple/length checks, leaving a timed-out entry linked,
-carrying a reply into a future waiter, ignoring completion, or losing an error
-would break the corresponding check. Assertions also require the pending list
-to be empty and unlocked after every wait. A correct future correlation change
-must update fixtures/API calls to send genuine request IDs; do not invert the
-regression assertions or label baseline failures as passes.
+Known baseline sanitizer failure
+--------------------------------
 
-This test does not exercise requester restart, peer identity, older-peer remote
-execution, CPU ownership or actual parking. Those are source-trace/proposal
-items in the task report, not claims supported by these host checks. No wire
-policy or production code is changed. The test is deliberately standalone and
-not registered as a passing kernel selftest target.
+Full UBSan with -fno-sanitize-recover=undefined reports unaligned resource/ACK
+payload access: mk_message.payload starts at offset 20 on rv64/x86_64 while
+several payload structs require 8-byte alignment. Reproduced with the original
+characterization test at 11efe070fdd57c9e3f71218c92989697723f9a84 (before these
+fixes). Do not report full UBSan as passing, or change the wire layout to hide
+it. A wire-preserving alignment fix is a separate follow-up.
+
+Historical RED evidence: the original test at 11efe070 (on upstream 347841a29a94)
+failed eight regression assertions and passed ten characterizations. Worker
+echo tests additionally reproduced loss of nonzero IDs in all seven workers
+before ID plumbing. These are not expected-failure wrappers; current logical
+checks and ASan must pass.

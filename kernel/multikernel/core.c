@@ -1539,6 +1539,7 @@ void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size)
 
 struct mk_shutdown_work {
 	struct work_struct work;
+	u64 msg_id;
 	u32 flags;
 	int sender_instance_id;
 };
@@ -1551,7 +1552,7 @@ struct mk_shutdown_work {
  * from a voluntary halt the parent never asked for (HALTED); both mean
  * "my CPUs are about to park on my context".
  */
-static void __noreturn mk_notify_down_and_park(int target_id, u32 subtype)
+static void __noreturn mk_notify_down_and_park(int target_id, u32 subtype, u64 msg_id)
 {
 	struct mk_resource_ack ack;
 
@@ -1559,7 +1560,7 @@ static void __noreturn mk_notify_down_and_park(int target_id, u32 subtype)
 	ack.result = 0;
 	ack.resource_id = mk_self->id;
 
-	mk_send_message(target_id, MK_MSG_SYSTEM, subtype, &ack, sizeof(ack));
+	mk_send_message_id(target_id, MK_MSG_SYSTEM, subtype, msg_id, &ack, sizeof(ack));
 
 	pr_info("Multikernel instance %d shutting down\n", mk_self->id);
 
@@ -1582,16 +1583,17 @@ static void __noreturn mk_notify_down_and_park(int target_id, u32 subtype)
  */
 void __noreturn mk_halt_to_pool(void)
 {
-	mk_notify_down_and_park(0, MK_SYS_HALTED);
+	mk_notify_down_and_park(0, MK_SYS_HALTED, 0);
 }
 
 static void mk_shutdown_work_fn(struct work_struct *work)
 {
 	struct mk_shutdown_work *sw = container_of(work, struct mk_shutdown_work, work);
 	int sender_instance_id = sw->sender_instance_id;
+	u64 msg_id = sw->msg_id;
 
 	kfree(sw);
-	mk_notify_down_and_park(sender_instance_id, MK_SYS_SHUTDOWN_ACK);
+	mk_notify_down_and_park(sender_instance_id, MK_SYS_SHUTDOWN_ACK, msg_id);
 }
 
 /*
@@ -1631,7 +1633,7 @@ static void mk_halted_work_fn(struct work_struct *work)
 	kfree(aw);
 }
 
-static void mk_system_msg_handler(u32 msg_type, u32 subtype,
+static void mk_system_msg_handler(u32 msg_type, u32 subtype, u64 msg_id,
 				  void *payload, u32 payload_len, void *ctx)
 {
 	if (msg_type != MK_MSG_SYSTEM)
@@ -1652,6 +1654,7 @@ static void mk_system_msg_handler(u32 msg_type, u32 subtype,
 			return;
 
 		INIT_WORK(&sw->work, mk_shutdown_work_fn);
+		sw->msg_id = msg_id;
 		sw->flags = req->flags;
 		sw->sender_instance_id = req->sender_instance_id;
 		schedule_work(&sw->work);
@@ -1668,7 +1671,7 @@ static void mk_system_msg_handler(u32 msg_type, u32 subtype,
 		 * and settles its state itself.
 		 */
 		mk_msg_pending_complete(MK_MSG_SYSTEM, MK_SYS_SHUTDOWN,
-					ack->resource_id, ack->result);
+					ack->resource_id, msg_id, ack->result);
 		break;
 	}
 	case MK_SYS_HALTED: {
@@ -1730,15 +1733,15 @@ int multikernel_halt_by_id(int mk_id)
 	payload.sender_instance_id = mk_self->id;
 
 	pending = mk_msg_pending_add(MK_MSG_SYSTEM, MK_SYS_SHUTDOWN, mk_id);
-	if (!pending) {
+	if (IS_ERR(pending)) {
 		mk_instance_put(instance);
-		return -ENOMEM;
+		return PTR_ERR(pending);
 	}
 
-	ret = mk_send_message(mk_id, MK_MSG_SYSTEM, MK_SYS_SHUTDOWN,
-			      &payload, sizeof(payload));
+	ret = mk_send_message_id(mk_id, MK_MSG_SYSTEM, MK_SYS_SHUTDOWN,
+				 mk_msg_pending_id(pending), &payload, sizeof(payload));
 	if (ret < 0) {
-		mk_msg_pending_wait(pending, 0);
+		mk_msg_pending_cancel(pending);
 		mk_instance_put(instance);
 		return ret;
 	}
