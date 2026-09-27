@@ -12,10 +12,13 @@
 #include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/ktime.h>
+#include <linux/err.h>
+#include <linux/limits.h>
 #include <linux/multikernel.h>
 
 /* Pending message tracking for request-response pattern */
 struct mk_pending_msg {
+	u64 msg_id;                 /* Nonzero, never reused during this kernel boot */
 	u32 msg_type;               /* Message type (e.g., MK_MSG_RESOURCE) */
 	u32 operation;              /* Operation subtype (e.g., MK_RES_CPU_ADD) */
 	u64 resource_id;            /* Resource identifier (physical CPU ID, PFN, etc.) */
@@ -27,6 +30,7 @@ struct mk_pending_msg {
 
 static LIST_HEAD(mk_pending_msgs);
 static DEFINE_SPINLOCK(mk_pending_msgs_lock);
+static u64 mk_last_msg_id;
 
 /* Per-type message handler registry */
 struct mk_msg_type_handler {
@@ -91,7 +95,8 @@ static void mk_message_type_ipi_callback(struct mk_ipi_data *data, void *ctx)
 		 msg_type, msg_subtype, payload_len, data->sender_cpu);
 
 	/* Call the registered handler for this message type */
-	type_handler->msg_handler(msg_type, msg_subtype, payload, payload_len, type_handler->context);
+	type_handler->msg_handler(msg_type, msg_subtype, msg->msg_id,
+				  payload, payload_len, type_handler->context);
 }
 
 /*
@@ -104,7 +109,8 @@ static void mk_message_type_ipi_callback(struct mk_ipi_data *data, void *ctx)
  * @operation: Operation subtype
  * @resource_id: Resource identifier
  *
- * Returns pointer to pending message structure, or NULL on failure
+ * Returns a pending message, or ERR_PTR(-ENOMEM/-EOVERFLOW).
+ * The requester must consume it exactly once with wait or cancel.
  */
 struct mk_pending_msg *mk_msg_pending_add(u32 msg_type, u32 operation, u64 resource_id)
 {
@@ -113,7 +119,7 @@ struct mk_pending_msg *mk_msg_pending_add(u32 msg_type, u32 operation, u64 resou
 
 	pending = kzalloc(sizeof(*pending), GFP_KERNEL);
 	if (!pending)
-		return NULL;
+		return ERR_PTR(-ENOMEM);
 
 	pending->msg_type = msg_type;
 	pending->operation = operation;
@@ -122,10 +128,33 @@ struct mk_pending_msg *mk_msg_pending_add(u32 msg_type, u32 operation, u64 resou
 	init_completion(&pending->done);
 
 	spin_lock_irqsave(&mk_pending_msgs_lock, flags);
+	/* IDs are boot-local: exhaustion must fail, never wrap into an old ID. */
+	if (mk_last_msg_id == U64_MAX) {
+		spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
+		kfree(pending);
+		return ERR_PTR(-EOVERFLOW);
+	}
+	pending->msg_id = ++mk_last_msg_id;
 	list_add(&pending->list, &mk_pending_msgs);
 	spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
 
 	return pending;
+}
+
+u64 mk_msg_pending_id(const struct mk_pending_msg *pending)
+{
+	return pending->msg_id;
+}
+
+/* Local cleanup only: does not cancel a request already delivered to a peer. */
+void mk_msg_pending_cancel(struct mk_pending_msg *pending)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&mk_pending_msgs_lock, flags);
+	list_del(&pending->list);
+	spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
+	kfree(pending);
 }
 
 /**
@@ -133,18 +162,21 @@ struct mk_pending_msg *mk_msg_pending_add(u32 msg_type, u32 operation, u64 resou
  * @msg_type: Message type
  * @operation: Operation subtype
  * @resource_id: Resource identifier
+ * @msg_id: Nonzero request ID echoed by the responder
  * @result: Operation result (0 = success, negative = error)
  *
  * Called by response handlers to wake up waiting thread
  */
-void mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id, int result)
+void mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id,
+			     u64 msg_id, int result)
 {
 	struct mk_pending_msg *pending;
 	unsigned long flags;
 
 	spin_lock_irqsave(&mk_pending_msgs_lock, flags);
 	list_for_each_entry(pending, &mk_pending_msgs, list) {
-		if (pending->msg_type == msg_type &&
+		if (pending->msg_id == msg_id &&
+		    pending->msg_type == msg_type &&
 		    pending->operation == operation &&
 		    pending->resource_id == resource_id) {
 			if (!pending->completed) {
@@ -188,17 +220,19 @@ int mk_msg_pending_wait(struct mk_pending_msg *pending, unsigned long timeout_ms
 }
 
 /**
- * mk_send_message - Send a message to another multikernel instance
+ * mk_build_and_send - Build a message for an ID or referenced instance
  * @instance_id: Target multikernel instance ID
+ * @instance: Referenced target, or NULL for an ID lookup
  * @msg_type: Message type identifier
  * @subtype: Message subtype
+ * @msg_id: Request ID, or zero for an uncorrelated message
  * @payload: Pointer to payload data (can be NULL)
  * @payload_len: Length of payload data
  *
  * Returns 0 on success, negative error code on failure
  */
 static int mk_build_and_send(int instance_id, struct mk_instance *instance,
-			     u32 msg_type, u32 subtype, void *payload,
+			     u32 msg_type, u32 subtype, u64 msg_id, void *payload,
 			     u32 payload_len)
 {
 	struct mk_message *msg;
@@ -223,7 +257,7 @@ static int mk_build_and_send(int instance_id, struct mk_instance *instance,
 	/* Fill in message header */
 	msg->msg_type = msg_type;
 	msg->msg_subtype = subtype;
-	msg->msg_id = 0; /* Could be enhanced with unique IDs later */
+	msg->msg_id = msg_id;
 	msg->payload_len = payload_len;
 
 	/* Copy payload if provided */
@@ -252,18 +286,25 @@ static int mk_build_and_send(int instance_id, struct mk_instance *instance,
 	return 0;
 }
 
+int mk_send_message_id(int instance_id, u32 msg_type, u32 subtype, u64 msg_id,
+		       void *payload, u32 payload_len)
+{
+	return mk_build_and_send(instance_id, NULL, msg_type, subtype, msg_id,
+				 payload, payload_len);
+}
+
 int mk_send_message(int instance_id, u32 msg_type, u32 subtype,
 		    void *payload, u32 payload_len)
 {
-	return mk_build_and_send(instance_id, NULL, msg_type, subtype, payload,
-				 payload_len);
+	return mk_send_message_id(instance_id, msg_type, subtype, 0,
+				  payload, payload_len);
 }
 EXPORT_SYMBOL(mk_send_message);
 
 int mk_send_message_to(struct mk_instance *instance, u32 msg_type, u32 subtype,
 		       void *payload, u32 payload_len)
 {
-	return mk_build_and_send(instance->id, instance, msg_type, subtype,
+	return mk_build_and_send(instance->id, instance, msg_type, subtype, 0,
 				 payload, payload_len);
 }
 EXPORT_SYMBOL(mk_send_message_to);

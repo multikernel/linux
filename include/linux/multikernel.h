@@ -350,7 +350,7 @@ struct mk_shutdown_payload {
 /**
  * Message handler callback type
  */
-typedef void (*mk_msg_handler_t)(u32 msg_type, u32 subtype,
+typedef void (*mk_msg_handler_t)(u32 msg_type, u32 subtype, u64 msg_id,
 				 void *payload, u32 payload_len, void *ctx);
 
 /* Opaque type for pending message tracking */
@@ -372,6 +372,8 @@ struct mk_pending_msg;
  */
 int mk_send_message(int instance_id, u32 msg_type, u32 subtype,
 		    void *payload, u32 payload_len);
+int mk_send_message_id(int instance_id, u32 msg_type, u32 subtype, u64 msg_id,
+		       void *payload, u32 payload_len);
 
 /*
  * The same for a caller that holds a reference to @instance. Looking an
@@ -413,9 +415,16 @@ int mk_register_msg_handler(u32 msg_type, mk_msg_handler_t handler, void *ctx);
  */
 int mk_unregister_msg_handler(u32 msg_type, mk_msg_handler_t handler);
 
-/* Pending message tracking for request-response pattern */
+/*
+ * Pending requests: add returns ERR_PTR on failure. The requester owns the
+ * pointer until exactly one wait or cancel; neither may run concurrently on
+ * the same pointer. IDs are unique only within this kernel's lifetime.
+ */
 struct mk_pending_msg *mk_msg_pending_add(u32 msg_type, u32 operation, u64 resource_id);
-void mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id, int result);
+u64 mk_msg_pending_id(const struct mk_pending_msg *pending);
+void mk_msg_pending_cancel(struct mk_pending_msg *pending);
+void mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id,
+			     u64 msg_id, int result);
 int mk_msg_pending_wait(struct mk_pending_msg *pending, unsigned long timeout_ms);
 
 /**

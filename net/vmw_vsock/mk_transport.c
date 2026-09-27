@@ -296,7 +296,7 @@ static void mk_vsock_rx_work(struct work_struct *work)
 		mk_vsock_rx_pkt(skb);
 }
 
-static void mk_vsock_ipi_handler(u32 msg_type, u32 subtype,
+static void mk_vsock_ipi_handler(u32 msg_type, u32 subtype, u64 msg_id,
 				 void *payload, u32 payload_len, void *ctx)
 {
 	struct sk_buff *skb;
