@@ -452,6 +452,37 @@ static void worker_regressions(void)
 	       ((struct mk_message *)sent.buffer)->msg_subtype == MK_SYS_HALTED, 1);
 }
 
+static void pci_key_regressions(void)
+{
+	const u16 domains[] = { 0x8000, 0xffff };
+	const u32 ops[] = { MK_RES_DEVICE_ADD, MK_RES_DEVICE_REMOVE };
+	struct mk_device_resource_payload payload = { .devfn = 1, .sender_instance_id = 3 };
+	size_t i, j;
+
+	for (i = 0; i < ARRAY_SIZE(domains); i++) {
+		for (j = 0; j < ARRAY_SIZE(ops); j++) {
+			struct mk_pending_msg *p;
+			struct work_struct *work;
+			u32 resource_id = ((u32)domains[i] << 16) | payload.devfn;
+
+			payload.domain = domains[i];
+			p = mk_msg_pending_add(MK_MSG_RESOURCE, ops[j], resource_id);
+			assert(!IS_ERR(p));
+			assert(!mk_send_message_id(1, MK_MSG_RESOURCE, ops[j],
+						   mk_msg_pending_id(p), &payload,
+						   sizeof(payload)));
+			dispatch(&sent);
+			assert(queued);
+			work = queued;
+			queued = NULL;
+			mutation_result = 0;
+			run_work(work, false);
+			dispatch(&sent);
+			expect("REGRESSION", "high PCI domain round trip", finish(p), 0);
+		}
+	}
+}
+
 static void failure_regressions(void)
 {
 	struct mk_pending_msg *p, *other;
@@ -525,6 +556,8 @@ int main(int argc, char **argv)
 		completion_regressions();
 	if (argc == 1 || !strcmp(argv[1], "regression"))
 		regressions();
+	if (argc == 1 || !strcmp(argv[1], "regression"))
+		pci_key_regressions();
 	if (argc == 1 || !strcmp(argv[1], "characterization"))
 		characterizations();
 	if (argc == 1 || !strcmp(argv[1], "workers"))

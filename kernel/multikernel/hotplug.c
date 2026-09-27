@@ -837,7 +837,7 @@ static void mk_device_add_work_fn(struct work_struct *work)
 
 	ack.operation = hp_work->operation;
 	ack.result = ret;
-	ack.resource_id = (hp_work->domain << 16) | (hp_work->bus << 8) | hp_work->devfn;
+	ack.resource_id = ((u32)hp_work->domain << 16) | (hp_work->bus << 8) | hp_work->devfn;
 
 	ack_ret = mk_send_message_id(hp_work->sender_instance_id, MK_MSG_RESOURCE,
 				     MK_RES_ACK, hp_work->msg_id, &ack, sizeof(ack));
@@ -860,7 +860,7 @@ static void mk_device_remove_work_fn(struct work_struct *work)
 
 	ack.operation = hp_work->operation;
 	ack.result = ret;
-	ack.resource_id = (hp_work->domain << 16) | (hp_work->bus << 8) | hp_work->devfn;
+	ack.resource_id = ((u32)hp_work->domain << 16) | (hp_work->bus << 8) | hp_work->devfn;
 
 	ack_ret = mk_send_message_id(hp_work->sender_instance_id, MK_MSG_RESOURCE,
 				     MK_RES_ACK, hp_work->msg_id, &ack, sizeof(ack));
@@ -1606,7 +1606,7 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 	else
 		payload.driver_override[0] = '\0';
 
-	resource_id = (domain << 16) | (bus << 8) | devfn;
+	resource_id = ((u32)domain << 16) | (bus << 8) | devfn;
 
 	if (instance_id == mk_self->id) {
 		if (mk_pool)
@@ -1684,7 +1684,7 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 	u32 resource_id;
 
 	payload.driver_override[0] = '\0';
-	resource_id = (domain << 16) | (bus << 8) | devfn;
+	resource_id = ((u32)domain << 16) | (bus << 8) | devfn;
 
 	if (instance_id == mk_self->id) {
 		if (mk_pool)
