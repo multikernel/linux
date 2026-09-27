@@ -5,8 +5,11 @@
  * Copyright (c) 2020 Western Digital Corporation or its affiliates.
  */
 
+#include <linux/cacheflush.h>
 #include <linux/init.h>
+#include <linux/io.h>
 #include <linux/mm.h>
+#include <linux/multikernel.h>
 #include <linux/sched/task_stack.h>
 #include <asm/cpu_ops.h>
 #include <asm/cpu_ops_sbi.h>
@@ -23,42 +26,87 @@ const struct cpu_operations cpu_ops_sbi;
  */
 static struct sbi_hart_boot_data boot_data[NR_CPUS];
 
-static int sbi_hsm_hart_start(unsigned long hartid, unsigned long saddr,
-			      unsigned long priv)
+static int sbi_hsm_err_map_linux_errno(long err)
+{
+	switch (err) {
+	case SBI_ERR_ALREADY_AVAILABLE:
+	case SBI_ERR_ALREADY_STARTED:
+	case SBI_ERR_ALREADY_STOPPED:
+		return -EALREADY;
+	case SBI_ERR_FAILURE:
+		return -EIO;
+	default:
+		return sbi_err_map_linux_errno(err);
+	}
+}
+
+int sbi_hsm_hart_start(unsigned long hartid, unsigned long saddr,
+		       unsigned long priv)
 {
 	struct sbiret ret;
 
 	ret = sbi_ecall(SBI_EXT_HSM, SBI_EXT_HSM_HART_START,
 			hartid, saddr, priv, 0, 0, 0);
 	if (ret.error)
-		return sbi_err_map_linux_errno(ret.error);
+		return sbi_hsm_err_map_linux_errno(ret.error);
 	else
 		return 0;
 }
 
 #ifdef CONFIG_HOTPLUG_CPU
-static int sbi_hsm_hart_stop(void)
+int sbi_hsm_hart_stop(void)
 {
 	struct sbiret ret;
 
+	/* A stopped hart cannot receive the remote fence for its next entry. */
+	local_flush_icache_all();
 	ret = sbi_ecall(SBI_EXT_HSM, SBI_EXT_HSM_HART_STOP, 0, 0, 0, 0, 0, 0);
 
 	if (ret.error)
-		return sbi_err_map_linux_errno(ret.error);
+		return sbi_hsm_err_map_linux_errno(ret.error);
 	else
 		return 0;
 }
 
-static int sbi_hsm_hart_get_status(unsigned long hartid)
+int sbi_hsm_hart_get_status(unsigned long hartid)
 {
 	struct sbiret ret;
 
 	ret = sbi_ecall(SBI_EXT_HSM, SBI_EXT_HSM_HART_STATUS,
 			hartid, 0, 0, 0, 0, 0);
 	if (ret.error)
-		return sbi_err_map_linux_errno(ret.error);
+		return sbi_hsm_err_map_linux_errno(ret.error);
 	else
 		return ret.value;
+}
+#endif
+
+#ifdef CONFIG_MULTIKERNEL
+static int sbi_spawn_cpu_entry(unsigned long *boot_addr)
+{
+	struct mk_riscv_spawn_context *ctx;
+	phys_addr_t stub_addr;
+
+	if (!mk_spawned())
+		return 0;
+
+	stub_addr = mk_manifest_entry_stub_phys();
+	if (stub_addr < PAGE_SIZE || !IS_ALIGNED(stub_addr, PAGE_SIZE)) {
+		pr_err_once("SBI: invalid multikernel entry stub address %pa\n",
+			    &stub_addr);
+		return -EINVAL;
+	}
+
+	/* #27 reserves this host-owned data no-map; do not assume a linear map. */
+	ctx = memremap(stub_addr - PAGE_SIZE, PAGE_SIZE, MEMREMAP_WB);
+	if (!ctx)
+		return -ENOMEM;
+	WRITE_ONCE(ctx->image_entry, *boot_addr);
+	/* Publish the secondary entry before firmware can enter the stub. */
+	smp_wmb();
+	memunmap(ctx);
+	*boot_addr = stub_addr;
+	return 0;
 }
 #endif
 
@@ -73,6 +121,14 @@ static int sbi_cpu_start(unsigned int cpuid, struct task_struct *tidle)
 	smp_mb();
 	bdata->task_ptr = tidle;
 	bdata->stack_ptr = task_pt_regs(tidle);
+#ifdef CONFIG_MULTIKERNEL
+	{
+		int ret = sbi_spawn_cpu_entry(&boot_addr);
+
+		if (ret)
+			return ret;
+	}
+#endif
 	/* Make sure boot data is updated */
 	smp_mb();
 	hsm_data = __pa(bdata);
