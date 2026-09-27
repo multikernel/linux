@@ -8,6 +8,11 @@ From the repository root, with a host C compiler and awk:
   sh tools/testing/selftests/multikernel/ack_test.sh
   sh tools/testing/selftests/multikernel/ack_test.sh regression
   sh tools/testing/selftests/multikernel/ack_test.sh characterization
+  sh tools/testing/selftests/multikernel/ack_test.sh completion
+
+The completion mode isolates duplicate-result immutability (including after
+the waiter consumes its completion token), shutdown-operation validation and
+outer/inner message-family validation. It is not proof of request-ID matching.
 
 At baseline 347841a29a940f0e4f0079ef51956d8cb4ddd3fe, the first two commands
 exit 1. Eight REGRESSION assertions fail; this is intentional evidence of
