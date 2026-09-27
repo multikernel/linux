@@ -20,6 +20,7 @@ struct mk_pending_msg {
 	u32 operation;              /* Operation subtype (e.g., MK_RES_CPU_ADD) */
 	u64 resource_id;            /* Resource identifier (physical CPU ID, PFN, etc.) */
 	int result;                 /* Operation result */
+	bool completed;             /* First reply wins, even after the waiter wakes */
 	struct completion done;     /* Completion for waiting */
 	struct list_head list;      /* List linkage */
 };
@@ -71,6 +72,8 @@ static void mk_message_type_ipi_callback(struct mk_ipi_data *data, void *ctx)
 	}
 
 	msg = (struct mk_message *)data->buffer;
+	if (msg->msg_type != data->type)
+		return;
 
 	/* Validate message structure */
 	if (msg->payload_len > (data->data_size - sizeof(struct mk_message))) {
@@ -144,8 +147,11 @@ void mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id, int r
 		if (pending->msg_type == msg_type &&
 		    pending->operation == operation &&
 		    pending->resource_id == resource_id) {
-			pending->result = result;
-			complete(&pending->done);
+			if (!pending->completed) {
+				pending->result = result;
+				pending->completed = true;
+				complete(&pending->done);
+			}
 			break;
 		}
 	}
@@ -163,18 +169,17 @@ int mk_msg_pending_wait(struct mk_pending_msg *pending, unsigned long timeout_ms
 {
 	unsigned long timeout = msecs_to_jiffies(timeout_ms);
 	unsigned long flags;
+	unsigned long completed;
 	int result;
 
-	if (!wait_for_completion_timeout(&pending->done, timeout)) {
+	completed = wait_for_completion_timeout(&pending->done, timeout);
+	if (!completed)
 		pr_err("Timeout waiting for operation 0x%x on resource %llu\n",
 		       pending->operation, pending->resource_id);
-		result = -ETIMEDOUT;
-	} else {
-		result = pending->result;
-	}
 
-	/* Remove from list and free */
+	/* A reply arriving after the wait timed out cannot undo the timeout. */
 	spin_lock_irqsave(&mk_pending_msgs_lock, flags);
+	result = completed ? pending->result : -ETIMEDOUT;
 	list_del(&pending->list);
 	spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
 	kfree(pending);

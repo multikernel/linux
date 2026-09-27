@@ -1707,7 +1707,7 @@ static void mk_system_msg_handler(u32 msg_type, u32 subtype,
 	case MK_SYS_SHUTDOWN_ACK: {
 		struct mk_resource_ack *ack = payload;
 
-		if (payload_len < sizeof(*ack))
+		if (payload_len < sizeof(*ack) || ack->operation != MK_SYS_SHUTDOWN)
 			return;
 		/*
 		 * Reply to a shutdown this kernel requested: wake the

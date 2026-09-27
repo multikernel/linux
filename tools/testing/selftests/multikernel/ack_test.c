@@ -31,6 +31,7 @@ struct completion {
 };
 
 static void (*at_timeout)(void);
+static void (*at_completion)(void);
 
 static void init_completion(struct completion *c)
 {
@@ -47,6 +48,12 @@ static unsigned long wait_for_completion_timeout(struct completion *c,
 {
 	if (c->done) {
 		c->done--;
+		if (at_completion) {
+			void (*hook)(void) = at_completion;
+
+			at_completion = NULL;
+			hook();
+		}
 		return timeout ? timeout : 1;
 	}
 	/* Inject an ACK after timeout is decided, before pending list removal. */
@@ -169,6 +176,57 @@ static void cpu_ack(void)
 	reply(MK_MSG_RESOURCE, MK_RES_CPU_ADD, 65537, 0, 0, false);
 }
 
+static void cpu_error_ack(void)
+{
+	reply(MK_MSG_RESOURCE, MK_RES_CPU_ADD, 65537, -EIO, 0, false);
+}
+
+static unsigned int callbacks;
+
+static void count_callback(u32 type, u32 subtype, void *payload, u32 len, void *ctx)
+{
+	callbacks++;
+}
+
+static void completion_regressions(void)
+{
+	struct mk_pending_msg *p;
+	struct mk_ipi_data data = { .type = MK_MSG_RESOURCE };
+	struct mk_message *msg = (struct mk_message *)data.buffer;
+	struct mk_msg_type_handler handler = {
+		.msg_type = MK_MSG_RESOURCE, .msg_handler = count_callback,
+	};
+
+	/* A completion token is consumed by the waiter, not by duplicates. */
+	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
+	cpu_ack();
+	cpu_error_ack();
+	expect("REGRESSION", "duplicate must preserve first success", finish(p), 0);
+	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
+	cpu_error_ack();
+	cpu_ack();
+	expect("REGRESSION", "duplicate must preserve first error", finish(p), -EIO);
+	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
+	cpu_ack();
+	at_completion = cpu_error_ack;
+	expect("REGRESSION", "duplicate after waiter consumes token", finish(p), 0);
+
+	p = pending(MK_MSG_SYSTEM, MK_SYS_SHUTDOWN);
+	reply(MK_MSG_SYSTEM, MK_RES_CPU_ADD, 65537, 0, 0, false);
+	expect("REGRESSION", "shutdown operation mismatch", finish(p), -ETIMEDOUT);
+
+	/* Reject a confused outer/inner family before calling any handler. */
+	msg->msg_type = MK_MSG_SYSTEM;
+	msg->payload_len = 0;
+	data.data_size = sizeof(*msg);
+	mk_message_type_ipi_callback(&data, &handler);
+	expect("REGRESSION", "outer/inner family mismatch", callbacks, 0);
+	callbacks = 0;
+	msg->msg_type = MK_MSG_RESOURCE;
+	mk_message_type_ipi_callback(&data, &handler);
+	expect("REGRESSION", "matching family reaches handler", callbacks, 1);
+}
+
 static void regressions(void)
 {
 	const struct {
@@ -195,16 +253,6 @@ static void regressions(void)
 		expect("REGRESSION", stale[i].name, finish(p), -ETIMEDOUT);
 	}
 
-	/* Fix: accept a result once under the pending-list lock. */
-	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
-	cpu_ack();
-	reply(MK_MSG_RESOURCE, MK_RES_CPU_ADD, 65537, -EIO, 0, false);
-	expect("REGRESSION", "duplicate must preserve first success", finish(p), 0);
-	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
-	reply(MK_MSG_RESOURCE, MK_RES_CPU_ADD, 65537, -EIO, 0, false);
-	cpu_ack();
-	expect("REGRESSION", "duplicate must preserve first error", finish(p), -EIO);
-
 	/* Proposed contract, not the baseline protocol: zero cannot authorize. */
 	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
 	cpu_ack();
@@ -213,10 +261,6 @@ static void regressions(void)
 	reply(MK_MSG_RESOURCE, MK_RES_CPU_ADD, 65537, 0, 42, false);
 	expect("REGRESSION", "unissued msg_id must not authorize", finish(p), -ETIMEDOUT);
 
-	/* Fix: validate the operation before completing a shutdown request. */
-	p = pending(MK_MSG_SYSTEM, MK_SYS_SHUTDOWN);
-	reply(MK_MSG_SYSTEM, MK_RES_CPU_ADD, 65537, 0, 0, false);
-	expect("REGRESSION", "shutdown operation mismatch", finish(p), -ETIMEDOUT);
 }
 
 static void characterizations(void)
@@ -275,10 +319,14 @@ static void characterizations(void)
 int main(int argc, char **argv)
 {
 	if (argc > 2 || (argc == 2 && strcmp(argv[1], "regression") &&
-			strcmp(argv[1], "characterization"))) {
-		fprintf(stderr, "usage: ack_test [regression|characterization]\n");
+			strcmp(argv[1], "characterization") &&
+			strcmp(argv[1], "completion"))) {
+		fprintf(stderr, "usage: ack_test [regression|characterization|completion]\n");
 		return 2;
 	}
+	if (argc == 1 || !strcmp(argv[1], "regression") ||
+	    !strcmp(argv[1], "completion"))
+		completion_regressions();
 	if (argc == 1 || !strcmp(argv[1], "regression"))
 		regressions();
 	if (argc == 1 || !strcmp(argv[1], "characterization"))
