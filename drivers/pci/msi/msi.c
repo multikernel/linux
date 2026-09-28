@@ -11,6 +11,7 @@
 #include <linux/export.h>
 #include <linux/irq.h>
 #include <linux/irqdomain.h>
+#include <linux/multikernel.h>
 
 #include "../pci.h"
 #include "msi.h"
@@ -239,6 +240,14 @@ static inline void pci_write_msg_msix(struct msi_desc *desc, struct msi_msg *msg
 void __pci_write_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
 {
 	struct pci_dev *dev = msi_desc_to_pci_dev(entry);
+
+	if (mk_pci_msi_controlled(dev)) {
+		/* Host programming is committed later from the setup context. */
+		entry->msg = *msg;
+		if (entry->write_msi_msg)
+			entry->write_msi_msg(entry, entry->write_msi_msg_data);
+		return;
+	}
 
 	if (dev->current_state != PCI_D0 || pci_dev_is_disconnected(dev)) {
 		/* Don't touch the hardware now */
@@ -714,6 +723,7 @@ static int msix_setup_interrupts(struct pci_dev *dev, struct msix_entry *entries
 static int msix_capability_init(struct pci_dev *dev, struct msix_entry *entries,
 				int nvec, struct irq_affinity *affd)
 {
+	bool controlled = mk_pci_msi_controlled(dev);
 	int ret, tsize;
 	u16 control;
 
@@ -736,6 +746,15 @@ static int msix_capability_init(struct pci_dev *dev, struct msix_entry *entries,
 		ret = -ENOMEM;
 		goto out_disable;
 	}
+	if (controlled &&
+	    !pci_msi_domain_supports(dev, MSI_FLAG_NO_MASK, DENY_LEGACY)) {
+		/*
+		 * The controlled setup path activates host-owned vectors from
+		 * msix_setup_interrupts(). Clear stale table entries while the
+		 * function-wide mask is still set, before host activation.
+		 */
+		msix_mask_all(dev->msix_base, tsize);
+	}
 
 	ret = msix_setup_interrupts(dev, entries, nvec, affd);
 	if (ret)
@@ -744,7 +763,8 @@ static int msix_capability_init(struct pci_dev *dev, struct msix_entry *entries,
 	/* Disable INTX */
 	pci_intx_for_msi(dev, 0);
 
-	if (!pci_msi_domain_supports(dev, MSI_FLAG_NO_MASK, DENY_LEGACY)) {
+	if (!controlled &&
+	    !pci_msi_domain_supports(dev, MSI_FLAG_NO_MASK, DENY_LEGACY)) {
 		/*
 		 * Ensure that all table entries are masked to prevent
 		 * stale entries from firing in a crash kernel.

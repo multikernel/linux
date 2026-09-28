@@ -128,6 +128,14 @@ static int do_kexec_load(unsigned long entry, unsigned long nr_segments,
 
 			count = kimage_get_all_by_type(KEXEC_TYPE_MULTIKERNEL, images, 10);
 			for (i = 0; i < count; i++) {
+				ret = kimage_prepare_multikernel_unload(images[i]);
+				if (ret) {
+					pr_err("Multikernel image %d is still in use: %d\n",
+					       images[i]->mk_id, ret);
+					goto out_unlock;
+				}
+			}
+			for (i = 0; i < count; i++) {
 				kimage_remove_from_list(images[i]);
 				kimage_free(images[i]);
 			}

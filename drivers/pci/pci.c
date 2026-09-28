@@ -16,6 +16,7 @@
 #include <linux/iommu.h>
 #include <linux/lockdep.h>
 #include <linux/msi.h>
+#include <linux/multikernel.h>
 #include <linux/of.h>
 #include <linux/pci.h>
 #include <linux/pm.h>
@@ -4380,6 +4381,8 @@ int pcie_reset_flr(struct pci_dev *dev, bool probe)
 
 	if (probe)
 		return 0;
+	if (mk_pci_controlled(dev))
+		return mk_pci_reset_flr(dev);
 
 	return pcie_flr(dev);
 }

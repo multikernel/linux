@@ -14,6 +14,7 @@
 
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/bitmap.h>
 #include <linux/cpu.h>
 #include <linux/memory.h>
 #include <linux/memory_hotplug.h>
@@ -23,6 +24,8 @@
 #include <linux/mmzone.h>
 #include <linux/multikernel.h>
 #include <linux/pci.h>
+#include <linux/ratelimit.h>
+#include <linux/workqueue.h>
 #include "internal.h"
 
 static const char mk_mem_resource_name[] = "System RAM (multikernel)";
@@ -65,36 +68,97 @@ struct mk_hotplug_op {
 static DEFINE_MUTEX(mk_hotplug_mutex);
 static LIST_HEAD(mk_hotplug_ops);
 
+struct mk_hotplug_work {
+	struct work_struct work;
+	work_func_t dispatch;
+	unsigned int pool_slot;
+	int sender_instance_id;
+	u32 operation;
+	union {
+		struct {
+			mk_phys_cpu_t cpu_id;
+			u32 numa_node;
+			u32 flags;
+		} cpu;
+		struct {
+			u64 start_pfn;
+			u64 nr_pages;
+			u32 numa_node;
+			u32 mem_type;
+		} mem;
+		struct {
+			u16 domain;
+			u8 bus;
+			u8 devfn;
+			u32 flags;
+			char driver_override[64];
+		} device;
+	};
+};
+
+static struct mk_hotplug_work *mk_hotplug_work_pool;
+static unsigned long *mk_hotplug_work_pool_busy;
+static unsigned int mk_hotplug_work_pool_size;
+static atomic_t mk_hotplug_work_pool_cursor = ATOMIC_INIT(0);
+static struct workqueue_struct *mk_hotplug_workqueue;
+static atomic64_t mk_hotplug_work_dropped = ATOMIC64_INIT(0);
+static DEFINE_RATELIMIT_STATE(mk_hotplug_work_pool_rs,
+			     DEFAULT_RATELIMIT_INTERVAL,
+			     DEFAULT_RATELIMIT_BURST);
+
+static void mk_hotplug_work_drop(void)
+{
+	atomic64_inc(&mk_hotplug_work_dropped);
+	if (__ratelimit(&mk_hotplug_work_pool_rs))
+		printk_deferred("WARNING: Multikernel hotplug work request dropped\n");
+}
+
+static struct mk_hotplug_work *mk_hotplug_work_get(void)
+{
+	unsigned int start;
+	unsigned int slot;
+	unsigned int i;
+
+	start = (unsigned int)atomic_inc_return(&mk_hotplug_work_pool_cursor);
+	for (i = 0; i < mk_hotplug_work_pool_size; i++) {
+		slot = (start + i) % mk_hotplug_work_pool_size;
+		if (!test_and_set_bit_lock(slot, mk_hotplug_work_pool_busy))
+			return &mk_hotplug_work_pool[slot];
+	}
+
+	mk_hotplug_work_drop();
+	return NULL;
+}
+
+static void mk_hotplug_work_put(struct mk_hotplug_work *hp_work)
+{
+	clear_bit_unlock(hp_work->pool_slot, mk_hotplug_work_pool_busy);
+}
+
+static void mk_hotplug_work_fn(struct work_struct *work)
+{
+	struct mk_hotplug_work *hp_work =
+		container_of(work, struct mk_hotplug_work, work);
+
+	hp_work->dispatch(work);
+	mk_hotplug_work_put(hp_work);
+}
+
+static int mk_hotplug_work_queue(struct mk_hotplug_work *hp_work,
+				 work_func_t dispatch)
+{
+	hp_work->dispatch = dispatch;
+	if (queue_work(mk_hotplug_workqueue, &hp_work->work))
+		return 0;
+
+	mk_hotplug_work_put(hp_work);
+	mk_hotplug_work_drop();
+	return -EBUSY;
+}
+
 /*
  * CPU Hotplug Operations
  */
-struct mk_cpu_hotplug_work {
-	struct work_struct work;
-	mk_phys_cpu_t cpu_id;
-	u32 numa_node;
-	u32 flags;
-	int sender_instance_id;  /* For sending ACK back */
-	u32 operation;           /* MK_RES_CPU_ADD or MK_RES_CPU_REMOVE */
-};
-
-/*
- * Ownership tracking for this kernel's own hotplug: mk_self->cpus
- * is the set of CPUs this kernel owns, in the host and in spawn kernels
- * alike. The assignable-pool bookkeeping (mk_pool) is not done here;
- * it belongs to the mk_send_cpu_* initiator paths of the kernel that
- * manages the pool.
- */
-static void mk_account_cpu_online(mk_phys_cpu_t cpu_id)
-{
-	if (mk_self->cpus && mk_cpu_set_add(mk_self->cpus, cpu_id))
-		pr_warn("Multikernel hotplug: Failed to track CPU %llu\n",
-			cpu_id);
-}
-
-static void mk_account_cpu_offline(mk_phys_cpu_t cpu_id)
-{
-	mk_cpu_set_del(mk_self->cpus, cpu_id);
-}
 
 /**
  * Search present CPUs (not possible CPUs) to find the logical CPU with matching
@@ -124,6 +188,7 @@ static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 	pr_info("Multikernel hotplug: Adding CPU %llu (numa=%d, flags=0x%x)\n",
 		cpu_id, (int)numa_node, flags);
 
+	mk_cpu_transaction_lock();
 	logical_cpu = mk_cpu_to_logical(cpu_id);
 	if (logical_cpu < 0) {
 		/*
@@ -136,7 +201,8 @@ static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 		if (logical_cpu < 0) {
 			pr_err("Multikernel hotplug: CPU %llu is not in this kernel's pool\n",
 			       cpu_id);
-			return -ENODEV;
+			ret = -ENODEV;
+			goto unlock_transaction;
 		}
 		set_cpu_present(logical_cpu, true);
 	}
@@ -144,18 +210,37 @@ static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 	if (cpu_online(logical_cpu)) {
 		pr_warn("Multikernel hotplug: CPU %d (phys %llu) already online\n",
 			logical_cpu, cpu_id);
-		mk_account_cpu_online(cpu_id);
-		return 0;
+		mk_cpu_ownership_lock();
+		if (mk_self->cpus) {
+			ret = mk_cpu_set_add(mk_self->cpus, cpu_id);
+			if (ret)
+				pr_warn("Multikernel hotplug: Failed to track CPU %llu in root pool\n",
+					cpu_id);
+		}
+		mk_cpu_ownership_unlock();
+		ret = 0;
+		goto unlock_transaction;
 	}
+
+	mk_cpu_ownership_lock();
+	if (mk_self->cpus) {
+		ret = mk_cpu_set_reserve(mk_self->cpus, 1);
+		if (ret) {
+			mk_cpu_ownership_unlock();
+			goto unlock_transaction;
+		}
+	}
+	mk_cpu_ownership_unlock();
 
 	if (!get_cpu_device(logical_cpu)) {
 		struct cpu *c = &per_cpu(cpu_devices, logical_cpu);
+
 		c->hotpluggable = true;
 		ret = register_cpu(c, logical_cpu);
 		if (ret) {
 			pr_err("Multikernel hotplug: Failed to register CPU %d: %d\n",
 			       logical_cpu, ret);
-			return ret;
+			goto unlock_transaction;
 		}
 	}
 
@@ -163,10 +248,19 @@ static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 	if (ret < 0) {
 		pr_err("Multikernel hotplug: Failed to add CPU %d (phys %llu): %d\n",
 		       logical_cpu, cpu_id, ret);
-		return ret;
+		goto unlock_transaction;
 	}
 
-	mk_account_cpu_online(cpu_id);
+	mk_cpu_ownership_lock();
+	if (mk_self->cpus) {
+		ret = mk_cpu_set_add(mk_self->cpus, cpu_id);
+		if (ret)
+			pr_warn("Multikernel hotplug: Failed to track CPU %llu in root pool\n",
+				cpu_id);
+	}
+	mk_cpu_ownership_unlock();
+	if (ret)
+		goto unlock_transaction;
 
 	/* Track the operation for potential rollback */
 	op = kzalloc(sizeof(*op), GFP_KERNEL);
@@ -183,7 +277,10 @@ static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 	pr_info("Multikernel hotplug: Successfully added CPU %d (phys %llu)\n",
 		logical_cpu, cpu_id);
 
-	return 0;
+	ret = 0;
+unlock_transaction:
+	mk_cpu_transaction_unlock();
+	return ret;
 }
 
 static int mk_do_cpu_remove(mk_phys_cpu_t cpu_id)
@@ -191,34 +288,56 @@ static int mk_do_cpu_remove(mk_phys_cpu_t cpu_id)
 	int logical_cpu;
 	int ret;
 	struct mk_hotplug_op *op;
+	bool tracked;
 
+	mk_cpu_transaction_lock();
 	logical_cpu = mk_cpu_to_logical(cpu_id);
 	if (logical_cpu < 0) {
 		pr_err("Multikernel hotplug: Physical CPU %llu not found\n", cpu_id);
-		return -ENODEV;
+		ret = -ENODEV;
+		goto unlock_transaction;
 	}
+
+	mk_cpu_ownership_lock();
+	tracked = mk_self->cpus &&
+		  mk_cpu_set_contains(mk_self->cpus, cpu_id);
 
 	if (!cpu_online(logical_cpu)) {
 		pr_warn("Multikernel hotplug: CPU %d (phys %llu) already offline\n",
 			logical_cpu, cpu_id);
-		mk_account_cpu_offline(cpu_id);
-		return 0;
+		mk_cpu_set_del(mk_self->cpus, cpu_id);
+		mk_cpu_ownership_unlock();
+		ret = 0;
+		goto unlock_transaction;
+	}
+
+	if (!tracked) {
+		pr_err("Multikernel hotplug: CPU %llu is not tracked in root pool\n",
+		       cpu_id);
+		mk_cpu_ownership_unlock();
+		ret = -EINVAL;
+		goto unlock_transaction;
 	}
 
 	/* Don't allow removing CPU 0 (boot processor) */
 	if (logical_cpu == 0) {
 		pr_err("Multikernel hotplug: Cannot remove boot CPU\n");
-		return -EINVAL;
+		mk_cpu_ownership_unlock();
+		ret = -EINVAL;
+		goto unlock_transaction;
 	}
+	mk_cpu_ownership_unlock();
 
 	ret = depart_cpu(logical_cpu);
 	if (ret < 0) {
 		pr_err("Multikernel hotplug: Failed to remove CPU %d (phys %llu): %d\n",
 		       logical_cpu, cpu_id, ret);
-		return ret;
+		goto unlock_transaction;
 	}
 
-	mk_account_cpu_offline(cpu_id);
+	mk_cpu_ownership_lock();
+	mk_cpu_set_del(mk_self->cpus, cpu_id);
+	mk_cpu_ownership_unlock();
 
 	/*
 	 * Clear CPU from present mask to prevent host kernel from trying
@@ -241,127 +360,121 @@ static int mk_do_cpu_remove(mk_phys_cpu_t cpu_id)
 	pr_info("Multikernel hotplug: Successfully removed CPU %d (phys %llu)\n",
 		logical_cpu, cpu_id);
 
-	return 0;
+	ret = 0;
+unlock_transaction:
+	mk_cpu_transaction_unlock();
+	return ret;
 }
 
 static void mk_cpu_add_work_fn(struct work_struct *work)
 {
-	struct mk_cpu_hotplug_work *hp_work = container_of(work, struct mk_cpu_hotplug_work, work);
+	struct mk_hotplug_work *hp_work =
+		container_of(work, struct mk_hotplug_work, work);
 	struct mk_resource_ack ack;
 	int ret, ack_ret;
 
-	ret = mk_do_cpu_add(hp_work->cpu_id, hp_work->numa_node, hp_work->flags);
+	ret = mk_do_cpu_add(hp_work->cpu.cpu_id, hp_work->cpu.numa_node,
+			    hp_work->cpu.flags);
 
 	/* Send ACK back to sender */
 	ack.operation = hp_work->operation;
 	ack.result = ret;
-	ack.resource_id = hp_work->cpu_id;
+	ack.resource_id = hp_work->cpu.cpu_id;
 
 	ack_ret = mk_send_message(hp_work->sender_instance_id, MK_MSG_RESOURCE, MK_RES_ACK,
 				  &ack, sizeof(ack));
 	if (ack_ret < 0) {
 		pr_warn("Multikernel hotplug: Failed to send ACK for CPU %llu: %d\n",
-			hp_work->cpu_id, ack_ret);
+			hp_work->cpu.cpu_id, ack_ret);
 	}
-
-	kfree(hp_work);
 }
 
 static void mk_cpu_remove_work_fn(struct work_struct *work)
 {
-	struct mk_cpu_hotplug_work *hp_work = container_of(work, struct mk_cpu_hotplug_work, work);
+	struct mk_hotplug_work *hp_work =
+		container_of(work, struct mk_hotplug_work, work);
 	struct mk_resource_ack ack;
 	int ret, ack_ret;
 
-	ret = mk_do_cpu_remove(hp_work->cpu_id);
+	ret = mk_do_cpu_remove(hp_work->cpu.cpu_id);
 
 	/* Send ACK back to sender */
 	ack.operation = hp_work->operation;
 	ack.result = ret;
-	ack.resource_id = hp_work->cpu_id;
+	ack.resource_id = hp_work->cpu.cpu_id;
 
 	ack_ret = mk_send_message(hp_work->sender_instance_id, MK_MSG_RESOURCE, MK_RES_ACK,
 				  &ack, sizeof(ack));
 	if (ack_ret < 0) {
 		pr_warn("Multikernel hotplug: Failed to send ACK for CPU %llu: %d\n",
-			hp_work->cpu_id, ack_ret);
+			hp_work->cpu.cpu_id, ack_ret);
 	}
-
-	kfree(hp_work);
 }
 
 /**
  * mk_handle_cpu_add - Handle CPU addition request
  * @payload: CPU resource payload
  * @payload_len: Payload length
+ * @sender_instance_id: Authenticated sending instance
  *
  * Brings a CPU online in the receiving kernel. This is called on the spawn
  * kernel side when the host kernel transfers a CPU to it.
  *
  * Returns 0 on success, negative error code on failure
  */
-static int mk_handle_cpu_add(struct mk_cpu_resource_payload *payload, u32 payload_len)
+static int mk_handle_cpu_add(struct mk_cpu_resource_payload *payload,
+			     u32 payload_len, s32 sender_instance_id)
 {
-	struct mk_cpu_hotplug_work *hp_work;
+	struct mk_hotplug_work *hp_work;
 
 	if (payload_len < sizeof(*payload)) {
 		pr_err("Multikernel hotplug: Invalid CPU add payload size: %u\n", payload_len);
 		return -EINVAL;
 	}
 
-	/*
-	 * We're in IRQ context (IPI handler), so we can't call add_cpu() directly.
-	 */
-	hp_work = kmalloc(sizeof(*hp_work), GFP_ATOMIC);
+	hp_work = mk_hotplug_work_get();
 	if (!hp_work)
 		return -ENOMEM;
 
-	INIT_WORK(&hp_work->work, mk_cpu_add_work_fn);
-	hp_work->cpu_id = payload->cpu_id;
-	hp_work->numa_node = payload->numa_node;
-	hp_work->flags = payload->flags;
-	hp_work->sender_instance_id = payload->sender_instance_id;
+	hp_work->cpu.cpu_id = payload->cpu_id;
+	hp_work->cpu.numa_node = payload->numa_node;
+	hp_work->cpu.flags = payload->flags;
+	hp_work->sender_instance_id = sender_instance_id;
 	hp_work->operation = MK_RES_CPU_ADD;
-	schedule_work(&hp_work->work);
-
-	return 0;
+	return mk_hotplug_work_queue(hp_work, mk_cpu_add_work_fn);
 }
 
 /**
  * mk_handle_cpu_remove - Handle CPU removal request
  * @payload: CPU resource payload
  * @payload_len: Payload length
+ * @sender_instance_id: Authenticated sending instance
  *
  * Takes a CPU offline in the current kernel. This is called on the host
  * kernel side before transferring a CPU to a spawn kernel.
  *
  * Returns 0 on success, negative error code on failure
  */
-int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_len)
+int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload,
+			 u32 payload_len, s32 sender_instance_id)
 {
-	struct mk_cpu_hotplug_work *hp_work;
+	struct mk_hotplug_work *hp_work;
 
 	if (payload_len < sizeof(*payload)) {
 		pr_err("Multikernel hotplug: Invalid CPU remove payload size: %u\n", payload_len);
 		return -EINVAL;
 	}
 
-	/*
-	 * We're in IRQ context (IPI handler), so we can't call remove_cpu() directly.
-	 */
-	hp_work = kmalloc(sizeof(*hp_work), GFP_ATOMIC);
+	hp_work = mk_hotplug_work_get();
 	if (!hp_work)
 		return -ENOMEM;
 
-	INIT_WORK(&hp_work->work, mk_cpu_remove_work_fn);
-	hp_work->cpu_id = payload->cpu_id;
-	hp_work->numa_node = payload->numa_node;
-	hp_work->flags = payload->flags;
-	hp_work->sender_instance_id = payload->sender_instance_id;
+	hp_work->cpu.cpu_id = payload->cpu_id;
+	hp_work->cpu.numa_node = payload->numa_node;
+	hp_work->cpu.flags = payload->flags;
+	hp_work->sender_instance_id = sender_instance_id;
 	hp_work->operation = MK_RES_CPU_REMOVE;
-	schedule_work(&hp_work->work);
-
-	return 0;
+	return mk_hotplug_work_queue(hp_work, mk_cpu_remove_work_fn);
 }
 
 /*
@@ -520,119 +633,98 @@ static int mk_do_mem_remove(u64 start_pfn, u64 nr_pages)
 	return 0;
 }
 
-struct mk_mem_hotplug_work {
-	struct work_struct work;
-	u64 start_pfn;
-	u64 nr_pages;
-	u32 numa_node;
-	u32 mem_type;
-	int sender_instance_id;
-	u32 operation;
-};
-
 static void mk_mem_add_work_fn(struct work_struct *work)
 {
-	struct mk_mem_hotplug_work *hp_work = container_of(work, struct mk_mem_hotplug_work, work);
+	struct mk_hotplug_work *hp_work =
+		container_of(work, struct mk_hotplug_work, work);
 	struct mk_resource_ack ack;
 	int ret, ack_ret;
 
-	ret = mk_do_mem_add(hp_work->start_pfn, hp_work->nr_pages,
-			    hp_work->numa_node, hp_work->mem_type);
+	ret = mk_do_mem_add(hp_work->mem.start_pfn, hp_work->mem.nr_pages,
+			    hp_work->mem.numa_node, hp_work->mem.mem_type);
 
 	ack.operation = hp_work->operation;
 	ack.result = ret;
-	ack.resource_id = hp_work->start_pfn;
+	ack.resource_id = hp_work->mem.start_pfn;
 
 	ack_ret = mk_send_message(hp_work->sender_instance_id, MK_MSG_RESOURCE, MK_RES_ACK,
 				  &ack, sizeof(ack));
 	if (ack_ret < 0) {
 		pr_warn("Multikernel hotplug: Failed to send ACK for mem add at 0x%llx: %d\n",
-			(u64)hp_work->start_pfn, ack_ret);
+			hp_work->mem.start_pfn, ack_ret);
 	}
-
-	kfree(hp_work);
 }
 
 static void mk_mem_remove_work_fn(struct work_struct *work)
 {
-	struct mk_mem_hotplug_work *hp_work = container_of(work, struct mk_mem_hotplug_work, work);
+	struct mk_hotplug_work *hp_work =
+		container_of(work, struct mk_hotplug_work, work);
 	struct mk_resource_ack ack;
 	int ret, ack_ret;
 
-	ret = mk_do_mem_remove(hp_work->start_pfn, hp_work->nr_pages);
+	ret = mk_do_mem_remove(hp_work->mem.start_pfn, hp_work->mem.nr_pages);
 
 	ack.operation = hp_work->operation;
 	ack.result = ret;
-	ack.resource_id = hp_work->start_pfn;
+	ack.resource_id = hp_work->mem.start_pfn;
 
 	ack_ret = mk_send_message(hp_work->sender_instance_id, MK_MSG_RESOURCE, MK_RES_ACK,
 				  &ack, sizeof(ack));
 	if (ack_ret < 0) {
 		pr_warn("Multikernel hotplug: Failed to send ACK for mem remove at 0x%llx: %d\n",
-			(u64)hp_work->start_pfn, ack_ret);
+			hp_work->mem.start_pfn, ack_ret);
 	}
-
-	kfree(hp_work);
 }
 
-static int mk_handle_mem_add(struct mk_mem_resource_payload *payload, u32 payload_len)
+static int mk_handle_mem_add(struct mk_mem_resource_payload *payload,
+			     u32 payload_len, s32 sender_instance_id)
 {
-	struct mk_mem_hotplug_work *hp_work;
+	struct mk_hotplug_work *hp_work;
 
 	if (payload_len < sizeof(*payload)) {
 		pr_err("Multikernel hotplug: Invalid memory add payload size: %u\n", payload_len);
 		return -EINVAL;
 	}
 
-	hp_work = kmalloc(sizeof(*hp_work), GFP_ATOMIC);
-	if (!hp_work) {
-		pr_err("Multikernel hotplug: Failed to allocate work for mem add at 0x%llx\n",
-		       (u64)payload->start_pfn);
+	hp_work = mk_hotplug_work_get();
+	if (!hp_work)
 		return -ENOMEM;
-	}
 
-	INIT_WORK(&hp_work->work, mk_mem_add_work_fn);
-	hp_work->start_pfn = payload->start_pfn;
-	hp_work->nr_pages = payload->nr_pages;
-	hp_work->numa_node = payload->numa_node;
-	hp_work->mem_type = payload->mem_type;
-	hp_work->sender_instance_id = payload->sender_instance_id;
+	hp_work->mem.start_pfn = payload->start_pfn;
+	hp_work->mem.nr_pages = payload->nr_pages;
+	hp_work->mem.numa_node = payload->numa_node;
+	hp_work->mem.mem_type = payload->mem_type;
+	hp_work->sender_instance_id = sender_instance_id;
 	hp_work->operation = MK_RES_MEM_ADD;
-	schedule_work(&hp_work->work);
-
-	return 0;
+	return mk_hotplug_work_queue(hp_work, mk_mem_add_work_fn);
 }
 
-static int mk_handle_mem_remove(struct mk_mem_resource_payload *payload, u32 payload_len)
+static int mk_handle_mem_remove(struct mk_mem_resource_payload *payload,
+				u32 payload_len, s32 sender_instance_id)
 {
-	struct mk_mem_hotplug_work *hp_work;
+	struct mk_hotplug_work *hp_work;
 
 	if (payload_len < sizeof(*payload)) {
 		pr_err("Multikernel hotplug: Invalid memory remove payload size: %u\n", payload_len);
 		return -EINVAL;
 	}
 
-	hp_work = kmalloc(sizeof(*hp_work), GFP_ATOMIC);
-	if (!hp_work) {
-		pr_err("Multikernel hotplug: Failed to allocate work for mem remove at 0x%llx\n",
-		       (u64)payload->start_pfn);
+	hp_work = mk_hotplug_work_get();
+	if (!hp_work)
 		return -ENOMEM;
-	}
 
-	INIT_WORK(&hp_work->work, mk_mem_remove_work_fn);
-	hp_work->start_pfn = payload->start_pfn;
-	hp_work->nr_pages = payload->nr_pages;
-	hp_work->sender_instance_id = payload->sender_instance_id;
+	hp_work->mem.start_pfn = payload->start_pfn;
+	hp_work->mem.nr_pages = payload->nr_pages;
+	hp_work->sender_instance_id = sender_instance_id;
 	hp_work->operation = MK_RES_MEM_REMOVE;
-	schedule_work(&hp_work->work);
-
-	return 0;
+	return mk_hotplug_work_queue(hp_work, mk_mem_remove_work_fn);
 }
 
 /*
  * PCI Device Hotplug Operations
  */
 
+#if IS_ENABLED(CONFIG_PCI)
 static int mk_do_device_add(u16 domain, u8 bus, u8 devfn,
 			    const char *driver_override, u32 flags)
 {
@@ -802,121 +894,117 @@ static int mk_do_device_remove(u16 domain, u8 bus, u8 devfn)
 	return 0;
 }
 
-struct mk_device_hotplug_work {
-	struct work_struct work;
-	u16 domain;
-	u8 bus;
-	u8 devfn;
-	u32 flags;
-	char driver_override[64];
-	int sender_instance_id;
-	u32 operation;
-};
+#else /* CONFIG_PCI */
+static int mk_do_device_add(u16 domain, u8 bus, u8 devfn,
+			    const char *driver_override, u32 flags)
+{
+	return -ENODEV;
+}
+
+static int mk_do_device_remove(u16 domain, u8 bus, u8 devfn)
+{
+	return -ENODEV;
+}
+#endif /* CONFIG_PCI */
 
 static void mk_device_add_work_fn(struct work_struct *work)
 {
-	struct mk_device_hotplug_work *hp_work = container_of(work, struct mk_device_hotplug_work, work);
+	struct mk_hotplug_work *hp_work =
+		container_of(work, struct mk_hotplug_work, work);
 	struct mk_resource_ack ack;
 	int ret, ack_ret;
 
-	ret = mk_do_device_add(hp_work->domain, hp_work->bus, hp_work->devfn,
-			       hp_work->driver_override, hp_work->flags);
+	ret = mk_do_device_add(hp_work->device.domain, hp_work->device.bus,
+			       hp_work->device.devfn,
+			       hp_work->device.driver_override,
+			       hp_work->device.flags);
 
 	ack.operation = hp_work->operation;
 	ack.result = ret;
-	ack.resource_id = (hp_work->domain << 16) | (hp_work->bus << 8) | hp_work->devfn;
+	ack.resource_id = (hp_work->device.domain << 16) |
+			  (hp_work->device.bus << 8) | hp_work->device.devfn;
 
 	ack_ret = mk_send_message(hp_work->sender_instance_id, MK_MSG_RESOURCE, MK_RES_ACK,
 				  &ack, sizeof(ack));
 	if (ack_ret < 0) {
 		pr_warn("Multikernel hotplug: Failed to send ACK for device %04x:%02x:%02x.%x: %d\n",
-			hp_work->domain, hp_work->bus,
-			PCI_SLOT(hp_work->devfn), PCI_FUNC(hp_work->devfn), ack_ret);
+			hp_work->device.domain, hp_work->device.bus,
+			PCI_SLOT(hp_work->device.devfn),
+			PCI_FUNC(hp_work->device.devfn), ack_ret);
 	}
-
-	kfree(hp_work);
 }
 
 static void mk_device_remove_work_fn(struct work_struct *work)
 {
-	struct mk_device_hotplug_work *hp_work = container_of(work, struct mk_device_hotplug_work, work);
+	struct mk_hotplug_work *hp_work =
+		container_of(work, struct mk_hotplug_work, work);
 	struct mk_resource_ack ack;
 	int ret, ack_ret;
 
-	ret = mk_do_device_remove(hp_work->domain, hp_work->bus, hp_work->devfn);
+	ret = mk_do_device_remove(hp_work->device.domain, hp_work->device.bus,
+				  hp_work->device.devfn);
 
 	ack.operation = hp_work->operation;
 	ack.result = ret;
-	ack.resource_id = (hp_work->domain << 16) | (hp_work->bus << 8) | hp_work->devfn;
+	ack.resource_id = (hp_work->device.domain << 16) |
+			  (hp_work->device.bus << 8) | hp_work->device.devfn;
 
 	ack_ret = mk_send_message(hp_work->sender_instance_id, MK_MSG_RESOURCE, MK_RES_ACK,
 				  &ack, sizeof(ack));
 	if (ack_ret < 0) {
 		pr_warn("Multikernel hotplug: Failed to send ACK for device %04x:%02x:%02x.%x: %d\n",
-			hp_work->domain, hp_work->bus,
-			PCI_SLOT(hp_work->devfn), PCI_FUNC(hp_work->devfn), ack_ret);
+			hp_work->device.domain, hp_work->device.bus,
+			PCI_SLOT(hp_work->device.devfn),
+			PCI_FUNC(hp_work->device.devfn), ack_ret);
 	}
-
-	kfree(hp_work);
 }
 
-static int mk_handle_device_add(struct mk_device_resource_payload *payload, u32 payload_len)
+static int mk_handle_device_add(struct mk_device_resource_payload *payload,
+				u32 payload_len, s32 sender_instance_id)
 {
-	struct mk_device_hotplug_work *hp_work;
+	struct mk_hotplug_work *hp_work;
 
 	if (payload_len < sizeof(*payload)) {
 		pr_err("Multikernel hotplug: Invalid device add payload size: %u\n", payload_len);
 		return -EINVAL;
 	}
 
-	hp_work = kmalloc(sizeof(*hp_work), GFP_ATOMIC);
-	if (!hp_work) {
-		pr_err("Multikernel hotplug: Failed to allocate work structure for device %04x:%02x:%02x.%x\n",
-		       payload->domain, payload->bus,
-		       PCI_SLOT(payload->devfn), PCI_FUNC(payload->devfn));
+	hp_work = mk_hotplug_work_get();
+	if (!hp_work)
 		return -ENOMEM;
-	}
 
-	INIT_WORK(&hp_work->work, mk_device_add_work_fn);
-	hp_work->domain = payload->domain;
-	hp_work->bus = payload->bus;
-	hp_work->devfn = payload->devfn;
-	hp_work->flags = payload->flags;
-	strscpy(hp_work->driver_override, payload->driver_override, sizeof(hp_work->driver_override));
-	hp_work->sender_instance_id = payload->sender_instance_id;
+	hp_work->device.domain = payload->domain;
+	hp_work->device.bus = payload->bus;
+	hp_work->device.devfn = payload->devfn;
+	hp_work->device.flags = payload->flags;
+	strscpy(hp_work->device.driver_override, payload->driver_override,
+		sizeof(hp_work->device.driver_override));
+	hp_work->sender_instance_id = sender_instance_id;
 	hp_work->operation = MK_RES_DEVICE_ADD;
-	schedule_work(&hp_work->work);
-
-	return 0;
+	return mk_hotplug_work_queue(hp_work, mk_device_add_work_fn);
 }
 
-static int mk_handle_device_remove(struct mk_device_resource_payload *payload, u32 payload_len)
+static int mk_handle_device_remove(struct mk_device_resource_payload *payload,
+				   u32 payload_len, s32 sender_instance_id)
 {
-	struct mk_device_hotplug_work *hp_work;
+	struct mk_hotplug_work *hp_work;
 
 	if (payload_len < sizeof(*payload)) {
 		pr_err("Multikernel hotplug: Invalid device remove payload size: %u\n", payload_len);
 		return -EINVAL;
 	}
 
-	hp_work = kmalloc(sizeof(*hp_work), GFP_ATOMIC);
-	if (!hp_work) {
-		pr_err("Multikernel hotplug: Failed to allocate work structure for device %04x:%02x:%02x.%x\n",
-		       payload->domain, payload->bus,
-		       PCI_SLOT(payload->devfn), PCI_FUNC(payload->devfn));
+	hp_work = mk_hotplug_work_get();
+	if (!hp_work)
 		return -ENOMEM;
-	}
 
-	INIT_WORK(&hp_work->work, mk_device_remove_work_fn);
-	hp_work->domain = payload->domain;
-	hp_work->bus = payload->bus;
-	hp_work->devfn = payload->devfn;
-	hp_work->flags = payload->flags;
-	hp_work->sender_instance_id = payload->sender_instance_id;
+	hp_work->device.domain = payload->domain;
+	hp_work->device.bus = payload->bus;
+	hp_work->device.devfn = payload->devfn;
+	hp_work->device.flags = payload->flags;
+	hp_work->sender_instance_id = sender_instance_id;
 	hp_work->operation = MK_RES_DEVICE_REMOVE;
-	schedule_work(&hp_work->work);
-
-	return 0;
+	return mk_hotplug_work_queue(hp_work, mk_device_remove_work_fn);
 }
 
 /*
@@ -929,6 +1017,7 @@ static int mk_handle_device_remove(struct mk_device_resource_payload *payload, u
  * @subtype: Message subtype (CPU_ADD, CPU_REMOVE, MEM_ADD, MEM_REMOVE, DEVICE_ADD, DEVICE_REMOVE)
  * @payload: Payload data
  * @payload_len: Payload length
+ * @sender_instance_id: Authenticated sending instance
  * @ctx: Context (unused)
  *
  * This is the main message handler registered with the multikernel
@@ -936,7 +1025,8 @@ static int mk_handle_device_remove(struct mk_device_resource_payload *payload, u
  * message subtype.
  */
 static void mk_resource_msg_handler(u32 msg_type, u32 subtype,
-				    void *payload, u32 payload_len, void *ctx)
+				    void *payload, u32 payload_len,
+				    s32 sender_instance_id, void *ctx)
 {
 	int ret = 0;
 
@@ -947,27 +1037,31 @@ static void mk_resource_msg_handler(u32 msg_type, u32 subtype,
 
 	switch (subtype) {
 	case MK_RES_CPU_ADD:
-		ret = mk_handle_cpu_add((struct mk_cpu_resource_payload *)payload, payload_len);
+		ret = mk_handle_cpu_add(payload, payload_len, sender_instance_id);
 		break;
 
 	case MK_RES_CPU_REMOVE:
-		ret = mk_handle_cpu_remove((struct mk_cpu_resource_payload *)payload, payload_len);
+		ret = mk_handle_cpu_remove(payload, payload_len,
+					   sender_instance_id);
 		break;
 
 	case MK_RES_MEM_ADD:
-		ret = mk_handle_mem_add((struct mk_mem_resource_payload *)payload, payload_len);
+		ret = mk_handle_mem_add(payload, payload_len, sender_instance_id);
 		break;
 
 	case MK_RES_MEM_REMOVE:
-		ret = mk_handle_mem_remove((struct mk_mem_resource_payload *)payload, payload_len);
+		ret = mk_handle_mem_remove(payload, payload_len,
+					   sender_instance_id);
 		break;
 
 	case MK_RES_DEVICE_ADD:
-		ret = mk_handle_device_add((struct mk_device_resource_payload *)payload, payload_len);
+		ret = mk_handle_device_add(payload, payload_len,
+					   sender_instance_id);
 		break;
 
 	case MK_RES_DEVICE_REMOVE:
-		ret = mk_handle_device_remove((struct mk_device_resource_payload *)payload, payload_len);
+		ret = mk_handle_device_remove(payload, payload_len,
+					      sender_instance_id);
 		break;
 
 	case MK_RES_ACK:
@@ -1009,19 +1103,65 @@ static void mk_resource_msg_handler(u32 msg_type, u32 subtype,
  */
 int __init mk_hotplug_init(void)
 {
+	unsigned int pool_size;
+	unsigned int i;
 	int ret;
 
 	pr_info("Initializing multikernel hotplug subsystem\n");
+
+	/*
+	 * Match the PCI control-plane reserve. Exhaustion is still handled
+	 * explicitly because resource requests do not consume reply-slot credits.
+	 */
+	pool_size = max_t(unsigned int, num_possible_cpus(), 1) *
+			MK_REPLY_SLOTS;
+	mk_hotplug_work_pool = kcalloc(pool_size,
+				       sizeof(*mk_hotplug_work_pool),
+				       GFP_KERNEL);
+	if (!mk_hotplug_work_pool)
+		return -ENOMEM;
+
+	mk_hotplug_work_pool_busy = bitmap_zalloc(pool_size, GFP_KERNEL);
+	if (!mk_hotplug_work_pool_busy) {
+		ret = -ENOMEM;
+		goto free_pool;
+	}
+	mk_hotplug_work_pool_size = pool_size;
+	atomic_set(&mk_hotplug_work_pool_cursor, 0);
+	for (i = 0; i < pool_size; i++) {
+		INIT_WORK(&mk_hotplug_work_pool[i].work,
+			  mk_hotplug_work_fn);
+		mk_hotplug_work_pool[i].pool_slot = i;
+	}
+
+	mk_hotplug_workqueue =
+		alloc_workqueue("mk-hotplug", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+	if (!mk_hotplug_workqueue) {
+		ret = -ENOMEM;
+		goto free_pool_bitmap;
+	}
 
 	/* Register handler for resource management messages */
 	ret = mk_register_msg_handler(MK_MSG_RESOURCE, mk_resource_msg_handler, NULL);
 	if (ret < 0) {
 		pr_err("Failed to register multikernel hotplug message handler: %d\n", ret);
-		return ret;
+		goto destroy_workqueue;
 	}
 
 	pr_info("Multikernel hotplug subsystem initialized\n");
 	return 0;
+
+destroy_workqueue:
+	destroy_workqueue(mk_hotplug_workqueue);
+	mk_hotplug_workqueue = NULL;
+free_pool_bitmap:
+	bitmap_free(mk_hotplug_work_pool_busy);
+	mk_hotplug_work_pool_busy = NULL;
+	mk_hotplug_work_pool_size = 0;
+free_pool:
+	kfree(mk_hotplug_work_pool);
+	mk_hotplug_work_pool = NULL;
+	return ret;
 }
 
 /**
@@ -1037,6 +1177,18 @@ void mk_hotplug_cleanup(void)
 
 	/* Unregister message handler */
 	mk_unregister_msg_handler(MK_MSG_RESOURCE, mk_resource_msg_handler);
+	if (mk_hotplug_workqueue) {
+		destroy_workqueue(mk_hotplug_workqueue);
+		mk_hotplug_workqueue = NULL;
+	}
+	WARN_ON_ONCE(mk_hotplug_work_pool_busy &&
+		     !bitmap_empty(mk_hotplug_work_pool_busy,
+				   mk_hotplug_work_pool_size));
+	bitmap_free(mk_hotplug_work_pool_busy);
+	mk_hotplug_work_pool_busy = NULL;
+	mk_hotplug_work_pool_size = 0;
+	kfree(mk_hotplug_work_pool);
+	mk_hotplug_work_pool = NULL;
 
 	/* Free operation tracking list */
 	mutex_lock(&mk_hotplug_mutex);
@@ -1198,6 +1350,7 @@ int mk_pool_device_remove(u16 domain, u8 bus, u8 devfn,
  */
 int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 {
+	struct mk_cpu_set removing = { .nr = 1, .cap = 1, .ids = &cpu_id };
 	struct mk_cpu_resource_payload payload = {
 		.cpu_id = cpu_id,
 		.numa_node = 0,
@@ -1207,6 +1360,8 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	struct mk_pending_msg *pending;
 	struct mk_instance *target_instance;
 	int ret;
+
+	raw_spin_lock_init(&removing.lock);
 
 	/* For self-removal, execute directly (we're in process context) */
 	if (instance_id == mk_self->id) {
@@ -1223,6 +1378,7 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	if (target_instance->state != MK_STATE_ACTIVE) {
 		struct mk_cpu_set cpus = { .nr = 1, .cap = 1, .ids = &cpu_id };
 
+		raw_spin_lock_init(&cpus.lock);
 		/*
 		 * A CPU the instance has already run on is parked on that
 		 * instance's context. Bring it back to the host slot before
@@ -1248,26 +1404,46 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 		goto out;
 	}
 
-	ret = mk_cpu_set_reserve(mk_pool->cpus, 1);
-	if (ret)
-		goto out;
-
+	mk_cpu_transaction_lock();
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_CPU_REMOVE, cpu_id);
 	if (!pending) {
 		ret = -ENOMEM;
-		goto out;
+		goto unlock_transaction;
 	}
 
-	ret = mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_CPU_REMOVE,
-			      &payload, sizeof(payload));
+	mk_cpu_ownership_lock();
+	if (!mk_cpu_set_contains(target_instance->cpus, cpu_id)) {
+		pr_err("Multikernel hotplug: CPU %llu not assigned to instance %d\n",
+		       cpu_id, instance_id);
+		ret = -EINVAL;
+		mk_cpu_ownership_unlock();
+		mk_msg_pending_wait(pending, 0);
+		goto unlock_transaction;
+	}
+
+	ret = mk_cpu_set_reserve(mk_pool->cpus, 1);
+	if (ret) {
+		mk_cpu_ownership_unlock();
+		mk_msg_pending_wait(pending, 0);
+		goto unlock_transaction;
+	}
+	mk_cpu_ownership_unlock();
+	ret = mk_instance_migrate_irq_route(target_instance, &removing);
+	if (ret) {
+		mk_msg_pending_wait(pending, 0);
+		goto unlock_transaction;
+	}
+	ret = mk_send_message_to_instance(target_instance, MK_MSG_RESOURCE,
+					  MK_RES_CPU_REMOVE, &payload,
+					  sizeof(payload));
 	if (ret < 0) {
 		mk_msg_pending_wait(pending, 0);  /* Immediate cleanup */
-		goto out;
+		goto unlock_transaction;
 	}
 
 	ret = mk_msg_pending_wait(pending, 10000);
 	if (ret < 0)
-		goto out;
+		goto unlock_transaction;
 
 	/*
 	 * The spawn kernel parked the CPU on its own context when it went
@@ -1281,13 +1457,29 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	if (ret < 0) {
 		pr_err("Multikernel hotplug: CPU %llu offline in instance %d but not reparked to host: %d\n",
 		       cpu_id, instance_id, ret);
-		goto out;
+		goto unlock_transaction;
 	}
 
+	down_write(&target_instance->control_route_sem);
+	mk_cpu_ownership_lock();
+	if (!mk_cpu_set_contains(target_instance->cpus, cpu_id)) {
+		ret = -ESTALE;
+		goto unlock_ownership;
+	}
+	ret = mk_cpu_set_add(mk_pool->cpus, cpu_id);
+	if (ret) {
+		pr_warn("Multikernel hotplug: Failed to track CPU %llu in pool\n",
+			cpu_id);
+		goto unlock_ownership;
+	}
 	mk_cpu_set_del(target_instance->cpus, cpu_id);
-	mk_cpu_set_add(mk_pool->cpus, cpu_id);
 
 	ret = 0;
+unlock_ownership:
+	mk_cpu_ownership_unlock();
+	up_write(&target_instance->control_route_sem);
+unlock_transaction:
+	mk_cpu_transaction_unlock();
 out:
 	mk_instance_put(target_instance);
 	return ret;
@@ -1332,25 +1524,43 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 		       instance_id);
 		return -ENODEV;
 	}
+	if (arch_cpu_from_physical_id(cpu_id) == 0) {
+		pr_err("Multikernel hotplug: CPU %llu is reserved for host control\n",
+		       cpu_id);
+		ret = -EINVAL;
+		goto out;
+	}
 
 	/* For non-running instances, transfer CPU from root using existing API */
 	if (target_instance->state != MK_STATE_ACTIVE) {
 		struct mk_cpu_set cpus = { .nr = 1, .cap = 1, .ids = &cpu_id };
 
+		raw_spin_lock_init(&cpus.lock);
 		ret = mk_instance_transfer_cpus(target_instance, &cpus);
 		goto out;
 	}
 
-	/*
-	 * Only a CPU from the assignable pool is parked on the host slot;
-	 * publishing a wakeup for any other CPU can only time out.
-	 */
-	if (!mk_cpu_set_contains(mk_pool->cpus, cpu_id)) {
-		pr_err("Multikernel hotplug: CPU %llu is not in this kernel's pool\n",
-		       cpu_id);
-		ret = -EBUSY;
+	if (!mk_pool) {
+		ret = -ENODEV;
 		goto out;
 	}
+
+	mk_cpu_transaction_lock();
+	mk_cpu_ownership_lock();
+	if (!mk_cpu_set_contains(mk_pool->cpus, cpu_id)) {
+		pr_err("Multikernel hotplug: CPU %llu not available in the pool\n",
+		       cpu_id);
+		ret = -EBUSY;
+		mk_cpu_ownership_unlock();
+		goto unlock_transaction;
+	}
+
+	ret = mk_cpu_set_reserve(target_instance->cpus, 1);
+	if (ret) {
+		mk_cpu_ownership_unlock();
+		goto unlock_transaction;
+	}
+	mk_cpu_ownership_unlock();
 
 	/*
 	 * The CPU is parked on the host slot, where the spawn kernel's
@@ -1361,22 +1571,23 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 	if (ret < 0) {
 		pr_err("Multikernel hotplug: Failed to repark CPU %llu to instance %d: %d\n",
 		       cpu_id, instance_id, ret);
-		goto out;
+		goto unlock_transaction;
 	}
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_CPU_ADD, cpu_id);
 	if (!pending) {
 		mk_repark_cpu_to_host(target_instance, cpu_id);
 		ret = -ENOMEM;
-		goto out;
+		goto unlock_transaction;
 	}
 
-	ret = mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_CPU_ADD,
-			      &payload, sizeof(payload));
+	ret = mk_send_message_to_instance(target_instance, MK_MSG_RESOURCE,
+					  MK_RES_CPU_ADD, &payload,
+					  sizeof(payload));
 	if (ret < 0) {
 		mk_msg_pending_wait(pending, 0);  /* Immediate cleanup */
 		mk_repark_cpu_to_host(target_instance, cpu_id);
-		goto out;
+		goto unlock_transaction;
 	}
 
 	ret = mk_msg_pending_wait(pending, 10000);
@@ -1388,18 +1599,49 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 		 * watching the context and this times out harmlessly.
 		 */
 		mk_repark_cpu_to_host(target_instance, cpu_id);
-		goto out;
+		goto unlock_transaction;
 	}
 
-	if (mk_cpu_set_add(target_instance->cpus, cpu_id))
+	down_write(&target_instance->control_route_sem);
+	mk_cpu_ownership_lock();
+	if (!mk_cpu_set_contains(mk_pool->cpus, cpu_id)) {
+		ret = -ESTALE;
+		goto unlock_ownership;
+	}
+	ret = mk_cpu_set_add(target_instance->cpus, cpu_id);
+	if (ret) {
 		pr_warn("Multikernel hotplug: Failed to track CPU %llu in instance %d\n",
 			cpu_id, instance_id);
+		goto unlock_ownership;
+	}
 	mk_cpu_set_del(mk_pool->cpus, cpu_id);
+	if (mk_instance_irq_route_load(target_instance) == MK_PHYS_CPU_INVALID)
+		mk_instance_irq_route_store(target_instance, cpu_id);
 
 	ret = 0;
+unlock_ownership:
+	mk_cpu_ownership_unlock();
+	up_write(&target_instance->control_route_sem);
+unlock_transaction:
+	mk_cpu_transaction_unlock();
 out:
 	mk_instance_put(target_instance);
 	return ret;
+}
+
+static int mk_memory_change_allowed(struct mk_instance *instance)
+{
+	bool iommu_active;
+
+	mutex_lock(&instance->resource_mutex);
+	iommu_active = mk_pci_iommu_lease_active_locked(instance);
+	mutex_unlock(&instance->resource_mutex);
+	if (!iommu_active)
+		return 0;
+
+	pr_err("Cannot change memory for instance %d while an IOMMU lease is active\n",
+	       instance->id);
+	return -EBUSY;
 }
 
 /**
@@ -1438,6 +1680,11 @@ int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
 	target_instance = mk_instance_find(instance_id);
 	if (!target_instance)
 		return -ENODEV;
+	ret = mk_memory_change_allowed(target_instance);
+	if (ret) {
+		mk_instance_put(target_instance);
+		return ret;
+	}
 
 	/* For non-running instances, allocate memory from pool and add to instance */
 	if (target_instance->state != MK_STATE_ACTIVE) {
@@ -1506,6 +1753,11 @@ int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages)
 	target_instance = mk_instance_find(instance_id);
 	if (!target_instance)
 		return -ENODEV;
+	ret = mk_memory_change_allowed(target_instance);
+	if (ret) {
+		mk_instance_put(target_instance);
+		return ret;
+	}
 
 	/* For non-running instances, just remove the memory region from the instance */
 	if (target_instance->state != MK_STATE_ACTIVE) {

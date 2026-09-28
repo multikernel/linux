@@ -455,6 +455,7 @@ extern int kernel_kexec(void);
 #ifdef CONFIG_MULTIKERNEL
 extern int multikernel_kexec_by_id(int mk_id);
 extern struct kimage *kimage_find_by_id(int mk_id);
+int kimage_prepare_multikernel_unload(struct kimage *image);
 #else
 static inline int multikernel_kexec_by_id(int mk_id)
 {
@@ -463,6 +464,11 @@ static inline int multikernel_kexec_by_id(int mk_id)
 static inline struct kimage *kimage_find_by_id(int mk_id)
 {
 	return NULL;
+}
+
+static inline int kimage_prepare_multikernel_unload(struct kimage *image)
+{
+	return -EOPNOTSUPP;
 }
 #endif
 extern struct page *kimage_alloc_control_pages(struct kimage *image,

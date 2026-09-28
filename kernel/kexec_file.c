@@ -369,16 +369,13 @@ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 
 		image->mk_instance = instance;
 		image->mk_id = mk_id;
-		instance->kimage = image;
-
-		pr_info("Associated kimage with multikernel instance %d\n", mk_id);
 
 		fdt_page = alloc_pages(GFP_KERNEL | __GFP_ZERO,
 				       get_order(MK_MANIFEST_SIZE));
 		if (!fdt_page) {
 			pr_err("Failed to allocate FDT pages for multikernel kimage\n");
 			ret = -ENOMEM;
-			goto out_free_image;
+			goto out_free_fdt;
 		}
 		image->mk_manifest = page_to_phys(fdt_page);
 
@@ -406,7 +403,7 @@ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 	ret = kimage_file_prepare_segments(image, kernel_fd, initrd_fd,
 					   cmdline_ptr, cmdline_len, flags);
 	if (ret)
-		goto out_free_image;
+		goto out_free_fdt;
 
 	ret = sanity_check_segment_list(image);
 	if (ret)
@@ -428,6 +425,11 @@ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 		}
 	}
 
+	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
+		image->mk_instance->kimage = image;
+		pr_info("Associated kimage with multikernel instance %d\n",
+			image->mk_id);
+	}
 	*rimage = image;
 	return 0;
 out_free_control_pages:
@@ -436,8 +438,18 @@ out_free_post_load_bufs:
 	kimage_file_post_load_cleanup(image);
 out_free_fdt:
 	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
+		unsigned long i;
+
+		for (i = 0; i < image->nr_segments; i++) {
+			void *virt_addr = phys_to_virt(image->segment[i].mem);
+
+			mk_kimage_free(image, virt_addr,
+				       image->segment[i].memsz);
+		}
+		image->nr_segments = 0;
 		if (image->mk_ipi) {
 			unsigned int order = get_order(sizeof(struct mk_shared_data));
+
 			__free_pages(phys_to_page(image->mk_ipi), order);
 			image->mk_ipi = 0;
 		}
@@ -446,13 +458,13 @@ out_free_fdt:
 				     get_order(MK_MANIFEST_SIZE));
 			image->mk_manifest = 0;
 		}
-		if (image->mk_instance) {
-			image->mk_instance->kimage = NULL;
-			mk_instance_put(image->mk_instance);
-			image->mk_instance = NULL;
-		}
+		/*
+		 * The caller retains the lookup reference unless allocation
+		 * succeeds and the image is published above.
+		 */
+		image->mk_instance = NULL;
 	}
-out_free_image:
+	kimage_file_free_cmdline(image);
 	kfree(image);
 	return ret;
 }
@@ -499,9 +511,16 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 				goto out;
 			}
 
+			ret = kimage_prepare_multikernel_unload(mk_image);
+			if (ret) {
+				pr_err("Multikernel instance %d is still using its image: %d\n",
+				       mk_id, ret);
+				goto out;
+			}
+
 			pr_info("Unloading kernel from multikernel instance %d\n", mk_id);
-			kimage_remove_from_list(mk_image);
-			image = mk_image;
+			/* Keep lookup, detach, and free serialized with exec. */
+			kimage_free(mk_image);
 			ret = 0;
 			goto out;
 		} else {
@@ -648,6 +667,15 @@ out:
 		arch_kexec_protect_crashkres();
 #endif
 
+	/*
+	 * A partially prepared multikernel image is already visible through
+	 * its instance.  Keep failure cleanup serialized with load, exec, and
+	 * unload until that pointer and all image-owned resources are gone.
+	 */
+	if (image && image->type == KEXEC_TYPE_MULTIKERNEL) {
+		kimage_free(image);
+		image = NULL;
+	}
 	kexec_unlock();
 	kimage_free(image);
 	return ret;

@@ -238,10 +238,14 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 		}
 
 		if (strcmp(device_type, "pci") == 0) {
+			struct mk_pci_device *existing;
 			struct mk_pci_device *pci_dev;
 			const char *pci_id_str;
 			const fdt32_t *vendor_prop, *device_prop;
-			unsigned int domain, bus, slot, func;
+			u32 vendor, device;
+			u16 domain;
+			u8 bus, slot, func;
+			int ret;
 
 			pci_id_str = fdt_getprop(fdt, dev_node, "pci-id", &len);
 			if (!pci_id_str) {
@@ -250,10 +254,12 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 				return -EINVAL;
 			}
 
-			if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
-				pr_err("Invalid pci-id format '%s' for device '%s'\n",
-				       pci_id_str, dev_name);
-				return -EINVAL;
+			ret = mk_pci_parse_bdf(pci_id_str, len, &domain, &bus,
+					       &slot, &func);
+			if (ret) {
+				pr_err("Invalid or out-of-range pci-id '%.*s' for device '%s'\n",
+				       len, pci_id_str, dev_name);
+				return ret;
 			}
 
 			vendor_prop = fdt_getprop(fdt, dev_node, "vendor-id", &len);
@@ -269,6 +275,22 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 				       dev_name);
 				return -EINVAL;
 			}
+			vendor = fdt32_to_cpu(*vendor_prop);
+			device = fdt32_to_cpu(*device_prop);
+			if (vendor > U16_MAX || device > U16_MAX) {
+				pr_err("Out-of-range vendor-id or device-id for device '%s'\n",
+				       dev_name);
+				return -ERANGE;
+			}
+			list_for_each_entry(existing, pci_list, list) {
+				if (existing->domain == domain &&
+				    existing->bus == bus && existing->slot == slot &&
+				    existing->func == func) {
+					pr_err("Duplicate baseline PCI BDF %04x:%02x:%02x.%x\n",
+					       domain, bus, slot, func);
+					return -EEXIST;
+				}
+			}
 
 			pci_dev = kzalloc_obj(*pci_dev, GFP_KERNEL);
 			if (!pci_dev) {
@@ -279,12 +301,12 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 			alias = mk_dt_node_alias(fdt, dev_node);
 			if (alias)
 				strscpy(pci_dev->alias, alias, sizeof(pci_dev->alias));
-			pci_dev->vendor = (u16)fdt32_to_cpu(*vendor_prop);
-			pci_dev->device = (u16)fdt32_to_cpu(*device_prop);
-			pci_dev->domain = (u16)domain;
-			pci_dev->bus = (u8)bus;
-			pci_dev->slot = (u8)slot;
-			pci_dev->func = (u8)func;
+			pci_dev->vendor = (u16)vendor;
+			pci_dev->device = (u16)device;
+			pci_dev->domain = domain;
+			pci_dev->bus = bus;
+			pci_dev->slot = slot;
+			pci_dev->func = func;
 
 			list_add_tail(&pci_dev->list, pci_list);
 			pci_count++;
@@ -384,7 +406,7 @@ static int mk_baseline_initialize_cpus(const struct mk_cpu_set *requested)
 static int mk_baseline_initialize_devices(struct list_head *pci_list)
 {
 	struct mk_pci_device *pci_dev;
-	int ret, failed = 0, moved = 0;
+	int ret, failed = 0, available = 0;
 
 	if (list_empty(pci_list)) {
 		pr_debug("No PCI devices in baseline to move into the pool\n");
@@ -392,24 +414,25 @@ static int mk_baseline_initialize_devices(struct list_head *pci_list)
 	}
 
 	list_for_each_entry(pci_dev, pci_list, list) {
-		ret = mk_pool_device_add(pci_dev->domain, pci_dev->bus,
-					 PCI_DEVFN(pci_dev->slot, pci_dev->func),
-					 pci_dev->alias);
+		ret = mk_root_add_pci_device(pci_dev->domain, pci_dev->bus,
+					     PCI_DEVFN(pci_dev->slot, pci_dev->func),
+					     pci_dev->alias);
 		if (ret) {
-			pr_warn("PCI device %04x:%04x@%04x:%02x:%02x.%x not moved into the pool: %d\n",
+			pr_warn("PCI device %04x:%04x@%04x:%02x:%02x.%x unavailable for the pool: %d\n",
 				pci_dev->vendor, pci_dev->device, pci_dev->domain,
 				pci_dev->bus, pci_dev->slot, pci_dev->func, ret);
 			failed++;
 			continue;
 		}
 
-		moved++;
+		available++;
 	}
 
 	if (failed > 0)
-		pr_warn("Failed to move %d PCI devices into the pool\n", failed);
+		pr_warn("Failed to inventory %d PCI devices for the pool\n", failed);
 
-	pr_info("Moved %d PCI devices into the multikernel pool\n", moved);
+	pr_info("Inventoried %d PCI devices; host drivers remain bound until assignment\n",
+		available);
 
 	return 0;
 }

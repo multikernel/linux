@@ -503,6 +503,9 @@ struct pci_dev {
 	unsigned int	non_mappable_bars:1;	/* BARs can't be mapped to user-space  */
 	pci_dev_flags_t dev_flags;
 	atomic_t	enable_cnt;	/* pci_enable_device has been called */
+#ifdef CONFIG_MULTIKERNEL
+	u32		multikernel_reset_generation;
+#endif
 
 	spinlock_t	pcie_cap_lock;		/* Protects RMW ops in capability accessors */
 	u32		saved_config_space[16]; /* Config space saved at suspend time */
@@ -524,6 +527,12 @@ struct pci_dev {
 #ifdef CONFIG_PCI_MSI
 	void __iomem	*msix_base;
 	raw_spinlock_t	msi_lock;
+#ifdef CONFIG_MULTIKERNEL
+	u32		multikernel_msi_generation;
+	u16		multikernel_msi_nvec;
+	u8		multikernel_msi_state;
+	u8		multikernel_msi_msix;
+#endif
 #endif
 	struct pci_vpd	vpd;
 #ifdef CONFIG_PCIE_DPC
