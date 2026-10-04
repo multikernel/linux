@@ -319,14 +319,14 @@ static int __init mk_restore_host_instance(void)
 	phys_addr_t host_ipi_phys;
 	u32 host_ipi_pages;
 	size_t host_ipi_size;
-	u64 host_ipi_cpu;
+	u64 host_ipi_cpu = 0;
 
-	if (!mk_chosen_ring("host-ipi", &host_ipi_phys, &host_ipi_pages) ||
-	    of_property_read_u64(of_chosen, "multikernel,host-ipi-cpu",
-				 &host_ipi_cpu)) {
+	if (!mk_chosen_ring("host-ipi", &host_ipi_phys, &host_ipi_pages)) {
 		pr_warn("No host IPI buffer in the boot tree (spawn won't be able to send to host)\n");
 		return -ENOENT;
 	}
+	/* Older hosts ring physical CPU 0 and do not describe a target. */
+	of_property_read_u64(of_chosen, "multikernel,host-ipi-cpu", &host_ipi_cpu);
 	host_ipi_size = (size_t)host_ipi_pages << PAGE_SHIFT;
 
 	hi = mk_instance_alloc(0, "host");
