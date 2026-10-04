@@ -28,6 +28,9 @@ static bool allocation_fails;
 	do { assert(!*(lock)); *(lock) = true; (flags) = 0; } while (0)
 #define spin_unlock_irqrestore(lock, flags) \
 	do { assert(*(lock)); *(lock) = false; (void)(flags); } while (0)
+#define DEFINE_RAW_SPINLOCK(name) DEFINE_SPINLOCK(name)
+#define raw_spin_lock_irqsave(lock, flags) spin_lock_irqsave(lock, flags)
+#define raw_spin_unlock_irqrestore(lock, flags) spin_unlock_irqrestore(lock, flags)
 #define msecs_to_jiffies(ms) (ms)
 
 struct completion {
@@ -94,6 +97,8 @@ static int multikernel_send_ipi_data(int instance_id, void *data,
 struct work_struct {
 	void (*func)(struct work_struct *work);
 };
+struct workqueue_struct { int unused; };
+static struct workqueue_struct cpu_queue;
 
 static struct work_struct *queued;
 static int mutation_result, mutations;
@@ -131,6 +136,13 @@ static void schedule_work(struct work_struct *work)
 {
 	assert(!queued);
 	queued = work;
+}
+
+static bool queue_work(struct workqueue_struct *wq, struct work_struct *work)
+{
+	assert(wq == &cpu_queue);
+	schedule_work(work);
+	return true;
 }
 
 static void unexpected_work(struct work_struct *work)
@@ -599,6 +611,9 @@ static void failure_regressions(void)
 
 int main(int argc, char **argv)
 {
+	/* Queue creation/lifetime is exercised by cpu_work_test, not this fixture. */
+	mk_cpu_hotplug_wq = &cpu_queue;
+
 	if (argc > 2 || (argc == 2 && strcmp(argv[1], "regression") &&
 			strcmp(argv[1], "characterization") &&
 			strcmp(argv[1], "completion") && strcmp(argv[1], "workers") &&
