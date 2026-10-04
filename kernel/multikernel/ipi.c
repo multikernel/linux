@@ -55,7 +55,8 @@ void mk_ipi_ring_drop_pending(void)
 	     tail = mk_ring_idx(tail + 1))
 		ring->entries[tail].data_size = 0;
 
-	atomic_set(&ring->tail, head);
+	/* Release capacity only after all abandoned slots have been cleared. */
+	atomic_set_release(&ring->tail, head);
 }
 
 /**
@@ -253,7 +254,8 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 	do {
 		head = mk_ring_idx(atomic_read(&ipi_data->ring.head));
 		next_head = mk_ring_idx(head + 1);
-		tail = mk_ring_idx(atomic_read(&ipi_data->ring.tail));
+		/* Pair with the consumer's release of cleared slot capacity. */
+		tail = mk_ring_idx(atomic_read_acquire(&ipi_data->ring.tail));
 
 		/* Check if ring buffer is full */
 		if (next_head == tail) {
@@ -343,7 +345,8 @@ static void mk_ipi_drain_ring(void)
 				     tail, data_size);
 			slot->data_size = 0;
 			next_tail = mk_ring_idx(tail + 1);
-			atomic_set(&mk_self->ipi_data->ring.tail, next_tail);
+			/* Do not let a producer reuse the slot before its clear. */
+			atomic_set_release(&mk_self->ipi_data->ring.tail, next_tail);
 			continue;
 		}
 
@@ -364,7 +367,8 @@ static void mk_ipi_drain_ring(void)
 		/* Mark consumed so the slot reads as unpublished again */
 		slot->data_size = 0;
 		next_tail = mk_ring_idx(tail + 1);
-		atomic_set(&mk_self->ipi_data->ring.tail, next_tail);
+		/* Pair with producers' acquire: clear precedes all future reuse. */
+		atomic_set_release(&mk_self->ipi_data->ring.tail, next_tail);
 		messages_processed++;
 
 		if (messages_processed >= MK_IPI_RING_SIZE)

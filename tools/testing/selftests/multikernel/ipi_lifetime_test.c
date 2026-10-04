@@ -29,6 +29,7 @@ typedef pthread_mutex_t raw_spinlock_t;
 #define RCU_INIT_POINTER(p, v) rcu_assign_pointer(p, v)
 #define atomic_read(p) (*(p))
 #define atomic_set(p, v) (*(p) = (v))
+#define atomic_set_release(p, v) __atomic_store_n((p), (v), __ATOMIC_RELEASE)
 #define smp_load_acquire(p) (*(p))
 
 struct mk_ipi_data { size_t data_size; unsigned long type; };
