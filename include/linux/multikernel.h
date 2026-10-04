@@ -183,7 +183,6 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 void generic_multikernel_interrupt(void);
 
 /* Discard everything queued in this kernel's ring (instance re-spawn) */
-void mk_ipi_ring_drop_pending(void);
 
 /*
  * Multikernel Messaging System

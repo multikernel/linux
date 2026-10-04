@@ -32,34 +32,6 @@ static inline unsigned int mk_ring_idx(unsigned int i)
 }
 
 /**
- * mk_ipi_ring_drop_pending - Discard everything queued in this kernel's ring
- *
- * Called when an instance is re-spawned. A halting instance parks its CPUs
- * wherever they were, including between claiming a ring slot and publishing
- * it, and the drain stops at such a slot forever. Anything still queued was
- * sent by a kernel that is gone, so drop it all rather than let one
- * abandoned slot wedge the ring.
- */
-void mk_ipi_ring_drop_pending(void)
-{
-	struct mk_ipi_ring *ring;
-	unsigned int head, tail;
-
-	if (!mk_self || !mk_self->ipi_data)
-		return;
-
-	ring = &mk_self->ipi_data->ring;
-	head = mk_ring_idx(atomic_read(&ring->head));
-
-	for (tail = mk_ring_idx(atomic_read(&ring->tail)); tail != head;
-	     tail = mk_ring_idx(tail + 1))
-		ring->entries[tail].data_size = 0;
-
-	/* Release capacity only after all abandoned slots have been cleared. */
-	atomic_set_release(&ring->tail, head);
-}
-
-/**
  * multikernel_register_handler - Register a callback for multikernel IPI
  * @callback: Function to call when IPI is received
  * @ctx: Context pointer passed to the callback
@@ -332,9 +304,11 @@ static void mk_ipi_drain_ring(void)
 		 * drop the message it is about to publish. Its own IPI, or
 		 * the next one, brings us back here.
 		 *
-		 * A sender stopped before publishing leaves its slot zero
-		 * forever; mk_ipi_ring_drop_pending() clears those out when
-		 * the instance is re-spawned.
+		 * A stopped sender may leave its slot zero permanently. Without
+		 * per-slot ownership or a quiescence protocol, respawning one peer
+		 * cannot safely clear this shared receive ring: other peers may
+		 * still publish or this receiver may advance tail concurrently.
+		 * Retain the slot rather than fabricate reusable capacity.
 		 */
 		data_size = smp_load_acquire(&slot->data_size);
 		if (data_size == 0)

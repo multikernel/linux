@@ -210,7 +210,12 @@ static int arch_cpu_from_physical_id(mk_phys_cpu_t cpu)
 static int mk_instance_confirm_parked(struct mk_instance *instance) { return stage("confirm"); }
 static int kimage_load_segment(struct kimage *image, unsigned int i) { return stage("copy"); }
 static int mk_manifest_finalize(struct kimage *image) { return stage("manifest"); }
-static void mk_ipi_ring_drop_pending(void) { stage("reset-ring"); }
+static unsigned int host_ring_drops;
+static __attribute__((unused)) void mk_ipi_ring_drop_pending(void)
+{
+	host_ring_drops++;
+	stage("reset-ring");
+}
 static void mk_instance_ipi_deactivate(struct mk_instance *instance)
 {
 	stage("deactivate");
@@ -437,6 +442,7 @@ int main(void)
 	expect("MK exec", multikernel_kexec_by_id(2), 0);
 	finish_probe();
 	expect("spawn state published", target.state, MK_STATE_ACTIVE);
+	expect("exec never rewinds or discards shared host receive traffic", host_ring_drops, 0);
 
 	for (i = 0; i < sizeof(exec_fail_stages) / sizeof(*exec_fail_stages); i++) {
 		reset(true);

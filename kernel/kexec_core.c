@@ -1785,12 +1785,11 @@ int multikernel_kexec_by_id(int mk_id)
 	mk_instance_ipi_reset(instance);
 
 	/*
-	 * Same for the other direction: whatever the halted instance left
-	 * queued for us is addressed from a kernel that no longer exists,
-	 * and a slot it claimed but never published stalls our ring for
-	 * good.
+	 * Do not reset the host receive ring here. It is shared with live
+	 * peers and its IRQ consumer; confirming this instance stopped does
+	 * not quiesce either. A stalled unpublished slot needs a separate
+	 * ownership/quiescence protocol, not a cached-head tail rewind.
 	 */
-	mk_ipi_ring_drop_pending();
 
 	/* A failed start may already have released some CPUs into this Image. */
 	mk_instance_set_state(instance, MK_STATE_ACTIVE);
