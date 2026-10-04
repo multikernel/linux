@@ -8,6 +8,7 @@ trap 'rm -rf -- "$build"' EXIT HUP INT TERM
 awk '/^static inline unsigned int mk_ring_idx\(/ { copy = 1 }
      /^int multikernel_send_ipi_data(_to)?\(/ { copy = 1 }
      /^void mk_instance_ipi_(reset|publish|deactivate)\(/ { copy = 1 }
+     /^static void mk_ipi_drain_ring\(/ { copy = 1 }
      copy { print }
      copy && /^}/ { copy = 0 }' "$src/kernel/multikernel/ipi.c" \
      > "$build/writer-production.h"
