@@ -191,7 +191,6 @@ int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
 				 size_t data_size, unsigned long type);
 
 /* Discard everything queued in this kernel's ring (instance re-spawn) */
-void mk_ipi_ring_drop_pending(void);
 
 /*
  * Multikernel Messaging System

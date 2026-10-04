@@ -21,7 +21,6 @@ static enum mk_instance_state state_at_start;
 #define mk_instance_track_dump(...) do { } while (0)
 #define lockdep_assert_held(...) do { } while (0)
 #define mk_instance_ipi_reset(instance) (*(instance)->ipi_data = 0)
-#define mk_ipi_ring_drop_pending() do { } while (0)
 
 static int mk_pciback_lend(struct mk_instance *instance)
 {

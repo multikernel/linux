@@ -507,12 +507,10 @@ int mk_instance_start(struct mk_instance *instance, struct kimage *image,
 	mk_instance_ipi_reset(instance);
 
 	/*
-	 * Same for the other direction: whatever the halted instance left
-	 * queued for us is addressed from a kernel that no longer exists,
-	 * and a slot it claimed but never published stalls our ring for
-	 * good.
+	 * Do not reset the host receive ring: it is shared with live peers
+	 * and its IRQ consumer. Stopped instance CPUs do not quiesce either.
+	 * An abandoned unpublished slot needs a separate ownership protocol.
 	 */
-	mk_ipi_ring_drop_pending();
 
 	ret = mk_pciback_lend(instance);
 	if (ret) {
