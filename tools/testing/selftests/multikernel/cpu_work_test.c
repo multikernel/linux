@@ -23,6 +23,8 @@ struct irq_lock { bool held; };
 #define DEFINE_RAW_SPINLOCK(name) struct irq_lock name
 #define mutex_lock(m) do { assert(!*(m)); *(m) = true; } while (0)
 #define mutex_unlock(m) do { assert(*(m)); *(m) = false; } while (0)
+#define mutex_trylock(m) (*(m) ? false : (*(m) = true))
+static bool mk_overlay_mutex;
 #define spin_lock_irqsave(m, flags) \
 	do { lock_irq(m, false); (flags) = 0; } while (0)
 #define spin_unlock_irqrestore(m, flags) \
@@ -50,6 +52,7 @@ static int add_error, remove_error;
 static int send_error;
 static bool hard_irq;
 static unsigned int rt_atomic_lock_errors;
+static unsigned int unlocked_mutations;
 static mk_phys_cpu_t ids[] = { 65537, 0x123456789abcdef0ULL };
 static bool memory_added, device_added, shutdown_sent, parked_cpus;
 static unsigned int shutdown_jobs_pending;
@@ -177,6 +180,7 @@ static unsigned int cpu_index(mk_phys_cpu_t id)
 
 static int mk_do_cpu_add(mk_phys_cpu_t id, u32 numa, u32 flags)
 {
+	unlocked_mutations += !mk_overlay_mutex;
 	if (!add_error)
 		online[cpu_index(id)] = true;
 	return add_error;
@@ -184,6 +188,7 @@ static int mk_do_cpu_add(mk_phys_cpu_t id, u32 numa, u32 flags)
 
 static int mk_do_cpu_remove(mk_phys_cpu_t id)
 {
+	unlocked_mutations += !mk_overlay_mutex;
 	if (!remove_error)
 		online[cpu_index(id)] = false;
 	return remove_error;
@@ -191,24 +196,28 @@ static int mk_do_cpu_remove(mk_phys_cpu_t id)
 
 static int mk_do_mem_add(u64 pfn, u64 pages, u32 node, u32 type)
 {
+	unlocked_mutations += !mk_overlay_mutex;
 	memory_added = true;
 	return 0;
 }
 
 static int mk_do_mem_remove(u64 pfn, u64 pages)
 {
+	unlocked_mutations += !mk_overlay_mutex;
 	memory_added = false;
 	return 0;
 }
 
 static int mk_do_device_add(u16 domain, u8 bus, u8 devfn, const char *driver, u32 flags)
 {
+	unlocked_mutations += !mk_overlay_mutex;
 	device_added = true;
 	return 0;
 }
 
 static int mk_do_device_remove(u16 domain, u8 bus, u8 devfn)
 {
+	unlocked_mutations += !mk_overlay_mutex;
 	device_added = false;
 	return 0;
 }
@@ -396,6 +405,9 @@ static void shutdown_regressions(void)
 		run_one(&system_queue);
 	expect("shutdown reaches parking boundary", parked_cpus, 1);
 	expect("shutdown ACK sent", shutdown_sent, 1);
+	expect("shutdown excludes local controllers until all CPUs park", mk_overlay_mutex, 1);
+	/* longjmp models disposal of this stopped kernel, not mutex unlocking. */
+	mk_overlay_mutex = false;
 	expect("no accepted resource job remains at shutdown ACK", shutdown_jobs_pending, 0);
 	expect("CPU work completed before parking", online[0], 1);
 	expect("memory work completed before parking", memory_added, 1);
@@ -454,6 +466,38 @@ static void shutdown_regressions(void)
 	expect("cleanup releases mixed work despite lost ACK", allocations, 0);
 	expect("cleanup leaves no system jobs", system_queue.nr, 0);
 	expect("cleanup releases CPU queue", queues_live, 0);
+	reset();
+}
+
+static void controller_regressions(void)
+{
+	struct mk_cpu_resource_payload cpu = { .cpu_id = 65537, .sender_instance_id = 3 };
+	struct mk_mem_resource_payload mem = { .start_pfn = 65537, .sender_instance_id = 3 };
+	struct mk_device_resource_payload dev = { .domain = 1, .sender_instance_id = 3 };
+	unsigned int i;
+
+	reset();
+	expect("init for controller contention", mk_hotplug_init(), 0);
+	expect("queue busy CPU add", mk_handle_cpu_add(&cpu, sizeof(cpu), 71), 0);
+	expect("queue busy CPU remove", mk_handle_cpu_remove(&cpu, sizeof(cpu), 72), 0);
+	expect("queue busy memory add", mk_handle_mem_add(&mem, sizeof(mem), 73), 0);
+	expect("queue busy memory remove", mk_handle_mem_remove(&mem, sizeof(mem), 74), 0);
+	expect("queue busy device add", mk_handle_device_add(&dev, sizeof(dev), 75), 0);
+	expect("queue busy device remove", mk_handle_device_remove(&dev, sizeof(dev), 76), 0);
+	mutex_lock(&mk_overlay_mutex);
+	drain(cpu_queue);
+	drain(&system_queue);
+	expect("busy workers leave controller lock held", mk_overlay_mutex, 1);
+	expect("busy workers do not mutate resources", online[0] || memory_added || device_added, 0);
+	expect("every busy worker attempts an ACK", nr_replies, 6);
+	for (i = 0; i < nr_replies; i++)
+		expect("busy ACK never claims success", replies[i].ack.result, -EBUSY);
+	mutex_unlock(&mk_overlay_mutex);
+	expect("retry admitted after controller unlock", mk_handle_cpu_add(&cpu, sizeof(cpu), 77), 0);
+	drain(cpu_queue);
+	expect("retry mutates after unlock", online[0], 1);
+	expect("retry ACK succeeds", replies[6].ack.result, 0);
+	mk_hotplug_cleanup();
 	reset();
 }
 
@@ -548,6 +592,8 @@ int main(void)
 	mk_hotplug_cleanup();
 	reset();
 	shutdown_regressions();
+	controller_regressions();
+	expect("incoming mutation excludes direct controller/pool changes", unlocked_mutations, 0);
 	expect("hard-IPI admission never takes an RT sleeping lock", rt_atomic_lock_errors, 0);
 	printf("CPU work ordering: %u checks, %u failures\n", checks, failures);
 	return failures ? EXIT_FAILURE : EXIT_SUCCESS;

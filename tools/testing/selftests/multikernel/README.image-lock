@@ -27,7 +27,8 @@ is now inside kexec_lock, as it already is for legacy kexec_load.
 
 Kernel allocation, segment copying, firmware, pool mutation, instance registry
 storage and kernfs removal are controlled host boundaries. The real MK release
-helper is exercised; the general kimage_free dispatcher is a boundary. The
+and can-free helpers are exercised; the general kimage_free dispatcher is a
+boundary. The
 fixture contains only the fields reached by the extracted functions. Kernel
 sign-compare and unused-argument diagnostics from those functions are excluded
 from the host compiler's -Werror policy, not from kernel build validation.
@@ -37,12 +38,17 @@ Remaining release gates
 ----------------------
 
 This mutex covers local controller overlay/baseline resource changes and MK
-image load, exec and cleanup. It does not cancel queued remote work, serialize
-all deferred workers, confirm every CPU stopped, or make unload of an active
-image safe. Halt/HALTED/force-halt settlement, teardown admission, remote-work
-quiescence and cross-kernel dependencies remain separate follow-ups. The
-existing exec path still warns and continues on manifest-finalization failure;
-that error handling is not fixed or qualified here.
+image load, exec and cleanup. Incoming resource workers now refuse a contended
+resource lock with -EBUSY rather than mutate through a controller operation.
+Active Image unload is refused; an uncertain failed start must first confirm
+all assigned/tracked CPUs stopped. Manifest-finalization failure prevents
+starting the Image, and a partial start failure retains FAILED state rather
+than publishing a reusable LOADED state. These paths are covered here with
+controlled stop/start boundaries, not actual firmware execution.
+
+Halt/HALTED/force-halt settlement and destruction are tested separately by
+halt_settlement_test.sh, teardown_test.sh and memory_teardown_test.sh. They do
+not cancel queued remote work or qualify cross-kernel producer retirement.
 
 A substituted successful firmware start does not prove CPU execution or safe
 reclamation after a partial start. Local threading, sanitizers and kernel links

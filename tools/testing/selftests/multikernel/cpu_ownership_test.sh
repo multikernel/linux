@@ -15,6 +15,10 @@ awk '/^#define MK_MSG_IO / { copy = 1 }
      /^\/\* Opaque type/ { copy = 0 }
      copy { print }' "$src/include/linux/multikernel.h" >> "$build/cpu-types.h"
 sed '/^#include /d' "$src/kernel/multikernel/cpuset.c" > "$build/cpu-set.h"
+awk '/^void mk_instance_ipi_retarget\(/ { copy = 1 }
+     copy { print }
+     copy && /^}/ { copy = 0 }' "$src/kernel/multikernel/ipi.c" \
+     > "$build/cpu-retarget.h"
 awk '/^int mk_instance_(transfer|return)_cpus\(/ { copy = 1 }
      copy { print }
      copy && /^}/ { copy = 0 }' "$src/kernel/multikernel/core.c" \

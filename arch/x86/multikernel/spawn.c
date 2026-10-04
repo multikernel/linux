@@ -581,15 +581,17 @@ int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 	struct mk_spawn_context *ctx = instance->arch.spawn_ctx;
 	int ret;
 
-	if (!ctx || !ctx->park_phys)
+	if (!mk_pool || !mk_pool->arch.slot)
 		return -ENODEV;
 
 	guard(mutex)(&mk_pool->park_lock);
 
-	ret = mk_publish_repark(ctx, (u32)phys_cpu, ctx->park_phys,
-				ctx->park_cr3, instance->arch.spawn_ctx_phys,
-				"confirm parked");
-	if (!ret || !mk_pool || !mk_pool->arch.slot)
+	ret = -ENODEV;
+	if (ctx && ctx->park_phys)
+		ret = mk_publish_repark(ctx, (u32)phys_cpu, ctx->park_phys,
+					ctx->park_cr3, instance->arch.spawn_ctx_phys,
+					"confirm parked");
+	if (!ret)
 		return ret;
 
 	/*

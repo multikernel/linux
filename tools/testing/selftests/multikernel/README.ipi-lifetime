@@ -1,0 +1,46 @@
+.. SPDX-License-Identifier: GPL-2.0-only
+
+IPI callback and local writer lifetime
+======================================
+
+Run ipi_lifetime_test.sh, instance_lookup_test.sh, instance_release_test.sh
+and ipi_writer_test.sh with bash. CC and CFLAGS select the host compiler and
+sanitizers. Each runner extracts the production functions, not another
+implementation. Kernel RCU, scheduler, IDR, physical IPI and hardware boundaries
+are substituted; these tests do not qualify kernel IRQ/RCU behavior.
+
+The callback test holds an entered callback while another pthread unregisters
+it. The baseline freed its handler before that callback returned. The fixed
+path unlinks under the writer lock, then waits outside that lock for an RCU
+grace period covering lookup and callback invocation. The test requires an
+active protected reader, not merely entry into the grace-period shim. Caller
+context remains live until unregister returns. Unregister is process-context
+only, must not run inside a callback, and cannot hold callback-owned locks.
+
+Lookup now pins the instance in an RCU read-side section with
+kref_get_unless_zero(), without the sleeping registry mutex in a hard-IPI
+sender. IDR writers reserve an empty slot under the registry mutex and publish
+only after the instance ID is initialized. No allocator runs under a raw
+membership lock. Normal destruction returns resources synchronously, so later
+fragments of the same overlay can reuse them. The last reference defers record
+and persistent boot-page reclamation to process context after an RCU grace
+period. Early-publication failure also drops its reference instead of freeing
+an object another lookup can have pinned.
+
+Local producers hold the per-instance raw ring lock through payload publication,
+but release it before ringing a doorbell or logging. Reset closes publication
+under that lock, clears the persistent ring with IRQs enabled, then republishes
+it and a cached physical target. Atomic senders do not walk a mutable CPU set.
+The fixture exercises send, closed admission and reset/republication ordering.
+The target cache is refreshed at publication/reset and local CPU ownership
+changes, except for the firmware-described parent doorbell target. Runtime
+boot-hart reassignment remains a hardware qualification gate.
+
+The host-owned ring allocation now outlives the Image grant on this upstream
+base. Host instance references therefore pin its storage. These local locks
+do not fence foreign kernels writing the same physical ring: remote producer
+retirement, requester restart and the shared receive-ring reset remain protocol
+limitations, not solved by resetting indices or confirming receiver CPUs.
+No #7 protocol dependency, new message layout or mixed-peer claim is introduced.
+mktty IRQ locking and higher-level messaging registration admission are separate
+baseline gates; callback retirement alone does not qualify them.

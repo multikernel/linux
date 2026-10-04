@@ -596,6 +596,23 @@ static void kimage_free_cma(struct kimage *image)
  * its load-time buffers and its reference on the instance. Also unwinds a
  * load that failed before the image was published.
  */
+int kimage_can_free_multikernel(struct kimage *image)
+{
+#ifdef CONFIG_MULTIKERNEL
+	struct mk_instance *instance = image->mk_instance;
+
+	lockdep_assert_held(&mk_overlay_mutex);
+	/* An unpublished loader candidate has never released a CPU into its Image. */
+	if (!instance || instance->kimage != image)
+		return 0;
+	if (instance->state == MK_STATE_ACTIVE)
+		return -EBUSY;
+	return mk_instance_confirm_parked(instance);
+#else
+	return -EOPNOTSUPP;
+#endif
+}
+
 void kimage_free_multikernel(struct kimage *image)
 {
 	struct mk_instance *instance = image->mk_instance;
@@ -604,6 +621,11 @@ void kimage_free_multikernel(struct kimage *image)
 #ifdef CONFIG_MULTIKERNEL
 	lockdep_assert_held(&mk_overlay_mutex);
 #endif
+	/* Published Images reach here only after kimage_free() validated stop. */
+	if (!instance)
+		return;
+	if (instance->kimage == image)
+		mk_instance_ipi_deactivate(instance);
 
 	for (i = 0; i < image->nr_segments; i++)
 		mk_kimage_free(image, phys_to_virt(image->segment[i].mem),
@@ -614,7 +636,6 @@ void kimage_free_multikernel(struct kimage *image)
 
 	if (instance->kimage == image) {
 		/* No kernel left to read the ring */
-		instance->ipi_data = NULL;
 		instance->kimage = NULL;
 		mk_instance_set_state(instance, MK_STATE_READY);
 	}
@@ -622,13 +643,20 @@ void kimage_free_multikernel(struct kimage *image)
 	image->mk_instance = NULL;
 }
 
-void kimage_free(struct kimage *image)
+int kimage_free(struct kimage *image)
 {
 	kimage_entry_t *ptr, entry;
 	kimage_entry_t ind = 0;
+	int ret;
 
 	if (!image)
-		return;
+		return 0;
+	/* All free paths, including future bulk callers, must fail before unlink. */
+	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
+		ret = kimage_can_free_multikernel(image);
+		if (ret)
+			return ret;
+	}
 
 	/* Remove from linked list and update compatibility pointers */
 	kimage_remove_from_list(image);
@@ -685,6 +713,7 @@ void kimage_free(struct kimage *image)
 	}
 
 	kfree(image);
+	return 0;
 }
 
 static kimage_entry_t *kimage_dst_used(struct kimage *image,
@@ -1739,10 +1768,11 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	rc = mk_manifest_finalize(mk_image);
-	if (rc)
-		pr_warn("Manifest finalization failed: %d\n", rc);
-	else
-		pr_info("Manifest finalized for multikernel instance\n");
+	if (rc) {
+		pr_err("Manifest finalization failed: %d; refusing start\n", rc);
+		goto unlock;
+	}
+	pr_info("Manifest finalized for multikernel instance\n");
 
 	rc = mk_instance_start(instance, mk_image, cpu);
 

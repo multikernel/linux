@@ -46,6 +46,8 @@ struct mk_instance {
 	int id, state;
 	const char *name;
 	struct mk_cpu_set *cpus, *cpus_on_slot;
+	mk_phys_cpu_t ipi_target;
+	bool ipi_lock;
 	struct {
 		struct mk_spawn_context *spawn_ctx;
 		unsigned long spawn_ctx_phys;
@@ -63,6 +65,7 @@ struct mk_pool {
 
 #define MK_STATE_ACTIVE 2
 #define MK_STATE_LOADED 1
+#define MK_STATE_FAILED 3
 #define MK_SPAWN_F_REPARK 1
 #define virt_to_phys(p) ((unsigned long)(p))
 #define per_cpu(name, cpu) name(cpu)
@@ -73,6 +76,8 @@ static u32 x86_cpu_to_apicid(int cpu)
 }
 static struct mk_instance self = { .id = 1 }, target;
 static struct mk_instance *mk_self = &self;
+static struct mk_instance *host_instance;
+static bool mk_overlay_mutex = true;
 static struct mk_pool pool, *mk_pool = &pool;
 static struct mk_spawn_context host_slot, spawn_ctx;
 static int references, wakes, wake_fail_at, send_error, wait_error;
@@ -98,6 +103,11 @@ static bool *lock(bool *held)
 
 #define guard(kind) bool *held_##kind __attribute__((cleanup(unlock))) = lock
 #define lockdep_assert_held(held) assert(*(held))
+#define raw_spin_lock_irqsave(m, flags) \
+	do { assert(!*(m)); *(m) = true; (flags) = 0; } while (0)
+#define raw_spin_unlock_irqrestore(m, flags) \
+	do { assert(*(m)); *(m) = false; (void)(flags); } while (0)
+#include "cpu-retarget.h"
 
 static int arch_cpu_from_physical_id(mk_phys_cpu_t cpu)
 {
@@ -253,6 +263,7 @@ int main(void)
 	expect("ownership precedes handoff", owned_at_wake, 1);
 	expect("tracking precedes handoff", tracked_at_wake, 1);
 	expect("ownership precedes remote start request", owned_at_send, 1);
+	expect("CPU addition refreshes physical doorbell", target.ipi_target == test_cpu, 1);
 	retained();
 	expect("repeat add is rejected", mk_send_cpu_add(2, test_cpu, 0, 0), -EBUSY);
 	expect("repeat add publishes nothing", sends, 1);
@@ -330,6 +341,7 @@ int main(void)
 	       mk_cpu_set_contains(pool.cpus, test_cpu), 1);
 	expect("removed CPU no longer target-owned", target.cpus->nr, 0);
 	expect("confirmed host return clears tracking", target.cpus_on_slot->nr, 0);
+	expect("CPU return removes obsolete doorbell", target.ipi_target == MK_PHYS_CPU_INVALID, 1);
 
 	reset();
 	assert(!mk_instance_transfer_cpus(&target, pool.cpus));
@@ -392,7 +404,23 @@ int main(void)
 	       mk_instance_confirm_parked(&target), 0);
 	expect("all confirmed host CPUs were visited", target.cpus_on_slot->nr, 0);
 	expect("host confirmation retains both owners", target.cpus->nr, 2);
-	expect("empty tracking confirms without a probe",
+	expect("assigned CPUs confirm despite empty tracking",
+	       mk_instance_confirm_parked(&target), 0);
+
+	reset();
+	assert(!mk_instance_transfer_cpus(&target, pool.cpus));
+	assert(!mk_cpu_set_add(target.cpus, 7));
+	confirm_mode = true;
+	expect("untracked assigned CPU must not escape confirmation",
+	       mk_instance_confirm_parked(&target), -EBUSY);
+	expect("untracked running CPU probed", running_probes, 2);
+	expect("untracked running CPU retains ownership", mk_cpu_set_contains(target.cpus, 7), 1);
+
+	reset();
+	assert(!mk_instance_transfer_cpus(&target, pool.cpus));
+	target.arch.spawn_ctx = NULL;
+	confirm_mode = true;
+	expect("before first spawn confirm host park slot",
 	       mk_instance_confirm_parked(&target), 0);
 
 	reset();

@@ -9,8 +9,9 @@ struct kexec_segment;
 struct kimage *do_kimage_alloc_init(void);
 int sanity_check_segment_list(struct kimage *image);
 void kimage_free_page_list(struct list_head *list);
-void kimage_free(struct kimage *image);
+int kimage_free(struct kimage *image);
 void kimage_free_multikernel(struct kimage *image);
+int kimage_can_free_multikernel(struct kimage *image);
 int kimage_load_segment(struct kimage *image, int idx);
 void kimage_terminate(struct kimage *image);
 int kimage_is_destination_range(struct kimage *image,

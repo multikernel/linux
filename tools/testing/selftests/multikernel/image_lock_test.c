@@ -54,6 +54,9 @@ enum { KEXEC_LOCK = 1, OVERLAY_LOCK = 2, REGISTRY_LOCK = 4 };
 struct mutex { pthread_mutex_t native; unsigned int bit; };
 static struct mutex mk_overlay_mutex = { PTHREAD_MUTEX_INITIALIZER, OVERLAY_LOCK };
 static struct mutex mk_instance_mutex = { PTHREAD_MUTEX_INITIALIZER, REGISTRY_LOCK };
+#define rcu_read_lock() do { assert(!(held & 8)); held |= 8; } while (0)
+#define rcu_read_unlock() do { assert(held & 8); held &= ~8U; } while (0)
+#define kref_get_unless_zero(p) (references++, true)
 
 static void mutex_lock(struct mutex *m)
 {
@@ -137,6 +140,7 @@ struct kimage {
 	struct list_head control_pages;
 };
 static struct mk_instance target;
+static struct mk_instance self, *mk_self = &self;
 static struct kimage *kexec_image, *kexec_crash_image;
 static struct { unsigned long start; } crashk_res;
 static unsigned int references;
@@ -181,7 +185,6 @@ static struct mk_instance *idr_find(int *idr, int id)
 {
 	return id == target.id ? &target : NULL;
 }
-static void mk_instance_get(struct mk_instance *instance) { references++; }
 static void mk_instance_put(struct mk_instance *instance)
 {
 	if (!instance)
@@ -190,7 +193,6 @@ static void mk_instance_put(struct mk_instance *instance)
 	references--;
 }
 #define mk_instance_track_dump(...) do { } while (0)
-#include "image-instance.h"
 
 static void mk_kimage_free(struct kimage *image, void *addr, size_t size)
 {
@@ -208,22 +210,48 @@ static int mk_instance_confirm_parked(struct mk_instance *instance) { return sta
 static int kimage_load_segment(struct kimage *image, unsigned int i) { return stage("copy"); }
 static int mk_manifest_finalize(struct kimage *image) { return stage("manifest"); }
 static void mk_ipi_ring_drop_pending(void) { stage("reset-ring"); }
+static void mk_instance_ipi_deactivate(struct mk_instance *instance)
+{
+	stage("deactivate");
+	instance->ipi_data = NULL;
+}
+static void mk_instance_ipi_publish(struct mk_instance *instance)
+{
+	stage("publish-ring");
+	instance->ipi_data = ring;
+}
+static void mk_instance_ipi_reset(struct mk_instance *instance)
+{
+	stage("reset-instance-ring");
+}
 static int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance, int cpu)
 {
 	return stage("start");
 }
+/* PCI operations are boundary probes, not device emulation. */
+static int mk_pciback_lend(struct mk_instance *instance) { return stage("lend"); }
+static void mk_pciback_unlend(struct mk_instance *instance) { stage("unlend"); }
+#include "image-instance.h"
 #include "image-core.h"
 
-static void kimage_free(struct kimage *image)
+static int kimage_free(struct kimage *image)
 {
+	int ret;
+
 	if (!image)
-		return;
+		return 0;
+	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
+		ret = kimage_can_free_multikernel(image);
+		if (ret)
+			return ret;
+	}
 	stage("free-image");
 	if (image->type == KEXEC_TYPE_MULTIKERNEL)
 		kimage_free_multikernel(image);
 	else
 		kimage_file_post_load_cleanup(image);
 	free(image);
+	return 0;
 }
 static struct kimage *do_kimage_alloc_init(void)
 {
@@ -358,7 +386,7 @@ int main(void)
 		"boot-pages", "read-image", "validate", "prepare", "vmcore",
 		"digest", "copy", "post-load", "control-page", "swap-page"
 	};
-	static const char * const exec_fail_stages[] = { "confirm", "copy", "start" };
+	static const char * const exec_fail_stages[] = { "confirm", "copy", "manifest", "start" };
 	unsigned int i;
 
 	for (i = 0; i < sizeof(load_stages) / sizeof(*load_stages); i++) {
@@ -389,6 +417,24 @@ int main(void)
 	expect("unload releases reference", references, 0);
 
 	reset(true);
+	expect("setup active unload", kexec_file_load(0, 0, 0, NULL, mk_flags), 0);
+	target.state = MK_STATE_ACTIVE;
+	expect("active unload rejected", kexec_file_load(0, 0, 0, NULL,
+	       mk_flags | KEXEC_FILE_UNLOAD), -EBUSY);
+	expect("active unload retains image", target.kimage != NULL, 1);
+	expect("active unload retains reference", references, 1);
+	target.state = MK_STATE_FAILED;
+	fail_at = "confirm";
+	expect("uncertain failed unload rejected", kexec_file_load(0, 0, 0, NULL,
+	       mk_flags | KEXEC_FILE_UNLOAD), -EIO);
+	expect("failed confirmation retains image", target.kimage != NULL, 1);
+	expect("failed confirmation retains reference", references, 1);
+	fail_at = NULL;
+	expect("confirmed failed start can unload", kexec_file_load(0, 0, 0, NULL,
+	       mk_flags | KEXEC_FILE_UNLOAD), 0);
+	expect("confirmed unload releases reference", references, 0);
+
+	reset(true);
 	expect("setup exec", kexec_file_load(0, 0, 0, NULL, mk_flags), 0);
 	probe_at = "start";
 	expect("MK exec", multikernel_kexec_by_id(2), 0);
@@ -401,7 +447,8 @@ int main(void)
 		fail_at = probe_at = exec_fail_stages[i];
 		expect("failed exec", multikernel_kexec_by_id(2), -EIO);
 		finish_probe();
-		expect("failed exec remains loaded", target.state, MK_STATE_LOADED);
+		expect("failed exec retains non-reusable state after start", target.state,
+		       !strcmp(exec_fail_stages[i], "start") ? MK_STATE_FAILED : MK_STATE_LOADED);
 	}
 	reset(true);
 	expect("setup invalid CPU exec", kexec_file_load(0, 0, 0, NULL, mk_flags), 0);

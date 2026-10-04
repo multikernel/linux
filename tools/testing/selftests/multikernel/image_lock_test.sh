@@ -27,12 +27,14 @@ awk '/^enum mk_overlay_tx_status \{/ { copy = 1 }
      copy && /^};/ { copy = 0 }' "$src/kernel/multikernel/overlay.c" \
      >> "$build/image-types.h"
 awk '/^void mk_instance_set_state\(/ { copy = 1 }
+     /^int mk_instance_start\(/ { copy = 1 }
      /^struct mk_instance \*mk_instance_find\(/ { copy = 1 }
      /^int mk_instance_set_kexec_active\(/ { copy = 1 }
      copy { print }
      copy && /^}/ { copy = 0 }' "$src/kernel/multikernel/core.c" \
      > "$build/image-instance.h"
 awk '/^void kimage_free_multikernel\(/ { copy = 1 }
+     /^int kimage_can_free_multikernel\(/ { copy = 1 }
      /^struct kimage \*kimage_find_by_id\(/ { copy = 1 }
      /^int multikernel_kexec_by_id\(/ { copy = 1 }
      copy { print }
