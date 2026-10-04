@@ -200,7 +200,7 @@ static int mk_slot_wake(struct mk_spawn_context *slot, u32 apic_id,
  * at the instance's own context, so the spawn kernel can wake them by
  * writing memory inside its own partition.
  */
-/* The instance's set of CPUs parked on its own context, allocated on demand */
+/* CPUs that may use the instance context, including uncertain handoffs. */
 static struct mk_cpu_set *mk_slot_set(struct mk_instance *instance)
 {
 	if (!instance->cpus_on_slot)
@@ -239,9 +239,8 @@ static int mk_repark_to_instance(struct mk_instance *instance,
 		return -ENOMEM;
 
 	/*
-	 * Guarantee the tracking add after each successful wake cannot
-	 * fail: a CPU that moved but was not recorded would be woken
-	 * through the wrong mailbox forever after.
+	 * Reserve tracking before publication: a timed-out wake may already
+	 * have moved a CPU, so it must remain recorded even on failure.
 	 */
 	ret = mk_cpu_set_reserve(on_slot, mk_cpu_set_count(instance->cpus));
 	if (ret)
@@ -259,13 +258,15 @@ static int mk_repark_to_instance(struct mk_instance *instance,
 		if (mk_cpu_set_contains(on_slot, phys_cpu))
 			continue;
 
+		ret = mk_cpu_set_add(on_slot, phys_cpu);
+		if (ret)
+			return ret;
+
 		ret = mk_publish_repark(slot, (u32)phys_cpu, ctx->park_phys,
 					ctx->park_cr3, virt_to_phys(ctx),
 					"repark to instance");
 		if (ret)
 			return ret;
-
-		mk_cpu_set_add(on_slot, phys_cpu);
 	}
 
 	return 0;
@@ -307,17 +308,11 @@ int mk_spawn_cpu(struct mk_instance *instance, int cpu,
 	slot->trampoline_phys = ctx->trampoline_phys;
 	slot->self_phys = virt_to_phys(ctx);
 	slot->flags = 0;
-	ret = mk_slot_wake(slot, apic_id, "first spawn boot cpu");
-	if (!ret) {
-		/*
-		 * It is running the instance's kernel now, and will park on
-		 * that kernel's context when the instance halts. The add
-		 * cannot fail: mk_repark_to_instance() reserved room for
-		 * every CPU of the instance.
-		 */
-		mk_cpu_set_add(instance->cpus_on_slot, apic_id);
-	}
-	return ret;
+	/* The boot CPU may run even if the host misses its acknowledgment. */
+	ret = mk_cpu_set_add(instance->cpus_on_slot, apic_id);
+	if (ret)
+		return ret;
+	return mk_slot_wake(slot, apic_id, "first spawn boot cpu");
 }
 
 /**
@@ -519,7 +514,7 @@ int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_c
 	if (!ctx || !slot || !ctx->park_phys || !on_slot)
 		return -ENODEV;
 
-	/* Make the tracking add below infallible before moving the CPU */
+	/* Reserve tracking before moving the CPU, including failed wakeups. */
 	ret = mk_cpu_set_reserve(on_slot, 1);
 	if (ret)
 		return ret;
@@ -529,12 +524,13 @@ int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_c
 	if (mk_cpu_set_contains(on_slot, phys_cpu))
 		return 0;
 
-	ret = mk_publish_repark(slot, (u32)phys_cpu, ctx->park_phys,
+	ret = mk_cpu_set_add(on_slot, phys_cpu);
+	if (ret)
+		return ret;
+
+	return mk_publish_repark(slot, (u32)phys_cpu, ctx->park_phys,
 				ctx->park_cr3, instance->arch.spawn_ctx_phys,
 				"repark hot-added cpu");
-	if (!ret)
-		mk_cpu_set_add(on_slot, phys_cpu);
-	return ret;
 }
 
 /**
