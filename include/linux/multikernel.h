@@ -1156,6 +1156,15 @@ void mk_register_cpus_from_manifest(void);
 /* Accept the manifest handed over at boot (spawn kernels) */
 void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len);
 
+bool mk_spawned(void);
+phys_addr_t mk_manifest_entry_stub_phys(void);
+
+/* Called under the exec serialization, before emitting the boot manifest. */
+int mk_arch_prepare_instance(struct kimage *image, struct mk_instance *instance);
+/* Emit properties only: the caller has opened /chosen, before its children. */
+int mk_arch_manifest_chosen(void *fdt, struct kimage *image,
+			    struct mk_instance *instance);
+
 /* Build the manifest for a spawn (host, kexec path) */
 int mk_manifest_finalize(struct kimage *image);
 #else
@@ -1210,6 +1219,14 @@ static inline void mk_register_cpus_from_manifest(void)
 static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 {
 }
+static inline bool mk_spawned(void)
+{
+	return false;
+}
+static inline phys_addr_t mk_manifest_entry_stub_phys(void)
+{
+	return 0;
+}
 #endif
 
 /**
@@ -1218,6 +1235,7 @@ static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 #define MK_DT_CONFIG_VERSION_1  1
 #define MK_DT_CONFIG_CURRENT    MK_DT_CONFIG_VERSION_1
 #define MK_FDT_COMPATIBLE "multikernel-v1"
+#define MK_FDT_ENTRY_STUB "multikernel,entry-stub"
 
 /**
  * Property Names
