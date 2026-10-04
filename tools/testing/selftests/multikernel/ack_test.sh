@@ -29,6 +29,9 @@ awk '/^struct mk_(pending_msg|msg_type_handler) \{/ { copy = 1 }
      copy && /^}/ { copy = 0 }' "$src/kernel/multikernel/messaging.c" \
      > "$build/ack-messaging.h"
 awk '/^struct mk_(cpu|mem|device)_hotplug_work \{/ { copy = 1 }
+     /^static DEFINE_(RAW_)?SPINLOCK\(mk_cpu_hotplug_lock\);/ { print }
+     /^static struct workqueue_struct \*mk_cpu_hotplug_wq;/ { print }
+     /^static int mk_queue_cpu_work\(/ { copy = 1 }
      /^static void mk_(cpu|mem|device)_(add|remove)_work_fn\(/ { copy = 1 }
      /^(static )?int mk_handle_(cpu|mem|device)_(add|remove)\(/ { copy = 1 }
      /^static void mk_resource_msg_handler\(/ { copy = 1 }

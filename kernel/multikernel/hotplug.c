@@ -23,6 +23,8 @@
 #include <linux/mmzone.h>
 #include <linux/multikernel.h>
 #include <linux/pci.h>
+#include <linux/spinlock.h>
+#include <linux/workqueue.h>
 #include "internal.h"
 
 static const char mk_mem_resource_name[] = "System RAM (multikernel)";
@@ -64,6 +66,41 @@ struct mk_hotplug_op {
 
 static DEFINE_MUTEX(mk_hotplug_mutex);
 static LIST_HEAD(mk_hotplug_ops);
+
+/*
+ * A remove ACK must not overtake an earlier queued add. CPU requests share an
+ * ordered queue; memory and device workers retain their existing scheduling.
+ * The raw lock protects submission against queue detachment during cleanup;
+ * the receive path runs in hard-IPI context, including on PREEMPT_RT.
+ */
+static DEFINE_RAW_SPINLOCK(mk_cpu_hotplug_lock);
+static struct workqueue_struct *mk_cpu_hotplug_wq;
+
+static int mk_queue_cpu_work(struct work_struct *work)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	raw_spin_lock_irqsave(&mk_cpu_hotplug_lock, flags);
+	if (mk_cpu_hotplug_wq)
+		queue_work(mk_cpu_hotplug_wq, work);
+	else
+		ret = -ESHUTDOWN;
+	raw_spin_unlock_irqrestore(&mk_cpu_hotplug_lock, flags);
+	return ret;
+}
+
+static struct workqueue_struct *mk_cpu_hotplug_detach(void)
+{
+	struct workqueue_struct *wq;
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&mk_cpu_hotplug_lock, flags);
+	wq = mk_cpu_hotplug_wq;
+	mk_cpu_hotplug_wq = NULL;
+	raw_spin_unlock_irqrestore(&mk_cpu_hotplug_lock, flags);
+	return wq;
+}
 
 /*
  * CPU Hotplug Operations
@@ -306,6 +343,7 @@ static int mk_handle_cpu_add(struct mk_cpu_resource_payload *payload, u32 payloa
 			       u64 msg_id)
 {
 	struct mk_cpu_hotplug_work *hp_work;
+	int ret;
 
 	if (payload_len < sizeof(*payload)) {
 		pr_err("Multikernel hotplug: Invalid CPU add payload size: %u\n", payload_len);
@@ -326,9 +364,11 @@ static int mk_handle_cpu_add(struct mk_cpu_resource_payload *payload, u32 payloa
 	hp_work->flags = payload->flags;
 	hp_work->sender_instance_id = payload->sender_instance_id;
 	hp_work->operation = MK_RES_CPU_ADD;
-	schedule_work(&hp_work->work);
+	ret = mk_queue_cpu_work(&hp_work->work);
+	if (ret)
+		kfree(hp_work);
 
-	return 0;
+	return ret;
 }
 
 /**
@@ -346,6 +386,7 @@ int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_le
 			 u64 msg_id)
 {
 	struct mk_cpu_hotplug_work *hp_work;
+	int ret;
 
 	if (payload_len < sizeof(*payload)) {
 		pr_err("Multikernel hotplug: Invalid CPU remove payload size: %u\n", payload_len);
@@ -366,9 +407,11 @@ int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_le
 	hp_work->flags = payload->flags;
 	hp_work->sender_instance_id = payload->sender_instance_id;
 	hp_work->operation = MK_RES_CPU_REMOVE;
-	schedule_work(&hp_work->work);
+	ret = mk_queue_cpu_work(&hp_work->work);
+	if (ret)
+		kfree(hp_work);
 
-	return 0;
+	return ret;
 }
 
 /*
@@ -1102,14 +1145,25 @@ static void mk_resource_msg_handler(u32 msg_type, u32 subtype, u64 msg_id,
  */
 int __init mk_hotplug_init(void)
 {
+	struct workqueue_struct *wq;
+	unsigned long flags;
 	int ret;
 
 	pr_info("Initializing multikernel hotplug subsystem\n");
+
+	wq = alloc_ordered_workqueue("mk_cpu_hotplug", WQ_MEM_RECLAIM);
+	if (!wq)
+		return -ENOMEM;
+
+	raw_spin_lock_irqsave(&mk_cpu_hotplug_lock, flags);
+	mk_cpu_hotplug_wq = wq;
+	raw_spin_unlock_irqrestore(&mk_cpu_hotplug_lock, flags);
 
 	/* Register handler for resource management messages */
 	ret = mk_register_msg_handler(MK_MSG_RESOURCE, mk_resource_msg_handler, NULL);
 	if (ret < 0) {
 		pr_err("Failed to register multikernel hotplug message handler: %d\n", ret);
+		destroy_workqueue(mk_cpu_hotplug_detach());
 		return ret;
 	}
 
@@ -1124,12 +1178,19 @@ int __init mk_hotplug_init(void)
  */
 void mk_hotplug_cleanup(void)
 {
+	struct workqueue_struct *wq;
 	struct mk_hotplug_op *op, *tmp;
 
 	pr_info("Cleaning up multikernel hotplug subsystem\n");
 
+	/* Reject late CPU submissions before draining and freeing their queue. */
+	wq = mk_cpu_hotplug_detach();
+
 	/* Unregister message handler */
 	mk_unregister_msg_handler(MK_MSG_RESOURCE, mk_resource_msg_handler);
+
+	if (wq)
+		destroy_workqueue(wq);
 
 	/* Free operation tracking list */
 	mutex_lock(&mk_hotplug_mutex);

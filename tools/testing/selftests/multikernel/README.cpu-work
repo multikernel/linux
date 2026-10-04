@@ -1,0 +1,61 @@
+.. SPDX-License-Identifier: GPL-2.0-only
+
+Deferred CPU-request ordering checks
+===================================
+
+Run from this source tree, without building or booting a kernel:
+
+  sh tools/testing/selftests/multikernel/cpu_work_test.sh
+  CC=gcc CFLAGS=-O2 sh tools/testing/selftests/multikernel/cpu_work_test.sh
+  CC=clang CFLAGS='-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer' \
+    sh tools/testing/selftests/multikernel/cpu_work_test.sh
+
+The runner extracts verbatim CPU receive handlers, workers, queue submission
+and detachment, hotplug init and cleanup. It tests real admission, error/free
+paths and ACK fields against controlled scheduler, CPU mutation, registration
+and transport boundaries. A legal adverse scheduler runs unordered requests
+newest-first; the ordered-queue boundary follows the kernel's FIFO contract.
+This is not a real Linux workqueue or concurrent hotplug execution test.
+
+The lock boundary also models hard-IPI context with PREEMPT_RT semantics:
+ordinary spin locks may sleep, raw locks may not. Before the review fix, that
+check reported 12 invalid lock acquisitions (44 checks, one failure). It passes
+with raw submission/detachment/publication locks. This models the API choice;
+it is not a reproduced PREEMPT_RT kernel failure or full RT qualification.
+
+Before the source fix: 35 checks, 14 failures, including a remove ACK preceding
+an older queued add and the CPU becoming online afterward. Queue initialization,
+registration failure, sparse full-width CPU IDs, worker errors, allocation
+failure, short payloads, teardown admission and draining are also exercised.
+Cleanup injects an already-entered callback at unregister to check that it
+cannot submit after the CPU queue is detached. Kernel callback-object lifetime
+and actual IRQ synchronization are not simulated or qualified by that check.
+
+Behavior and limits
+-------------------
+
+Incoming CPU adds/removes now share alloc_ordered_workqueue, which guarantees
+at most one running work item and FIFO queue order. Do not substitute a bound
+queue with max_active=1: the in-tree workqueue API documents why that is not a
+global ordering guarantee. A remove worker and its ACK follow CPU requests
+already admitted ahead of it. The separate ack_test retains real pending/ID
+and worker echo coverage with its single-item scheduler boundary.
+
+Submission and queue detachment share an IRQ-safe raw spinlock. Detach closes CPU
+admission before unregister; destroy_workqueue drains admitted CPU work before
+freeing the queue. Init failure does not publish a resource handler without its
+CPU queue. Rejected work is freed and returns -ESHUTDOWN to the receive dispatch;
+no success ACK is fabricated. The existing dispatcher logs that error rather
+than replying, so a requester may time out and must retain uncertain ownership.
+
+This orders already received CPU requests only. It does not cancel a timed-out
+request, exclude later messages or another controller, serialize local pool
+operations with all incoming workers, drain memory/device work, or fence all
+surviving peers. Memory/device and shutdown scheduling stay unchanged. No wire
+layout or request-ID change is introduced.
+
+Full halt/HALTED/force-halt settlement, destruction/admission, callback and
+ring/image lifetime, shutdown quiescence and cross-kernel dependencies remain
+release gates. All parked CPUs or a reset ring alone are not a queued-work
+cancellation proof. Kernel lockdep, x86 runtime/concurrency, QEMU/OpenSBI and
+same/different-Image 50-cycle failure/stress tests remain required.
