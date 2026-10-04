@@ -33,6 +33,7 @@ awk '/^void mk_instance_set_state\(/ { copy = 1 }
      copy && /^}/ { copy = 0 }' "$src/kernel/multikernel/core.c" \
      > "$build/image-instance.h"
 awk '/^void kimage_free_multikernel\(/ { copy = 1 }
+     /^int kimage_can_free_multikernel\(/ { copy = 1 }
      /^struct kimage \*kimage_find_by_id\(/ { copy = 1 }
      /^int multikernel_kexec_by_id\(/ { copy = 1 }
      copy { print }

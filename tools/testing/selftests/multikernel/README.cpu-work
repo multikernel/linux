@@ -70,10 +70,21 @@ Quiescence waits without controller, registry, tracking or admission locks held.
 If an accepted operation never returns, no successful shutdown ACK is sent.
 No timeout is used to pretend the operation was cancelled.
 
-This is incoming-worker quiescence for requested graceful shutdown only. It
-does not cancel a timed-out request, serialize local controllers/pool operations,
-exclude another controller, synchronize callback-object lifetime, or fence
-surviving peers/driver activity. Voluntary halt, poweroff/reboot, panic and force
+Workers also exclude local controller/pool mutations with mk_overlay_mutex.
+They use trylock: a controller can hold its local resource lock while waiting
+for another kernel's ACK. Waiting for that same lock in incoming workers could
+make two such controllers depend on each other indefinitely. A contended worker
+returns -EBUSY in its correlated ACK without mutating any resource. ACK delivery
+and work retirement happen after releasing the resource lock. Retry is explicit;
+this is not a successful mutation or recovery of uncertain ownership.
+
+The fixture covers all six busy worker paths and a successful retry after the
+controller unlocks. It also requires every substituted mutation to run under
+the resource lock. All traced direct send/pool callers are within baseline or
+overlay resource critical sections. After incoming quiescence, requested
+shutdown takes that mutex and retains it until every local CPU is stopped,
+excluding local controllers from passing shutdown. Voluntary halt, poweroff/
+reboot, panic and force
 stop do not use the sleeping barrier and remain separate qualification gates.
 No wire layout or request-ID change is introduced; no success ACK is fabricated
 for late rejected resource requests.

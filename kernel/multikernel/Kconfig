@@ -10,6 +10,10 @@ config ARCH_SUPPORTS_MULTIKERNEL
 config ARCH_HAS_MK_HOST_PARK
 	bool
 
+# The architecture can forcibly stop a remote instance's CPUs (x86 NMI).
+config ARCH_HAS_MK_FORCE_STOP
+	bool
+
 config MULTIKERNEL
 	bool "Multikernel support"
 	depends on ARCH_SUPPORTS_MULTIKERNEL

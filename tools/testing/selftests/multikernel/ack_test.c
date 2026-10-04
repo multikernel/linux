@@ -115,6 +115,11 @@ static int mutate(void)
 	return mutation_result;
 }
 
+static bool mk_overlay_mutex;
+#define mutex_lock(m) do { assert(!*(m)); *(m) = true; } while (0)
+#define mutex_trylock(m) (*(m) ? false : (*(m) = true))
+#define mutex_unlock(m) do { assert(*(m)); *(m) = false; } while (0)
+
 #define mk_do_cpu_add(...) mutate()
 #define mk_do_cpu_remove(...) mutate()
 #define mk_do_mem_add(...) mutate()
@@ -378,6 +383,8 @@ static void run_work(struct work_struct *work, bool parks)
 		assert(!parks);
 	} else {
 		assert(parks);
+		/* The parked fixture kernel is discarded before the next case. */
+		mk_overlay_mutex = false;
 	}
 }
 

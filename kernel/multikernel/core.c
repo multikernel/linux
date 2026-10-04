@@ -14,17 +14,48 @@
 #include <linux/multikernel.h>
 #include <linux/pci.h>
 #include <linux/vmalloc.h>
+#include <linux/rcupdate.h>
 #include "internal.h"
 
-static void mk_instance_return_all_cpus(struct mk_instance *instance)
+int mk_instance_idr_add(struct mk_instance *instance, int start, int end)
 {
-	if (!instance || mk_cpu_set_empty(instance->cpus))
-		return;
+	int id;
 
-	if (instance == mk_self || instance->id == 0)
-		return;
+	lockdep_assert_held(&mk_instance_mutex);
+	/* Reserve an empty slot; RCU readers must see the initialized ID. */
+	id = idr_alloc(&mk_instance_idr, NULL, start, end, GFP_KERNEL);
+	if (id >= 0) {
+		instance->id = id;
+		idr_replace(&mk_instance_idr, instance, id);
+	}
+	return id;
+}
 
-	mk_instance_return_cpus(instance, instance->cpus);
+void mk_instance_idr_remove(int id)
+{
+	lockdep_assert_held(&mk_instance_mutex);
+	idr_remove(&mk_instance_idr, id);
+}
+
+int mk_instance_prepare_destroy(struct mk_instance *instance)
+{
+	int ret;
+
+	lockdep_assert_held(&mk_overlay_mutex);
+	ret = mk_instance_confirm_parked(instance);
+	if (ret)
+		return ret;
+	ret = mk_arch_release_instance(instance);
+	if (ret)
+		return ret;
+
+	if (mk_cpu_set_empty(instance->cpus))
+		return 0;
+	/* Bookkeeping only: no firmware/park waits under the registry mutex. */
+	mutex_lock(&mk_instance_mutex);
+	ret = mk_instance_return_cpus(instance, instance->cpus);
+	mutex_unlock(&mk_instance_mutex);
+	return ret;
 }
 
 static void mk_instance_return_pci_devices(struct mk_instance *instance)
@@ -211,17 +242,40 @@ static void mk_instance_free_boot_pages(struct mk_instance *instance)
 	instance->manifest_phys = 0;
 }
 
-static void mk_instance_release(struct kref *kref)
+void mk_instance_retire_resources(struct mk_instance *instance)
 {
-	struct mk_instance *instance = container_of(kref, struct mk_instance, refcount);
+	lockdep_assert_held(&mk_overlay_mutex);
+	mk_instance_return_pci_devices(instance);
+	mk_instance_return_platform_devices(instance);
+	mk_instance_free_memory(instance);
+}
+
+static void mk_instance_release_work(struct work_struct *work)
+{
+	struct mk_instance *instance = container_of(work, struct mk_instance, release_work);
+	int ret;
+
+	/* Drain lookups that saw this record but did not acquire a reference. */
+	synchronize_rcu();
+	mutex_lock(&mk_overlay_mutex);
+	if (instance->state != MK_STATE_READY || instance->kimage) {
+		pr_err("Instance %d final release refused: not reusable; retaining allocations\n",
+		       instance->id);
+		mutex_unlock(&mk_overlay_mutex);
+		return;
+	}
 
 	pr_info("Releasing multikernel instance %d (%s), returning resources to root\n",
 		instance->id, instance->name);
 
-	mk_instance_return_all_cpus(instance);
-	mk_instance_return_pci_devices(instance);
-	mk_instance_return_platform_devices(instance);
-	mk_instance_free_memory(instance);
+	ret = mk_instance_prepare_destroy(instance);
+	if (ret) {
+		pr_err("Instance %d final release refused: %d; retaining allocations\n",
+		       instance->id, ret);
+		mutex_unlock(&mk_overlay_mutex);
+		return;
+	}
+	mk_instance_retire_resources(instance);
 	mk_instance_free_boot_pages(instance);
 
 	mk_instance_track_dump(instance, instance->state, MK_STATE_READY);
@@ -229,6 +283,16 @@ static void mk_instance_release(struct kref *kref)
 	mk_cpu_set_free(instance->cpus);
 	kfree(instance->name);
 	kfree(instance);
+	mutex_unlock(&mk_overlay_mutex);
+}
+
+static void mk_instance_release(struct kref *kref)
+{
+	struct mk_instance *instance = container_of(kref, struct mk_instance, refcount);
+
+	/* A ring sender can drop the last reference from hard-IPI context. */
+	INIT_WORK(&instance->release_work, mk_instance_release_work);
+	schedule_work(&instance->release_work);
 }
 
 /**
@@ -278,6 +342,7 @@ struct mk_instance *mk_instance_alloc(int id, const char *name)
 
 	instance->state = MK_STATE_READY;
 	instance->ipi_target = MK_PHYS_CPU_INVALID;
+	raw_spin_lock_init(&instance->ipi_lock);
 	INIT_LIST_HEAD(&instance->memory_regions);
 	INIT_LIST_HEAD(&instance->list);
 	INIT_LIST_HEAD(&instance->pci_devices);
@@ -307,9 +372,11 @@ int mk_instance_publish(struct mk_instance *instance)
 {
 	int ret;
 
+	/* Self inboxes must also be usable without walking their CPU set in IRQ. */
+	if (instance->ipi_target == MK_PHYS_CPU_INVALID)
+		instance->ipi_target = mk_cpu_set_first(instance->cpus);
 	mutex_lock(&mk_instance_mutex);
-	ret = idr_alloc(&mk_instance_idr, instance, instance->id,
-			instance->id + 1, GFP_KERNEL);
+	ret = mk_instance_idr_add(instance, instance->id, instance->id + 1);
 	if (ret < 0) {
 		mutex_unlock(&mk_instance_mutex);
 		return ret;
@@ -395,11 +462,11 @@ struct mk_instance *mk_instance_find(int mk_id)
 {
 	struct mk_instance *instance;
 
-	mutex_lock(&mk_instance_mutex);
+	rcu_read_lock();
 	instance = idr_find(&mk_instance_idr, mk_id);
-	if (instance)
-		mk_instance_get(instance);
-	mutex_unlock(&mk_instance_mutex);
+	if (instance && !kref_get_unless_zero(&instance->refcount))
+		instance = NULL;
+	rcu_read_unlock();
 
 	return instance;
 }
@@ -433,7 +500,8 @@ bool multikernel_allow_emergency_restart(void)
 			continue;
 
 		if (instance->state == MK_STATE_ACTIVE ||
-		    instance->state == MK_STATE_LOADED) {
+		    instance->state == MK_STATE_LOADED ||
+		    instance->state == MK_STATE_FAILED) {
 			pr_info("Found active spawn instance %d (%s) in state %d\n",
 				 instance->id, instance->name, instance->state);
 			has_active_spawn = true;
@@ -474,13 +542,21 @@ int mk_instance_confirm_parked(struct mk_instance *instance)
 	unsigned int i;
 	int ret, failed = 0;
 
-	/*
-	 * Confirmation can remove the current CPU from the tracking set
-	 * (for example, a failed handoff still parked on the host slot).
-	 * Walk backwards so that deletion cannot skip another CPU.
-	 */
+	/* Ownership is authoritative; tracking may be incomplete after a failure. */
+	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
+		ret = mk_arch_confirm_parked(instance, phys_cpu);
+		if (ret) {
+			pr_err("Instance %d (%s): CPU %llu is not parked: %d\n",
+			       instance->id, instance->name, phys_cpu, ret);
+			failed++;
+		}
+	}
+
+	/* Also retain/probe orphan tracking; confirmation may delete its entry. */
 	for (i = mk_cpu_set_count(instance->cpus_on_slot); i-- > 0; ) {
 		phys_cpu = instance->cpus_on_slot->ids[i];
+		if (mk_cpu_set_contains(instance->cpus, phys_cpu))
+			continue;
 		ret = mk_arch_confirm_parked(instance, phys_cpu);
 		if (ret) {
 			pr_err("Instance %d (%s): CPU %llu is not parked: %d\n",
@@ -552,6 +628,7 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 		mk_cpu_set_del(mk_pool->cpus, phys_cpu);
 		mk_cpu_set_add(instance->cpus, phys_cpu);
 	}
+	mk_instance_ipi_retarget(instance);
 
 	mk_cpu_set_format(buf, sizeof(buf), instance->cpus);
 	pr_info("Transferred %u CPUs from pool to instance %d (%s): %s\n",
@@ -622,6 +699,7 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 		mk_cpu_set_add(mk_pool->cpus, phys_cpu);
 		mk_cpu_set_del(instance->cpus, phys_cpu);
 	}
+	mk_instance_ipi_retarget(instance);
 
 	pr_info("Returned %u CPUs from instance %d (%s) to the pool: %s\n",
 		requested_count, instance->id, instance->name, buf);
@@ -1257,6 +1335,13 @@ void mk_instance_free_memory(struct mk_instance *instance)
 
 	if (!instance)
 		return;
+	/* Never detach metadata or forget the pool when execution is uncertain. */
+	if (instance->state == MK_STATE_ACTIVE || instance->state == MK_STATE_FAILED ||
+	    instance->kimage || mk_arch_release_instance(instance)) {
+		pr_err("Instance %d memory release refused; retaining pool and metadata\n",
+		       instance->id);
+		return;
+	}
 
 	list_for_each_entry_safe(region, tmp, &instance->memory_regions, list) {
 		u64 region_size = resource_size(&region->res);
@@ -1290,22 +1375,6 @@ void mk_instance_free_memory(struct mk_instance *instance)
 		 * instance's memory back to the host pool before the block
 		 * goes away.
 		 */
-		if (mk_arch_release_instance(instance)) {
-			/*
-			 * A CPU never claimed its repark: it is still parked
-			 * on this instance's context, executing from the park
-			 * page inside this pool. Handing the memory back
-			 * would let the next instance overwrite code a CPU is
-			 * running, so leak the whole pool instead.
-			 */
-			pr_err("Instance %d (%s): leaking its %zu byte pool, a lost CPU still parks in it\n",
-			       instance->id, instance->name,
-			       instance->pool_size);
-			instance->instance_pool = NULL;
-			instance->pool_size = 0;
-			return;
-		}
-
 		if (instance->ctrl_va) {
 			mk_instance_mem_free(instance, instance->ctrl_va,
 					 MK_CTRL_BLOCK_SIZE);
@@ -1600,21 +1669,28 @@ static void mk_shutdown_work_fn(struct work_struct *work)
 	kfree(sw);
 	/* This worker may sleep; the voluntary machine-halt path may not. */
 	mk_hotplug_quiesce();
+	/* Finish local controllers, then exclude them until this kernel stops. */
+	mutex_lock(&mk_overlay_mutex);
 	mk_notify_down_and_park(sender_instance_id, MK_SYS_SHUTDOWN_ACK, msg_id);
 }
 
 /*
- * Mark a halted instance re-spawnable. No wakeups are published here:
- * the instance's CPUs may still be on their way to the park loop, and
- * poking its context while its (old or next) kernel also publishes on
- * it corrupts the single-producer mailbox. The kexec path confirms the
- * CPUs are parked before it rewrites the image.
+ * A notice is not stop proof. Keep the old state and allocations until every
+ * owned/tracked CPU is confirmed parked. The resource lock excludes exec,
+ * ownership changes and teardown throughout confirmation and publication.
  */
-static void mk_instance_settle_halted(struct mk_instance *instance)
+static int mk_instance_settle_halted(struct mk_instance *instance)
 {
-	pr_info("Instance %d (%s) halted, CPUs parking in pool\n",
+	int ret;
+
+	lockdep_assert_held(&mk_overlay_mutex);
+	ret = mk_instance_confirm_parked(instance);
+	if (ret)
+		return ret;
+	pr_info("Instance %d (%s) halted, all CPUs confirmed parked\n",
 		instance->id, instance->name);
 	mk_instance_set_state(instance, MK_STATE_LOADED);
+	return 0;
 }
 
 struct mk_halted_work {
@@ -1627,10 +1703,18 @@ static void mk_halted_work_fn(struct work_struct *work)
 	struct mk_halted_work *aw =
 		container_of(work, struct mk_halted_work, work);
 	struct mk_instance *instance;
+	int ret;
+
+	guard(mutex)(&mk_overlay_mutex);
 
 	instance = mk_instance_find(aw->instance_id);
 	if (instance) {
-		mk_instance_settle_halted(instance);
+		if (instance->state == MK_STATE_ACTIVE || instance->state == MK_STATE_FAILED) {
+			ret = mk_instance_settle_halted(instance);
+			if (ret)
+				pr_warn("Instance %d halt remains unconfirmed: %d\n",
+					instance->id, ret);
+		}
 		mk_instance_put(instance);
 	} else {
 		pr_warn("Shutdown ACK from unknown instance %d\n",
@@ -1738,11 +1822,14 @@ int multikernel_halt_by_id(int mk_id)
 	struct mk_pending_msg *pending;
 	int ret;
 
+	guard(mutex)(&mk_overlay_mutex);
+
 	instance = mk_instance_find(mk_id);
 	if (!instance)
 		return -ENOENT;
 
-	if (instance->state != MK_STATE_ACTIVE) {
+	if (instance == mk_self || (instance->state != MK_STATE_ACTIVE &&
+				    instance->state != MK_STATE_FAILED)) {
 		mk_instance_put(instance);
 		return -EINVAL;
 	}
@@ -1765,14 +1852,8 @@ int multikernel_halt_by_id(int mk_id)
 	}
 
 	ret = mk_msg_pending_wait(pending, 30000);
-	if (ret == 0) {
-		if (mk_instance_confirm_parked(instance))
-			pr_warn("Multikernel instance %d halted with CPUs unaccounted for\n",
-				mk_id);
-
-		mk_instance_set_state(instance, MK_STATE_LOADED);
-		pr_info("Multikernel instance %d halted (graceful)\n", mk_id);
-	}
+	if (!ret)
+		ret = mk_instance_settle_halted(instance);
 
 	mk_instance_put(instance);
 	return ret;
@@ -1917,6 +1998,11 @@ int multikernel_force_halt_by_id(int mk_id)
 	int cpu_count = 0;
 	int ret;
 
+	if (!IS_ENABLED(CONFIG_ARCH_HAS_MK_FORCE_STOP))
+		return -EOPNOTSUPP;
+
+	guard(mutex)(&mk_overlay_mutex);
+
 	instance = mk_instance_find(mk_id);
 	if (!instance)
 		return -ENOENT;
@@ -1928,13 +2014,13 @@ int multikernel_force_halt_by_id(int mk_id)
 	}
 
 	/*
-	 * LOADED is allowed for the retry case: a previous halt already
-	 * settled the state, but a CPU that missed its NMI is still
-	 * running the old image and kexec refuses to reload it. Without
-	 * a rerun the instance is stuck for good. The parent is ACTIVE.
+	 * FAILED permits recovery after an uncertain partial start. LOADED
+	 * permits an explicit retry, but is never stop proof: settlement
+	 * must still confirm every assigned CPU before publishing it again.
 	 */
 	if (instance->state != MK_STATE_ACTIVE &&
-	    instance->state != MK_STATE_LOADED) {
+	    instance->state != MK_STATE_LOADED &&
+	    instance->state != MK_STATE_FAILED) {
 		pr_err("Instance %d not running (state=%d), nothing to force halt\n",
 			mk_id, instance->state);
 		mk_instance_put(instance);
@@ -1959,8 +2045,10 @@ int multikernel_force_halt_by_id(int mk_id)
 	pr_info("Force halting multikernel instance %d via NMI\n", mk_id);
 
 	ret = mk_arm_force_halt(instance);
-	if (ret)
-		pr_err("Failed to arm force-halt marker: %d (sending NMI anyway)\n", ret);
+	if (ret) {
+		pr_err("Failed to arm force-halt marker: %d\n", ret);
+		goto out_targets;
+	}
 
 	mk_cpu_set_for_each(i, phys_cpu, targets) {
 		mk_force_stop_cpu(phys_cpu);
@@ -1982,8 +2070,9 @@ int multikernel_force_halt_by_id(int mk_id)
 	if (instance == host_instance)
 		ret = mk_confirm_fenced(instance, targets);
 	else
-		mk_instance_settle_halted(instance);
+		ret = mk_instance_settle_halted(instance);
 
+out_targets:
 	mk_cpu_set_free(targets);
 	mk_instance_put(instance);
 	return ret;

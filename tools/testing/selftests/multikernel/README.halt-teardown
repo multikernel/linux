@@ -1,0 +1,44 @@
+.. SPDX-License-Identifier: GPL-2.0-only
+
+Confirmed halt and fail-safe teardown
+====================================
+
+Run halt_settlement_test.sh, teardown_test.sh and memory_teardown_test.sh with
+bash. CC and CFLAGS select host compiler/sanitizers. Runners extract production
+functions; firmware, transport, kernel scheduler and resource allocation are
+controlled boundaries. These are not native kernel or QEMU lifecycle tests.
+
+Halt settlement requires confirmation of every assigned CPU and orphaned park
+tracking before publishing LOADED. Requested, voluntary and supported force
+halt failures keep the existing non-reusable state. A lost ACK is not remote
+cancellation. Unsupported architectural force stop returns -EOPNOTSUPP; marker
+arming failure must not send force-stop interrupts. CPU ownership tests also
+cover an assigned CPU missing from park tracking and the pre-first-spawn host
+park slot.
+
+Image unload admission is centralized before kimage_free() unlinks anything.
+ACTIVE is refused. FAILED retains its Image until stop confirmation succeeds.
+The Image locking fixture covers these paths plus failed load and manifest
+finalization. Normal/crash callers remain outside the multikernel resource
+lock, and their successful free returns zero.
+
+Destruction requires READY with no Image. Stop/repark proof precedes IDR or
+kernfs removal. Registry locking is dropped for firmware waits and kernfs
+draining, while the resource lock excludes competing controllers. Resource
+retirement is synchronous; only the final record and persistent boot pages
+await lookup reference release and an RCU grace period. A refused memory release
+keeps the pool, region metadata and control allocation intact. The memory test
+can characterize a saved production revision with MK_CORE_REV=<commit>.
+
+The unused bulk kernfs cleanup entry point refuses live boot records, loaded
+Images and uncertain states. It does not supply a new inbox/IRQ retirement
+contract. Unexpected final-reference release without stop proof retains
+allocations rather than reclaiming executing memory; that diagnostic fallback
+is not a recoverable management API or proof of leak-free error handling.
+
+Remaining qualification gates include native x86 concurrency/lockdep, QEMU
+OpenSBI HSM transitions, foreign ring producers, driver/DMA quiescence, stale
+queued notifications across re-spawns, and 50-cycle same/different Image reuse.
+No #7 session protocol, wire-layout change or mixed-peer compatibility claim
+is introduced. RISC-V runtime additionally needs the explicitly separate
+modern #26 loader and #27/#28 test integration dependencies.

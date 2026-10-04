@@ -16,6 +16,8 @@
 #include <linux/mutex.h>
 #include <linux/numa.h>
 #include <linux/sizes.h>
+#include <linux/spinlock.h>
+#include <linux/workqueue.h>
 
 #ifdef CONFIG_MULTIKERNEL
 #include <asm/multikernel.h>
@@ -140,7 +142,7 @@ struct mk_ipi_handler {
 	mk_ipi_callback_t callback;
 	void *context;
 	unsigned int ipi_type;       /* IPI type this handler is registered for */
-	struct mk_ipi_handler *next;
+	struct mk_ipi_handler __rcu *next;
 };
 
 /**
@@ -156,6 +158,11 @@ struct mk_ipi_handler *multikernel_register_handler(mk_ipi_callback_t callback, 
 /**
  * multikernel_unregister_handler - Unregister a multikernel IPI callback
  * @handler: Handler pointer returned from multikernel_register_handler
+ *
+ * Sleeps until entered callbacks have returned. Call from process context,
+ * never from an IPI callback, and do not hold locks needed by callbacks.
+ * After return, the caller may release the callback context. The caller must
+ * serialize unregister calls for a given handler.
  */
 void multikernel_unregister_handler(struct mk_ipi_handler *handler);
 
@@ -652,6 +659,7 @@ struct mk_instance {
 	int id;                         /* Kernel-assigned instance ID */
 	char *name;                     /* User-provided instance name */
 	enum mk_instance_state state;   /* Current state */
+	raw_spinlock_t ipi_lock;         /* Ring writers versus reset/publication */
 
 	/* Resource management - list of reserved memory regions */
 	struct list_head memory_regions;  /* List of struct mk_memory_region */
@@ -750,6 +758,7 @@ struct mk_instance {
 
 	/* Reference counting */
 	struct kref refcount;           /* Reference count for cleanup */
+	struct work_struct release_work; /* Last reference may be put from an IPI */
 };
 
 /**
@@ -866,6 +875,17 @@ struct mk_instance *mk_instance_find_by_name(const char *name);
  */
 struct mk_instance *mk_instance_get(struct mk_instance *instance);
 int mk_instance_alloc_boot_pages(struct mk_instance *instance);
+#ifdef CONFIG_MULTIKERNEL
+void mk_instance_ipi_publish(struct mk_instance *instance);
+void mk_instance_ipi_deactivate(struct mk_instance *instance);
+void mk_instance_ipi_reset(struct mk_instance *instance);
+void mk_instance_ipi_retarget(struct mk_instance *instance);
+#else
+static inline void mk_instance_ipi_publish(struct mk_instance *instance) { }
+static inline void mk_instance_ipi_deactivate(struct mk_instance *instance) { }
+static inline void mk_instance_ipi_reset(struct mk_instance *instance) { }
+static inline void mk_instance_ipi_retarget(struct mk_instance *instance) { }
+#endif
 
 /**
  * mk_halt_to_pool() - Halt this spawn kernel, returning its CPUs to the pool

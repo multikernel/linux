@@ -466,7 +466,7 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 			 KEXEC_TYPE_CRASH : KEXEC_TYPE_DEFAULT;
 	struct kimage **dest_image, *image;
 	struct mk_instance *instance = NULL;
-	int ret = 0, i;
+	int ret = 0, i, free_ret;
 
 	/* We only trust the superuser with rebooting the system. */
 	if (!kexec_load_permitted(image_type))
@@ -510,7 +510,6 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 			}
 
 			pr_info("Unloading kernel from multikernel instance %d\n", mk_id);
-			kimage_remove_from_list(mk_image);
 			image = mk_image;
 			ret = 0;
 			goto out;
@@ -522,7 +521,8 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 				goto out;
 			}
 
-			if (instance->kimage) {
+			if (instance == mk_self || instance->state != MK_STATE_READY ||
+			    instance->kimage) {
 				pr_err("Multikernel instance %d already has an associated kimage\n", mk_id);
 				mk_instance_put(instance);
 				ret = -EBUSY;
@@ -619,7 +619,7 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 	if (image && image->type == KEXEC_TYPE_MULTIKERNEL) {
 		/* Publish only a complete image to exec, unload and IPI */
 		image->mk_instance->kimage = image;
-		image->mk_instance->ipi_data = phys_to_virt(image->mk_instance->ipi_phys);
+		mk_instance_ipi_publish(image->mk_instance);
 		mk_instance_set_state(image->mk_instance, MK_STATE_LOADED);
 		kimage_add_to_list(image);
 		image = NULL; /* Don't free the new image */
@@ -657,7 +657,9 @@ out:
 #endif
 
 	/* Failed-load and unload cleanup still use the instance pool. */
-	kimage_free(image);
+	free_ret = kimage_free(image);
+	if (!ret)
+		ret = free_ret;
 #ifdef CONFIG_MULTIKERNEL
 	if (flags & KEXEC_MULTIKERNEL)
 		mutex_unlock(&mk_overlay_mutex);

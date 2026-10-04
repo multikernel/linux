@@ -181,11 +181,13 @@ static void mk_account_cpu_online(mk_phys_cpu_t cpu_id)
 	if (mk_self->cpus && mk_cpu_set_add(mk_self->cpus, cpu_id))
 		pr_warn("Multikernel hotplug: Failed to track CPU %llu\n",
 			cpu_id);
+	mk_instance_ipi_retarget(mk_self);
 }
 
 static void mk_account_cpu_offline(mk_phys_cpu_t cpu_id)
 {
 	mk_cpu_set_del(mk_self->cpus, cpu_id);
+	mk_instance_ipi_retarget(mk_self);
 }
 
 /**
@@ -342,7 +344,12 @@ static void mk_cpu_add_work_fn(struct work_struct *work)
 	struct mk_resource_ack ack;
 	int ret, ack_ret;
 
-	ret = mk_do_cpu_add(hp_work->cpu_id, hp_work->numa_node, hp_work->flags);
+	/* A controller may hold this lock while waiting for a remote ACK. */
+	ret = -EBUSY;
+	if (mutex_trylock(&mk_overlay_mutex)) {
+		ret = mk_do_cpu_add(hp_work->cpu_id, hp_work->numa_node, hp_work->flags);
+		mutex_unlock(&mk_overlay_mutex);
+	}
 
 	/* Send ACK back to sender */
 	ack.operation = hp_work->operation;
@@ -366,7 +373,11 @@ static void mk_cpu_remove_work_fn(struct work_struct *work)
 	struct mk_resource_ack ack;
 	int ret, ack_ret;
 
-	ret = mk_do_cpu_remove(hp_work->cpu_id);
+	ret = -EBUSY;
+	if (mutex_trylock(&mk_overlay_mutex)) {
+		ret = mk_do_cpu_remove(hp_work->cpu_id);
+		mutex_unlock(&mk_overlay_mutex);
+	}
 
 	/* Send ACK back to sender */
 	ack.operation = hp_work->operation;
@@ -643,8 +654,12 @@ static void mk_mem_add_work_fn(struct work_struct *work)
 	struct mk_resource_ack ack;
 	int ret, ack_ret;
 
-	ret = mk_do_mem_add(hp_work->start_pfn, hp_work->nr_pages,
-			    hp_work->numa_node, hp_work->mem_type);
+	ret = -EBUSY;
+	if (mutex_trylock(&mk_overlay_mutex)) {
+		ret = mk_do_mem_add(hp_work->start_pfn, hp_work->nr_pages,
+				    hp_work->numa_node, hp_work->mem_type);
+		mutex_unlock(&mk_overlay_mutex);
+	}
 
 	ack.operation = hp_work->operation;
 	ack.result = ret;
@@ -667,7 +682,11 @@ static void mk_mem_remove_work_fn(struct work_struct *work)
 	struct mk_resource_ack ack;
 	int ret, ack_ret;
 
-	ret = mk_do_mem_remove(hp_work->start_pfn, hp_work->nr_pages);
+	ret = -EBUSY;
+	if (mutex_trylock(&mk_overlay_mutex)) {
+		ret = mk_do_mem_remove(hp_work->start_pfn, hp_work->nr_pages);
+		mutex_unlock(&mk_overlay_mutex);
+	}
 
 	ack.operation = hp_work->operation;
 	ack.result = ret;
@@ -943,8 +962,12 @@ static void mk_device_add_work_fn(struct work_struct *work)
 	struct mk_resource_ack ack;
 	int ret, ack_ret;
 
-	ret = mk_do_device_add(hp_work->domain, hp_work->bus, hp_work->devfn,
-			       hp_work->driver_override, hp_work->flags);
+	ret = -EBUSY;
+	if (mutex_trylock(&mk_overlay_mutex)) {
+		ret = mk_do_device_add(hp_work->domain, hp_work->bus, hp_work->devfn,
+				       hp_work->driver_override, hp_work->flags);
+		mutex_unlock(&mk_overlay_mutex);
+	}
 
 	ack.operation = hp_work->operation;
 	ack.result = ret;
@@ -968,7 +991,11 @@ static void mk_device_remove_work_fn(struct work_struct *work)
 	struct mk_resource_ack ack;
 	int ret, ack_ret;
 
-	ret = mk_do_device_remove(hp_work->domain, hp_work->bus, hp_work->devfn);
+	ret = -EBUSY;
+	if (mutex_trylock(&mk_overlay_mutex)) {
+		ret = mk_do_device_remove(hp_work->domain, hp_work->bus, hp_work->devfn);
+		mutex_unlock(&mk_overlay_mutex);
+	}
 
 	ack.operation = hp_work->operation;
 	ack.result = ret;
@@ -1394,6 +1421,10 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 		return -ENODEV;
 
 	/* For non-running instances, return CPU to root using existing API */
+	if (target_instance->state == MK_STATE_FAILED) {
+		ret = -EBUSY;
+		goto out;
+	}
 	if (target_instance->state != MK_STATE_ACTIVE) {
 		struct mk_cpu_set cpus = { .nr = 1, .cap = 1, .ids = &cpu_id };
 
@@ -1460,6 +1491,7 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 
 	mk_cpu_set_del(target_instance->cpus, cpu_id);
 	mk_cpu_set_add(mk_pool->cpus, cpu_id);
+	mk_instance_ipi_retarget(target_instance);
 
 	ret = 0;
 out:
@@ -1509,6 +1541,10 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 	}
 
 	/* For non-running instances, transfer CPU from root using existing API */
+	if (target_instance->state == MK_STATE_FAILED) {
+		ret = -EBUSY;
+		goto out;
+	}
 	if (target_instance->state != MK_STATE_ACTIVE) {
 		ret = mk_instance_transfer_cpus(target_instance, &cpus);
 		goto out;
@@ -1608,6 +1644,10 @@ int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
 		return -ENODEV;
 
 	/* For non-running instances, allocate memory from pool and add to instance */
+	if (target_instance->state == MK_STATE_FAILED) {
+		ret = -EBUSY;
+		goto out;
+	}
 	if (target_instance->state != MK_STATE_ACTIVE) {
 		size_t size;
 
@@ -1676,6 +1716,10 @@ int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages)
 		return -ENODEV;
 
 	/* For non-running instances, just remove the memory region from the instance */
+	if (target_instance->state == MK_STATE_FAILED) {
+		ret = -EBUSY;
+		goto out;
+	}
 	if (target_instance->state != MK_STATE_ACTIVE) {
 		phys_addr_t phys_addr;
 		size_t size;
@@ -1769,6 +1813,10 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 	if (!target_instance)
 		return -ENODEV;
 
+	if (target_instance->state == MK_STATE_FAILED) {
+		ret = -EBUSY;
+		goto out;
+	}
 	if (target_instance->state != MK_STATE_ACTIVE) {
 		ret = mk_instance_add_pci_device(target_instance, domain, bus, devfn);
 		goto out;
@@ -1846,6 +1894,10 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 	if (!target_instance)
 		return -ENODEV;
 
+	if (target_instance->state == MK_STATE_FAILED) {
+		ret = -EBUSY;
+		goto out;
+	}
 	if (target_instance->state != MK_STATE_ACTIVE) {
 		ret = mk_instance_remove_pci_device(target_instance, domain, bus, devfn);
 		goto out;
