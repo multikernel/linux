@@ -601,6 +601,10 @@ void kimage_free_multikernel(struct kimage *image)
 	struct mk_instance *instance = image->mk_instance;
 	unsigned long i;
 
+#ifdef CONFIG_MULTIKERNEL
+	lockdep_assert_held(&mk_overlay_mutex);
+#endif
+
 	for (i = 0; i < image->nr_segments; i++)
 		mk_kimage_free(image, phys_to_virt(image->segment[i].mem),
 			       image->segment[i].memsz);
@@ -1645,6 +1649,9 @@ struct kimage *kimage_find_by_id(int mk_id)
 	struct mk_instance *instance;
 	struct kimage *image = NULL;
 
+	/* The caller keeps the image alive through its complete operation. */
+	lockdep_assert_held(&mk_overlay_mutex);
+
 	if (mk_id <= 0)
 		return NULL;
 
@@ -1667,6 +1674,8 @@ int multikernel_kexec_by_id(int mk_id)
 
 	if (!kexec_trylock())
 		return -EBUSY;
+
+	mutex_lock(&mk_overlay_mutex);
 
 	mk_image = kimage_find_by_id(mk_id);
 	if (!mk_image) {
@@ -1762,6 +1771,7 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 unlock:
+	mutex_unlock(&mk_overlay_mutex);
 	kexec_unlock();
 	return rc;
 }

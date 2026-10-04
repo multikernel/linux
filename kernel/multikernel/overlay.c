@@ -77,7 +77,9 @@ static LIST_HEAD(mk_overlay_tx_list);            /* List of all transactions */
 /*
  * Serializes every user-driven reconfiguration of this kernel's resources:
  * the transaction list, overlay application and rollback, and the baseline
- * write in kernfs.c. Two writers would otherwise run pool moves at once.
+ * write in kernfs.c. MK image load, exec and cleanup take it too, so an image
+ * cannot use the instance pool while a controller resource writer changes it.
+ * Two writers would otherwise run pool moves at once.
  */
 DEFINE_MUTEX(mk_overlay_mutex);
 static atomic_t mk_overlay_next_id = ATOMIC_INIT(1); /* Next transaction ID */

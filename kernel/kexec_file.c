@@ -485,6 +485,11 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 	if (!kexec_trylock())
 		return -EBUSY;
 
+#ifdef CONFIG_MULTIKERNEL
+	if (flags & KEXEC_MULTIKERNEL)
+		mutex_lock(&mk_overlay_mutex);
+#endif
+
 	if (flags & KEXEC_MULTIKERNEL) {
 		int mk_id = KEXEC_GET_MK_ID(flags);
 
@@ -651,8 +656,13 @@ out:
 		arch_kexec_protect_crashkres();
 #endif
 
-	kexec_unlock();
+	/* Failed-load and unload cleanup still use the instance pool. */
 	kimage_free(image);
+#ifdef CONFIG_MULTIKERNEL
+	if (flags & KEXEC_MULTIKERNEL)
+		mutex_unlock(&mk_overlay_mutex);
+#endif
+	kexec_unlock();
 	return ret;
 }
 

@@ -1,0 +1,49 @@
+.. SPDX-License-Identifier: GPL-2.0-only
+
+Controller resource/image serialization checks
+==============================================
+
+Run from a checkout without building or booting the kernel:
+
+  sh tools/testing/selftests/multikernel/image_lock_test.sh
+  CC=gcc CFLAGS=-O2 sh tools/testing/selftests/multikernel/image_lock_test.sh
+  CC=clang CFLAGS='-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer' \
+    sh tools/testing/selftests/multikernel/image_lock_test.sh
+
+The runner extracts verbatim production file-load, allocation/error cleanup,
+MK image release, lookup, exec, instance lookup/state and overlay-rmdir functions.
+It uses real pthread mutexes and a second thread entering the actual overlay
+rmdir control flow during load, exec, unload or failed-load cleanup. The
+contender announces its lock attempt and cannot mutate until the image operation
+unlocks. Without the patch, the initial harness reported 166 failures in 842
+checks, including actual contender progress inside an image operation.
+
+Assertions check kexec -> resource -> registry acquisition, reverse release,
+no image work under the registry lock, cleanup before unlocking and exclusion
+from overlay rollback. Load/exec failure stages, unknown IDs, empty CPU sets,
+mapping/allocation failure and early permission/flag/busy exits are covered.
+Normal/crash images retain their existing absence of a resource lock; cleanup
+is now inside kexec_lock, as it already is for legacy kexec_load.
+
+Kernel allocation, segment copying, firmware, pool mutation, instance registry
+storage and kernfs removal are controlled host boundaries. The real MK release
+helper is exercised; the general kimage_free dispatcher is a boundary. The
+fixture contains only the fields reached by the extracted functions. Kernel
+sign-compare and unused-argument diagnostics from those functions are excluded
+from the host compiler's -Werror policy, not from kernel build validation.
+The host mutexes check control-flow locking, not kernel lockdep or scheduling.
+
+Remaining release gates
+----------------------
+
+This mutex covers local controller overlay/baseline resource changes and MK
+image load, exec and cleanup. It does not cancel queued remote work, serialize
+all deferred workers, confirm every CPU stopped, or make unload of an active
+image safe. Halt/HALTED/force-halt settlement, teardown admission, remote-work
+quiescence and cross-kernel dependencies remain separate follow-ups. The
+existing exec path still warns and continues on manifest-finalization failure;
+that error handling is not fixed or qualified here.
+
+A substituted successful firmware start does not prove CPU execution or safe
+reclamation after a partial start. Local threading, sanitizers and kernel links
+do not replace x86 or QEMU/OpenSBI runtime, failure-injection and re-spawn tests.

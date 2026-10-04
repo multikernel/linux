@@ -37,7 +37,6 @@ int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 
 /* overlay.c */
 extern struct kernfs_node *mk_overlay_root_kn;
-extern struct mutex mk_overlay_mutex;
 int mk_overlay_init(void);
 void mk_overlay_exit(void);
 int mk_overlay_rmdir(struct kernfs_node *kn);
