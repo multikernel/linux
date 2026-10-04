@@ -30,6 +30,11 @@ awk '/^struct mk_(pending_msg|msg_type_handler) \{/ { copy = 1 }
 awk '/^struct mk_(cpu|mem|device)_hotplug_work \{/ { copy = 1 }
      /^static DEFINE_(RAW_)?SPINLOCK\(mk_cpu_hotplug_lock\);/ { print }
      /^static struct workqueue_struct \*mk_cpu_hotplug_wq;/ { print }
+     /^static (bool mk_hotplug_accepting|unsigned int mk_hotplug_inflight)/ { print }
+     /^static DECLARE_WAIT_QUEUE_HEAD\(mk_hotplug_wait\);/ { print }
+     /^static int mk_queue_hotplug_work\(/ { copy = 1 }
+     /^static (void|bool) mk_hotplug_(work_done|idle)\(/ { copy = 1 }
+     /^void mk_hotplug_quiesce\(/ { copy = 1 }
      /^static int mk_queue_cpu_work\(/ { copy = 1 }
      /^static void mk_(cpu|mem|device)_(add|remove)_work_fn\(/ { copy = 1 }
      /^(static )?int mk_handle_(cpu|mem|device)_(add|remove)\(/ { copy = 1 }

@@ -10,8 +10,9 @@ Run from this source tree, without building or booting a kernel:
   CC=clang CFLAGS='-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer' \
     sh tools/testing/selftests/multikernel/cpu_work_test.sh
 
-The runner extracts verbatim CPU receive handlers, workers, queue submission
-and detachment, hotplug init and cleanup. It tests real admission, error/free
+The runner extracts verbatim CPU/memory/device receive handlers and workers,
+admission/quiescence helpers, hotplug init/cleanup, core init and the requested
+shutdown worker. It tests real admission, error/free
 paths and ACK fields against controlled scheduler, CPU mutation, registration
 and transport boundaries. A legal adverse scheduler runs unordered requests
 newest-first; the ordered-queue boundary follows the kernel's FIFO contract.
@@ -41,21 +42,44 @@ global ordering guarantee. A remove worker and its ACK follow CPU requests
 already admitted ahead of it. The separate ack_test retains real pending/ID
 and worker echo coverage with its single-item scheduler boundary.
 
-Submission and queue detachment share an IRQ-safe raw spinlock. Detach closes CPU
-admission before unregister; destroy_workqueue drains admitted CPU work before
-freeing the queue. Init failure does not publish a resource handler without its
+Submission and admission closure share an IRQ-safe raw spinlock. Cleanup closes
+admission and waits before detaching the CPU queue and unregistering;
+destroy_workqueue finishes releasing the CPU queue. Init failure does not
+publish a resource handler without its
 CPU queue. Rejected work is freed and returns -ESHUTDOWN to the receive dispatch;
 no success ACK is fabricated. The existing dispatcher logs that error rather
 than replying, so a requester may time out and must retain uncertain ownership.
 
-This orders already received CPU requests only. It does not cancel a timed-out
-request, exclude later messages or another controller, serialize local pool
-operations with all incoming workers, drain memory/device work, or fence all
-surviving peers. Memory/device and shutdown scheduling stay unchanged. No wire
-layout or request-ID change is introduced.
+Requested shutdown now closes incoming resource admission and waits for every
+accepted CPU, memory and device worker to finish its mutation, ACK attempt and
+work allocation release before sending SHUTDOWN_ACK and entering the park path.
+Cleanup also drains these jobs before freeing tracking. Memory/device jobs
+remain on their existing system queue; CPU jobs retain FIFO ordering. Handler
+registration exposes shutdown only after hotplug admission is initialized.
+
+The shutdown regression schedules shutdown ahead of three older resource jobs.
+Before this fix, 68 checks reported 16 failures: shutdown ACK preceded those jobs,
+late requests were accepted, and the system handler was exposed before hotplug
+initialization. The fixture controls wait progression and injects late receives
+during drain. It does not exercise native wait-queue wakeups or kernel scheduling.
+Registration/unwind and mixed-resource cleanup with lost ACKs are also covered.
+
+Admission closure and the in-flight count share the raw lock. Completion is
+published only after freeing work; the idle predicate takes the same lock.
+Quiescence waits without controller, registry, tracking or admission locks held.
+If an accepted operation never returns, no successful shutdown ACK is sent.
+No timeout is used to pretend the operation was cancelled.
+
+This is incoming-worker quiescence for requested graceful shutdown only. It
+does not cancel a timed-out request, serialize local controllers/pool operations,
+exclude another controller, synchronize callback-object lifetime, or fence
+surviving peers/driver activity. Voluntary halt, poweroff/reboot, panic and force
+stop do not use the sleeping barrier and remain separate qualification gates.
+No wire layout or request-ID change is introduced; no success ACK is fabricated
+for late rejected resource requests.
 
 Full halt/HALTED/force-halt settlement, destruction/admission, callback and
-ring/image lifetime, shutdown quiescence and cross-kernel dependencies remain
+ring/image lifetime, other shutdown quiescence and cross-kernel dependencies remain
 release gates. All parked CPUs or a reset ring alone are not a queued-work
 cancellation proof. Kernel lockdep, x86 runtime/concurrency, QEMU/OpenSBI and
 same/different-Image 50-cycle failure/stress tests remain required.

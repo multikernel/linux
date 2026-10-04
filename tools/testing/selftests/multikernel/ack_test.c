@@ -32,6 +32,10 @@ static bool allocation_fails;
 #define raw_spin_lock_irqsave(lock, flags) spin_lock_irqsave(lock, flags)
 #define raw_spin_unlock_irqrestore(lock, flags) spin_unlock_irqrestore(lock, flags)
 #define msecs_to_jiffies(ms) (ms)
+#define DECLARE_WAIT_QUEUE_HEAD(name) int name
+#define wake_up_all(wait) ((void)(wait))
+/* This fixture executes one job at a time; the multi-job drain is tested separately. */
+#define wait_event(wait, condition) do { (void)(wait); assert(condition); } while (0)
 
 struct completion {
 	unsigned int done;
@@ -419,6 +423,9 @@ static void worker_regressions(void)
 			u64 id = ids[j];
 			int result;
 
+			/* Each case represents a fresh receiver, before shutdown closes it. */
+			mk_hotplug_accepting = true;
+
 			if (i < 2) {
 				payload = &cpu;
 				len = sizeof(cpu);
@@ -613,6 +620,7 @@ int main(int argc, char **argv)
 {
 	/* Queue creation/lifetime is exercised by cpu_work_test, not this fixture. */
 	mk_cpu_hotplug_wq = &cpu_queue;
+	mk_hotplug_accepting = true;
 
 	if (argc > 2 || (argc == 2 && strcmp(argv[1], "regression") &&
 			strcmp(argv[1], "characterization") &&
