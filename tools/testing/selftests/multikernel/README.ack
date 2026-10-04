@@ -46,6 +46,9 @@ Checks include:
 * Voluntary HALTED and the uncorrelated sender retain their zero-ID behavior.
 * PCI add/remove ACKs match requester keys for domains 0x8000 and 0xffff;
   signed promotion must not sign-extend the worker's u64 resource key.
+* Receive decoding preserves wire bytes and sizes, accepts maximum-size trailing
+  data without overrunning local storage, and rejects short/empty requests.
+  HALTED retains its instance ID without an unaligned payload access.
 
 This is controlled interleaving, not a threaded race, kernel memory-ordering,
 transport-delay, boot or physical-runtime test. Pending entries must be removed
@@ -67,15 +70,24 @@ queued work across restart, remote cancellation, CPU ownership recovery and
 safe image/ring reclamation require separate work. A shutdown ACK means the
 peer is about to park, not proof that all its CPUs have stopped.
 
-Known baseline sanitizer failure
---------------------------------
+Payload alignment regression
+----------------------------
 
-Full UBSan with -fno-sanitize-recover=undefined reports unaligned resource/ACK
-payload access: mk_message.payload starts at offset 20 on rv64/x86_64 while
-several payload structs require 8-byte alignment. Reproduced with the original
-characterization test at 11efe070fdd57c9e3f71218c92989697723f9a84 (before these
-fixes). Do not report full UBSan as passing, or change the wire layout to hide
-it. A wire-preserving alignment fix is a separate follow-up.
+The original characterization test at 11efe070fdd57c9e3f71218c92989697723f9a84
+and ACK tip 99f395007d84 reported unaligned resource/ACK accesses under UBSan:
+mk_message.payload starts at offset 20 on rv64/x86_64 while several decoded
+structs require 8-byte alignment. Resource and system dispatch now copy bounded
+payloads into aligned local storage. The existing header, payload offsets and
+payload sizes remain unchanged, and workers retain their own data before the
+callback returns. The vsock handler already copies its payload into an skb.
+
+Run the full suite with alignment checking enabled:
+
+  CC=clang CFLAGS='-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer' \
+    sh tools/testing/selftests/multikernel/ack_test.sh
+
+The test itself also uses memcpy to decode captured wire ACKs. Sanitizer success
+applies to these exercised production paths and deterministic boundaries.
 
 Historical RED evidence: the original test at 11efe070 (on upstream 347841a29a94)
 failed eight regression assertions and passed ten characterizations. Worker

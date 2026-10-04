@@ -1019,11 +1019,23 @@ static int mk_handle_device_remove(struct mk_device_resource_payload *payload, u
 static void mk_resource_msg_handler(u32 msg_type, u32 subtype, u64 msg_id,
 				    void *payload, u32 payload_len, void *ctx)
 {
+	union {
+		struct mk_cpu_resource_payload cpu;
+		struct mk_mem_resource_payload mem;
+		struct mk_device_resource_payload device;
+		struct mk_resource_ack ack;
+	} decoded;
 	int ret = 0;
 
 	if (msg_type != MK_MSG_RESOURCE) {
 		pr_warn("Multikernel hotplug: Unexpected message type: 0x%x\n", msg_type);
 		return;
+	}
+
+	/* Wire payloads need not be aligned for their typed fields. */
+	if (payload_len) {
+		memcpy(&decoded, payload, min_t(size_t, payload_len, sizeof(decoded)));
+		payload = &decoded;
 	}
 
 	switch (subtype) {

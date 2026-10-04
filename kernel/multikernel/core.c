@@ -1683,8 +1683,19 @@ static void mk_halted_work_fn(struct work_struct *work)
 static void mk_system_msg_handler(u32 msg_type, u32 subtype, u64 msg_id,
 				  void *payload, u32 payload_len, void *ctx)
 {
+	union {
+		struct mk_shutdown_payload shutdown;
+		struct mk_resource_ack ack;
+	} decoded;
+
 	if (msg_type != MK_MSG_SYSTEM)
 		return;
+
+	/* Preserve the wire layout while providing aligned typed accesses. */
+	if (payload_len) {
+		memcpy(&decoded, payload, min_t(size_t, payload_len, sizeof(decoded)));
+		payload = &decoded;
+	}
 
 	switch (subtype) {
 	case MK_SYS_SHUTDOWN: {

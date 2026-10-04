@@ -397,11 +397,18 @@ static void worker_regressions(void)
 	struct mk_shutdown_payload shutdown = { .sender_instance_id = 3 };
 	size_t i, j;
 
+	/* The existing 64-bit wire ABI has an unaligned flexible payload. */
+	assert(sizeof(struct mk_message) == 24);
+	assert(offsetof(struct mk_message, payload) == 20);
+	assert(sizeof(cpu) == 24 && sizeof(mem) == 32 && sizeof(dev) == 76);
+	assert(sizeof(struct mk_resource_ack) == 16 && sizeof(shutdown) == 8);
+
 	for (i = 0; i < ARRAY_SIZE(cases); i++) {
 		for (j = 0; j < ARRAY_SIZE(ids); j++) {
 			struct mk_ipi_data request = { .type = cases[i].type };
+			struct mk_ipi_data before;
 			struct mk_message *msg = (void *)request.buffer;
-			struct mk_resource_ack *ack;
+			struct mk_resource_ack ack;
 			struct work_struct *work;
 			struct mk_pending_msg *p = NULL;
 			void *payload;
@@ -429,11 +436,22 @@ static void worker_regressions(void)
 			assert(!mk_send_message_id(1, cases[i].type, cases[i].op,
 						   id, payload, len));
 			request = sent;
+			if (j == 1) {
+				/* A large extension must not overrun the local decoder. */
+				msg = (void *)request.buffer;
+				memset(msg->payload + len, 0xa5,
+				       MK_MAX_DATA_SIZE - sizeof(*msg) - len);
+				msg->payload_len = MK_MAX_DATA_SIZE - sizeof(*msg);
+				request.data_size = MK_MAX_DATA_SIZE;
+			}
+			before = request;
 			mutations = 0;
 			mutation_result = j ? -EIO : 0;
 			result = i == 6 ? 0 : mutation_result;
 			dispatch(&request);
 			assert(queued);
+			expect("DECODE", "receive buffer unchanged",
+			       memcmp(&request, &before, sizeof(request)) == 0, 1);
 			work = queued;
 			queued = NULL;
 			/* A worker must retain the ID after the receive buffer is reused. */
@@ -441,18 +459,29 @@ static void worker_regressions(void)
 			memset(&sent, 0, sizeof(sent));
 			run_work(work, i == 6);
 			msg = (void *)sent.buffer;
-			ack = (void *)msg->payload;
+			/* Test code must also decode the wire without unaligned reads. */
+			memcpy(&ack, msg->payload, sizeof(ack));
 			assert(sent_to == 3 && msg->msg_type == cases[i].type);
 			assert(msg->msg_subtype == (i == 6 ? MK_SYS_SHUTDOWN_ACK : MK_RES_ACK));
-			assert(msg->payload_len == sizeof(*ack));
-			assert(ack->operation == cases[i].op && ack->resource_id == 65537);
-			assert((int)ack->result == result);
+			assert(msg->payload_len == sizeof(ack));
+			assert(ack.operation == cases[i].op && ack.resource_id == 65537);
+			assert((int)ack.result == result);
 			assert(mutations == (i == 6 ? 0 : 1));
 			expect("WORKER", cases[i].name, msg->msg_id == id, 1);
 			if (p) {
 				dispatch(&sent);
 				expect("ROUNDTRIP", cases[i].name, finish(p), result);
 			}
+		}
+		/* Short and empty requests must not queue work or read missing fields. */
+		for (j = 0; j < 2; j++) {
+			u8 bytes[sizeof(mem)] = {};
+
+			assert(!queued);
+			assert(!mk_send_message_id(1, cases[i].type, cases[i].op,
+						   1, bytes, j));
+			dispatch(&sent);
+			expect("DECODE", "short request queues no work", queued == NULL, 1);
 		}
 	}
 	run_work(NULL, true);
@@ -490,6 +519,32 @@ static void pci_key_regressions(void)
 			expect("REGRESSION", "high PCI domain round trip", finish(p), 0);
 		}
 	}
+}
+
+static void halted_decode_regression(void)
+{
+	struct mk_resource_ack ack = { .resource_id = 65537 };
+	struct mk_ipi_data before;
+	struct mk_halted_work *work;
+	size_t len;
+
+	assert(!mk_send_message(0, MK_MSG_SYSTEM, MK_SYS_HALTED, &ack, sizeof(ack)));
+	before = sent;
+	dispatch(&sent);
+	assert(queued);
+	work = container_of(queued, struct mk_halted_work, work);
+	expect("DECODE", "HALTED retains instance ID", work->instance_id, 65537);
+	expect("DECODE", "HALTED receive buffer unchanged",
+	       memcmp(&sent, &before, sizeof(sent)) == 0, 1);
+	queued = NULL;
+	free(work);
+
+	for (len = 0; len < sizeof(ack); len++) {
+		assert(!mk_send_message(0, MK_MSG_SYSTEM, MK_SYS_HALTED, &ack, len));
+		dispatch(&sent);
+		assert(!queued);
+	}
+	expect("DECODE", "short HALTED queues no work", queued == NULL, 1);
 }
 
 static void failure_regressions(void)
@@ -571,6 +626,8 @@ int main(int argc, char **argv)
 		characterizations();
 	if (argc == 1 || !strcmp(argv[1], "workers"))
 		worker_regressions();
+	if (argc == 1 || !strcmp(argv[1], "workers"))
+		halted_decode_regression();
 	if (argc == 1 || !strcmp(argv[1], "failure"))
 		failure_regressions();
 	return failures ? 1 : 0;
