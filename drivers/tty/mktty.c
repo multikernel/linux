@@ -68,6 +68,7 @@ static struct mktty_host_conn *mktty_find_conn(int instance_id)
 {
 	struct mktty_host_conn *conn;
 
+	lockdep_assert_held(&mktty_host_conns_lock);
 	list_for_each_entry(conn, &mktty_host_conns, list) {
 		if (conn->instance_id == instance_id)
 			return conn;
@@ -78,6 +79,7 @@ static struct mktty_host_conn *mktty_find_conn(int instance_id)
 static int mktty_host_open(struct inode *inode, struct file *filp)
 {
 	struct mktty_host_conn *conn;
+	unsigned long flags;
 
 	conn = kzalloc(sizeof(*conn), GFP_KERNEL);
 	if (!conn)
@@ -95,9 +97,9 @@ static int mktty_host_open(struct inode *inode, struct file *filp)
 	conn->rx_head = 0;
 	conn->rx_tail = 0;
 
-	spin_lock(&mktty_host_conns_lock);
+	spin_lock_irqsave(&mktty_host_conns_lock, flags);
 	list_add(&conn->list, &mktty_host_conns);
-	spin_unlock(&mktty_host_conns_lock);
+	spin_unlock_irqrestore(&mktty_host_conns_lock, flags);
 
 	filp->private_data = conn;
 	return 0;
@@ -106,10 +108,11 @@ static int mktty_host_open(struct inode *inode, struct file *filp)
 static int mktty_host_release(struct inode *inode, struct file *filp)
 {
 	struct mktty_host_conn *conn = filp->private_data;
+	unsigned long flags;
 
-	spin_lock(&mktty_host_conns_lock);
+	spin_lock_irqsave(&mktty_host_conns_lock, flags);
 	list_del(&conn->list);
-	spin_unlock(&mktty_host_conns_lock);
+	spin_unlock_irqrestore(&mktty_host_conns_lock, flags);
 
 	kfree(conn->rx_buf);
 	kfree(conn);
@@ -124,7 +127,7 @@ static ssize_t mktty_host_read(struct file *filp, char __user *buf,
 	unsigned long flags;
 	int ret;
 
-	if (conn->instance_id < 0)
+	if (READ_ONCE(conn->instance_id) < 0)
 		return -ENOTCONN;
 
 	while (copied == 0) {
@@ -169,10 +172,12 @@ static ssize_t mktty_host_write(struct file *filp, const char __user *buf,
 	char numbuf[16];
 	size_t sent = 0;
 	size_t chunk;
+	unsigned long flags;
+	int instance_id = READ_ONCE(conn->instance_id);
 	int ret;
 
 	/* First write selects instance */
-	if (conn->instance_id < 0) {
+	if (instance_id < 0) {
 		size_t len = min(count, sizeof(numbuf) - 1);
 		int id;
 
@@ -191,7 +196,14 @@ static ssize_t mktty_host_write(struct file *filp, const char __user *buf,
 			return -ENODEV;
 		mk_instance_put(instance);
 
-		conn->instance_id = id;
+		/* Publish once under the callback's lookup/lifetime lock. */
+		spin_lock_irqsave(&mktty_host_conns_lock, flags);
+		if (conn->instance_id >= 0) {
+			spin_unlock_irqrestore(&mktty_host_conns_lock, flags);
+			return -EISCONN;
+		}
+		WRITE_ONCE(conn->instance_id, id);
+		spin_unlock_irqrestore(&mktty_host_conns_lock, flags);
 		pr_info("mktty: fd connected to instance %d\n", id);
 		return count;
 	}
@@ -214,7 +226,7 @@ static ssize_t mktty_host_write(struct file *filp, const char __user *buf,
 		msg->len = chunk;
 		msg->reserved = 0;
 
-		ret = multikernel_send_ipi_data(conn->instance_id, msg,
+		ret = multikernel_send_ipi_data(instance_id, msg,
 						sizeof(*msg) - MKTTY_MAX_DATA + chunk,
 						MKTTY_IPI_TYPE);
 		if (ret < 0) {
@@ -235,7 +247,7 @@ static __poll_t mktty_host_poll(struct file *filp, poll_table *wait)
 	__poll_t mask = 0;
 	unsigned long flags;
 
-	if (conn->instance_id < 0)
+	if (READ_ONCE(conn->instance_id) < 0)
 		return EPOLLOUT | EPOLLWRNORM;  /* can write instance ID */
 
 	poll_wait(filp, &conn->wait, wait);
