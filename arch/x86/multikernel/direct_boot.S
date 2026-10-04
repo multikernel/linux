@@ -414,6 +414,9 @@ SYM_CODE_START_LOCAL_NOALIGN(mk_park_identity)
 	 * The repark_* dispatch fields are separate from the park_phys/
 	 * park_cr3/self_phys anchor so that publishing a repark on a live
 	 * instance context never corrupts the context's own park identity.
+	 * Clearing ready below proves only claim. Before retiring this page or
+	 * its page table the publisher must obtain a second claim from the
+	 * destination loop, which cannot run until the jump below completes.
 	 */
 	movq	MK_CTX_repark_park_cr3(%r12), %r14
 	movq	MK_CTX_repark_park_phys(%r12), %rcx

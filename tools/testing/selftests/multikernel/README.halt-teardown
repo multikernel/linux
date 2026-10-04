@@ -16,6 +16,14 @@ arming failure must not send force-stop interrupts. CPU ownership tests also
 cover an assigned CPU missing from park tracking and the pre-first-spawn host
 park slot.
 
+Repark retirement additionally requires a destination-loop self-repark claim.
+The old mailbox clears ready before jumping away, so its claim alone permits
+premature reuse of the old park page/page table. repark_arrival_test.sh exercises
+the production publication and tracking paths with delayed destination arrival:
+source claim plus destination timeout must retain tracking, while successful
+arrival needs both claims. This is a controlled mailbox boundary, not native
+assembly execution or a reproduced physical race. The park ABI is unchanged.
+
 Image unload admission is centralized before kimage_free() unlinks anything.
 ACTIVE is refused. FAILED retains its Image until stop confirmation succeeds.
 The Image locking fixture covers these paths plus failed load and manifest
