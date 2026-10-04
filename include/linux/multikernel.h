@@ -1013,6 +1013,13 @@ struct pci_bus;
 struct pci_dev;
 
 #ifdef CONFIG_MULTIKERNEL
+/*
+ * Serializes controller resource changes with MK image load, exec and cleanup.
+ * Process context only. Lock order: kexec_lock -> mk_overlay_mutex ->
+ * mk_instance_mutex. Do not wait for remote work under mk_instance_mutex.
+ */
+extern struct mutex mk_overlay_mutex;
+
 bool multikernel_allow_emergency_restart(void);
 int multikernel_halt_by_id(int mk_id);
 int multikernel_force_halt_by_id(int mk_id);
