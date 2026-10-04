@@ -217,13 +217,31 @@ static int mk_publish_repark(struct mk_spawn_context *from, u32 apic_id,
 			     unsigned long park_phys, unsigned long park_cr3,
 			     unsigned long slot_phys, const char *what)
 {
+	struct mk_spawn_context *to = __va(slot_phys);
+	int ret;
+
 	lockdep_assert_held(&mk_pool->park_lock);
 
 	from->repark_park_phys = park_phys;
 	from->repark_park_cr3 = park_cr3;
 	from->repark_slot_phys = slot_phys;
 	from->flags = MK_SPAWN_F_REPARK;
-	return mk_slot_wake(from, apic_id, what);
+	ret = mk_slot_wake(from, apic_id, what);
+	if (ret || from == to)
+		return ret;
+
+	/*
+	 * Clearing ready claims the staged registers, not departure from the
+	 * old park page/page table. Only the destination loop can claim this
+	 * self-repark, after jumping off both. Keep tracking and old allocations
+	 * until that proof arrives. All destinations are host-managed control
+	 * allocations in the direct map; park_lock serializes both mailboxes.
+	 */
+	to->repark_park_phys = park_phys;
+	to->repark_park_cr3 = park_cr3;
+	to->repark_slot_phys = slot_phys;
+	to->flags = MK_SPAWN_F_REPARK;
+	return mk_slot_wake(to, apic_id, "confirm repark arrival");
 }
 
 static int mk_repark_to_instance(struct mk_instance *instance,

@@ -80,6 +80,14 @@ static struct mk_instance *host_instance;
 static bool mk_overlay_mutex = true;
 static struct mk_pool pool, *mk_pool = &pool;
 static struct mk_spawn_context host_slot, spawn_ctx;
+static void *test_phys_to_virt(unsigned long phys)
+{
+	if (phys == 0x123000 || phys == (unsigned long)&spawn_ctx)
+		return &spawn_ctx;
+	assert(phys == 0x456000 || phys == (unsigned long)&host_slot);
+	return &host_slot;
+}
+#define __va(p) test_phys_to_virt(p)
 static int references, wakes, wake_fail_at, send_error, wait_error;
 static unsigned int live_pending, sends;
 static bool owned_at_wake, tracked_at_wake, owned_at_send;
@@ -309,13 +317,13 @@ int main(void)
 	expect("transport failure after handoff",
 	       mk_send_cpu_add(2, test_cpu, 0, 0), -ENOSPC);
 	retained();
-	expect("transport failure does not guess rollback", wakes, 1);
+	expect("transport failure adds no wake beyond confirmed handoff", wakes, 2);
 
 	reset();
 	wait_error = -ETIMEDOUT;
 	expect("lost start ACK", mk_send_cpu_add(2, test_cpu, 0, 0), -ETIMEDOUT);
 	retained();
-	expect("lost ACK does not guess rollback", wakes, 1);
+	expect("lost ACK adds no wake beyond confirmed handoff", wakes, 2);
 
 	reset();
 	wait_error = -EIO;
@@ -367,13 +375,14 @@ int main(void)
 	assert(!mk_instance_transfer_cpus(&target, pool.cpus));
 	assert(!mk_cpu_set_add(target.cpus, test_cpu + 1));
 	assert(!mk_cpu_set_add(target.cpus, 7));
-	wake_fail_at = 2;
+	/* First CPU claims source and destination; second source claim fails. */
+	wake_fail_at = 3;
 	expect("partial secondary handoff failure",
 	       mk_spawn_cpu(&target, 7, &spawn_ctx), -ETIMEDOUT);
 	retained();
 	expect("second uncertain CPU remains tracked",
 	       mk_cpu_set_contains(target.cpus_on_slot, test_cpu + 1), 1);
-	expect("partial handoff does not wake boot CPU", wakes, 2);
+	expect("partial handoff does not wake boot CPU", wakes, 3);
 	expect("unpublished boot stays untracked",
 	       mk_cpu_set_contains(target.cpus_on_slot, 7), 0);
 
