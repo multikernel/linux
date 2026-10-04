@@ -1339,6 +1339,7 @@ out:
  */
 int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 {
+	struct mk_cpu_set cpus = { .nr = 1, .cap = 1, .ids = &cpu_id };
 	struct mk_cpu_resource_payload payload = {
 		.cpu_id = cpu_id,
 		.numa_node = numa_node,
@@ -1365,8 +1366,6 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 
 	/* For non-running instances, transfer CPU from root using existing API */
 	if (target_instance->state != MK_STATE_ACTIVE) {
-		struct mk_cpu_set cpus = { .nr = 1, .cap = 1, .ids = &cpu_id };
-
 		ret = mk_instance_transfer_cpus(target_instance, &cpus);
 		goto out;
 	}
@@ -1375,10 +1374,28 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 	 * Only a CPU from the assignable pool is parked on the host slot;
 	 * publishing a wakeup for any other CPU can only time out.
 	 */
-	if (!mk_cpu_set_contains(mk_pool->cpus, cpu_id)) {
+	if (!mk_pool || !mk_cpu_set_contains(mk_pool->cpus, cpu_id)) {
 		pr_err("Multikernel hotplug: CPU %llu is not in this kernel's pool\n",
 		       cpu_id);
 		ret = -EBUSY;
+		goto out;
+	}
+
+	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_CPU_ADD, cpu_id);
+	if (IS_ERR(pending)) {
+		ret = PTR_ERR(pending);
+		goto out;
+	}
+
+	/*
+	 * Reserve ownership before any handoff. Once a wakeup is published,
+	 * an error or timeout cannot prove the CPU did not consume it. Keep
+	 * the CPU assigned to the target, even on failure, until a separate
+	 * quiesced removal can safely return it to the pool.
+	 */
+	ret = mk_instance_transfer_cpus(target_instance, &cpus);
+	if (ret) {
+		mk_msg_pending_cancel(pending);
 		goto out;
 	}
 
@@ -1391,13 +1408,7 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 	if (ret < 0) {
 		pr_err("Multikernel hotplug: Failed to repark CPU %llu to instance %d: %d\n",
 		       cpu_id, instance_id, ret);
-		goto out;
-	}
-
-	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_CPU_ADD, cpu_id);
-	if (IS_ERR(pending)) {
-		mk_repark_cpu_to_host(target_instance, cpu_id);
-		ret = PTR_ERR(pending);
+		mk_msg_pending_cancel(pending);
 		goto out;
 	}
 
@@ -1405,28 +1416,11 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 				 mk_msg_pending_id(pending), &payload, sizeof(payload));
 	if (ret < 0) {
 		mk_msg_pending_cancel(pending);
-		mk_repark_cpu_to_host(target_instance, cpu_id);
 		goto out;
 	}
 
+	/* A timed-out waiter does not cancel the remote CPU-start work. */
 	ret = mk_msg_pending_wait(pending, 10000);
-	if (ret < 0) {
-		/*
-		 * Best effort: if the instance never picked the CPU up, it
-		 * is still parked on the instance context and comes home;
-		 * if the instance onlined it despite the error, nothing is
-		 * watching the context and this times out harmlessly.
-		 */
-		mk_repark_cpu_to_host(target_instance, cpu_id);
-		goto out;
-	}
-
-	if (mk_cpu_set_add(target_instance->cpus, cpu_id))
-		pr_warn("Multikernel hotplug: Failed to track CPU %llu in instance %d\n",
-			cpu_id, instance_id);
-	mk_cpu_set_del(mk_pool->cpus, cpu_id);
-
-	ret = 0;
 out:
 	mk_instance_put(target_instance);
 	return ret;

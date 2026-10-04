@@ -1,0 +1,50 @@
+.. SPDX-License-Identifier: GPL-2.0-only
+
+CPU ownership and x86 handoff regression checks
+==============================================
+
+Run from a checkout without building the kernel:
+
+  sh tools/testing/selftests/multikernel/cpu_ownership_test.sh
+  CC=gcc CFLAGS=-O2 sh tools/testing/selftests/multikernel/cpu_ownership_test.sh
+  CC=clang CFLAGS='-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer' \
+    sh tools/testing/selftests/multikernel/cpu_ownership_test.sh
+
+The runner extracts verbatim production CPU set and transfer functions, CPU
+add/remove senders, generic parked confirmation, and the x86 first-boot,
+secondary, hot-add and parked-confirmation paths.
+Changes to ownership or publication ordering therefore change the tested code.
+Mailbox/firmware execution, allocation, pending waits, instance lookup and lock
+scheduling are controlled host boundaries. The separate ack_test.sh exercises
+the real pending list, message transport framing and deferred workers.
+
+Before the fix, the first 81 checks reported 25 failures: ownership/tracking
+lagged publication, ambiguous handoffs remained assignable, failed or timed-out
+requests attempted automatic return, and waiter allocation happened after the
+handoff. Expanded coverage includes partial secondary failure, allocation and
+mapping failure, confirmed removal and sparse full-width nonrunning transfers.
+
+Review exposed a consumer interaction: x86 host-slot confirmation deletes an
+uncertain member, so forward iteration could skip the next running CPU and
+falsely permit image overwrite. An additional production-path regression first
+failed with success instead of -EBUSY and zero running-CPU probes. Reverse
+iteration now checks that CPU and remains safe when the current member is removed.
+
+Ownership is reserved before handoff, and uncertain outcomes remain target-owned
+and tracked. This deliberately prefers retention to unsafe pool reuse. A failed
+tracking allocation after generic reservation can also retain an unmoved CPU;
+this is conservative, not a proof that the CPU entered the instance.
+
+Timeout/cancel removes only a local waiter. It does not cancel queued remote
+CPU-start work. Do not use a stopped snapshot or a successful repark alone to
+recover an outstanding timed-out add: quiesce such work first. The successful
+remove check models an independent acknowledged remove with no outstanding add.
+
+The post-wake allocation case checks ownership/tracking and waiter storage,
+not all allocations: real message framing can still allocate and fail after
+handoff, covered here by an injected transport error.
+
+These deterministic checks do not prove firmware execution, memory ordering,
+resource/image lock serialization, teardown, or actual concurrent CPU hotplug.
+Those require kernel runtime and failure-injection tests. This patch alone does
+not make the lifecycle or reclamation series ready for publication.
