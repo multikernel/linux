@@ -1,0 +1,101 @@
+.. SPDX-License-Identifier: GPL-2.0-only
+
+Local callback writers: messaging registry and host mktty
+========================================================
+
+Run from the repository root (no kernel build):
+
+  sh tools/testing/selftests/multikernel/messaging_registry_test.sh
+  sh tools/testing/selftests/multikernel/mktty_lifetime_test.sh
+
+Both scripts extract the current production functions verbatim into a temporary
+header, compile a host harness, and remove their temporary directory on exit.
+CC and CFLAGS select the compiler/options; for example repeat both commands with
+CC=gcc CFLAGS=-O2, then CC=clang
+CFLAGS='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer'.
+Assertions must remain enabled. mktty's harness suppresses unused-parameter and
+sign-compare warnings present in the extracted baseline file operations.
+
+Messaging registry
+------------------
+
+The mutex serializes duplicate check, lower-level callback registration and list
+insertion. Unregister holds it through lower-level callback retirement and context
+freeing, so a replacement of the same type cannot overlap the old callback's
+retirement. Cleanup closes admission before detaching the list and retains the
+mutex until every detached handler is retired. A concurrent cleanup therefore
+cannot report completion while another cleanup still drains callbacks.
+
+Admission begins closed. Init opens it once; cleanup permanently closes it even
+if called before init. Registration while closed returns -ESHUTDOWN; another init
+returns -EALREADY. Allocation failure and duplicate/missing-handler errors leave
+the mutex usable. No message layout, peer/session protocol or API version changes.
+
+Register, unregister and cleanup require sleepable process context and no
+callback-owned locks. Interrupt-context attempts are warned and rejected
+(-EWOULDBLOCK for register/unregister; cleanup returns without changing state).
+Other atomic process-context callers remain forbidden by the mutex contract.
+The callback accesses its immutable per-type context, never the registry mutex;
+callbacks must not register/unregister or clean up messaging. Owners retain their
+callback context until successful unregister or completed cleanup. Production
+multikernel_unregister_handler() supplies the existing RCU grace-period guarantee.
+
+Seven controlled scenarios exercise competing same-type writers, unregister vs
+replacement, cleanup vs registration, concurrent cleanups, closed admission and
+one-shot init, allocation/error paths, and interrupt-context rejection. An entered
+callback runs the extracted message wrapper while a remover waits at the modeled
+RCU boundary; its context must not be freed before callback return. Checkpoints
+use condition variables and observed lock contention, not scheduling sleeps.
+
+Host mktty
+----------
+
+Open/release now use IRQ-save locking of the same connection-list lock held by
+the hardIRQ receive callback. This excludes same-CPU interrupt reentry. The
+callback retains the list lock through RX use and wakeup; release unlinks under
+that lock before freeing the RX buffer and connection. Concurrent file operations
+continue to rely on VFS file references delaying final .release().
+
+First writes validate the instance outside the spinlock, then publish the target
+once under the connection-list lock with WRITE_ONCE. A competing first write
+that also observed an unconnected FD returns -EISCONN after losing publication.
+Later read/poll/write paths use READ_ONCE; a data write snapshots the immutable
+target once for all chunks. Callback lookup reads the target under the publication
+lock. This does not pin a remote instance for the connection's entire lifetime or
+solve remote restart/ID reuse; each send retains its existing lookup behavior.
+
+Four scenarios check IRQ exclusion at open/release lock-acquisition checkpoints,
+release waiting for a callback paused during wakeup, simultaneous first-target
+writers plus read/poll/data writes, and failed target validation/nonblocking I/O.
+The IRQ checkpoint records the baseline's potential reentrant deadlock rather
+than deliberately hanging a host thread. Baseline cross-thread callback/release
+lifetime and validation scenarios already passed; their lifetime scheme remains.
+
+Evidence and limits
+-------------------
+
+Tests were written and run before production changes at c5f7c18e1229:
+messaging's initial six scenarios failed (duplicate successes, retirement
+overlap, surviving post-cleanup registration, open-before-init/reopen, missing
+context constraint); mktty failed two of four (IRQ exclusion and competing target
+publication/marked reads). Concurrent-cleanup and broader context checks were
+then added to messaging's suite.
+
+Final checks: all seven messaging and four mktty scenarios passed with plain cc,
+GCC -O2 and Clang -O1 ASan+UBSan (including alignment). The existing extracted
+ipi_lifetime_test.sh passed with plain cc, and git diff --check passed. No kernel
+build was run.
+
+These are production-extraction behavioral tests with NON-NATIVE boundaries.
+pthread mutexes stand in for kernel locks; registry callback registration/RCU
+retirement, local IRQ masking, scheduler, allocation and VFS/instance operations
+are controlled substitutes. They are not a native kernel, lockdep, KCSAN, physical
+IPI, RCU or hardware qualification. The existing ipi_lifetime_test.sh separately
+extracts the lower-level registration/removal/dispatch path.
+
+Remaining gates: native non-RT IRQ/lockdep and callback-drain stress on controller
+and worker paths; actual multikernel/TTY use and remote retirement/restart evidence.
+PREEMPT_RT remains explicitly UNQUALIFIED: ordinary spinlocks in callback pending,
+mktty RX and wait/wakeup paths remain baseline limitations. Host compiler/sanitizer
+success must not be interpreted as full RT safety, complete driver/DMA safety,
+foreign-writer retirement or a wire/session lifetime protocol.

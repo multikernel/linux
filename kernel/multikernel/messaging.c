@@ -12,6 +12,8 @@
 #include <linux/completion.h>
 #include <linux/err.h>
 #include <linux/limits.h>
+#include <linux/interrupt.h>
+#include <linux/mutex.h>
 #include <linux/multikernel.h>
 
 /* Pending message tracking for request-response pattern */
@@ -40,7 +42,14 @@ struct mk_msg_type_handler {
 };
 
 static struct mk_msg_type_handler *mk_msg_type_handlers;
-static raw_spinlock_t mk_msg_type_handlers_lock = __RAW_SPIN_LOCK_UNLOCKED(mk_msg_type_handlers_lock);
+/*
+ * Process-context writers only. Callbacks use their immutable type_handler,
+ * never this registry or its mutex, and must not register/unregister handlers.
+ * Writers must not hold callback-owned locks while waiting for retirement.
+ */
+static DEFINE_MUTEX(mk_msg_type_handlers_lock);
+static bool mk_messaging_initialized;
+static bool mk_messaging_accepting;
 
 /**
  * mk_message_type_ipi_callback - IPI callback to handle incoming messages for a specific type
@@ -291,31 +300,40 @@ EXPORT_SYMBOL(mk_send_message);
  * @handler: Handler function
  * @ctx: Context pointer passed to handler
  *
+ * Process context only, never from a callback or with callback-owned locks held.
  * Returns 0 on success, negative error code on failure
  */
 int mk_register_msg_handler(u32 msg_type, mk_msg_handler_t handler, void *ctx)
 {
 	struct mk_msg_type_handler *type_handler;
-	unsigned long flags;
+	int ret;
 
 	if (!handler)
 		return -EINVAL;
+	if (WARN_ON_ONCE(in_interrupt()))
+		return -EWOULDBLOCK;
+
+	mutex_lock(&mk_msg_type_handlers_lock);
+	if (!mk_messaging_accepting) {
+		ret = -ESHUTDOWN;
+		goto unlock;
+	}
 
 	/* Check if handler for this type already exists */
-	raw_spin_lock_irqsave(&mk_msg_type_handlers_lock, flags);
 	for (type_handler = mk_msg_type_handlers; type_handler; type_handler = type_handler->next) {
 		if (type_handler->msg_type == msg_type) {
-			raw_spin_unlock_irqrestore(&mk_msg_type_handlers_lock, flags);
 			pr_warn("Handler for message type 0x%x already registered\n", msg_type);
-			return -EEXIST;
+			ret = -EEXIST;
+			goto unlock;
 		}
 	}
-	raw_spin_unlock_irqrestore(&mk_msg_type_handlers_lock, flags);
 
 	/* Allocate new type handler entry */
 	type_handler = kzalloc(sizeof(*type_handler), GFP_KERNEL);
-	if (!type_handler)
-		return -ENOMEM;
+	if (!type_handler) {
+		ret = -ENOMEM;
+		goto unlock;
+	}
 
 	type_handler->msg_type = msg_type;
 	type_handler->msg_handler = handler;
@@ -327,17 +345,19 @@ int mk_register_msg_handler(u32 msg_type, mk_msg_handler_t handler, void *ctx)
 	if (!type_handler->ipi_handler) {
 		pr_err("Failed to register IPI handler for message type 0x%x\n", msg_type);
 		kfree(type_handler);
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto unlock;
 	}
 
 	/* Add to type handler list */
-	raw_spin_lock_irqsave(&mk_msg_type_handlers_lock, flags);
 	type_handler->next = mk_msg_type_handlers;
 	mk_msg_type_handlers = type_handler;
-	raw_spin_unlock_irqrestore(&mk_msg_type_handlers_lock, flags);
 
 	pr_debug("Registered multikernel message handler for type 0x%x\n", msg_type);
-	return 0;
+	ret = 0;
+unlock:
+	mutex_unlock(&mk_msg_type_handlers_lock);
+	return ret;
 }
 EXPORT_SYMBOL(mk_register_msg_handler);
 
@@ -346,18 +366,21 @@ EXPORT_SYMBOL(mk_register_msg_handler);
  * @msg_type: Message type to unregister
  * @handler: Handler function to remove
  *
+ * Process context only, never from a callback or with callback-owned locks held.
+ * Drains entered callbacks before the caller may release its context.
  * Returns 0 on success, negative error code on failure
  */
 int mk_unregister_msg_handler(u32 msg_type, mk_msg_handler_t handler)
 {
 	struct mk_msg_type_handler **pp, *type_handler;
-	unsigned long flags;
 	int found = 0;
 
 	if (!handler)
 		return -EINVAL;
+	if (WARN_ON_ONCE(in_interrupt()))
+		return -EWOULDBLOCK;
 
-	raw_spin_lock_irqsave(&mk_msg_type_handlers_lock, flags);
+	mutex_lock(&mk_msg_type_handlers_lock);
 	pp = &mk_msg_type_handlers;
 	while ((type_handler = *pp) != NULL) {
 		if (type_handler->msg_type == msg_type && type_handler->msg_handler == handler) {
@@ -367,18 +390,19 @@ int mk_unregister_msg_handler(u32 msg_type, mk_msg_handler_t handler)
 		}
 		pp = &type_handler->next;
 	}
-	raw_spin_unlock_irqrestore(&mk_msg_type_handlers_lock, flags);
 
 	if (found) {
-		/* Unregister the IPI handler */
+		/* Keep same-type insertion excluded until old callbacks have returned. */
 		if (type_handler->ipi_handler) {
 			multikernel_unregister_handler(type_handler->ipi_handler);
 		}
 		kfree(type_handler);
+		mutex_unlock(&mk_msg_type_handlers_lock);
 		pr_debug("Unregistered multikernel message handler for type 0x%x\n", msg_type);
 		return 0;
 	}
 
+	mutex_unlock(&mk_msg_type_handlers_lock);
 	return -ENOENT;
 }
 EXPORT_SYMBOL(mk_unregister_msg_handler);
@@ -391,6 +415,15 @@ EXPORT_SYMBOL(mk_unregister_msg_handler);
  */
 int __init mk_messaging_init(void)
 {
+	mutex_lock(&mk_msg_type_handlers_lock);
+	if (mk_messaging_initialized) {
+		mutex_unlock(&mk_msg_type_handlers_lock);
+		return -EALREADY;
+	}
+	mk_messaging_initialized = true;
+	mk_messaging_accepting = true;
+	mutex_unlock(&mk_msg_type_handlers_lock);
+
 	/* No global IPI handler needed anymore - handlers are registered per message type */
 	pr_info("Multikernel messaging system initialized\n");
 	return 0;
@@ -399,19 +432,24 @@ int __init mk_messaging_init(void)
 /**
  * mk_messaging_cleanup - Cleanup the messaging system
  *
- * Called during multikernel cleanup
+ * Process context only; no callback-owned locks may be held.
+ * Closes registration permanently, then drains entered callbacks.
  */
 void mk_messaging_cleanup(void)
 {
 	struct mk_msg_type_handler *type_handler, *next;
-	unsigned long flags;
+
+	if (WARN_ON_ONCE(in_interrupt()))
+		return;
 
 	/* Clean up all registered message type handlers */
-	raw_spin_lock_irqsave(&mk_msg_type_handlers_lock, flags);
+	mutex_lock(&mk_msg_type_handlers_lock);
+	mk_messaging_initialized = true;
+	mk_messaging_accepting = false;
 	type_handler = mk_msg_type_handlers;
 	mk_msg_type_handlers = NULL;
-	raw_spin_unlock_irqrestore(&mk_msg_type_handlers_lock, flags);
 
+	/* The mutex is never callback-owned; concurrent cleanup also waits here. */
 	while (type_handler) {
 		next = type_handler->next;
 
@@ -423,6 +461,7 @@ void mk_messaging_cleanup(void)
 		kfree(type_handler);
 		type_handler = next;
 	}
+	mutex_unlock(&mk_msg_type_handlers_lock);
 
 	pr_info("Multikernel messaging system cleaned up\n");
 }
