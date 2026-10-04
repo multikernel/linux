@@ -1645,6 +1645,8 @@ static void mk_shutdown_work_fn(struct work_struct *work)
 	u64 msg_id = sw->msg_id;
 
 	kfree(sw);
+	/* This worker may sleep; the voluntary machine-halt path may not. */
+	mk_hotplug_quiesce();
 	mk_notify_down_and_park(sender_instance_id, MK_SYS_SHUTDOWN_ACK, msg_id);
 }
 
@@ -2047,17 +2049,18 @@ static int __init multikernel_init(void)
 		return ret;
 	}
 
-	ret = mk_register_msg_handler(MK_MSG_SYSTEM, mk_system_msg_handler, NULL);
+	/* Resource admission must be ready before a shutdown can be received. */
+	ret = mk_hotplug_init();
 	if (ret < 0) {
-		pr_err("Failed to register system message handler: %d\n", ret);
+		pr_err("Failed to initialize multikernel hotplug: %d\n", ret);
 		mk_messaging_cleanup();
 		return ret;
 	}
 
-	ret = mk_hotplug_init();
+	ret = mk_register_msg_handler(MK_MSG_SYSTEM, mk_system_msg_handler, NULL);
 	if (ret < 0) {
-		pr_err("Failed to initialize multikernel hotplug: %d\n", ret);
-		mk_unregister_msg_handler(MK_MSG_SYSTEM, mk_system_msg_handler);
+		pr_err("Failed to register system message handler: %d\n", ret);
+		mk_hotplug_cleanup();
 		mk_messaging_cleanup();
 		return ret;
 	}

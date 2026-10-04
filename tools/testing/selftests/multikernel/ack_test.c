@@ -32,6 +32,10 @@ static bool allocation_fails;
 #define raw_spin_lock_irqsave(lock, flags) spin_lock_irqsave(lock, flags)
 #define raw_spin_unlock_irqrestore(lock, flags) spin_unlock_irqrestore(lock, flags)
 #define msecs_to_jiffies(ms) (ms)
+#define DECLARE_WAIT_QUEUE_HEAD(name) int name
+#define wake_up_all(wait) ((void)(wait))
+/* This fixture executes one job at a time; the multi-job drain is tested separately. */
+#define wait_event(wait, condition) do { (void)(wait); assert(condition); } while (0)
 
 struct completion {
 	unsigned int done;
@@ -412,7 +416,7 @@ static void worker_regressions(void)
 	/* The existing 64-bit wire ABI has an unaligned flexible payload. */
 	assert(sizeof(struct mk_message) == 24);
 	assert(offsetof(struct mk_message, payload) == 20);
-	assert(sizeof(cpu) == 24 && sizeof(mem) == 32 && sizeof(dev) == 76);
+	assert(sizeof(cpu) == 24 && sizeof(mem) == 32 && sizeof(dev) == 544);
 	assert(sizeof(struct mk_resource_ack) == 16 && sizeof(shutdown) == 8);
 
 	for (i = 0; i < ARRAY_SIZE(cases); i++) {
@@ -427,6 +431,9 @@ static void worker_regressions(void)
 			u32 len;
 			u64 id = ids[j];
 			int result;
+
+			/* Each case represents a fresh receiver, before shutdown closes it. */
+			mk_hotplug_accepting = true;
 
 			if (i < 2) {
 				payload = &cpu;
@@ -622,6 +629,7 @@ int main(int argc, char **argv)
 {
 	/* Queue creation/lifetime is exercised by cpu_work_test, not this fixture. */
 	mk_cpu_hotplug_wq = &cpu_queue;
+	mk_hotplug_accepting = true;
 
 	if (argc > 2 || (argc == 2 && strcmp(argv[1], "regression") &&
 			strcmp(argv[1], "characterization") &&

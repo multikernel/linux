@@ -25,6 +25,7 @@
 #include <linux/pci.h>
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
+#include <linux/wait.h>
 #include "internal.h"
 
 static const char mk_mem_resource_name[] = "System RAM (multikernel)";
@@ -70,24 +71,77 @@ static LIST_HEAD(mk_hotplug_ops);
 /*
  * A remove ACK must not overtake an earlier queued add. CPU requests share an
  * ordered queue; memory and device workers retain their existing scheduling.
- * The raw lock protects submission against queue detachment during cleanup;
+ * The raw lock protects resource admission and CPU queue detachment;
  * the receive path runs in hard-IPI context, including on PREEMPT_RT.
  */
 static DEFINE_RAW_SPINLOCK(mk_cpu_hotplug_lock);
 static struct workqueue_struct *mk_cpu_hotplug_wq;
+static bool mk_hotplug_accepting;
+static unsigned int mk_hotplug_inflight;
+static DECLARE_WAIT_QUEUE_HEAD(mk_hotplug_wait);
 
-static int mk_queue_cpu_work(struct work_struct *work)
+static int mk_queue_hotplug_work(struct work_struct *work, bool cpu)
 {
 	unsigned long flags;
 	int ret = 0;
 
 	raw_spin_lock_irqsave(&mk_cpu_hotplug_lock, flags);
-	if (mk_cpu_hotplug_wq)
-		queue_work(mk_cpu_hotplug_wq, work);
-	else
+	if (!mk_hotplug_accepting) {
 		ret = -ESHUTDOWN;
+	} else {
+		mk_hotplug_inflight++;
+		if (cpu)
+			queue_work(mk_cpu_hotplug_wq, work);
+		else
+			schedule_work(work);
+	}
 	raw_spin_unlock_irqrestore(&mk_cpu_hotplug_lock, flags);
 	return ret;
+}
+
+static int mk_queue_cpu_work(struct work_struct *work)
+{
+	return mk_queue_hotplug_work(work, true);
+}
+
+static void mk_hotplug_work_done(void)
+{
+	unsigned long flags;
+	bool idle;
+
+	raw_spin_lock_irqsave(&mk_cpu_hotplug_lock, flags);
+	idle = !--mk_hotplug_inflight;
+	raw_spin_unlock_irqrestore(&mk_cpu_hotplug_lock, flags);
+	if (idle)
+		wake_up_all(&mk_hotplug_wait);
+}
+
+static bool mk_hotplug_idle(void)
+{
+	unsigned long flags;
+	bool idle;
+
+	raw_spin_lock_irqsave(&mk_cpu_hotplug_lock, flags);
+	idle = !mk_hotplug_inflight;
+	raw_spin_unlock_irqrestore(&mk_cpu_hotplug_lock, flags);
+	return idle;
+}
+
+/*
+ * Process context only, outside all controller/tracking locks and resource
+ * workers. Close incoming admission before waiting for accepted workers to
+ * finish mutation, ACK transmission and work allocation release. A stuck
+ * worker must prevent a successful shutdown ACK, not permit unsafe reuse.
+ * This does not fence local controllers, drivers or other ring writers.
+ */
+void mk_hotplug_quiesce(void)
+{
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&mk_cpu_hotplug_lock, flags);
+	mk_hotplug_accepting = false;
+	raw_spin_unlock_irqrestore(&mk_cpu_hotplug_lock, flags);
+	wait_event(mk_hotplug_wait, mk_hotplug_idle());
 }
 
 static struct workqueue_struct *mk_cpu_hotplug_detach(void)
@@ -303,6 +357,7 @@ static void mk_cpu_add_work_fn(struct work_struct *work)
 	}
 
 	kfree(hp_work);
+	mk_hotplug_work_done();
 }
 
 static void mk_cpu_remove_work_fn(struct work_struct *work)
@@ -326,6 +381,7 @@ static void mk_cpu_remove_work_fn(struct work_struct *work)
 	}
 
 	kfree(hp_work);
+	mk_hotplug_work_done();
 }
 
 /**
@@ -655,6 +711,7 @@ static void mk_mem_add_work_fn(struct work_struct *work)
 	}
 
 	kfree(hp_work);
+	mk_hotplug_work_done();
 }
 
 static void mk_mem_remove_work_fn(struct work_struct *work)
@@ -677,12 +734,14 @@ static void mk_mem_remove_work_fn(struct work_struct *work)
 	}
 
 	kfree(hp_work);
+	mk_hotplug_work_done();
 }
 
 static int mk_handle_mem_add(struct mk_mem_resource_payload *payload, u32 payload_len,
 			       u64 msg_id)
 {
 	struct mk_mem_hotplug_work *hp_work;
+	int ret;
 
 	if (payload_len < sizeof(*payload)) {
 		pr_err("Multikernel hotplug: Invalid memory add payload size: %u\n", payload_len);
@@ -704,7 +763,11 @@ static int mk_handle_mem_add(struct mk_mem_resource_payload *payload, u32 payloa
 	hp_work->mem_type = payload->mem_type;
 	hp_work->sender_instance_id = payload->sender_instance_id;
 	hp_work->operation = MK_RES_MEM_ADD;
-	schedule_work(&hp_work->work);
+	ret = mk_queue_hotplug_work(&hp_work->work, false);
+	if (ret) {
+		kfree(hp_work);
+		return ret;
+	}
 
 	return 0;
 }
@@ -713,6 +776,7 @@ static int mk_handle_mem_remove(struct mk_mem_resource_payload *payload, u32 pay
 			       u64 msg_id)
 {
 	struct mk_mem_hotplug_work *hp_work;
+	int ret;
 
 	if (payload_len < sizeof(*payload)) {
 		pr_err("Multikernel hotplug: Invalid memory remove payload size: %u\n", payload_len);
@@ -732,7 +796,11 @@ static int mk_handle_mem_remove(struct mk_mem_resource_payload *payload, u32 pay
 	hp_work->nr_pages = payload->nr_pages;
 	hp_work->sender_instance_id = payload->sender_instance_id;
 	hp_work->operation = MK_RES_MEM_REMOVE;
-	schedule_work(&hp_work->work);
+	ret = mk_queue_hotplug_work(&hp_work->work, false);
+	if (ret) {
+		kfree(hp_work);
+		return ret;
+	}
 
 	return 0;
 }
@@ -951,6 +1019,7 @@ static void mk_device_add_work_fn(struct work_struct *work)
 	}
 
 	kfree(hp_work);
+	mk_hotplug_work_done();
 }
 
 static void mk_device_remove_work_fn(struct work_struct *work)
@@ -974,12 +1043,14 @@ static void mk_device_remove_work_fn(struct work_struct *work)
 	}
 
 	kfree(hp_work);
+	mk_hotplug_work_done();
 }
 
 static int mk_handle_device_add(struct mk_device_resource_payload *payload, u32 payload_len,
 			       u64 msg_id)
 {
 	struct mk_device_hotplug_work *hp_work;
+	int ret;
 
 	if (payload_len < sizeof(*payload)) {
 		pr_err("Multikernel hotplug: Invalid device add payload size: %u\n", payload_len);
@@ -1006,7 +1077,11 @@ static int mk_handle_device_add(struct mk_device_resource_payload *payload, u32 
 	hp_work->vendor = payload->vendor;
 	hp_work->device = payload->device;
 	hp_work->bus_desc = payload->bus_desc;
-	schedule_work(&hp_work->work);
+	ret = mk_queue_hotplug_work(&hp_work->work, false);
+	if (ret) {
+		kfree(hp_work);
+		return ret;
+	}
 
 	return 0;
 }
@@ -1015,6 +1090,7 @@ static int mk_handle_device_remove(struct mk_device_resource_payload *payload, u
 			       u64 msg_id)
 {
 	struct mk_device_hotplug_work *hp_work;
+	int ret;
 
 	if (payload_len < sizeof(*payload)) {
 		pr_err("Multikernel hotplug: Invalid device remove payload size: %u\n", payload_len);
@@ -1037,7 +1113,11 @@ static int mk_handle_device_remove(struct mk_device_resource_payload *payload, u
 	hp_work->flags = payload->flags;
 	hp_work->sender_instance_id = payload->sender_instance_id;
 	hp_work->operation = MK_RES_DEVICE_REMOVE;
-	schedule_work(&hp_work->work);
+	ret = mk_queue_hotplug_work(&hp_work->work, false);
+	if (ret) {
+		kfree(hp_work);
+		return ret;
+	}
 
 	return 0;
 }
@@ -1157,12 +1237,14 @@ int __init mk_hotplug_init(void)
 
 	raw_spin_lock_irqsave(&mk_cpu_hotplug_lock, flags);
 	mk_cpu_hotplug_wq = wq;
+	mk_hotplug_accepting = true;
 	raw_spin_unlock_irqrestore(&mk_cpu_hotplug_lock, flags);
 
 	/* Register handler for resource management messages */
 	ret = mk_register_msg_handler(MK_MSG_RESOURCE, mk_resource_msg_handler, NULL);
 	if (ret < 0) {
 		pr_err("Failed to register multikernel hotplug message handler: %d\n", ret);
+		mk_hotplug_quiesce();
 		destroy_workqueue(mk_cpu_hotplug_detach());
 		return ret;
 	}
@@ -1183,7 +1265,8 @@ void mk_hotplug_cleanup(void)
 
 	pr_info("Cleaning up multikernel hotplug subsystem\n");
 
-	/* Reject late CPU submissions before draining and freeing their queue. */
+	/* Close all resource admission and finish workers before freeing tracking. */
+	mk_hotplug_quiesce();
 	wq = mk_cpu_hotplug_detach();
 
 	/* Unregister message handler */
