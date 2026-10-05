@@ -926,16 +926,28 @@ static int mk_build_trampoline_pgtable(unsigned long trampoline_va,
  * Wakes a pool CPU to join this spawn kernel as a secondary CPU.
  */
 /*
- * Where to publish a wakeup for @apicid. A CPU the fence parked on the
- * host's slot is woken from that slot, which this kernel adopted as
- * its own after fencing (host_instance->pool_slot_phys); every other
- * secondary is woken from this kernel's own context. The returned slot
+ * Where to publish a wakeup for @apicid. A CPU donated to this kernel's
+ * local pool watches the local pool slot, even if this spawn originally
+ * received it on its parent's slot. Otherwise a CPU the fence parked on
+ * the host's slot is woken from that adopted slot; initial secondaries
+ * are woken from this kernel's own boot context. Do not change the boot
+ * context: it still supplies this kernel's dispatch and final halt target.
+ * The caller holds park_lock while selecting and publishing. The returned slot
  * is memremapped when it differs from @own and must be released with
  * mk_put_wake_slot().
  */
 static struct mk_spawn_context *mk_wake_slot(u32 apicid,
 					     struct mk_spawn_context *own)
 {
+	if (mk_pool) {
+		lockdep_assert_held(&mk_pool->park_lock);
+		if (mk_cpu_set_contains(mk_pool->cpus, apicid)) {
+			if (!mk_pool->arch.slot_phys)
+				return NULL;
+			return memremap(mk_pool->arch.slot_phys,
+					sizeof(struct mk_spawn_context), MEMREMAP_WB);
+		}
+	}
 	if (host_instance && host_instance->pool_slot_phys &&
 	    mk_cpu_set_contains(host_instance->cpus_on_slot, apicid))
 		return memremap(host_instance->pool_slot_phys,
@@ -953,6 +965,7 @@ static void mk_put_wake_slot(struct mk_spawn_context *slot,
 int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 					unsigned int cpu)
 {
+	struct mk_pool *pool = mk_pool;
 	struct mk_spawn_context *own = mk_own_context();
 	struct mk_spawn_context *slot;
 	unsigned long trampoline_phys, trampoline_va;
@@ -997,9 +1010,31 @@ int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 	if (ret)
 		return ret;
 
+	/* Initial secondary boot precedes baseline creation (pool == NULL). */
+	if (pool)
+		mutex_lock(&pool->park_lock);
+	if (pool && mk_cpu_set_contains(pool->cpus, apicid)) {
+		/*
+		 * The park loop jumps to the physical trampoline before that
+		 * trampoline switches CR3. A nested pool maps only its donated
+		 * chunks; the parent-given boot trampoline can be outside them.
+		 * Map its initial fetch in the OLD park table before publishing.
+		 * The mapping and any allocated table pages live with this pool.
+		 */
+		if (!pool->arch.pgt) {
+			ret = -ENODEV;
+			goto out_unlock;
+		}
+		ret = mk_ident_map_range(pool->arch.pgt, trampoline_phys,
+					 trampoline_phys + PAGE_SIZE);
+		if (ret)
+			goto out_unlock;
+	}
 	slot = mk_wake_slot(apicid, own);
-	if (!slot)
-		return -ENODEV;
+	if (!slot) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
 
 	/*
 	 * Revoke any unconsumed wakeup left over from a failed earlier
@@ -1036,7 +1071,11 @@ int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 	WRITE_ONCE(slot->ready, 1);
 
 	mk_put_wake_slot(slot, own);
-	return 0;
+	ret = 0;
+out_unlock:
+	if (pool)
+		mutex_unlock(&pool->park_lock);
+	return ret;
 }
 
 struct mk_ident_pgtable {
