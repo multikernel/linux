@@ -8,9 +8,9 @@ trap 'rm -rf -- "$build"' EXIT HUP INT TERM
 awk '/^#define MKTTY_/ { print }
      /^struct mktty_(message|host_conn) \{/ { copy = 1 }
      /^static LIST_HEAD\(mktty_host_conns\);/ { print }
-     /^static DEFINE_SPINLOCK\(mktty_host_conns_lock\);/ { print }
+     /^static DEFINE_(RAW_)?SPINLOCK\(mktty_host_conns_lock\);/ { print }
      /^static struct mktty_host_conn \*mktty_find_conn\(/ { copy = 1 }
-     /^static (int|ssize_t|__poll_t|void) mktty_host_(open|release|read|write|poll|ipi_handler)\(/ { copy = 1 }
+     /^static (int|ssize_t|__poll_t|void) mktty_host_(open|release|read|write|poll|ipi_handler|wake_work)\(/ { copy = 1 }
      copy { print }
      copy && /^}/ { copy = 0 }' "$src/drivers/tty/mktty.c" \
      > "$build/mktty-production.h"
