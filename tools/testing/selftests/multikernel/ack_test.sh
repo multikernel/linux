@@ -19,7 +19,7 @@ awk '/^#define MK_MAX_DATA_SIZE / { print }
 # Kernel top-level definitions end with a brace in column zero. Missing or
 # incompatible definitions cause a compile failure, never a substitute model.
 awk '/^struct mk_(pending_msg|msg_type_handler) \{/ { copy = 1 }
-     /^static (LIST_HEAD|DEFINE_SPINLOCK)\(mk_pending_msgs/ { print }
+     /^static (LIST_HEAD|DEFINE_(RAW_)?SPINLOCK)\(mk_pending_msgs/ { print }
      /^static u64 mk_last_msg_id;/ { print }
      /^(struct mk_pending_msg \*|void |int |u64 )mk_msg_pending_/ { copy = 1 }
      /^static void mk_message_type_ipi_callback\(/ { copy = 1 }
