@@ -31,7 +31,7 @@ struct mk_pending_msg {
 };
 
 static LIST_HEAD(mk_pending_msgs);
-static DEFINE_SPINLOCK(mk_pending_msgs_lock);
+static DEFINE_RAW_SPINLOCK(mk_pending_msgs_lock);
 static u64 mk_last_msg_id;
 
 /* Per-type message handler registry */
@@ -136,16 +136,16 @@ struct mk_pending_msg *mk_msg_pending_add(u32 msg_type, u32 operation, u64 resou
 	pending->result = -ETIMEDOUT;  /* Default to timeout */
 	init_completion(&pending->done);
 
-	spin_lock_irqsave(&mk_pending_msgs_lock, flags);
+	raw_spin_lock_irqsave(&mk_pending_msgs_lock, flags);
 	/* IDs are boot-local: exhaustion must fail, never wrap into an old ID. */
 	if (mk_last_msg_id == U64_MAX) {
-		spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
+		raw_spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
 		kfree(pending);
 		return ERR_PTR(-EOVERFLOW);
 	}
 	pending->msg_id = ++mk_last_msg_id;
 	list_add(&pending->list, &mk_pending_msgs);
-	spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
+	raw_spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
 
 	return pending;
 }
@@ -160,9 +160,9 @@ void mk_msg_pending_cancel(struct mk_pending_msg *pending)
 {
 	unsigned long flags;
 
-	spin_lock_irqsave(&mk_pending_msgs_lock, flags);
+	raw_spin_lock_irqsave(&mk_pending_msgs_lock, flags);
 	list_del(&pending->list);
-	spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
+	raw_spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
 	kfree(pending);
 }
 
@@ -182,7 +182,7 @@ void mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id,
 	struct mk_pending_msg *pending;
 	unsigned long flags;
 
-	spin_lock_irqsave(&mk_pending_msgs_lock, flags);
+	raw_spin_lock_irqsave(&mk_pending_msgs_lock, flags);
 	list_for_each_entry(pending, &mk_pending_msgs, list) {
 		if (pending->msg_id == msg_id &&
 		    pending->msg_type == msg_type &&
@@ -196,7 +196,7 @@ void mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id,
 			break;
 		}
 	}
-	spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
+	raw_spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
 }
 
 /**
@@ -219,10 +219,10 @@ int mk_msg_pending_wait(struct mk_pending_msg *pending, unsigned long timeout_ms
 		       pending->operation, pending->resource_id);
 
 	/* A reply arriving after the wait timed out cannot undo the timeout. */
-	spin_lock_irqsave(&mk_pending_msgs_lock, flags);
+	raw_spin_lock_irqsave(&mk_pending_msgs_lock, flags);
 	result = completed ? pending->result : -ETIMEDOUT;
 	list_del(&pending->list);
-	spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
+	raw_spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
 	kfree(pending);
 
 	return result;
