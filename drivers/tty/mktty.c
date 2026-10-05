@@ -21,6 +21,7 @@
 
 #include <linux/console.h>
 #include <linux/workqueue.h>
+#include <linux/kfifo.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/poll.h>
@@ -356,23 +357,103 @@ static void mktty_host_cleanup(void)
 
 struct mktty_spawn_state {
 	struct tty_port port;
-	spinlock_t lock;
+	raw_spinlock_t lock;
+	bool rx_enabled;
+	bool stopping;
+	u64 rx_dropped;
 	int instance_id;
 };
 
 static struct tty_driver *mktty_spawn_driver;
 static struct mktty_spawn_state mktty_spawn;
+static void mktty_spawn_receive_work(struct work_struct *work);
+static DECLARE_WORK(mktty_spawn_rx_work, mktty_spawn_receive_work);
+static DEFINE_KFIFO(mktty_spawn_rx_fifo, u8, MKTTY_RX_BUF_SIZE);
 static struct mk_ipi_handler *mktty_spawn_handler;
 static struct console mktty_spawn_console;
 static bool mktty_console_registered;
 
 static int mktty_spawn_activate(struct tty_port *port, struct tty_struct *tty)
 {
-	return 0;
+	unsigned long flags;
+	int ret = 0;
+
+	/* Port mutex serializes activation with the preceding shutdown/drain. */
+	raw_spin_lock_irqsave(&mktty_spawn.lock, flags);
+	if (mktty_spawn.stopping) {
+		ret = -ENODEV;
+	} else {
+		kfifo_reset(&mktty_spawn_rx_fifo);
+		mktty_spawn.rx_enabled = true;
+	}
+	raw_spin_unlock_irqrestore(&mktty_spawn.lock, flags);
+	return ret;
+}
+
+static void mktty_spawn_report_drops(void)
+{
+	unsigned long flags;
+	u64 dropped;
+
+	raw_spin_lock_irqsave(&mktty_spawn.lock, flags);
+	dropped = mktty_spawn.rx_dropped;
+	mktty_spawn.rx_dropped = 0;
+	raw_spin_unlock_irqrestore(&mktty_spawn.lock, flags);
+	if (dropped)
+		pr_warn_ratelimited("mktty: dropped %llu input bytes\n",
+				    (unsigned long long)dropped);
+}
+
+static void mktty_spawn_receive_work(struct work_struct *work)
+{
+	struct tty_struct *tty = tty_port_tty_get(&mktty_spawn.port);
+	unsigned int budget = MKTTY_RX_BUF_SIZE, count, inserted;
+	unsigned long flags;
+	u8 buf[512];
+
+	while (budget) {
+		raw_spin_lock_irqsave(&mktty_spawn.lock, flags);
+		count = mktty_spawn.rx_enabled ?
+			kfifo_out(&mktty_spawn_rx_fifo, buf,
+				  min_t(unsigned int, sizeof(buf), budget)) : 0;
+		raw_spin_unlock_irqrestore(&mktty_spawn.lock, flags);
+		if (!count)
+			break;
+		inserted = tty ? tty_insert_flip_string(&mktty_spawn.port, buf, count) : 0;
+		if (inserted)
+			tty_flip_buffer_push(&mktty_spawn.port);
+		if (inserted < count) {
+			raw_spin_lock_irqsave(&mktty_spawn.lock, flags);
+			mktty_spawn.rx_dropped += count - inserted;
+			raw_spin_unlock_irqrestore(&mktty_spawn.lock, flags);
+		}
+		budget -= count;
+	}
+	if (tty)
+		tty_kref_put(tty);
+
+	/* Serialize requeue with shutdown's admission close before cancellation. */
+	raw_spin_lock_irqsave(&mktty_spawn.lock, flags);
+	if (mktty_spawn.rx_enabled && !kfifo_is_empty(&mktty_spawn_rx_fifo))
+		schedule_work(&mktty_spawn_rx_work);
+	raw_spin_unlock_irqrestore(&mktty_spawn.lock, flags);
+	mktty_spawn_report_drops();
 }
 
 static void mktty_spawn_shutdown(struct tty_port *port)
 {
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&mktty_spawn.lock, flags);
+	mktty_spawn.rx_enabled = false;
+	raw_spin_unlock_irqrestore(&mktty_spawn.lock, flags);
+	/* The worker never takes the port mutex held by tty_port_shutdown(). */
+	cancel_work_sync(&mktty_spawn_rx_work);
+	raw_spin_lock_irqsave(&mktty_spawn.lock, flags);
+	mktty_spawn.rx_dropped += kfifo_len(&mktty_spawn_rx_fifo);
+	kfifo_reset(&mktty_spawn_rx_fifo);
+	raw_spin_unlock_irqrestore(&mktty_spawn.lock, flags);
+	mktty_spawn_report_drops();
 }
 
 static const struct tty_port_operations mktty_spawn_port_ops = {
@@ -451,25 +532,29 @@ static const struct tty_operations mktty_spawn_ops = {
 static void mktty_spawn_ipi_handler(struct mk_ipi_data *data, void *ctx)
 {
 	struct mktty_message *msg = (struct mktty_message *)data->buffer;
-	struct tty_struct *tty;
+	unsigned long flags;
+	unsigned int copied;
 
 	if (data->data_size < sizeof(*msg) - MKTTY_MAX_DATA)
 		return;
 	if (msg->type != MKTTY_MSG_INPUT)
 		return;
-	if (msg->len > MKTTY_MAX_DATA)
+	if (msg->len > MKTTY_MAX_DATA ||
+	    msg->len > data->data_size - (sizeof(*msg) - MKTTY_MAX_DATA))
 		return;
 
-	tty = tty_port_tty_get(&mktty_spawn.port);
-	if (tty) {
-		tty_insert_flip_string(&mktty_spawn.port, msg->data, msg->len);
-		tty_flip_buffer_push(&mktty_spawn.port);
-		tty_kref_put(tty);
+	/* The dispatcher releases the ring slot immediately after we return. */
+	raw_spin_lock_irqsave(&mktty_spawn.lock, flags);
+	if (mktty_spawn.rx_enabled) {
+		copied = kfifo_in(&mktty_spawn_rx_fifo, msg->data, msg->len);
+		mktty_spawn.rx_dropped += msg->len - copied;
+		schedule_work(&mktty_spawn_rx_work);
 	}
+	raw_spin_unlock_irqrestore(&mktty_spawn.lock, flags);
 }
 
 static struct mktty_message mktty_console_msg;
-static DEFINE_SPINLOCK(mktty_console_lock);
+static DEFINE_RAW_SPINLOCK(mktty_console_lock);
 
 static void mktty_spawn_console_write(struct console *con, const char *s,
 				      unsigned int count)
@@ -477,7 +562,7 @@ static void mktty_spawn_console_write(struct console *con, const char *s,
 	unsigned long flags;
 	size_t chunk;
 
-	spin_lock_irqsave(&mktty_console_lock, flags);
+	raw_spin_lock_irqsave(&mktty_console_lock, flags);
 	while (count > 0) {
 		chunk = min_t(size_t, count, MKTTY_MAX_DATA);
 		mktty_console_msg.type = MKTTY_MSG_OUTPUT;
@@ -492,7 +577,7 @@ static void mktty_spawn_console_write(struct console *con, const char *s,
 		s += chunk;
 		count -= chunk;
 	}
-	spin_unlock_irqrestore(&mktty_console_lock, flags);
+	raw_spin_unlock_irqrestore(&mktty_console_lock, flags);
 }
 
 static struct tty_driver *mktty_console_device(struct console *c, int *index)
@@ -542,7 +627,7 @@ static int mktty_spawn_init(void)
 		return -ENODEV;
 
 	mktty_spawn.instance_id = mk_self->id;
-	spin_lock_init(&mktty_spawn.lock);
+	raw_spin_lock_init(&mktty_spawn.lock);
 
 	pr_info("mktty: initializing spawn (instance %d)\n", mktty_spawn.instance_id);
 
@@ -587,8 +672,15 @@ static int mktty_spawn_init(void)
 
 static void mktty_spawn_cleanup(void)
 {
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&mktty_spawn.lock, flags);
+	mktty_spawn.stopping = true;
+	mktty_spawn.rx_enabled = false;
+	raw_spin_unlock_irqrestore(&mktty_spawn.lock, flags);
 	if (mktty_spawn_handler)
 		multikernel_unregister_handler(mktty_spawn_handler);
+	mktty_spawn_shutdown(&mktty_spawn.port);
 
 	if (mktty_console_registered) {
 		unregister_console(&mktty_spawn_console);
