@@ -19,7 +19,7 @@ static struct mk_ident_pgtable park_pgt;
 struct mk_pool {
 	struct mk_cpu_set *cpus;
 	struct { unsigned long slot_phys; struct mk_ident_pgtable *pgt; } arch;
-	bool park_lock;
+	bool park_lock, cpus_lock;
 };
 struct mk_instance {
 	unsigned long pool_slot_phys;
@@ -53,6 +53,7 @@ static inline void mutex_lock(bool *p) { assert(!*p); *p = true; }
 static inline void mutex_unlock(bool *p) { assert(*p); *p = false; }
 static bool mk_cpu_set_contains(struct mk_cpu_set *set, u32 cpu)
 {
+	assert(set != &free_cpus || pool.cpus_lock);
 	return set && set->present && set->id == cpu;
 }
 static void *memremap(unsigned long phys, size_t size, int flags)
@@ -100,7 +101,7 @@ static unsigned long per_cpu_offset(unsigned int cpu) { return 0x321000 + cpu; }
 #define cmpxchg(p, from, to) do { if (*(p) == (from)) *(p) = (to); } while (0)
 #define smp_wmb() ((void)0)
 #define WRITE_ONCE(p, v) do { \
-	publication_locked = !mk_pool || mk_pool->park_lock; \
+	publication_locked = !mk_pool || (mk_pool->park_lock && mk_pool->cpus_lock); \
 	dispatch_fetch_mapped = &(p) != &local.ready || park_trampoline_mapped; \
 	(p) = (v); publishes++; \
 } while (0)
@@ -113,6 +114,7 @@ static void expect(const char *name, bool passed)
 }
 static void reset(void)
 {
+	assert(!pool.park_lock && !pool.cpus_lock);
 	memset(&own, 0, sizeof(own));
 	memset(&local, 0, sizeof(local));
 	memset(&adopted, 0, sizeof(adopted));

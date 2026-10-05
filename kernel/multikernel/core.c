@@ -635,6 +635,7 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 		return -EINVAL;
 	}
 
+	guard(mutex)(&mk_pool->cpus_lock);
 	requested_count = mk_cpu_set_count(cpus);
 	if (requested_count == 0) {
 		pr_info("No CPUs requested for instance %d (%s)\n",
@@ -704,6 +705,7 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 		return -EINVAL;
 	}
 
+	guard(mutex)(&mk_pool->cpus_lock);
 	requested_count = mk_cpu_set_count(cpus);
 	if (requested_count == 0) {
 		pr_info("No CPUs requested to return from instance %d (%s)\n",

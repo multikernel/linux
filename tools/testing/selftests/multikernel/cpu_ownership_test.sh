@@ -34,7 +34,7 @@ awk '/^static struct mk_cpu_set \*mk_slot_set\(/ { copy = 1 }
      copy { print }
      copy && /^}/ { copy = 0 }' "$src/arch/x86/multikernel/spawn.c" \
      > "$build/cpu-x86.h"
-awk '/^int mk_send_cpu_(add|remove)\(/ { copy = 1 }
+awk '/^int mk_(send|pool)_cpu_(add|remove)\(/ { copy = 1 }
      copy { print }
      copy && /^}/ { copy = 0 }' "$src/kernel/multikernel/hotplug.c" \
      > "$build/cpu-send.h"

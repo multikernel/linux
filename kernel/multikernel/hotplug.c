@@ -1342,7 +1342,10 @@ int mk_pool_cpu_add(mk_phys_cpu_t cpu_id)
 	 * below must not be able to fail: grow it while the CPU is still
 	 * ours to keep.
 	 */
-	ret = mk_cpu_set_reserve(mk_pool->cpus, 1);
+	{
+		guard(mutex)(&mk_pool->cpus_lock);
+		ret = mk_cpu_set_reserve(mk_pool->cpus, 1);
+	}
 	if (ret)
 		return ret;
 
@@ -1351,7 +1354,10 @@ int mk_pool_cpu_add(mk_phys_cpu_t cpu_id)
 		return ret;
 
 	/* The CPU parked in the pool park area and is assignable again */
-	mk_cpu_set_add(mk_pool->cpus, cpu_id);
+	{
+		guard(mutex)(&mk_pool->cpus_lock);
+		mk_cpu_set_add(mk_pool->cpus, cpu_id);
+	}
 
 	return 0;
 }
@@ -1379,7 +1385,10 @@ int mk_pool_cpu_remove(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 		return ret;
 
 	/* From here on it is an ordinary CPU of this kernel */
-	mk_cpu_set_del(mk_pool->cpus, cpu_id);
+	{
+		guard(mutex)(&mk_pool->cpus_lock);
+		mk_cpu_set_del(mk_pool->cpus, cpu_id);
+	}
 
 	return 0;
 }
@@ -1516,7 +1525,10 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 		goto out;
 	}
 
-	ret = mk_cpu_set_reserve(mk_pool->cpus, 1);
+	{
+		guard(mutex)(&mk_pool->cpus_lock);
+		ret = mk_cpu_set_reserve(mk_pool->cpus, 1);
+	}
 	if (ret)
 		goto out;
 
@@ -1553,7 +1565,10 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	}
 
 	mk_cpu_set_del(target_instance->cpus, cpu_id);
-	mk_cpu_set_add(mk_pool->cpus, cpu_id);
+	{
+		guard(mutex)(&mk_pool->cpus_lock);
+		mk_cpu_set_add(mk_pool->cpus, cpu_id);
+	}
 	mk_instance_ipi_retarget(target_instance);
 
 	ret = 0;

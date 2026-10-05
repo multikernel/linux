@@ -493,6 +493,13 @@ struct mk_pool_chunk {
  */
 struct mk_pool {
 	struct mk_cpu_set *cpus;	/* Parked CPUs free to assign */
+	/*
+	 * Stabilizes cpus storage and membership against CPUHP wake readers.
+	 * Writers are serialized by mk_overlay_mutex, but CPUHP does not take
+	 * it. Nests inside park_lock and mk_instance_mutex; never hold across
+	 * CPU hotplug, park/repark calls or ACK waits (wake takes it again).
+	 */
+	struct mutex cpus_lock;
 	struct list_head chunks;	/* Donated memory (struct mk_pool_chunk) */
 	struct gen_pool *node_pools[MAX_NUMNODES];
 	struct mutex mem_lock;		/* Protects chunks and node_pools */
