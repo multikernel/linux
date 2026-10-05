@@ -414,6 +414,19 @@ static void truncated_case(void)
 	assert(!mktty_host_release(NULL, &file));
 }
 
+static void consumed_case(void)
+{
+	struct file file = { 0 };
+	char output;
+
+	assert(!mktty_host_open(NULL, &file));
+	assert(mktty_host_write(&file, "1\n", 2, NULL) == 2);
+	deliver(1);
+	assert(mktty_host_read(&file, &output, 1, NULL) == 1 && output == 'x');
+	assert(!mktty_host_release(NULL, &file));
+	CHECK(!wakes, "worker must check RX state under its lock before waking readers");
+}
+
 static void *worker_thread(void *work) { run_work(work); return NULL; }
 
 static void worker_close_case(void)
@@ -455,7 +468,7 @@ static void worker_close_case(void)
 int main(void)
 {
 	void (*cases[])(void) = { irq_case, lifetime_case, target_case, validation_case,
-		deferred_case, truncated_case, worker_close_case };
+		deferred_case, truncated_case, worker_close_case, consumed_case };
 	unsigned int i, failed = 0;
 
 	connections_lock = &mktty_host_conns_lock;
@@ -474,9 +487,9 @@ int main(void)
 			failed++;
 	}
 	if (failed) {
-		fprintf(stderr, "mktty lifetime: %u/7 scenarios failed\n", failed);
+		fprintf(stderr, "mktty lifetime: %u/8 scenarios failed\n", failed);
 		return 1;
 	}
-	puts("mktty lifetime: 7 scenarios PASS (non-native IRQ/scheduler boundaries)");
+	puts("mktty lifetime: 8 scenarios PASS (non-native IRQ/scheduler boundaries)");
 	return 0;
 }
