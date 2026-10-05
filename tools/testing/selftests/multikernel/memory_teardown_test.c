@@ -30,7 +30,13 @@ static unsigned int frees, removals, pools, controls, unmaps, checks, failures;
 #define resource_size(p) ((p)->end - (p)->start + 1)
 static int mk_arch_release_instance(struct mk_instance *p) { (void)p; return arch_error; }
 static void remove_resource(struct resource *p) { (void)p; removals++; }
-static void kfree(void *p) { if (p) { frees++; free(p); } }
+static void kfree(void *p)
+{
+	if (p) {
+		frees++;
+		free(p);
+	}
+}
 static void mk_instance_mem_free(struct mk_instance *p, void *ptr, size_t size)
 {
 	assert(ptr == p->ctrl_va && size == MK_CTRL_BLOCK_SIZE);

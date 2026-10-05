@@ -129,8 +129,12 @@ static void multikernel_unregister_handler(struct mk_ipi_handler *handler)
 #include "registry-production.h"
 
 static int failures;
-#define CHECK(expr, text) do { if (!(expr)) { \
-	fprintf(stderr, "FAIL: %s\n", text); failures++; } } while (0)
+#define CHECK(expr, text) do { \
+	if (!(expr)) { \
+		fprintf(stderr, "FAIL: %s\n", text); \
+		failures++; \
+	} \
+} while (0)
 
 static void callback(u32 type, u32 subtype, u64 id, void *payload, u32 len, void *ctx)
 {

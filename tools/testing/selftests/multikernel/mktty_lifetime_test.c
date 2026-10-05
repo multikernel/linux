@@ -31,7 +31,8 @@ static atomic_uint snapshots;
 #define READ_ONCE(p) (atomic_fetch_add(&snapshots, 1), __atomic_load_n(&(p), __ATOMIC_RELAXED))
 #define WRITE_ONCE(p, v) do { \
 	assert(holds_connections && irq_disabled); \
-	__atomic_store_n(&(p), (v), __ATOMIC_RELAXED); } while (0)
+	__atomic_store_n(&(p), (v), __ATOMIC_RELAXED); \
+} while (0)
 
 struct list_head { struct list_head *next, *prev; };
 #define LIST_HEAD(n) struct list_head n = { &n, &n }
@@ -179,8 +180,12 @@ static int multikernel_send_ipi_data(int id, void *buf, size_t size, u32 type)
 #include "mktty-production.h"
 
 static int failures;
-#define CHECK(expr, text) do { if (!(expr)) { \
-	fprintf(stderr, "FAIL: %s\n", text); failures++; } } while (0)
+#define CHECK(expr, text) do { \
+	if (!(expr)) { \
+		fprintf(stderr, "FAIL: %s\n", text); \
+		failures++; \
+	} \
+} while (0)
 
 static void deliver(int id)
 {

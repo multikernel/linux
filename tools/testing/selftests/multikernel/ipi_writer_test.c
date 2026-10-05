@@ -71,7 +71,12 @@ static bool mk_overlay_mutex = true;
 #define printk_deferred(...) do { if (0) printf(__VA_ARGS__); } while (0)
 #define atomic_read(p) (*(p))
 #define atomic_cmpxchg(p, old, new) \
-	({ unsigned int _old = *(p); if (_old == (old)) *(p) = (new); _old; })
+	({ \
+		unsigned int _old = *(p); \
+		if (_old == (old)) \
+			*(p) = (new); \
+		_old; \
+	})
 /* Publication is not concurrent in this boundary test. */
 #define smp_store_release(p, v) (*(p) = (v))
 #define raw_spin_lock_irqsave(m, flags) \
