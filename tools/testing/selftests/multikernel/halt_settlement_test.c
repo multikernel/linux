@@ -66,7 +66,10 @@ static int mk_instance_confirm_parked(struct mk_instance *p)
 static struct mk_pending_msg *mk_msg_pending_add(u32 type, u32 op, int id) { return &pending; }
 static u64 mk_msg_pending_id(struct mk_pending_msg *p) { return 31; }
 static int mk_send_message_id(int id, u32 type, u32 op, u64 msg_id,
-			      void *buf, size_t size) { return send_error; }
+			      void *buf, size_t size)
+{
+	return send_error;
+}
 static void mk_msg_pending_cancel(struct mk_pending_msg *p) { }
 static int mk_msg_pending_wait(struct mk_pending_msg *p, int ms) { return wait_error; }
 static struct mk_cpu_set *mk_cpu_set_alloc(void) { return &targets; }

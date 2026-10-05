@@ -34,7 +34,11 @@ static unsigned int wakes, destination_wakes, checks, failures;
 #define __va(p) ((void *)(unsigned long)(p))
 #define lockdep_assert_held(p) assert(*(p))
 static bool *lock(bool *p) { assert(!*p); *p = true; return p; }
-static void unlock(bool **p) { assert(**p); **p = false; }
+static void unlock(bool **p)
+{
+	assert(**p);
+	**p = false;
+}
 #define guard(kind) bool *held_##kind __attribute__((cleanup(unlock))) = lock
 static bool mk_cpu_set_contains(struct mk_cpu_set *set, mk_phys_cpu_t cpu)
 {
