@@ -22,6 +22,7 @@ static unsigned int raw_depth, bad_context, calls, refs;
 static unsigned long long reported_drops;
 static unsigned char delivered[65536];
 static size_t delivered_size, insert_limit = 65536;
+static size_t flip_pending;
 static void (*insert_hook)(void);
 #define raw_spin_lock_init(p) (*(p) = 0)
 #define raw_spin_lock_irqsave(p, flags) do { \
@@ -88,8 +89,19 @@ static void drain(void)
     while (queued && queued->pending) { assert(limit--); run_one(); }
 }
 
-struct tty_struct { int unused; } tty;
+struct tty_struct { int index; } tty;
 struct tty_port { bool open; };
+static void mktty_spawn_shutdown(struct tty_port *port);
+static void tty_port_hangup(struct tty_port *port)
+{
+    port->open = false;
+    mktty_spawn_shutdown(port);
+}
+static void __attribute__((unused)) tty_ldisc_flush(struct tty_struct *t)
+{
+    assert(t == &tty && !refs && !in_irq && !raw_depth);
+    flip_pending = 0;
+}
 static struct tty_struct *tty_port_tty_get(struct tty_port *port)
 {
     calls++;
@@ -106,6 +118,7 @@ static int tty_insert_flip_string(struct tty_port *port, const void *data, size_
     assert(delivered_size + size <= sizeof(delivered));
     memcpy(delivered + delivered_size, data, size);
     delivered_size += size;
+    flip_pending += size;
     if (insert_hook) { void (*hook)(void) = insert_hook; insert_hook = NULL; hook(); }
     return size;
 }
@@ -192,9 +205,22 @@ static void running_case(void)
     drain();
     CHECK(delivered_size == 6 && reported_drops == 3, "short TTY insert must account undelivered bytes");
 }
+static void hangup_case(void)
+{
+    open_port();
+    send_bytes(3, 'x', 3);
+    drain();
+    assert(flip_pending == 3);
+    mktty_spawn_hangup(&tty);
+    CHECK(!flip_pending, "hangup must flush bytes inserted before RX worker drainage");
+    open_port();
+    send_bytes(1, 'z', 1);
+    drain();
+    CHECK(flip_pending == 1, "new session must not inherit old flip-buffer bytes");
+}
 int main(void)
 {
-    void (*cases[])(void) = { context_case, truncated_case, shutdown_case, overflow_case, running_case };
+    void (*cases[])(void) = { context_case, truncated_case, shutdown_case, overflow_case, running_case, hangup_case };
     unsigned int i, bad = 0;
     for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         int status;
@@ -204,6 +230,6 @@ int main(void)
         assert(waitpid(child, &status, 0) == child);
         bad += !WIFEXITED(status) || WEXITSTATUS(status);
     }
-    printf("mktty spawn: %u/5 scenarios %s (substituted kernel boundaries)\n", bad ? bad : 5, bad ? "FAIL" : "PASS");
+    printf("mktty spawn: %u/6 scenarios %s (substituted kernel boundaries)\n", bad ? bad : 6, bad ? "FAIL" : "PASS");
     return bad != 0;
 }
