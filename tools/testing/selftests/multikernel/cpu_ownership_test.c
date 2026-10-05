@@ -56,7 +56,7 @@ struct mk_instance {
 
 struct mk_pool {
 	struct mk_cpu_set *cpus;
-	bool park_lock;
+	bool park_lock, cpus_lock;
 	struct {
 		struct mk_spawn_context *slot;
 		unsigned long park_phys, cr3, slot_phys;
@@ -111,6 +111,8 @@ static bool *lock(bool *held)
 
 #define guard(kind) bool *held_##kind __attribute__((cleanup(unlock))) = lock
 #define lockdep_assert_held(held) assert(*(held))
+#define mutex_lock(held) ((void)lock(held))
+#define mutex_unlock(held) do { assert(*(held)); *(held) = false; } while (0)
 #define raw_spin_lock_irqsave(m, flags) \
 	do { assert(!*(m)); *(m) = true; (flags) = 0; } while (0)
 #define raw_spin_unlock_irqrestore(m, flags) \
@@ -122,12 +124,35 @@ static int arch_cpu_from_physical_id(mk_phys_cpu_t cpu)
 	return cpu == test_cpu || cpu == 7 ? 0 : -EINVAL;
 }
 
+/* Check production callers, while setup below can construct unpublished sets. */
+static int checked_reserve(struct mk_cpu_set *set, unsigned int extra)
+{
+	assert(set != pool.cpus || pool.cpus_lock);
+	return mk_cpu_set_reserve(set, extra);
+}
+
+static int checked_add(struct mk_cpu_set *set, mk_phys_cpu_t cpu)
+{
+	assert(set != pool.cpus || pool.cpus_lock);
+	return mk_cpu_set_add(set, cpu);
+}
+
+static bool checked_del(struct mk_cpu_set *set, mk_phys_cpu_t cpu)
+{
+	assert(set != pool.cpus || pool.cpus_lock);
+	return mk_cpu_set_del(set, cpu);
+}
+#define mk_cpu_set_reserve checked_reserve
+#define mk_cpu_set_add checked_add
+#define mk_cpu_set_del checked_del
+
 #include "cpu-transfer.h"
 
 /* Mailbox publication can time out after a CPU has consumed the request. */
 static int mk_slot_wake(struct mk_spawn_context *ctx, u32 cpu, const char *what)
 {
 	assert(pool.park_lock);
+	assert(!pool.cpus_lock);
 	wakes++;
 	owned_at_wake = mk_cpu_set_contains(target.cpus, cpu) &&
 			!mk_cpu_set_contains(pool.cpus, cpu);
@@ -189,6 +214,7 @@ static void mk_msg_pending_cancel(struct mk_pending_msg *p)
 
 static int mk_msg_pending_wait(struct mk_pending_msg *p, unsigned long timeout)
 {
+	assert(!pool.cpus_lock && !pool.park_lock);
 	mk_msg_pending_cancel(p);
 	return wait_error;
 }
@@ -207,11 +233,40 @@ static int mk_send_message_id(int id, u32 type, u32 op, u64 req_id,
 	return send_error;
 }
 
-#define mk_pool_cpu_add(...) (-EOPNOTSUPP)
-#define mk_pool_cpu_remove(...) (-EOPNOTSUPP)
-#define mk_do_cpu_add(...) (-EOPNOTSUPP)
-#define mk_do_cpu_remove(...) (-EOPNOTSUPP)
+static bool local_online;
+static int hotplug_error;
+static unsigned int hotplug_calls;
+#define mk_cpu_to_logical(cpu) arch_cpu_from_physical_id(cpu)
+#define cpu_online(cpu) ((void)(cpu), local_online)
+static int mk_do_cpu_remove(mk_phys_cpu_t cpu)
+{
+	assert(!pool.cpus_lock && !pool.park_lock);
+	hotplug_calls++;
+	if (hotplug_error)
+		return hotplug_error;
+	local_online = false;
+	return 0;
+}
+
+static int mk_do_cpu_add(mk_phys_cpu_t cpu, u32 node, u32 flags)
+{
+	assert(!pool.cpus_lock && !pool.park_lock);
+	hotplug_calls++;
+	/* CPUHP's wake callback can take both locks during local pool return. */
+	mutex_lock(&pool.park_lock);
+	mutex_lock(&pool.cpus_lock);
+	assert(mk_cpu_set_contains(pool.cpus, cpu));
+	mutex_unlock(&pool.cpus_lock);
+	mutex_unlock(&pool.park_lock);
+	if (hotplug_error)
+		return hotplug_error;
+	local_online = true;
+	return 0;
+}
 #include "cpu-send.h"
+#undef mk_cpu_set_reserve
+#undef mk_cpu_set_add
+#undef mk_cpu_set_del
 
 static unsigned int failures, checks;
 
@@ -231,7 +286,9 @@ static void reset(void)
 	mk_cpu_set_free(target.cpus);
 	mk_cpu_set_free(target.cpus_on_slot);
 	mk_cpu_set_free(pool.cpus);
-	assert(!references && !live_pending && !pool.park_lock);
+	assert(!references && !live_pending && !pool.park_lock && !pool.cpus_lock);
+	local_online = true;
+	hotplug_error = hotplug_calls = 0;
 	fail_alloc = fail_set_alloc = fail_after_wake = false;
 	wakes = wake_fail_at = send_error = wait_error = 0;
 	sends = 0;
@@ -266,6 +323,27 @@ static void retained(void)
 
 int main(void)
 {
+	reset();
+	mk_cpu_set_clear(pool.cpus);
+	pool.cpus->cap = 0; /* Force reserve to grow before the CPU departs. */
+	fail_set_alloc = true;
+	expect("pool growth failure precedes CPU removal", mk_pool_cpu_add(test_cpu), -ENOMEM);
+	expect("failed growth leaves CPU online", local_online, 1);
+	expect("failed growth never calls CPUHP", hotplug_calls, 0);
+	fail_set_alloc = false;
+	hotplug_error = -EBUSY;
+	expect("failed departure does not donate", mk_pool_cpu_add(test_cpu), -EBUSY);
+	expect("failed departure leaves pool empty", pool.cpus->nr, 0);
+	hotplug_error = 0;
+	expect("local donation grows and publishes under set lock", mk_pool_cpu_add(test_cpu), 0);
+	expect("local donation records CPU", mk_cpu_set_contains(pool.cpus, test_cpu), 1);
+	hotplug_error = -EIO;
+	expect("failed local wake retains pool owner", mk_pool_cpu_remove(test_cpu, 0, 0), -EIO);
+	expect("failed local wake keeps membership", mk_cpu_set_contains(pool.cpus, test_cpu), 1);
+	hotplug_error = 0;
+	expect("local return lets CPUHP acquire pool locks", mk_pool_cpu_remove(test_cpu, 0, 0), 0);
+	expect("local return deletes under set lock", pool.cpus->nr, 0);
+
 	reset();
 	expect("initial add", mk_send_cpu_add(2, test_cpu, 0, 0), 0);
 	expect("ownership precedes handoff", owned_at_wake, 1);
@@ -466,6 +544,8 @@ int main(void)
 	expect("full-width ID remains assigned",
 	       mk_cpu_set_contains(target.cpus, 0x100010001ULL), 1);
 	expect("nonrunning transfer does not wake CPU", wakes, 0);
+	expect("return all CPUs under set lock", mk_instance_return_cpus(&target, target.cpus), 0);
+	expect("returned CPU is in the pool", mk_cpu_set_contains(pool.cpus, test_cpu), 1);
 	reset();
 	mk_cpu_set_free(target.cpus);
 	mk_cpu_set_free(target.cpus_on_slot);

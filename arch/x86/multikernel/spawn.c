@@ -932,8 +932,8 @@ static int mk_build_trampoline_pgtable(unsigned long trampoline_va,
  * the host's slot is woken from that adopted slot; initial secondaries
  * are woken from this kernel's own boot context. Do not change the boot
  * context: it still supplies this kernel's dispatch and final halt target.
- * The caller holds park_lock while selecting and publishing. The returned slot
- * is memremapped when it differs from @own and must be released with
+ * The caller holds park_lock and cpus_lock while selecting and publishing.
+ * The returned slot is memremapped when it differs from @own and released with
  * mk_put_wake_slot().
  */
 static struct mk_spawn_context *mk_wake_slot(u32 apicid,
@@ -941,6 +941,7 @@ static struct mk_spawn_context *mk_wake_slot(u32 apicid,
 {
 	if (mk_pool) {
 		lockdep_assert_held(&mk_pool->park_lock);
+		lockdep_assert_held(&mk_pool->cpus_lock);
 		if (mk_cpu_set_contains(mk_pool->cpus, apicid)) {
 			if (!mk_pool->arch.slot_phys)
 				return NULL;
@@ -1011,8 +1012,10 @@ int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 		return ret;
 
 	/* Initial secondary boot precedes baseline creation (pool == NULL). */
-	if (pool)
+	if (pool) {
 		mutex_lock(&pool->park_lock);
+		mutex_lock(&pool->cpus_lock);
+	}
 	if (pool && mk_cpu_set_contains(pool->cpus, apicid)) {
 		/*
 		 * The park loop jumps to the physical trampoline before that
@@ -1073,8 +1076,10 @@ int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 	mk_put_wake_slot(slot, own);
 	ret = 0;
 out_unlock:
-	if (pool)
+	if (pool) {
+		mutex_unlock(&pool->cpus_lock);
 		mutex_unlock(&pool->park_lock);
+	}
 	return ret;
 }
 
