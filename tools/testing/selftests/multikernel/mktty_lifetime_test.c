@@ -16,12 +16,14 @@
 #include <unistd.h>
 
 typedef uint32_t u32;
+typedef uint64_t u64;
 typedef unsigned int __poll_t;
 typedef int poll_table;
 #define __user
 #define MK_MAX_DATA_SIZE 32
 #define GFP_KERNEL 0
 #define pr_info(...) do { } while (0)
+#define pr_warn_ratelimited(...) do { } while (0)
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define kzalloc(n, flags) calloc(1, n)
 #define kmalloc(n, flags) malloc(n)
@@ -31,8 +33,7 @@ static atomic_uint snapshots;
 #define READ_ONCE(p) (atomic_fetch_add(&snapshots, 1), __atomic_load_n(&(p), __ATOMIC_RELAXED))
 #define WRITE_ONCE(p, v) do { \
 	assert(holds_connections && irq_disabled); \
-	__atomic_store_n(&(p), (v), __ATOMIC_RELAXED); \
-} while (0)
+	__atomic_store_n(&(p), (v), __ATOMIC_RELAXED); } while (0)
 
 struct list_head { struct list_head *next, *prev; };
 #define LIST_HEAD(n) struct list_head n = { &n, &n }
@@ -65,8 +66,10 @@ static bool callback_entered, release_callback, removal_blocked;
 static bool pause_callback, race_selection;
 static unsigned int selecting;
 static atomic_uint freed;
+static unsigned int unsafe_locks, unsafe_wakes, wakes;
+static bool pause_worker, worker_entered, release_worker, flush_entered;
 
-static void spin_lock(spinlock_t *lock)
+static void test_lock(spinlock_t *lock)
 {
 	int ret = pthread_mutex_trylock(lock);
 
@@ -87,6 +90,12 @@ static void spin_lock(spinlock_t *lock)
 			irq_hazards++;
 	}
 }
+static void __attribute__((unused)) spin_lock(spinlock_t *lock)
+{
+	if (in_callback)
+		unsafe_locks++;
+	test_lock(lock);
+}
 static void spin_unlock(spinlock_t *lock)
 {
 	if (lock == connections_lock)
@@ -99,19 +108,94 @@ static void spin_unlock(spinlock_t *lock)
 #define spin_unlock_irqrestore(p, flags) \
 	do { spin_unlock(p); irq_disabled = (flags); } while (0)
 #define lockdep_assert_held(p) assert(holds_connections && (p) == connections_lock)
+typedef spinlock_t raw_spinlock_t;
+#define DEFINE_RAW_SPINLOCK(n) DEFINE_SPINLOCK(n)
+#define raw_spin_lock_init(p) spin_lock_init(p)
+#define raw_spin_lock(p) test_lock(p)
+#define raw_spin_unlock(p) spin_unlock(p)
+#define raw_spin_lock_irqsave(p, flags) \
+	do { (flags) = irq_disabled; irq_disabled = true; test_lock(p); } while (0)
+#define raw_spin_unlock_irqrestore(p, flags) spin_unlock_irqrestore(p, flags)
 
-typedef struct { int initialized; } wait_queue_head_t;
-#define init_waitqueue_head(p) ((p)->initialized = 1)
-#define wait_event_interruptible(w, condition) ((condition) ? 0 : -EINTR)
-static void wake_up_interruptible(wait_queue_head_t *wait)
+struct work_struct { void (*fn)(struct work_struct *); bool pending, running; };
+static struct work_struct *queued_work;
+#define INIT_WORK(w, f) do { (w)->fn = (f); (w)->pending = (w)->running = false; } while (0)
+
+static void callback_pause(void)
 {
-	assert(wait->initialized && in_callback && holds_connections && irq_disabled);
 	if (!pause_callback)
 		return;
 	assert(!pthread_mutex_lock(&gate));
 	callback_entered = true;
 	assert(!pthread_cond_broadcast(&changed));
 	while (!release_callback)
+		assert(!pthread_cond_wait(&changed, &gate));
+	assert(!atomic_load(&freed));
+	assert(!pthread_mutex_unlock(&gate));
+}
+
+static bool __attribute__((unused)) schedule_work(struct work_struct *work)
+{
+	bool queued;
+
+	if (in_callback)
+		callback_pause();
+	assert(!pthread_mutex_lock(&gate));
+	queued = !work->pending;
+	work->pending = true;
+	queued_work = work;
+	assert(!pthread_mutex_unlock(&gate));
+	return queued;
+}
+
+static void run_work(struct work_struct *work)
+{
+	assert(!pthread_mutex_lock(&gate));
+	assert(work->pending && !work->running);
+	work->pending = false;
+	work->running = true;
+	assert(!pthread_mutex_unlock(&gate));
+	work->fn(work);
+	assert(!pthread_mutex_lock(&gate));
+	work->running = false;
+	assert(!pthread_cond_broadcast(&changed));
+	assert(!pthread_mutex_unlock(&gate));
+}
+
+static void __attribute__((unused)) flush_work(struct work_struct *work)
+{
+	assert(!holds_connections && !irq_disabled && !in_callback);
+	assert(!pthread_mutex_lock(&gate));
+	flush_entered = true;
+	assert(!pthread_cond_broadcast(&changed));
+	while (work->running)
+		assert(!pthread_cond_wait(&changed, &gate));
+	while (work->pending) {
+		assert(!pthread_mutex_unlock(&gate));
+		run_work(work);
+		assert(!pthread_mutex_lock(&gate));
+	}
+	queued_work = NULL;
+	assert(!pthread_mutex_unlock(&gate));
+}
+
+typedef struct { int initialized; } wait_queue_head_t;
+#define init_waitqueue_head(p) ((p)->initialized = 1)
+#define wait_event_interruptible(w, condition) ((condition) ? 0 : -EINTR)
+static void wake_up_interruptible(wait_queue_head_t *wait)
+{
+	assert(wait->initialized);
+	wakes++;
+	if (in_callback || holds_connections || irq_disabled)
+		unsafe_wakes++;
+	if (in_callback)
+		callback_pause();
+	if (!pause_worker)
+		return;
+	assert(!pthread_mutex_lock(&gate));
+	worker_entered = true;
+	assert(!pthread_cond_broadcast(&changed));
+	while (!release_worker)
 		assert(!pthread_cond_wait(&changed, &gate));
 	assert(!atomic_load(&freed));
 	assert(!pthread_mutex_unlock(&gate));
@@ -180,12 +264,8 @@ static int multikernel_send_ipi_data(int id, void *buf, size_t size, u32 type)
 #include "mktty-production.h"
 
 static int failures;
-#define CHECK(expr, text) do { \
-	if (!(expr)) { \
-		fprintf(stderr, "FAIL: %s\n", text); \
-		failures++; \
-	} \
-} while (0)
+#define CHECK(expr, text) do { if (!(expr)) { \
+	fprintf(stderr, "FAIL: %s\n", text); failures++; } } while (0)
 
 static void deliver(int id)
 {
@@ -304,9 +384,78 @@ static void validation_case(void)
 	assert(!mktty_host_release(NULL, &file));
 }
 
+static void deferred_case(void)
+{
+	struct file file = { 0 };
+
+	assert(!mktty_host_open(NULL, &file));
+	assert(mktty_host_write(&file, "1\n", 2, NULL) == 2);
+	deliver(1);
+	deliver(1);
+	CHECK(!unsafe_locks, "hard IPI must use raw locks only");
+	CHECK(!wakes, "IPI must queue wakeup, not execute it");
+	assert(!mktty_host_release(NULL, &file));
+	CHECK(wakes == 1 && !unsafe_wakes, "coalesced wakeup must run outside IRQ/raw locks before free");
+}
+
+static void truncated_case(void)
+{
+	struct file file = { .f_flags = O_NONBLOCK };
+	struct mktty_message msg = { .type = MKTTY_MSG_OUTPUT, .console_id = 1,
+		.len = 2, .data = { 'a', 'b' } };
+	struct mk_ipi_data data = { .buffer = &msg, .data_size = 17 };
+	char output;
+
+	assert(!mktty_host_open(NULL, &file));
+	assert(mktty_host_write(&file, "1\n", 2, NULL) == 2);
+	mktty_host_ipi_handler(&data, NULL);
+	CHECK(mktty_host_read(&file, &output, 1, NULL) == -EAGAIN,
+	      "declared payload beyond received bytes must not enter RX buffer");
+	assert(!mktty_host_release(NULL, &file));
+}
+
+static void *worker_thread(void *work) { run_work(work); return NULL; }
+
+static void worker_close_case(void)
+{
+	struct file file = { 0 };
+	pthread_t worker, closer;
+
+	assert(!mktty_host_open(NULL, &file));
+	assert(mktty_host_write(&file, "1\n", 2, NULL) == 2);
+	deliver(1);
+	CHECK(queued_work, "receive must publish deferred work");
+	if (!queued_work) {
+		mktty_host_release(NULL, &file);
+		return;
+	}
+	pause_worker = true;
+	assert(!pthread_create(&worker, NULL, worker_thread, queued_work));
+	assert(!pthread_mutex_lock(&gate));
+	while (!worker_entered)
+		assert(!pthread_cond_wait(&changed, &gate));
+	assert(!pthread_mutex_unlock(&gate));
+	/* A second receive while running needs another wake, not lost work. */
+	deliver(1);
+	assert(!pthread_create(&closer, NULL, release_thread, &file));
+	assert(!pthread_mutex_lock(&gate));
+	while (!flush_entered)
+		assert(!pthread_cond_wait(&changed, &gate));
+	CHECK(!atomic_load(&freed), "close must retain object while wake worker runs");
+	CHECK(mktty_host_conns.next == &mktty_host_conns, "unlink must precede worker drain");
+	release_worker = true;
+	assert(!pthread_cond_broadcast(&changed));
+	assert(!pthread_mutex_unlock(&gate));
+	assert(!pthread_join(worker, NULL));
+	assert(!pthread_join(closer, NULL));
+	CHECK(wakes == 2 && !unsafe_wakes && atomic_load(&freed) == 2,
+	      "close must drain running and requeued wake before freeing");
+}
+
 int main(void)
 {
-	void (*cases[])(void) = { irq_case, lifetime_case, target_case, validation_case };
+	void (*cases[])(void) = { irq_case, lifetime_case, target_case, validation_case,
+		deferred_case, truncated_case, worker_close_case };
 	unsigned int i, failed = 0;
 
 	connections_lock = &mktty_host_conns_lock;
@@ -325,9 +474,9 @@ int main(void)
 			failed++;
 	}
 	if (failed) {
-		fprintf(stderr, "mktty lifetime: %u/4 scenarios failed\n", failed);
+		fprintf(stderr, "mktty lifetime: %u/7 scenarios failed\n", failed);
 		return 1;
 	}
-	puts("mktty lifetime: 4 scenarios PASS (non-native IRQ/scheduler boundaries)");
+	puts("mktty lifetime: 7 scenarios PASS (non-native IRQ/scheduler boundaries)");
 	return 0;
 }
