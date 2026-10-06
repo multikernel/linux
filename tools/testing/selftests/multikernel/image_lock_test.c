@@ -34,6 +34,7 @@ static _Thread_local bool resource_thread;
 static bool is_mk, permitted = true, allocation_fails;
 static bool mapping_fails;
 static unsigned int control_page_calls;
+static unsigned int image_work_calls;
 static const char *probe_at, *fail_at;
 static bool probe_started, attempted, finished;
 static pthread_t competitor;
@@ -163,6 +164,7 @@ static void wait_for(bool *condition)
 
 static int stage(const char *name)
 {
+	image_work_calls++;
 	expect("image work holds kexec lock", !!(held & KEXEC_LOCK), 1);
 	expect("no image work under registry lock", !!(held & REGISTRY_LOCK), 0);
 	expect("MK work holds resource lock", !!(held & OVERLAY_LOCK), is_mk);
@@ -371,6 +373,7 @@ static void reset(bool multikernel)
 	permitted = true;
 	mapping_fails = false;
 	control_page_calls = 0;
+	image_work_calls = 0;
 	allocation_fails = probe_started = attempted = finished = false;
 	probe_at = fail_at = NULL;
 	atomic_store(&resource_updates, 0);
@@ -446,6 +449,14 @@ int main(void)
 	finish_probe();
 	expect("spawn state published", target.state, MK_STATE_ACTIVE);
 	expect("exec never rewinds or discards shared host receive traffic", host_ring_drops, 0);
+	/* ACTIVE must be settled by halt, not by an execution request. */
+	image_work_calls = 0;
+	expect("active exec rejected", multikernel_kexec_by_id(2), -EBUSY);
+	expect("active exec does no confirmation or image work", image_work_calls, 0);
+	expect("active exec retains state", target.state, MK_STATE_ACTIVE);
+	expect("active exec retains image", !!target.kimage, 1);
+	expect("active exec retains reference", references, 1);
+	expect("active exec releases all locks", held, 0);
 
 	for (i = 0; i < sizeof(exec_fail_stages) / sizeof(*exec_fail_stages); i++) {
 		reset(true);

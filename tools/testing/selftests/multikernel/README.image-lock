@@ -40,7 +40,11 @@ Remaining release gates
 This mutex covers local controller overlay/baseline resource changes and MK
 image load, exec and cleanup. Incoming resource workers now refuse a contended
 resource lock with -EBUSY rather than mutate through a controller operation.
-Active Image unload is refused; an uncertain failed start must first confirm
+Active Image unload and execution are refused. An execution request cannot
+bypass halt settlement merely because individual CPUs look parked; it returns
+-EBUSY before confirmation, Image writes, manifest updates or ring resets.
+The ACTIVE rejection is covered even when the substituted confirmation would
+succeed. An uncertain failed start must first confirm
 all assigned/tracked CPUs stopped. Manifest-finalization failure prevents
 starting the Image, and a partial start failure retains FAILED state rather
 than publishing a reusable LOADED state. These paths are covered here with
