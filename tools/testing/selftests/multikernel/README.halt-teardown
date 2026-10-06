@@ -30,6 +30,17 @@ The Image locking fixture covers these paths plus failed load and manifest
 finalization. Normal/crash callers remain outside the multikernel resource
 lock, and their successful free returns zero.
 
+FAILED is not evidence that no CPU executed: an unsuccessful spawn may have
+run preparation code or moved CPUs onto instance control memory. An architecture
+must not return a failed spawn with an uncancelled child-Image launch that can
+arrive after confirmation. The current x86 boot publication revokes an unclaimed
+wake on timeout and treats a concurrent claim as success; the RISC-V path returns
+the final SBI start result directly, relying on accurate firmware responses.
+Neither has a later error point after reported acceptance of the boot launch.
+All-owned/tracked-CPU confirmation and separate control-memory retirement remain
+required. This contract assumes exclusive ownership and a quiescent previous run;
+it does not authorize retrying an ACTIVE instance after a lost shutdown ACK.
+
 Destruction requires READY with no Image. Stop/repark proof precedes IDR or
 kernfs removal. Registry locking is dropped for firmware waits and kernfs
 draining, while the resource lock excludes competing controllers. Resource

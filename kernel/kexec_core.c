@@ -1714,6 +1714,12 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	instance = mk_image->mk_instance;
+	/* Execution must not bypass halt settlement, even if CPUs look parked. */
+	if (instance->state == MK_STATE_ACTIVE) {
+		rc = -EBUSY;
+		goto unlock;
+	}
+
 	if (!mk_cpu_set_empty(instance->cpus)) {
 		mk_phys_cpu_t phys_cpu = mk_cpu_set_first(instance->cpus);
 
