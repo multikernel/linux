@@ -1094,6 +1094,9 @@ config ARCH_SUPPORTS_MULTIKERNEL
 	depends on KEXEC_FILE
 	depends on HOTPLUG_CPU
 	depends on !RISCV_M_MODE
+	# Spawn identity requires the supplied DTB and ordered HSM boot.
+	depends on !BUILTIN_DTB
+	depends on !RISCV_BOOT_SPINWAIT
 
 config ARCH_SUPPORTS_CRASH_DUMP
 	def_bool y

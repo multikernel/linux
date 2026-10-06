@@ -9,6 +9,14 @@ description or #28 parent doorbell/panic-notification transport. Generic
 controller serialization and confirmed-stop retirement are separate master
 prerequisites. Force-stop is unsupported on RISC-V and must fail closed.
 
+Both host and spawn must use kernels with ``CONFIG_BUILTIN_DTB=n`` and
+``CONFIG_RISCV_BOOT_SPINWAIT=n``; Kconfig excludes multikernel otherwise.
+A built-in DTB replaces the supplied manifest before spawn detection, leaving
+host-wide reset setup enabled. Spinwait boot rejects physical hart IDs beyond
+``NR_CPUS`` and can leave a hart waiting in Image memory instead of HART_STOP.
+Ordered SBI HSM boot avoids that physical-ID bound. These checks constrain
+kernel builds, not arbitrary foreign Images loaded by the host.
+
 The host owns two adjacent control pages for the instance lifetime: a mutable
 entry record followed by immutable entry code. Before each start, the host
 copies the Image and writes the current entry, then publishes those stores

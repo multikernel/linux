@@ -12,7 +12,18 @@ From this source tree, run with a native C compiler:
   sh tools/testing/selftests/multikernel/hsm_test.sh
   sh tools/testing/selftests/multikernel/shutdown_test.sh
 
-These compile verbatim production functions against controlled kernel/firmware
+With the kernel LLVM build prerequisites installed, also run:
+
+  sh tools/testing/selftests/multikernel/riscv_config_test.sh
+
+This evaluates real Kconfig: the supported RV64 configuration enables
+multikernel; BUILTIN_DTB and RISCV_BOOT_SPINWAIT must each exclude it, and
+disabling either option must restore it. Both host and spawn require these
+options disabled. A built-in DTB hides manifest-based spawn identity before
+reset setup; spinwait rejects sparse physical hart IDs beyond NR_CPUS before
+the HSM lifecycle can run. This is a configuration check, not a guest boot.
+
+The C checks compile verbatim production functions against controlled kernel/firmware
 boundaries. Manifest checks use the in-tree libfdt. No RISC-V emulator, kernel
 boot or actual cache-coherence test is performed by these commands. They run
 from the source tree, not an installed kselftest bundle. CC and TMPDIR can be
