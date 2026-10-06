@@ -15,7 +15,14 @@
 #define CONFIG_MULTIKERNEL 1
 #define CONFIG_CRASH_DUMP 1
 #define __user
-#define kfree free
+static char *tracked_cmdline;
+static void test_kfree(void *ptr)
+{
+	if (ptr == tracked_cmdline)
+		tracked_cmdline = NULL;
+	free(ptr);
+}
+#define kfree test_kfree
 #define phys_to_virt(p) ((void *)(p))
 #define WARN_ON_ONCE(x) (x)
 #define pr_err(...) do { } while (0)
@@ -138,8 +145,10 @@ struct kimage {
 	unsigned long nr_segments, start, head, control_page;
 	struct kexec_segment segment[1];
 	void *control_code_page, *swap_page;
+	char *cmdline_buf;
 	struct list_head control_pages;
 };
+#include "image-cmdline.h"
 static struct mk_instance target;
 static struct mk_instance self, *mk_self = &self;
 static struct kimage *kexec_image, *kexec_crash_image;
@@ -254,6 +263,7 @@ static int kimage_free(struct kimage *image)
 		kimage_free_multikernel(image);
 	else
 		kimage_file_post_load_cleanup(image);
+	kimage_file_free_cmdline(image);
 	free(image);
 	return 0;
 }
@@ -276,6 +286,13 @@ static int mk_instance_alloc_boot_pages(struct mk_instance *instance)
 static int kimage_file_prepare_segments(struct kimage *image, int fd, int initrd,
 				       const char *cmdline, unsigned long len, unsigned int flags)
 {
+	if (len) {
+		assert(!tracked_cmdline);
+		tracked_cmdline = malloc(len);
+		assert(tracked_cmdline);
+		memcpy(tracked_cmdline, cmdline, len);
+		image->cmdline_buf = tracked_cmdline;
+	}
 	image->nr_segments = 1;
 	image->segment[0].kbuf = image_bytes;
 	image->segment[0].mem = (unsigned long)image_bytes;
@@ -384,6 +401,39 @@ static void finish_probe(void)
 	expect("operation releases all locks", held, 0);
 }
 
+static void check_cmdline_cleanup(void)
+{
+	static const char cmdline[] = "fixture";
+	const unsigned long flags[] = { 0, KEXEC_FILE_ON_CRASH, mk_flags };
+	const char * const stages[] = { "read-image", "validate", "control-page", "swap-page" };
+	unsigned int kind, step;
+
+	for (kind = 0; kind < sizeof(flags) / sizeof(*flags); kind++) {
+		for (step = 0; step < sizeof(stages) / sizeof(*stages); step++) {
+			/* Crash images do not allocate a swap page. */
+			if (flags[kind] == KEXEC_FILE_ON_CRASH && step == 3)
+				continue;
+			reset(kind == 2);
+			fail_at = stages[step];
+			expect("cmdline early load failure", kexec_file_load(0, 0,
+			       sizeof(cmdline), cmdline, flags[kind]), step < 2 ? -EIO : -ENOMEM);
+			expect("early unwind frees cmdline", tracked_cmdline != NULL, 0);
+			expect("cmdline failure releases instance reference", references, 0);
+			expect("cmdline failure releases locks", held, 0);
+			/* Keep the deliberately failing regression run leak-free. */
+			free(tracked_cmdline);
+			tracked_cmdline = NULL;
+		}
+		reset(kind == 2);
+		expect("cmdline successful load", kexec_file_load(0, 0,
+		       sizeof(cmdline), cmdline, flags[kind]), 0);
+		expect("successful load retains cmdline", tracked_cmdline != NULL, 1);
+		expect("cmdline unload", kexec_file_load(0, 0, 0, NULL,
+		       flags[kind] | KEXEC_FILE_UNLOAD), 0);
+		expect("unload frees cmdline", tracked_cmdline != NULL, 0);
+	}
+}
+
 int main(void)
 {
 	static const char * const load_stages[] = { "allocate", "copy", "publish" };
@@ -394,6 +444,7 @@ int main(void)
 	static const char * const exec_fail_stages[] = { "confirm", "copy", "manifest", "start" };
 	unsigned int i;
 
+	check_cmdline_cleanup();
 	for (i = 0; i < sizeof(load_stages) / sizeof(*load_stages); i++) {
 		reset(true);
 		probe_at = load_stages[i];

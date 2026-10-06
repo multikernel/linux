@@ -454,6 +454,7 @@ out_free_post_load_bufs:
 out_free_image:
 	if (image->type == KEXEC_TYPE_MULTIKERNEL)
 		kimage_free_multikernel(image);
+	kimage_file_free_cmdline(image);
 	kfree(image);
 	return ret;
 }
