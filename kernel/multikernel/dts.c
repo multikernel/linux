@@ -890,11 +890,9 @@ static int mk_dt_emit_pool_members(void *fdt)
 		return -ENOMEM;
 
 	/*
-	 * The root device tree is only generated from kernfs reads, which
-	 * hold no instance lock; instance creation generates a device tree
-	 * for the new instance, never for the root. The pool set itself is
-	 * mutated under no lock, so a concurrent move can still make this
-	 * snapshot stale.
+	 * The caller holds mk_overlay_mutex to stabilize pool and instance
+	 * CPU membership. Take the nested registry lock for list traversal;
+	 * the root kernfs reader does not already hold it.
 	 */
 	lockdep_assert_not_held(&mk_instance_mutex);
 
