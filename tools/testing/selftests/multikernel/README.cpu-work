@@ -90,9 +90,29 @@ hotplug operation must prevent the ACK, not authorize reclamation. The fixture
 checks invocation before the ACK, after incoming drain and outside the resource
 lock; it substitutes the native helper and does not qualify its kernel locking.
 All-hart parked confirmation remains required after acknowledgment.
-Voluntary halt, poweroff/
-reboot, panic and force
-stop do not use the sleeping barrier and remain separate qualification gates.
+Voluntary halt, poweroff/reboot, panic and force stop do not use the sleeping
+barrier above. The x86 machine-stop path now receives a separate syscore permit
+only during normal terminal shutdown, after migrate_to_reboot_cpu() disabled
+native CPU hotplug and a nonblocking resource-mutex acquisition succeeded.
+It holds that mutex through final parking; admitted resource workers cannot
+perform mutations while it is held. A panic, ordinary kexec or contended exit
+does not gain permission to send HALTED. Panic/kexec are rechecked immediately
+before consuming a previously published permit. Unqualified exits still park
+locally and leave the host retaining the instance; they are not recovery.
+Requested shutdown remains on its existing sleeping drain-and-ACK path.
+
+Run the extracted architecture-to-generic path checks with:
+
+  sh tools/testing/selftests/multikernel/voluntary_shutdown_test.sh
+
+Each case runs in a fresh process and uses the actual x86 reboot registration,
+syscore callback, machine operations and generic notification/parking bodies.
+Checks cover halt/poweroff/restart, direct emergency, panic and kexec before
+and after qualification, contention, nonterminal state and host exclusion.
+The controlled native-hotplug and SMP boundaries do not exercise actual
+cpu_hotplug_disable(), remote CPUs, syscore ordering or hardware memory
+ordering. Fresh native x86 shutdown/retention and lockdep tests remain required.
+No generic syscore hook is registered on RISC-V; its #28 transport stays separate.
 No wire layout or request-ID change is introduced; no success ACK is fabricated
 for late rejected resource requests.
 

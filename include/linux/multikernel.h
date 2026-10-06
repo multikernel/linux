@@ -961,11 +961,14 @@ static inline void mk_instance_ipi_retarget(struct mk_instance *instance) { }
 
 /**
  * mk_halt_to_pool() - Halt this spawn kernel, returning its CPUs to the pool
+ * @notify: Caller has excluded new resource operations through final parking
  *
- * Notifies the host and parks every CPU in the pool wait loop, keeping
- * the instance re-spawnable. Never returns.
+ * Parks every CPU in the pool wait loop. Only a qualified caller may notify
+ * the host that the instance can be considered for reuse after stop proof.
+ * Unqualified exits must pass false and leave the host retaining resources.
+ * Never returns.
  */
-void __noreturn mk_halt_to_pool(void);
+void __noreturn mk_halt_to_pool(bool notify);
 
 /**
  * mk_instance_reserve_resources() - Reserve CPU and memory resources for instance

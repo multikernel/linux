@@ -1668,7 +1668,6 @@ struct mk_shutdown_work {
 	int sender_instance_id;
 };
 
-
 /*
  * Notify @target_id that this kernel is going down, while messaging
  * still works, then park every CPU in the pool wait loop. The subtype
@@ -1676,7 +1675,8 @@ struct mk_shutdown_work {
  * from a voluntary halt the parent never asked for (HALTED); both mean
  * "my CPUs are about to park on my context".
  */
-static void __noreturn mk_notify_down_and_park(int target_id, u32 subtype, u64 msg_id)
+static void __noreturn mk_notify_down_and_park(int target_id, u32 subtype,
+					       u64 msg_id, bool notify)
 {
 	struct mk_resource_ack ack;
 
@@ -1684,7 +1684,10 @@ static void __noreturn mk_notify_down_and_park(int target_id, u32 subtype, u64 m
 	ack.result = 0;
 	ack.resource_id = mk_self->id;
 
-	mk_send_message_id(target_id, MK_MSG_SYSTEM, subtype, msg_id, &ack, sizeof(ack));
+	/* An unqualified exit still parks, but cannot authorize host reuse. */
+	if (notify)
+		mk_send_message_id(target_id, MK_MSG_SYSTEM, subtype, msg_id,
+				   &ack, sizeof(ack));
 
 	pr_info("Multikernel instance %d shutting down\n", mk_self->id);
 
@@ -1698,16 +1701,16 @@ static void __noreturn mk_notify_down_and_park(int target_id, u32 subtype, u64 m
 
 /**
  * mk_halt_to_pool - Halt this spawn kernel, returning its CPUs to the pool
+ * @notify: Caller has excluded new resource operations through final parking
  *
- * Called from the spawn kernel's machine halt path. A voluntary exit
- * cannot stay contained in this kernel: the parent owns the instance's
- * lifecycle, and without notice it would consider the instance running
- * forever. Send the parent (instance 0) a HALTED event, then park every
- * CPU in the pool wait loop.
+ * Called from the spawn kernel's machine halt path. Only a qualified normal
+ * shutdown may send the parent (instance 0) a HALTED event. Panic, unqualified
+ * emergency and contended exits still park every CPU, but leave the parent retaining
+ * the instance because a parked snapshot alone cannot prove quiescence.
  */
-void __noreturn mk_halt_to_pool(void)
+void __noreturn mk_halt_to_pool(bool notify)
 {
-	mk_notify_down_and_park(0, MK_SYS_HALTED, 0);
+	mk_notify_down_and_park(0, MK_SYS_HALTED, 0, notify);
 }
 
 static void mk_shutdown_work_fn(struct work_struct *work)
@@ -1723,7 +1726,7 @@ static void mk_shutdown_work_fn(struct work_struct *work)
 	cpu_hotplug_disable();
 	/* Finish local controllers, then exclude them until this kernel stops. */
 	mutex_lock(&mk_overlay_mutex);
-	mk_notify_down_and_park(sender_instance_id, MK_SYS_SHUTDOWN_ACK, msg_id);
+	mk_notify_down_and_park(sender_instance_id, MK_SYS_SHUTDOWN_ACK, msg_id, true);
 }
 
 /*
