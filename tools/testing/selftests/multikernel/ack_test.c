@@ -16,32 +16,66 @@
 #define GFP_KERNEL 0
 #define GFP_ATOMIC 0
 static bool allocation_fails;
-#define kzalloc(n, flags) ((void)(flags), allocation_fails ? NULL : calloc(1, n))
+#define kzalloc(n, flags) \
+	((void)(flags), allocation_fails ? NULL : calloc(1, n))
 #define kmalloc(n, flags) ((void)(flags), allocation_fails ? NULL : malloc(n))
 #define kfree free
 #define pr_err(...) fprintf(stderr, __VA_ARGS__)
 #define pr_warn(...) fprintf(stderr, __VA_ARGS__)
-#define pr_info(...) do { } while (0)
-#define pr_debug(...) do { } while (0)
+#define pr_info(...) \
+	do {         \
+	} while (0)
+#define pr_debug(...) \
+	do {          \
+	} while (0)
 static bool test_hardirq;
 #define DEFINE_SPINLOCK(name) bool name
 #define spin_lock_irqsave(lock, flags) \
-	do { assert(!test_hardirq); assert(!*(lock)); *(lock) = true; (flags) = 0; } while (0)
+	do {                           \
+		assert(!test_hardirq); \
+		assert(!*(lock));      \
+		*(lock) = true;        \
+		(flags) = 0;           \
+	} while (0)
 #define spin_unlock_irqrestore(lock, flags) \
-	do { assert(*(lock)); *(lock) = false; (void)(flags); } while (0)
-typedef struct { bool held; } test_raw_lock_t;
+	do {                                \
+		assert(*(lock));            \
+		*(lock) = false;            \
+		(void)(flags);              \
+	} while (0)
+typedef struct {
+	bool held;
+} test_raw_lock_t;
 #define DEFINE_RAW_SPINLOCK(name) test_raw_lock_t name
-static void test_raw_lock(test_raw_lock_t *lock) { assert(!lock->held); lock->held = true; }
-static void test_raw_unlock(test_raw_lock_t *lock) { assert(lock->held); lock->held = false; }
+static void test_raw_lock(test_raw_lock_t *lock)
+{
+	assert(!lock->held);
+	lock->held = true;
+}
+static void test_raw_unlock(test_raw_lock_t *lock)
+{
+	assert(lock->held);
+	lock->held = false;
+}
 #define raw_spin_lock_irqsave(lock, flags) \
-	do { test_raw_lock(lock); (flags) = 0; } while (0)
+	do {                               \
+		test_raw_lock(lock);       \
+		(flags) = 0;               \
+	} while (0)
 #define raw_spin_unlock_irqrestore(lock, flags) \
-	do { test_raw_unlock(lock); (void)(flags); } while (0)
+	do {                                    \
+		test_raw_unlock(lock);          \
+		(void)(flags);                  \
+	} while (0)
 #define msecs_to_jiffies(ms) (ms)
 #define DECLARE_WAIT_QUEUE_HEAD(name) int name
 #define wake_up_all(wait) ((void)(wait))
 /* This fixture executes one job at a time; the multi-job drain is tested separately. */
-#define wait_event(wait, condition) do { (void)(wait); assert(condition); } while (0)
+#define wait_event(wait, condition) \
+	do {                        \
+		(void)(wait);       \
+		assert(condition);  \
+	} while (0)
 
 struct completion {
 	unsigned int done;
@@ -90,8 +124,8 @@ static int sent_to;
 static int send_error;
 
 /* Transport boundary: capture real mk_send_message() output for replay. */
-static int multikernel_send_ipi_data(int instance_id, void *data,
-				     size_t size, unsigned long type)
+static int multikernel_send_ipi_data(int instance_id, void *data, size_t size,
+				     unsigned long type)
 {
 	assert(size <= sizeof(sent.buffer));
 	sent_to = instance_id;
@@ -107,13 +141,17 @@ static int multikernel_send_ipi_data(int instance_id, void *data,
 struct work_struct {
 	void (*func)(struct work_struct *work);
 };
-struct workqueue_struct { int unused; };
+struct workqueue_struct {
+	int unused;
+};
 static struct workqueue_struct cpu_queue;
 
 static struct work_struct *queued;
 static int mutation_result, mutations;
 static jmp_buf parked;
-static struct { int id; } self = { .id = 65537 }, *mk_self = &self;
+static struct {
+	int id;
+} self = { .id = 65537 }, *mk_self = &self;
 
 static int mutate(void)
 {
@@ -122,9 +160,17 @@ static int mutate(void)
 }
 
 static bool mk_overlay_mutex;
-#define mutex_lock(m) do { assert(!*(m)); *(m) = true; } while (0)
+#define mutex_lock(m)          \
+	do {                   \
+		assert(!*(m)); \
+		*(m) = true;   \
+	} while (0)
 #define mutex_trylock(m) (*(m) ? false : (*(m) = true))
-#define mutex_unlock(m) do { assert(*(m)); *(m) = false; } while (0)
+#define mutex_unlock(m)       \
+	do {                  \
+		assert(*(m)); \
+		*(m) = false; \
+	} while (0)
 
 #define mk_do_cpu_add(...) mutate()
 #define mk_do_cpu_remove(...) mutate()
@@ -176,8 +222,8 @@ static int failures;
 static void expect(const char *kind, const char *name, int got, int want)
 {
 	if (got != want) {
-		fprintf(stderr, "FAIL %s: %s: got %d, want %d\n",
-			kind, name, got, want);
+		fprintf(stderr, "FAIL %s: %s: got %d, want %d\n", kind, name,
+			got, want);
 		failures++;
 	} else {
 		printf("PASS %s: %s\n", kind, name);
@@ -210,22 +256,27 @@ static void dispatch(struct mk_ipi_data *data)
 	struct mk_msg_type_handler handler = {
 		.msg_type = data->type,
 		.msg_handler = data->type == MK_MSG_SYSTEM ?
-			mk_system_msg_handler : mk_resource_msg_handler,
+				       mk_system_msg_handler :
+				       mk_resource_msg_handler,
 	};
 
 	mk_message_type_ipi_callback(data, &handler);
 }
 
-static void reply(u32 type, u32 op, u64 resource, int result, u64 id, bool short_ack)
+static void reply(u32 type, u32 op, u64 resource, int result, u64 id,
+		  bool short_ack)
 {
 	struct mk_resource_ack ack = {
-		.operation = op, .result = result, .resource_id = resource,
+		.operation = op,
+		.result = result,
+		.resource_id = resource,
 	};
 	struct mk_ipi_data data = { .sender_cpu = 7, .type = type };
 	struct mk_message *msg = (struct mk_message *)data.buffer;
 
 	msg->msg_type = type;
-	msg->msg_subtype = type == MK_MSG_SYSTEM ? MK_SYS_SHUTDOWN_ACK : MK_RES_ACK;
+	msg->msg_subtype = type == MK_MSG_SYSTEM ? MK_SYS_SHUTDOWN_ACK :
+						   MK_RES_ACK;
 	msg->msg_id = id;
 	msg->payload_len = sizeof(ack) - short_ack;
 	memcpy(msg->payload, &ack, sizeof(ack));
@@ -245,7 +296,8 @@ static void cpu_error_ack(void)
 
 static unsigned int callbacks;
 
-static void count_callback(u32 type, u32 subtype, u64 id, void *payload, u32 len, void *ctx)
+static void count_callback(u32 type, u32 subtype, u64 id, void *payload,
+			   u32 len, void *ctx)
 {
 	callbacks++;
 }
@@ -256,26 +308,31 @@ static void completion_regressions(void)
 	struct mk_ipi_data data = { .type = MK_MSG_RESOURCE };
 	struct mk_message *msg = (struct mk_message *)data.buffer;
 	struct mk_msg_type_handler handler = {
-		.msg_type = MK_MSG_RESOURCE, .msg_handler = count_callback,
+		.msg_type = MK_MSG_RESOURCE,
+		.msg_handler = count_callback,
 	};
 
 	/* A completion token is consumed by the waiter, not by duplicates. */
 	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
 	cpu_ack();
 	cpu_error_ack();
-	expect("REGRESSION", "duplicate must preserve first success", finish(p), 0);
+	expect("REGRESSION", "duplicate must preserve first success", finish(p),
+	       0);
 	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
 	cpu_error_ack();
 	cpu_ack();
-	expect("REGRESSION", "duplicate must preserve first error", finish(p), -EIO);
+	expect("REGRESSION", "duplicate must preserve first error", finish(p),
+	       -EIO);
 	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
 	cpu_ack();
 	at_completion = cpu_error_ack;
-	expect("REGRESSION", "duplicate after waiter consumes token", finish(p), 0);
+	expect("REGRESSION", "duplicate after waiter consumes token", finish(p),
+	       0);
 
 	p = pending(MK_MSG_SYSTEM, MK_SYS_SHUTDOWN);
 	reply(MK_MSG_SYSTEM, MK_RES_CPU_ADD, 65537, 0, current_id, false);
-	expect("REGRESSION", "shutdown operation mismatch", finish(p), -ETIMEDOUT);
+	expect("REGRESSION", "shutdown operation mismatch", finish(p),
+	       -ETIMEDOUT);
 
 	/* Reject a confused outer/inner family before calling any handler. */
 	msg->msg_type = MK_MSG_SYSTEM;
@@ -295,9 +352,12 @@ static void regressions(void)
 		const char *name;
 		u32 type, op;
 	} stale[] = {
-		{ "delayed CPU_ADD A must not complete B", MK_MSG_RESOURCE, MK_RES_CPU_ADD },
-		{ "delayed CPU_REMOVE A must not complete B", MK_MSG_RESOURCE, MK_RES_CPU_REMOVE },
-		{ "delayed SHUTDOWN A must not complete B", MK_MSG_SYSTEM, MK_SYS_SHUTDOWN },
+		{ "delayed CPU_ADD A must not complete B", MK_MSG_RESOURCE,
+		  MK_RES_CPU_ADD },
+		{ "delayed CPU_REMOVE A must not complete B", MK_MSG_RESOURCE,
+		  MK_RES_CPU_REMOVE },
+		{ "delayed SHUTDOWN A must not complete B", MK_MSG_SYSTEM,
+		  MK_SYS_SHUTDOWN },
 	};
 	struct mk_pending_msg *p;
 	u64 old_id;
@@ -306,11 +366,13 @@ static void regressions(void)
 	/* Fix: allocate and echo distinct request IDs, then match them. */
 	for (i = 0; i < ARRAY_SIZE(stale); i++) {
 		p = pending(stale[i].type, stale[i].op);
-		assert(!mk_send_message_id(1, stale[i].type, stale[i].op, current_id, NULL, 0));
+		assert(!mk_send_message_id(1, stale[i].type, stale[i].op,
+					   current_id, NULL, 0));
 		old_id = ((struct mk_message *)sent.buffer)->msg_id;
 		assert(finish(p) == -ETIMEDOUT);
 		p = pending(stale[i].type, stale[i].op);
-		assert(!mk_send_message_id(1, stale[i].type, stale[i].op, current_id, NULL, 0));
+		assert(!mk_send_message_id(1, stale[i].type, stale[i].op,
+					   current_id, NULL, 0));
 		reply(stale[i].type, stale[i].op, 65537, 0, old_id, false);
 		expect("REGRESSION", stale[i].name, finish(p), -ETIMEDOUT);
 	}
@@ -318,11 +380,12 @@ static void regressions(void)
 	/* Zero replies from an older responder cannot complete a new request. */
 	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
 	reply(MK_MSG_RESOURCE, MK_RES_CPU_ADD, 65537, 0, 0, false);
-	expect("REGRESSION", "zero msg_id must not authorize", finish(p), -ETIMEDOUT);
+	expect("REGRESSION", "zero msg_id must not authorize", finish(p),
+	       -ETIMEDOUT);
 	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
 	reply(MK_MSG_RESOURCE, MK_RES_CPU_ADD, 65537, 0, U64_MAX, false);
-	expect("REGRESSION", "unissued msg_id must not authorize", finish(p), -ETIMEDOUT);
-
+	expect("REGRESSION", "unissued msg_id must not authorize", finish(p),
+	       -ETIMEDOUT);
 }
 
 static void characterizations(void)
@@ -333,24 +396,30 @@ static void characterizations(void)
 		u64 resource;
 		bool short_ack;
 	} reject[] = {
-		{ "resource operation mismatch", MK_MSG_RESOURCE, MK_RES_CPU_REMOVE, 65537, false },
-		{ "resource ID mismatch", MK_MSG_RESOURCE, MK_RES_CPU_ADD, 65538, false },
-		{ "short resource ACK", MK_MSG_RESOURCE, MK_RES_CPU_ADD, 65537, true },
+		{ "resource operation mismatch", MK_MSG_RESOURCE,
+		  MK_RES_CPU_REMOVE, 65537, false },
+		{ "resource ID mismatch", MK_MSG_RESOURCE, MK_RES_CPU_ADD,
+		  65538, false },
+		{ "short resource ACK", MK_MSG_RESOURCE, MK_RES_CPU_ADD, 65537,
+		  true },
 	};
 	struct mk_pending_msg *p;
 	size_t i;
 
 	/* Isolate type from dispatch validation. */
 	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
-	mk_msg_pending_complete(MK_MSG_SYSTEM, MK_RES_CPU_ADD, 65537, current_id, 0);
-	expect("CHARACTERIZATION", "message type mismatch", finish(p), -ETIMEDOUT);
+	mk_msg_pending_complete(MK_MSG_SYSTEM, MK_RES_CPU_ADD, 65537,
+				current_id, 0);
+	expect("CHARACTERIZATION", "message type mismatch", finish(p),
+	       -ETIMEDOUT);
 
 	/* Breaks if matching loses a tuple check or short-ACK validation. */
 	for (i = 0; i < ARRAY_SIZE(reject); i++) {
 		p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
-		reply(reject[i].type, reject[i].op, reject[i].resource,
-		      0, current_id, reject[i].short_ack);
-		expect("CHARACTERIZATION", reject[i].name, finish(p), -ETIMEDOUT);
+		reply(reject[i].type, reject[i].op, reject[i].resource, 0,
+		      current_id, reject[i].short_ack);
+		expect("CHARACTERIZATION", reject[i].name, finish(p),
+		       -ETIMEDOUT);
 	}
 	p = pending(MK_MSG_SYSTEM, MK_SYS_SHUTDOWN);
 	reply(MK_MSG_SYSTEM, MK_SYS_SHUTDOWN, 65537, 0, current_id, true);
@@ -358,11 +427,13 @@ static void characterizations(void)
 
 	/* Breaks if wait forgets cleanup, ignores completion or changes its result. */
 	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
-	expect("CHARACTERIZATION", "timeout removes pending A", finish(p), -ETIMEDOUT);
+	expect("CHARACTERIZATION", "timeout removes pending A", finish(p),
+	       -ETIMEDOUT);
 	cpu_ack(); /* Late reply after free, with no replacement: must be harmless. */
 	assert(list_empty(&mk_pending_msgs));
 	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
-	expect("CHARACTERIZATION", "ACK after cleanup is not saved for B", finish(p), -ETIMEDOUT);
+	expect("CHARACTERIZATION", "ACK after cleanup is not saved for B",
+	       finish(p), -ETIMEDOUT);
 	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
 	at_timeout = cpu_ack;
 	expect("CHARACTERIZATION", "ACK after timeout decision still cleans up",
@@ -370,12 +441,14 @@ static void characterizations(void)
 	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
 	cpu_ack();
 	cpu_ack();
-	expect("CHARACTERIZATION", "identical duplicate returns success", finish(p), 0);
+	expect("CHARACTERIZATION", "identical duplicate returns success",
+	       finish(p), 0);
 	cpu_ack(); /* Also harmless after a successful wait frees the request. */
 	assert(list_empty(&mk_pending_msgs));
 	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
 	reply(MK_MSG_RESOURCE, MK_RES_CPU_ADD, 65537, -EIO, current_id, false);
-	expect("CHARACTERIZATION", "matching error is returned", finish(p), -EIO);
+	expect("CHARACTERIZATION", "matching error is returned", finish(p),
+	       -EIO);
 }
 
 /* Keep longjmp at the parking boundary, outside the test-case loop. */
@@ -401,18 +474,26 @@ static void worker_regressions(void)
 		u32 type, op;
 	} cases[] = {
 		{ "CPU add worker echo", MK_MSG_RESOURCE, MK_RES_CPU_ADD },
-		{ "CPU remove worker echo", MK_MSG_RESOURCE, MK_RES_CPU_REMOVE },
+		{ "CPU remove worker echo", MK_MSG_RESOURCE,
+		  MK_RES_CPU_REMOVE },
 		{ "memory add worker echo", MK_MSG_RESOURCE, MK_RES_MEM_ADD },
-		{ "memory remove worker echo", MK_MSG_RESOURCE, MK_RES_MEM_REMOVE },
-		{ "device add worker echo", MK_MSG_RESOURCE, MK_RES_DEVICE_ADD },
-		{ "device remove worker echo", MK_MSG_RESOURCE, MK_RES_DEVICE_REMOVE },
+		{ "memory remove worker echo", MK_MSG_RESOURCE,
+		  MK_RES_MEM_REMOVE },
+		{ "device add worker echo", MK_MSG_RESOURCE,
+		  MK_RES_DEVICE_ADD },
+		{ "device remove worker echo", MK_MSG_RESOURCE,
+		  MK_RES_DEVICE_REMOVE },
 		{ "shutdown worker echo", MK_MSG_SYSTEM, MK_SYS_SHUTDOWN },
 	};
 	const u64 ids[] = { 0, 0x123456789abcdef0ULL, 0 /* allocated below */ };
-	struct mk_cpu_resource_payload cpu = { .cpu_id = 65537, .sender_instance_id = 3 };
-	struct mk_mem_resource_payload mem = { .start_pfn = 65537, .sender_instance_id = 3 };
+	struct mk_cpu_resource_payload cpu = { .cpu_id = 65537,
+					       .sender_instance_id = 3 };
+	struct mk_mem_resource_payload mem = { .start_pfn = 65537,
+					       .sender_instance_id = 3 };
 	struct mk_device_resource_payload dev = {
-		.domain = 1, .devfn = 1, .sender_instance_id = 3,
+		.domain = 1,
+		.devfn = 1,
+		.sender_instance_id = 3,
 	};
 	struct mk_shutdown_payload shutdown = { .sender_instance_id = 3 };
 	size_t i, j;
@@ -456,15 +537,17 @@ static void worker_regressions(void)
 				p = pending(cases[i].type, cases[i].op);
 				id = mk_msg_pending_id(p);
 			}
-			assert(!mk_send_message_id(1, cases[i].type, cases[i].op,
-						   id, payload, len));
+			assert(!mk_send_message_id(1, cases[i].type,
+						   cases[i].op, id, payload,
+						   len));
 			request = sent;
 			if (j == 1) {
 				/* A large extension must not overrun the local decoder. */
 				msg = (void *)request.buffer;
 				memset(msg->payload + len, 0xa5,
 				       MK_MAX_DATA_SIZE - sizeof(*msg) - len);
-				msg->payload_len = MK_MAX_DATA_SIZE - sizeof(*msg);
+				msg->payload_len =
+					MK_MAX_DATA_SIZE - sizeof(*msg);
 				request.data_size = MK_MAX_DATA_SIZE;
 			}
 			before = request;
@@ -474,7 +557,8 @@ static void worker_regressions(void)
 			dispatch(&request);
 			assert(queued);
 			expect("DECODE", "receive buffer unchanged",
-			       memcmp(&request, &before, sizeof(request)) == 0, 1);
+			       memcmp(&request, &before, sizeof(request)) == 0,
+			       1);
 			work = queued;
 			queued = NULL;
 			/* A worker must retain the ID after the receive buffer is reused. */
@@ -485,15 +569,18 @@ static void worker_regressions(void)
 			/* Test code must also decode the wire without unaligned reads. */
 			memcpy(&ack, msg->payload, sizeof(ack));
 			assert(sent_to == 3 && msg->msg_type == cases[i].type);
-			assert(msg->msg_subtype == (i == 6 ? MK_SYS_SHUTDOWN_ACK : MK_RES_ACK));
+			assert(msg->msg_subtype ==
+			       (i == 6 ? MK_SYS_SHUTDOWN_ACK : MK_RES_ACK));
 			assert(msg->payload_len == sizeof(ack));
-			assert(ack.operation == cases[i].op && ack.resource_id == 65537);
+			assert(ack.operation == cases[i].op &&
+			       ack.resource_id == 65537);
 			assert((int)ack.result == result);
 			assert(mutations == (i == 6 ? 0 : 1));
 			expect("WORKER", cases[i].name, msg->msg_id == id, 1);
 			if (p) {
 				dispatch(&sent);
-				expect("ROUNDTRIP", cases[i].name, finish(p), result);
+				expect("ROUNDTRIP", cases[i].name, finish(p),
+				       result);
 			}
 		}
 		/* Short and empty requests must not queue work or read missing fields. */
@@ -501,37 +588,44 @@ static void worker_regressions(void)
 			u8 bytes[sizeof(mem)] = {};
 
 			assert(!queued);
-			assert(!mk_send_message_id(1, cases[i].type, cases[i].op,
-						   1, bytes, j));
+			assert(!mk_send_message_id(1, cases[i].type,
+						   cases[i].op, 1, bytes, j));
 			dispatch(&sent);
-			expect("DECODE", "short request queues no work", queued == NULL, 1);
+			expect("DECODE", "short request queues no work",
+			       queued == NULL, 1);
 		}
 	}
 	run_work(NULL, true);
 	expect("WORKER", "voluntary HALTED remains a zero-ID notification",
-	       ((struct mk_message *)sent.buffer)->msg_id == 0 && sent_to == 0 &&
-	       ((struct mk_message *)sent.buffer)->msg_subtype == MK_SYS_HALTED, 1);
+	       ((struct mk_message *)sent.buffer)->msg_id == 0 &&
+		       sent_to == 0 &&
+		       ((struct mk_message *)sent.buffer)->msg_subtype ==
+			       MK_SYS_HALTED,
+	       1);
 }
 
 static void pci_key_regressions(void)
 {
 	const u16 domains[] = { 0x8000, 0xffff };
 	const u32 ops[] = { MK_RES_DEVICE_ADD, MK_RES_DEVICE_REMOVE };
-	struct mk_device_resource_payload payload = { .devfn = 1, .sender_instance_id = 3 };
+	struct mk_device_resource_payload payload = { .devfn = 1,
+						      .sender_instance_id = 3 };
 	size_t i, j;
 
 	for (i = 0; i < ARRAY_SIZE(domains); i++) {
 		for (j = 0; j < ARRAY_SIZE(ops); j++) {
 			struct mk_pending_msg *p;
 			struct work_struct *work;
-			u32 resource_id = ((u32)domains[i] << 16) | payload.devfn;
+			u32 resource_id = ((u32)domains[i] << 16) |
+					  payload.devfn;
 
 			payload.domain = domains[i];
-			p = mk_msg_pending_add(MK_MSG_RESOURCE, ops[j], resource_id);
+			p = mk_msg_pending_add(MK_MSG_RESOURCE, ops[j],
+					       resource_id);
 			assert(!IS_ERR(p));
 			assert(!mk_send_message_id(1, MK_MSG_RESOURCE, ops[j],
-						   mk_msg_pending_id(p), &payload,
-						   sizeof(payload)));
+						   mk_msg_pending_id(p),
+						   &payload, sizeof(payload)));
 			dispatch(&sent);
 			assert(queued);
 			work = queued;
@@ -539,7 +633,8 @@ static void pci_key_regressions(void)
 			mutation_result = 0;
 			run_work(work, false);
 			dispatch(&sent);
-			expect("REGRESSION", "high PCI domain round trip", finish(p), 0);
+			expect("REGRESSION", "high PCI domain round trip",
+			       finish(p), 0);
 		}
 	}
 }
@@ -551,19 +646,22 @@ static void halted_decode_regression(void)
 	struct mk_halted_work *work;
 	size_t len;
 
-	assert(!mk_send_message(0, MK_MSG_SYSTEM, MK_SYS_HALTED, &ack, sizeof(ack)));
+	assert(!mk_send_message(0, MK_MSG_SYSTEM, MK_SYS_HALTED, &ack,
+				sizeof(ack)));
 	before = sent;
 	dispatch(&sent);
 	assert(queued);
 	work = container_of(queued, struct mk_halted_work, work);
-	expect("DECODE", "HALTED retains instance ID", work->instance_id, 65537);
+	expect("DECODE", "HALTED retains instance ID", work->instance_id,
+	       65537);
 	expect("DECODE", "HALTED receive buffer unchanged",
 	       memcmp(&sent, &before, sizeof(sent)) == 0, 1);
 	queued = NULL;
 	free(work);
 
 	for (len = 0; len < sizeof(ack); len++) {
-		assert(!mk_send_message(0, MK_MSG_SYSTEM, MK_SYS_HALTED, &ack, len));
+		assert(!mk_send_message(0, MK_MSG_SYSTEM, MK_SYS_HALTED, &ack,
+					len));
 		dispatch(&sent);
 		assert(!queued);
 	}
@@ -595,7 +693,8 @@ static void failure_regressions(void)
 
 	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
 	allocation_fails = true;
-	ret = mk_send_message_id(1, MK_MSG_RESOURCE, MK_RES_CPU_ADD, current_id, NULL, 0);
+	ret = mk_send_message_id(1, MK_MSG_RESOURCE, MK_RES_CPU_ADD, current_id,
+				 NULL, 0);
 	expect("FAILURE", "send allocation error", ret, -ENOMEM);
 	allocation_fails = false;
 	mk_msg_pending_cancel(p);
@@ -604,7 +703,8 @@ static void failure_regressions(void)
 
 	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
 	send_error = -EIO;
-	ret = mk_send_message_id(1, MK_MSG_RESOURCE, MK_RES_CPU_ADD, current_id, NULL, 0);
+	ret = mk_send_message_id(1, MK_MSG_RESOURCE, MK_RES_CPU_ADD, current_id,
+				 NULL, 0);
 	expect("FAILURE", "transport error", ret, -EIO);
 	/* Even a reply racing local cleanup must not leave a dangling entry. */
 	cpu_ack();
@@ -619,12 +719,14 @@ static void failure_regressions(void)
 	/* Last: forcing exhaustion intentionally prevents all subsequent adds. */
 	mk_last_msg_id = U64_MAX - 1;
 	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
-	expect("FAILURE", "last representable ID is usable", current_id == U64_MAX, 1);
+	expect("FAILURE", "last representable ID is usable",
+	       current_id == U64_MAX, 1);
 	cpu_ack();
 	expect("FAILURE", "full-width ID matches", finish(p), 0);
 	p = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_CPU_ADD, 65537);
 	assert(IS_ERR(p));
-	expect("FAILURE", "ID exhaustion refuses reuse", PTR_ERR(p), -EOVERFLOW);
+	expect("FAILURE", "ID exhaustion refuses reuse", PTR_ERR(p),
+	       -EOVERFLOW);
 	assert(mk_last_msg_id == U64_MAX);
 	assert(list_empty(&mk_pending_msgs) && !mk_pending_msgs_lock.held);
 }
@@ -647,10 +749,11 @@ int main(int argc, char **argv)
 	mk_cpu_hotplug_wq = &cpu_queue;
 	mk_hotplug_accepting = true;
 
-	if (argc > 2 || (argc == 2 && strcmp(argv[1], "regression") &&
-			strcmp(argv[1], "characterization") &&
-			strcmp(argv[1], "completion") && strcmp(argv[1], "workers") &&
-			strcmp(argv[1], "failure"))) {
+	if (argc > 2 ||
+	    (argc == 2 && strcmp(argv[1], "regression") &&
+	     strcmp(argv[1], "characterization") &&
+	     strcmp(argv[1], "completion") && strcmp(argv[1], "workers") &&
+	     strcmp(argv[1], "failure"))) {
 		fprintf(stderr, "usage: ack_test [mode] (see README.ack)\n");
 		return 2;
 	}
