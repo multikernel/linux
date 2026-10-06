@@ -36,6 +36,8 @@
 #include <linux/percpu.h>
 #include <linux/set_memory.h>
 #include <linux/sched.h>
+#include <linux/panic.h>
+#include <linux/syscore_ops.h>
 
 #include <asm/apic.h>
 #include <asm/page.h>
@@ -1886,9 +1888,40 @@ EXPORT_SYMBOL_GPL(multikernel_restore_ap);
  * machine including the host. Park every CPU in the pool wait loop
  * instead, returning them to the multikernel pool.
  */
+static bool mk_halt_quiesced;
+
+static void mk_halt_shutdown_prepare(void *unused)
+{
+	/* Ordinary kexec also runs syscore shutdown, then reopens CPU hotplug. */
+	if (panic_in_progress() || kexec_in_progress)
+		return;
+	if (system_state != SYSTEM_HALT && system_state != SYSTEM_POWER_OFF &&
+	    system_state != SYSTEM_RESTART)
+		return;
+	/*
+	 * migrate_to_reboot_cpu() has already drained native CPU hotplug.
+	 * Exclude local controllers and received resource mutations until park.
+	 * Never wait for a contended controller from this terminal path.
+	 */
+	if (!mutex_trylock(&mk_overlay_mutex))
+		return;
+	/* The machine-stop path acquires this permit before publishing HALTED. */
+	smp_store_release(&mk_halt_quiesced, true);
+}
+
+static const struct syscore_ops mk_halt_syscore_ops = {
+	.shutdown = mk_halt_shutdown_prepare,
+};
+
+static struct syscore mk_halt_syscore = {
+	.ops = &mk_halt_syscore_ops,
+};
+
 static void __noreturn mk_machine_halt(void)
 {
-	mk_halt_to_pool();
+	/* Pair with syscore's permit publication while it retains the mutex. */
+	mk_halt_to_pool(smp_load_acquire(&mk_halt_quiesced) &&
+			!panic_in_progress() && !kexec_in_progress);
 }
 
 static void __noreturn mk_machine_restart(char *cmd)
@@ -1918,11 +1951,12 @@ static int __init mk_spawn_reboot_init(void)
 	machine_ops.restart = mk_machine_restart;
 	machine_ops.emergency_restart = mk_machine_halt;
 	smp_ops.stop_this_cpu = mk_stop_this_cpu;
+	register_syscore(&mk_halt_syscore);
 
 	/*
 	 * A panicked spawn kernel spinning in the panic loop holds its
 	 * CPUs hostage. "Reboot on panic" is mk_machine_halt here, which
-	 * notifies the host and parks, so make it the default; the panic
+	 * parks without authorizing host reuse, so make it the default. Panic
 	 * output has already been flushed to the console by then.
 	 */
 	if (!panic_timeout)

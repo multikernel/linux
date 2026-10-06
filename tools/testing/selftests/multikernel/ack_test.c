@@ -463,7 +463,8 @@ static void run_work(struct work_struct *work, bool parks)
 		if (work)
 			work->func(work);
 		else
-			mk_halt_to_pool();
+			/* Wire checks only; qualification is tested separately. */
+			mk_halt_to_pool(true);
 		assert(!parks);
 	} else {
 		assert(parks);
