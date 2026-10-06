@@ -25,6 +25,14 @@ mapping/allocation failure and early permission/flag/busy exits are covered.
 Normal/crash images retain their existing absence of a resource lock; cleanup
 is now inside kexec_lock, as it already is for legacy kexec_load.
 
+Command-line cleanup uses the extracted kimage_file_free_cmdline helper and a
+small tracked allocation supplied by the segment-preparation boundary. Early
+preparation, validation and control/swap-page failures must free it for normal,
+crash and multikernel images (crash images have no swap page). Successful loads
+must retain it until unload. Post-load cleanup intentionally retains this buffer;
+the early allocation unwind must release it before freeing the image directly.
+This is a host cleanup regression check, not a kernel syscall reproduction.
+
 Kernel allocation, segment copying, firmware, pool mutation, instance registry
 storage and kernfs removal are controlled host boundaries. The real MK release
 and can-free helpers are exercised; the general kimage_free dispatcher is a

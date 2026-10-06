@@ -46,6 +46,10 @@ awk '/^static int$/ { candidate = $0; next }
      copy { print }
      copy && /^}/ { copy = 0 }' "$src/kernel/kexec_file.c" \
      > "$build/image-file.h"
+awk '/^void kimage_file_free_cmdline\(/ { copy = 1 }
+     copy { print }
+     copy && /^}/ { copy = 0 }' "$src/kernel/kexec_file.c" \
+     > "$build/image-cmdline.h"
 awk '/^int mk_overlay_rmdir\(/ { copy = 1 }
      copy { print }
      copy && /^}/ { copy = 0 }' "$src/kernel/multikernel/overlay.c" \
