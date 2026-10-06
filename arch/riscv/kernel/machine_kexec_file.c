@@ -12,6 +12,7 @@
 #include <linux/of.h>
 #include <linux/libfdt.h>
 #include <linux/types.h>
+#include <linux/unaligned.h>
 #include <linux/memblock.h>
 #include <linux/vmalloc.h>
 #include <asm/setup.h>
@@ -118,6 +119,8 @@ static char *setup_kdump_cmdline(struct kimage *image, char *cmdline,
 
 #define ENCODE_ITYPE_IMM(x) \
 	(RV_X(x, 0, 12) << 20)
+#define ENCODE_STYPE_IMM(x) \
+	((RV_X(x, 0, 5) << 7) | (RV_X(x, 5, 7) << 25))
 #define ENCODE_BTYPE_IMM(x) \
 	((RV_X(x, 1, 4) << 8) | (RV_X(x, 5, 6) << 25) | \
 	(RV_X(x, 11, 1) << 7) | (RV_X(x, 12, 1) << 31))
@@ -164,6 +167,7 @@ int arch_kexec_apply_relocations_add(struct purgatory_info *pi,
 		unsigned long addr;	/* final location after relocation */
 		unsigned long val;	/* relocated symbol value */
 		unsigned long sec_base;	/* relocated symbol value */
+		long offset;
 		void *loc;		/* tmp location to modify */
 
 		sym = (void *)pi->ehdr + symtab->sh_offset;
@@ -204,13 +208,61 @@ int arch_kexec_apply_relocations_add(struct purgatory_info *pi,
 			*(u32 *)loc = CLEAN_IMM(JTYPE, *(u32 *)loc) |
 				 ENCODE_JTYPE_IMM(val - addr);
 			break;
-		/*
-		 * With no R_RISCV_PCREL_LO12_S, R_RISCV_PCREL_LO12_I
-		 * sym is expected to be next to R_RISCV_PCREL_HI20
-		 * in purgatory relsec. Handle it like R_RISCV_CALL
-		 * sym, instead of searching the whole relsec.
-		 */
 		case R_RISCV_PCREL_HI20:
+			offset = val - addr;
+			/* AUIPC plus a signed 12-bit immediate. */
+			if (offset < -(1L << 31) - (1L << 11) ||
+			    offset >= (1L << 31) - (1L << 11)) {
+				pr_err("PCREL_HI20 offset out of range\n");
+				return -ENOEXEC;
+			}
+			put_unaligned_le32(CLEAN_IMM(UTYPE, get_unaligned_le32(loc)) |
+				ENCODE_UTYPE_IMM(RISCV_CONST_HIGH_PART(offset)), loc);
+			break;
+		case R_RISCV_PCREL_LO12_I:
+		case R_RISCV_PCREL_LO12_S: {
+			const Elf64_Rela *hi = NULL;
+			const Elf_Sym *hi_sym;
+			unsigned int j;
+
+			/* The low relocation names the HI instruction, not its target. */
+			if (sym->st_shndx != relsec->sh_info || relas[i].r_addend)
+				return -ENOEXEC;
+
+			/*
+			 * Instructions and relocation records need not be adjacent or
+			 * ordered. Multiple low relocations may reference the same HI.
+			 * ponytail: small built-in table; index HI offsets if it grows.
+			 */
+			for (j = 0; j < relsec->sh_size / sizeof(*relas); j++) {
+				if (ELF64_R_TYPE(relas[j].r_info) == R_RISCV_PCREL_HI20 &&
+				    relas[j].r_offset == sym->st_value) {
+					hi = &relas[j];
+					break;
+				}
+			}
+			if (!hi || ELF64_R_SYM(hi->r_info) >= symtab->sh_size / sizeof(*sym)) {
+				pr_err("Missing PCREL_HI20 relocation or symbol\n");
+				return -ENOEXEC;
+			}
+			hi_sym = (void *)pi->ehdr + symtab->sh_offset;
+			hi_sym += ELF64_R_SYM(hi->r_info);
+			sec_base = 0;
+			if (hi_sym->st_shndx != SHN_ABS) {
+				if (hi_sym->st_shndx >= pi->ehdr->e_shnum)
+					return -ENOEXEC;
+				sec_base = pi->sechdrs[hi_sym->st_shndx].sh_addr;
+			}
+			val = hi_sym->st_value + sec_base + hi->r_addend -
+				(section->sh_addr + hi->r_offset);
+			if (r_type == R_RISCV_PCREL_LO12_I)
+				put_unaligned_le32(CLEAN_IMM(ITYPE, get_unaligned_le32(loc)) |
+					ENCODE_ITYPE_IMM(val), loc);
+			else
+				put_unaligned_le32(CLEAN_IMM(STYPE, get_unaligned_le32(loc)) |
+					ENCODE_STYPE_IMM(val), loc);
+			break;
+		}
 		case R_RISCV_CALL_PLT:
 		case R_RISCV_CALL:
 			*(u64 *)loc = CLEAN_IMM(UITYPE, *(u64 *)loc) |
@@ -236,8 +288,6 @@ int arch_kexec_apply_relocations_add(struct purgatory_info *pi,
 		case R_RISCV_SUB32:
 			*(u32 *)loc -= val;
 			break;
-		/* It has been applied by R_RISCV_PCREL_HI20 sym */
-		case R_RISCV_PCREL_LO12_I:
 		case R_RISCV_ALIGN:
 		case R_RISCV_RELAX:
 			break;
