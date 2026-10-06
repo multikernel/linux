@@ -55,6 +55,7 @@ static unsigned int rt_atomic_lock_errors;
 static unsigned int unlocked_mutations;
 static mk_phys_cpu_t ids[] = { 65537, 0x123456789abcdef0ULL };
 static bool memory_added, device_added, shutdown_sent, parked_cpus;
+static bool native_hotplug_disabled;
 static unsigned int shutdown_jobs_pending;
 static bool probe_at_wait, probe_system_registration;
 static int wait_probe_results[3], system_probe_result;
@@ -237,6 +238,8 @@ static int mk_send_message_id(int to, u32 type, u32 subtype, u64 id,
 
 	if (type == MK_MSG_SYSTEM) {
 		assert(subtype == MK_SYS_SHUTDOWN_ACK && id == 51 && to == 3);
+		expect("native CPU hotplug disabled before shutdown ACK",
+		       native_hotplug_disabled, 1);
 		shutdown_sent = true;
 		shutdown_jobs_pending = (cpu_queue ? cpu_queue->nr : 0) + system_queue.nr;
 		return send_error;
@@ -344,6 +347,15 @@ static void mk_system_msg_handler(u32 type, u32 subtype, u64 id,
 {
 }
 
+static void cpu_hotplug_disable(void)
+{
+	expect("native hotplug drain outside resource lock", mk_overlay_mutex, 0);
+	expect("native hotplug drain in process context", hard_irq, 0);
+	expect("incoming admission closed before native drain", mk_hotplug_accepting, 0);
+	expect("incoming workers retired before native drain", mk_hotplug_idle(), 1);
+	native_hotplug_disabled = true;
+}
+
 #include "work-shutdown.h"
 
 static int receive_cpu(bool add, struct mk_cpu_resource_payload *payload, u32 len, u64 id)
@@ -376,6 +388,7 @@ static void reset(void)
 	nr_replies = destroyed = 0;
 	online[0] = online[1] = false;
 	memory_added = device_added = shutdown_sent = parked_cpus = false;
+	native_hotplug_disabled = false;
 	probe_at_wait = probe_system_registration = false;
 	shutdown_jobs_pending = 0;
 	system_probe_result = 0;

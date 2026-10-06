@@ -167,6 +167,11 @@ static int mutate(void)
 }
 
 static bool mk_overlay_mutex;
+static void cpu_hotplug_disable(void)
+{
+	assert(!mk_overlay_mutex);
+}
+
 #define mutex_lock(m)          \
 	do {                   \
 		assert(!*(m)); \
