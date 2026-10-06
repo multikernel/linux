@@ -83,7 +83,14 @@ controller unlocks. It also requires every substituted mutation to run under
 the resource lock. All traced direct send/pool callers are within baseline or
 overlay resource critical sections. After incoming quiescence, requested
 shutdown takes that mutex and retains it until every local CPU is stopped,
-excluding local controllers from passing shutdown. Voluntary halt, poweroff/
+excluding local controllers from passing shutdown. Before taking that mutex,
+it also calls cpu_hotplug_disable() to drain native CPU hotplug and close native
+CPU-up admission, as the normal reboot path already does. A stuck native
+hotplug operation must prevent the ACK, not authorize reclamation. The fixture
+checks invocation before the ACK, after incoming drain and outside the resource
+lock; it substitutes the native helper and does not qualify its kernel locking.
+All-hart parked confirmation remains required after acknowledgment.
+Voluntary halt, poweroff/
 reboot, panic and force
 stop do not use the sleeping barrier and remain separate qualification gates.
 No wire layout or request-ID change is introduced; no success ACK is fabricated

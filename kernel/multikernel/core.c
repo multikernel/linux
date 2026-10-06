@@ -1671,6 +1671,8 @@ static void mk_shutdown_work_fn(struct work_struct *work)
 	kfree(sw);
 	/* This worker may sleep; the voluntary machine-halt path may not. */
 	mk_hotplug_quiesce();
+	/* Drain native CPU hotplug and prevent new starts before the ACK. */
+	cpu_hotplug_disable();
 	/* Finish local controllers, then exclude them until this kernel stops. */
 	mutex_lock(&mk_overlay_mutex);
 	mk_notify_down_and_park(sender_instance_id, MK_SYS_SHUTDOWN_ACK, msg_id);
