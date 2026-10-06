@@ -49,6 +49,16 @@ await lookup reference release and an RCU grace period. A refused memory release
 keeps the pool, region metadata and control allocation intact. The memory test
 can characterize a saved production revision with MK_CORE_REV=<commit>.
 
+Run kernfs_snapshot_test.sh with sh to check the production root and instance
+device_tree read callbacks. Each generation holds the resource mutex; contended
+reads return -EAGAIN so a controller holding that mutex can drain kernfs without
+waiting on a reader blocked behind it. Retry after contention clears. The mutex
+is released before copying the generated buffer. Separate partial reads still
+generate separate snapshots, not a stable snapshot for the whole open file.
+The fixture checks exclusion at a stubbed DT generator, controller-held-lock
+contention, retry, generation errors, offsets and buffer release using a host
+pthread mutex. It does not exercise the real DT emitter or native kernfs drain.
+
 The unused bulk kernfs cleanup entry point refuses live boot records, loaded
 Images and uncertain states. It does not supply a new inbox/IRQ retirement
 contract. Unexpected final-reference release without stop proof retains

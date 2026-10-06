@@ -132,7 +132,11 @@ static int root_device_tree_seq_show(struct seq_file *sf, void *v)
 	size_t dtb_size = 0;
 	int ret;
 
+	/* Teardown holds the resource lock while draining kernfs callbacks. */
+	if (!mutex_trylock(&mk_overlay_mutex))
+		return -EAGAIN;
 	ret = mk_dt_generate_instance_dtb(mk_self, &dtb_data, &dtb_size);
+	mutex_unlock(&mk_overlay_mutex);
 	if (ret) {
 		pr_err("Failed to generate baseline DTB: %d\n", ret);
 		return ret;
@@ -153,7 +157,11 @@ static ssize_t instance_device_tree_read(struct kernfs_open_file *of,
 	size_t to_read;
 	int ret;
 
+	/* Never wait on a controller that may be draining this callback. */
+	if (!mutex_trylock(&mk_overlay_mutex))
+		return -EAGAIN;
 	ret = mk_dt_generate_instance_dtb(instance, &dtb_data, &dtb_size);
+	mutex_unlock(&mk_overlay_mutex);
 	if (ret) {
 		pr_err("Instance '%s': Failed to generate device tree: %d\n",
 		       instance->name, ret);
