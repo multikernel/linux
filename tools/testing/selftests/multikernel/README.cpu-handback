@@ -1,0 +1,59 @@
+.. SPDX-License-Identifier: GPL-2.0-only
+
+CPU handback and ownership
+==========================
+
+Run from this worktree:
+
+  bash tools/testing/selftests/multikernel/cpu_handback_test.sh
+
+Optional userspace sanitizers:
+
+  CC=clang CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer -g' \
+    bash tools/testing/selftests/multikernel/cpu_handback_test.sh
+
+The script compiles the actual reclaim_cpu(), mk_do_cpu_add(), mapping and
+CPU-set functions with mocked native CPUHP/device operations. Its nineteen
+scenarios check caller ordering, not a real CPU transition or concurrency.
+
+Contract
+--------
+
+- The resource controller lock covers handback and ownership updates.
+- Validate the logical CPU before indexing per-CPU storage. Reserve local
+  ownership before device registration or native bringup can run.
+- Register an absent enumerated CPU under the device-hotplug lock. Presence
+  restoration, bringup and failure rollback are serialized by the native
+  device-hotplug/device/CPU-map locks. The CPU write lock is taken separately
+  for mask changes; _cpu_up() manages its own write-lock section.
+- OFFLINE and DEPARTED are the supported starting CPUHP states. Native hotplug
+  disable, SMT policy, possible-CPU and NUMA checks still apply. Successful
+  return requires the CPU to be online at CPUHP_ONLINE, with device bookkeeping.
+- Known preflight rejection undoes only newly added local ownership; it does
+  not remove free-pool membership. The attempted output reports entry into
+  native bringup, not whether firmware definitely started the hart/CPU.
+- Preserve pool membership during the wake callback, which selects the x86
+  local park slot. Never hold the pool lock across native bringup. After an
+  attempted failure, retain local ownership and remove free-pool eligibility
+  before releasing the resource controller lock, even for -EBUSY.
+- Restore the original presence mask after a failed absent-CPU bringup only
+  if the CPU is offline. An incomplete rollback must not make an online CPU
+  absent. No automatic retry follows a failed attempt; CPUHP rollback and
+  an errno are not proof that physical execution has stopped.
+- Ordinary add_cpu() remains unchanged. The CPU-device NUMA bookkeeping is
+  shared with the ordinary online callback and runs outside the CPU-map lock.
+
+Coverage and limits
+-------------------
+
+The fixture checks successful and first-local bringup; allocation and device
+registration failure; native hotplug/SMT/NUMA rejection; invalid CPUHP state;
+attempted failure, attempted -EBUSY, incomplete rollback and false success;
+impossible/out-of-range mappings; successful registration; preexisting
+ownership; originally present failure; and already-online idempotence.
+
+The native _cpu_up() implementation, scheduler, NUMA sysfs link changes and
+firmware are not executed by this fixture. Mock lock assertions do not replace
+live lockdep. Final x86 and RISC-V stack builds and native lifecycle tests are
+separate gates. Mailbox quarantine and park-memory lifetime protection must
+also land before claiming safe recovery from an uncertain x86 wake attempt.
