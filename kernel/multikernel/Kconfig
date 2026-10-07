@@ -17,6 +17,7 @@ config ARCH_HAS_MK_FORCE_STOP
 config MULTIKERNEL
 	bool "Multikernel support"
 	depends on ARCH_SUPPORTS_MULTIKERNEL
+	depends on HOTPLUG_CPU
 	depends on KEXEC_CORE
 	depends on MEMORY_HOTPLUG
 	depends on MEMORY_HOTREMOVE

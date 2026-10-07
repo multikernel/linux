@@ -7,6 +7,14 @@ Run from this worktree:
 
   bash tools/testing/selftests/multikernel/cpu_handback_test.sh
 
+Actual x86 Kconfig and affected-object build checks:
+
+  bash tools/testing/selftests/multikernel/cpu_hotplug_config_test.sh
+
+This rejects UP multikernel without CPU hotplug, builds ordinary UP CPU
+objects, then restores SMP/hotplug multikernel and builds its resource-hotplug
+object. It does not boot a guest or execute CPU transitions.
+
 Optional userspace sanitizers:
 
   CC=clang CFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer -g' \
