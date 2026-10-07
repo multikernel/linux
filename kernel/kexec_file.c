@@ -612,11 +612,9 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 		kimage_file_post_load_cleanup(image);
 
 	if (image && image->type == KEXEC_TYPE_MULTIKERNEL) {
-		/* Publish only a complete image to exec, unload and IPI */
-		image->mk_instance->kimage = image;
-		image->mk_instance->ipi_data = phys_to_virt(image->mk_instance->ipi_phys);
-		mk_instance_set_state(image->mk_instance, MK_STATE_LOADED);
-		kimage_add_to_list(image);
+		ret = mk_instance_publish_kimage(image->mk_instance, image);
+		if (ret)
+			goto out;
 		image = NULL; /* Don't free the new image */
 		goto out;
 	}

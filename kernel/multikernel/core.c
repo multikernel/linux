@@ -217,6 +217,8 @@ static void mk_instance_release(struct kref *kref)
 
 	pr_info("Releasing multikernel instance %d (%s), returning resources to root\n",
 		instance->id, instance->name);
+	WARN_ON_ONCE(READ_ONCE(instance->ipi_endpoint.registered));
+	WARN_ON_ONCE(instance->ipi_endpoint.tx || instance->ipi_endpoint.rx);
 
 	mk_instance_return_all_cpus(instance);
 	mk_instance_return_pci_devices(instance);
@@ -225,6 +227,8 @@ static void mk_instance_release(struct kref *kref)
 	mk_instance_free_boot_pages(instance);
 
 	mk_instance_track_dump(instance, instance->state, MK_STATE_READY);
+	if (instance->halt_data)
+		memunmap(instance->halt_data);
 	kfree(instance->host_tree);
 	mk_cpu_set_free(instance->cpus);
 	kfree(instance->name);
@@ -278,6 +282,9 @@ struct mk_instance *mk_instance_alloc(int id, const char *name)
 
 	instance->state = MK_STATE_READY;
 	instance->ipi_target = MK_PHYS_CPU_INVALID;
+	raw_spin_lock_init(&instance->ipi_endpoint.tx_lock);
+	raw_spin_lock_init(&instance->ipi_endpoint.rx_lock);
+	INIT_LIST_HEAD(&instance->ipi_endpoint.rx_node);
 	INIT_LIST_HEAD(&instance->memory_regions);
 	INIT_LIST_HEAD(&instance->list);
 	INIT_LIST_HEAD(&instance->pci_devices);
@@ -344,6 +351,8 @@ void mk_instance_free(struct mk_instance *instance)
 		list_del(&plat_dev->list);
 		kfree(plat_dev);
 	}
+	if (instance->halt_data)
+		memunmap(instance->halt_data);
 	kfree(instance->host_tree);
 	mk_cpu_set_free(instance->cpus);
 	kfree(instance->name);
@@ -419,6 +428,60 @@ int mk_instance_set_kexec_active(int mk_id)
 	pr_info("Multikernel instance %d is now active\n", mk_id);
 
 	return 0;
+}
+
+/**
+ * mk_instance_publish_kimage - Publish a completed multikernel image
+ * @instance: Referenced instance selected when the load began
+ * @image: Completed image to publish
+ *
+ * Serializes final publication with instance removal. A long-running load
+ * must not attach its endpoint to an instance that was removed and whose ID
+ * was reused while the image was prepared.
+ *
+ * Returns 0 on success, or a negative error if the instance is no longer the
+ * registered, publishable record or endpoint publication fails.
+ */
+int mk_instance_publish_kimage(struct mk_instance *instance,
+			       struct kimage *image)
+{
+	mk_phys_cpu_t doorbell_cpu;
+	int ret = 0;
+
+	if (!instance || !image || image->mk_instance != instance)
+		return -EINVAL;
+
+	mutex_lock(&mk_instance_mutex);
+	if (idr_find(&mk_instance_idr, instance->id) != instance) {
+		ret = -ENOENT;
+		goto out;
+	}
+	if (instance->state != MK_STATE_READY || instance->kimage ||
+	    instance->ipi_data || instance->ipi_endpoint.registered) {
+		ret = -EBUSY;
+		goto out;
+	}
+
+	doorbell_cpu = mk_cpu_set_first(instance->cpus);
+	if (doorbell_cpu == MK_PHYS_CPU_INVALID) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	instance->kimage = image;
+	instance->ipi_data = phys_to_virt(instance->ipi_phys);
+	ret = mk_ipi_endpoint_register(instance, true, doorbell_cpu);
+	if (ret) {
+		instance->ipi_data = NULL;
+		instance->kimage = NULL;
+		goto out;
+	}
+
+	mk_instance_set_state(instance, MK_STATE_LOADED);
+	kimage_add_to_list(image);
+out:
+	mutex_unlock(&mk_instance_mutex);
+	return ret;
 }
 
 bool multikernel_allow_emergency_restart(void)
@@ -1582,7 +1645,12 @@ static void __noreturn mk_notify_down_and_park(int target_id, u32 subtype)
  */
 void __noreturn mk_halt_to_pool(void)
 {
-	mk_notify_down_and_park(0, MK_SYS_HALTED);
+	int parent_id;
+
+	if (!host_instance)
+		panic("multikernel: spawned kernel has no parent instance");
+	parent_id = READ_ONCE(host_instance->id);
+	mk_notify_down_and_park(parent_id, MK_SYS_HALTED);
 }
 
 static void mk_shutdown_work_fn(struct work_struct *work)
@@ -1828,7 +1896,7 @@ EXPORT_SYMBOL_GPL(mk_cpu_rank);
 static int mk_fence_missing(struct mk_instance *instance,
 			    struct mk_cpu_set *targets)
 {
-	struct mk_shared_data *sd = instance->ipi_data;
+	struct mk_shared_data *sd = mk_instance_halt_data(instance);
 	mk_phys_cpu_t phys;
 	unsigned int i;
 	int missing = 0;
@@ -1853,7 +1921,7 @@ static int mk_fence_missing(struct mk_instance *instance,
 static int mk_confirm_fenced(struct mk_instance *instance,
 			     struct mk_cpu_set *targets)
 {
-	struct mk_shared_data *sd = instance->ipi_data;
+	struct mk_shared_data *sd = mk_instance_halt_data(instance);
 	mk_phys_cpu_t phys;
 	unsigned int i;
 	int missing, ret;
@@ -1968,6 +2036,8 @@ int multikernel_force_halt_by_id(int mk_id)
 	return ret;
 }
 
+static bool multikernel_initialized __initdata;
+
 static int __init multikernel_init(void)
 {
 	int ret;
@@ -2002,9 +2072,21 @@ static int __init multikernel_init(void)
 		return ret;
 	}
 
+	multikernel_initialized = true;
+
 	pr_info("Multikernel support initialized\n");
+	return 0;
+}
+
+static int __init multikernel_ipi_enable(void)
+{
+	if (!multikernel_initialized)
+		return 0;
+
+	mk_ipi_handlers_enable();
 	return 0;
 }
 
 /* Initialize multikernel after core kernel subsystems are ready */
 subsys_initcall(multikernel_init);
+late_initcall(multikernel_ipi_enable);

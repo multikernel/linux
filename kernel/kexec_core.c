@@ -609,7 +609,8 @@ void kimage_free_multikernel(struct kimage *image)
 	kimage_file_post_load_cleanup(image);
 
 	if (instance->kimage == image) {
-		/* No kernel left to read the ring */
+		/* Stop publishing the image's endpoint before dropping it. */
+		mk_ipi_endpoint_unregister(instance);
 		instance->ipi_data = NULL;
 		instance->kimage = NULL;
 		mk_instance_set_state(instance, MK_STATE_READY);
@@ -1662,6 +1663,7 @@ int multikernel_kexec_by_id(int mk_id)
 {
 	struct kimage *mk_image;
 	struct mk_instance *instance;
+	mk_phys_cpu_t doorbell_cpu = MK_PHYS_CPU_INVALID;
 	int cpu = -1;
 	int i, rc;
 
@@ -1679,6 +1681,7 @@ int multikernel_kexec_by_id(int mk_id)
 	if (!mk_cpu_set_empty(instance->cpus)) {
 		mk_phys_cpu_t phys_cpu = mk_cpu_set_first(instance->cpus);
 
+		doorbell_cpu = phys_cpu;
 		cpu = arch_cpu_from_physical_id(phys_cpu);
 		if (cpu < 0) {
 			pr_err("Physical CPU %llu not found in logical CPU map\n", phys_cpu);
@@ -1704,6 +1707,13 @@ int multikernel_kexec_by_id(int mk_id)
 	if (rc) {
 		pr_err("Instance %d still has running CPUs, refusing to reload its image\n",
 		       mk_id);
+		goto unlock;
+	}
+
+	mk_ipi_endpoint_unregister(instance);
+	rc = mk_ipi_link_reset(instance);
+	if (rc) {
+		pr_err("Failed to reset instance %d IPI link: %d\n", mk_id, rc);
 		goto unlock;
 	}
 
@@ -1735,24 +1745,11 @@ int multikernel_kexec_by_id(int mk_id)
 	else
 		pr_info("Manifest finalized for multikernel instance\n");
 
-	/*
-	 * Start the instance with an empty ring. It outlives the kernel
-	 * that was using it, so a new instance would otherwise inherit that
-	 * kernel's indices and any slot it left half written - which stalls
-	 * the reader, since an unpublished slot means "the sender is still
-	 * filling this one". Anything left in there was addressed to a
-	 * kernel that is gone.
-	 */
-	if (instance->ipi_data)
-		memset(instance->ipi_data, 0, sizeof(*instance->ipi_data));
-
-	/*
-	 * Same for the other direction: whatever the halted instance left
-	 * queued for us is addressed from a kernel that no longer exists,
-	 * and a slot it claimed but never published stalls our ring for
-	 * good.
-	 */
-	mk_ipi_ring_drop_pending();
+	rc = mk_ipi_endpoint_register(instance, true, doorbell_cpu);
+	if (rc) {
+		pr_err("Failed to reopen instance %d IPI link: %d\n", mk_id, rc);
+		goto unlock;
+	}
 
 	rc = mk_arch_spawn_instance(mk_image, instance, cpu);
 	if (rc == 0) {
