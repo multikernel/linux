@@ -292,19 +292,6 @@ static int mk_do_cpu_remove(mk_phys_cpu_t cpu_id)
 		return -ENODEV;
 	}
 
-	if (!cpu_online(logical_cpu)) {
-		pr_warn("Multikernel hotplug: CPU %d (phys %llu) already offline\n",
-			logical_cpu, cpu_id);
-		mk_account_cpu_offline(cpu_id);
-		return 0;
-	}
-
-	/* Don't allow removing CPU 0 (boot processor) */
-	if (logical_cpu == 0) {
-		pr_err("Multikernel hotplug: Cannot remove boot CPU\n");
-		return -EINVAL;
-	}
-
 	ret = depart_cpu(logical_cpu);
 	if (ret < 0) {
 		pr_err("Multikernel hotplug: Failed to remove CPU %d (phys %llu): %d\n",
@@ -313,12 +300,6 @@ static int mk_do_cpu_remove(mk_phys_cpu_t cpu_id)
 	}
 
 	mk_account_cpu_offline(cpu_id);
-
-	/*
-	 * Clear CPU from present mask to prevent host kernel from trying
-	 * to interact with it after spawn kernel takes over.
-	 */
-	set_cpu_present(logical_cpu, false);
 
 	/* Track the operation for potential rollback */
 	op = kzalloc(sizeof(*op), GFP_KERNEL);
