@@ -149,6 +149,16 @@ static bool checked_del(struct mk_cpu_set *set, mk_phys_cpu_t cpu)
 #include "cpu-transfer.h"
 
 /* Mailbox publication can time out after a CPU has consumed the request. */
+static int mk_slot_begin(struct mk_spawn_context *ctx)
+{
+	return ctx ? 0 : -ENODEV;
+}
+
+static bool mk_slot_idle(struct mk_spawn_context *ctx)
+{
+	return true;
+}
+
 static int mk_slot_wake(struct mk_spawn_context *ctx, u32 cpu, const char *what)
 {
 	assert(pool.park_lock);
@@ -471,11 +481,11 @@ int main(void)
 	assert(!mk_cpu_set_add(target.cpus, 7));
 	assert(!mk_cpu_set_add(target.cpus_on_slot, 7));
 	confirm_mode = true;
-	expect("host fallback deletion must not skip running CPU",
+	expect("uncertain tracked CPU must not escape confirmation",
 	       mk_instance_confirm_parked(&target), -EBUSY);
-	expect("running CPU probed on both slots", running_probes, 2);
-	expect("fallback clears only confirmed host CPU",
-	       mk_cpu_set_contains(target.cpus_on_slot, test_cpu), 0);
+	expect("running CPU probed only on recorded slot", running_probes, 1);
+	expect("failed tracked CPU never cleared by fallback",
+	       mk_cpu_set_contains(target.cpus_on_slot, test_cpu), 1);
 	expect("running CPU remains tracked",
 	       mk_cpu_set_contains(target.cpus_on_slot, 7), 1);
 	expect("host confirmation does not return ownership",
@@ -487,10 +497,11 @@ int main(void)
 	assert(!mk_cpu_set_add(target.cpus_on_slot, test_cpu));
 	assert(!mk_cpu_set_add(target.cpus_on_slot, test_cpu + 1));
 	confirm_mode = true;
-	expect("all host-slot fallbacks can remove tracking",
-	       mk_instance_confirm_parked(&target), 0);
-	expect("all confirmed host CPUs were visited", target.cpus_on_slot->nr, 0);
-	expect("host confirmation retains both owners", target.cpus->nr, 2);
+	expect("failed recorded-slot confirmations do not fall back",
+	       mk_instance_confirm_parked(&target), -EBUSY);
+	expect("failed tracked CPUs stay tracked", target.cpus_on_slot->nr, 2);
+	expect("failed confirmation retains both owners", target.cpus->nr, 2);
+	mk_cpu_set_clear(target.cpus_on_slot);
 	expect("assigned CPUs confirm despite empty tracking",
 	       mk_instance_confirm_parked(&target), 0);
 
@@ -500,7 +511,7 @@ int main(void)
 	confirm_mode = true;
 	expect("untracked assigned CPU must not escape confirmation",
 	       mk_instance_confirm_parked(&target), -EBUSY);
-	expect("untracked running CPU probed", running_probes, 2);
+	expect("untracked running CPU probed only on selected slot", running_probes, 1);
 	expect("untracked running CPU retains ownership", mk_cpu_set_contains(target.cpus, 7), 1);
 
 	reset();

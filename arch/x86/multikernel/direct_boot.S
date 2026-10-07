@@ -322,7 +322,7 @@ SYM_CODE_START_LOCAL_NOALIGN(mk_park_identity)
 
 .Lpark_wait:
 	movl	MK_CTX_ready(%r12), %eax
-	cmpl	$1, %eax
+	cmpl	$MK_SLOT_PENDING, %eax
 	je	.Lpark_pending
 
 	testq	%r15, %r15
@@ -334,7 +334,7 @@ SYM_CODE_START_LOCAL_NOALIGN(mk_park_identity)
 	xorl	%edx, %edx
 	monitor
 	movl	MK_CTX_ready(%r12), %eax
-	cmpl	$1, %eax
+	cmpl	$MK_SLOT_PENDING, %eax
 	je	.Lpark_pending
 	xorl	%eax, %eax
 	xorl	%ecx, %ecx
@@ -346,17 +346,24 @@ SYM_CODE_START_LOCAL_NOALIGN(mk_park_identity)
 	jmp	.Lpark_wait
 
 .Lpark_pending:
-	/* Wakeup published; is it for us? */
+	/* Advisory filter only; recheck after claiming the current publication. */
 	movl	MK_CTX_target_apic_id(%r12), %eax
 	cmpl	%r13d, %eax
 	jne	.Lpark_relax
 
 	/*
-	 * Copy the publication into registers BEFORE claiming: once the
-	 * claim clears ready, the publisher may reuse the slot for the
-	 * next CPU. The claim (lock cmpxchg) makes exactly one of
-	 * waker-revoke and us win; on loss the staged values are dropped.
+	 * Claim before authoritative reads. A reader delayed across slot reuse
+	 * can claim a newer publication, but then must re-read its target and
+	 * every dispatch field. BUSY prevents writes while registers are staged.
 	 */
+	movl	$MK_SLOT_PENDING, %eax
+	movl	$MK_SLOT_BUSY, %ebp
+	lock cmpxchgl %ebp, MK_CTX_ready(%r12)
+	jnz	.Lpark_wait
+	movl	MK_CTX_target_apic_id(%r12), %eax
+	cmpl	%r13d, %eax
+	jne	.Lpark_wrong_target
+
 	movl	MK_CTX_flags(%r12), %r11d
 	testl	$MK_SPAWN_F_REPARK, %r11d
 	jnz	.Lpark_repark
@@ -375,8 +382,8 @@ SYM_CODE_START_LOCAL_NOALIGN(mk_park_identity)
 	addq	$MK_CTX_bp, %rsi
 	movq	MK_CTX_kernel_entry(%r12), %rdx
 	movq	MK_CTX_trampoline_phys(%r12), %r8
-	movl	$1, %eax
-	xorl	%ebp, %ebp
+	movl	$MK_SLOT_BUSY, %eax
+	movl	$MK_SLOT_ACK, %ebp
 	lock cmpxchgl %ebp, MK_CTX_ready(%r12)
 	jnz	.Lpark_wait
 	movq	%r8, %rcx
@@ -395,8 +402,8 @@ SYM_CODE_START_LOCAL_NOALIGN(mk_park_identity)
 	movq	MK_CTX_stack(%r12), %rcx
 	movq	MK_CTX_secondary_trampoline_phys(%r12), %r8
 	movq	MK_CTX_spawn_cr3(%r12), %r9
-	movl	$1, %eax
-	xorl	%ebp, %ebp
+	movl	$MK_SLOT_BUSY, %eax
+	movl	$MK_SLOT_ACK, %ebp
 	lock cmpxchgl %ebp, MK_CTX_ready(%r12)
 	jnz	.Lpark_wait
 	ANNOTATE_RETPOLINE_SAFE
@@ -414,15 +421,15 @@ SYM_CODE_START_LOCAL_NOALIGN(mk_park_identity)
 	 * The repark_* dispatch fields are separate from the park_phys/
 	 * park_cr3/self_phys anchor so that publishing a repark on a live
 	 * instance context never corrupts the context's own park identity.
-	 * Clearing ready below proves only claim. Before retiring this page or
+	 * ACK below proves only staged dispatch. Before retiring this page or
 	 * its page table the publisher must obtain a second claim from the
 	 * destination loop, which cannot run until the jump below completes.
 	 */
 	movq	MK_CTX_repark_park_cr3(%r12), %r14
 	movq	MK_CTX_repark_park_phys(%r12), %rcx
 	movq	MK_CTX_repark_slot_phys(%r12), %r10
-	movl	$1, %eax
-	xorl	%ebp, %ebp
+	movl	$MK_SLOT_BUSY, %eax
+	movl	$MK_SLOT_ACK, %ebp
 	lock cmpxchgl %ebp, MK_CTX_ready(%r12)
 	jnz	.Lpark_wait
 	movq	%r10, %r12
@@ -433,6 +440,13 @@ SYM_CODE_START_LOCAL_NOALIGN(mk_park_identity)
 	addq	$mk_park_identity - mk_pool_park, %rcx
 	ANNOTATE_RETPOLINE_SAFE
 	jmp	*%rcx
+
+.Lpark_wrong_target:
+	/* A newer request belongs to another CPU; never undo quarantine. */
+	movl	$MK_SLOT_BUSY, %eax
+	movl	$MK_SLOT_PENDING, %ebp
+	lock cmpxchgl %ebp, MK_CTX_ready(%r12)
+	jmp	.Lpark_wait
 SYM_CODE_END(mk_park_identity)
 
 /*
