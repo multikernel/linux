@@ -1536,19 +1536,52 @@ EXPORT_SYMBOL_GPL(remove_cpu);
  *
  * Like remove_cpu(), but the takedown ends in CPUHP_DEPARTED instead
  * of CPUHP_OFFLINE: the CPU is handed to another kernel and is not
- * expected back. It stays departed until a later add_cpu() brings it
- * up; a bringup that fails rolls it back to departed.
+ * expected back. On success it is also absent, so native hotplug cannot
+ * bring it back before the owning kernel explicitly restores presence.
+ * A bringup that fails rolls it back to departed.
  *
  * Return: %0 on success or a negative errno code
  */
 int depart_cpu(unsigned int cpu)
 {
+	struct cpuhp_cpu_state *st;
 	int ret;
 
 	lock_device_hotplug();
-	ret = cpu_down(cpu, CPUHP_DEPARTED);
-	if (!ret)
-		cpuhp_offline_cpu_device(cpu);
+	cpu_maps_update_begin();
+
+	ret = -EINVAL;
+	if (!cpu || cpu >= nr_cpu_ids || !cpu_possible(cpu) ||
+	    !cpu_present(cpu) || !cpu_online(cpu))
+		goto out;
+	if (!get_cpu_device(cpu)) {
+		ret = -ENODEV;
+		goto out;
+	}
+	st = per_cpu_ptr(&cpuhp_state, cpu);
+	if (st->state != CPUHP_ONLINE)
+		goto out;
+
+	/*
+	 * Keep native CPU-map serialization across both teardown and presence
+	 * withdrawal. The device-hotplug lock alone does not exclude in-kernel
+	 * CPU bringup, including SMT changes. _cpu_down() takes the CPU write
+	 * lock itself; do not hold it across the teardown callbacks.
+	 */
+	ret = cpu_down_maps_locked(cpu, CPUHP_DEPARTED);
+	if (ret)
+		goto out;
+	if (WARN_ON_ONCE(st->state != CPUHP_DEPARTED || cpu_online(cpu))) {
+		ret = -EIO;
+		goto out;
+	}
+
+	cpus_write_lock();
+	set_cpu_present(cpu, false);
+	cpus_write_unlock();
+	cpuhp_offline_cpu_device(cpu);
+out:
+	cpu_maps_update_done();
 	unlock_device_hotplug();
 
 	return ret;
@@ -2106,6 +2139,7 @@ static struct cpuhp_step cpuhp_hp_states[] = {
 		.name			= "departed",
 		.startup.single		= NULL,
 		.teardown.single	= NULL,
+		.cant_stop		= true,
 	},
 #ifdef CONFIG_SMP
 	[CPUHP_CREATE_THREADS]= {
