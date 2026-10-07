@@ -1,0 +1,97 @@
+.. SPDX-License-Identifier: GPL-2.0-only
+
+x86 mailbox ownership and quarantine
+====================================
+
+Run these host-side checks from the worktree:
+
+  bash tools/testing/selftests/multikernel/mailbox_test.sh
+  bash tools/testing/selftests/multikernel/mailbox_lifetime_test.sh
+  bash tools/testing/selftests/multikernel/mailbox_reader_test.sh
+  bash tools/testing/selftests/multikernel/pool_return_test.sh
+
+The reader test requires x86-64 userspace and returns kselftest skip status 4
+on other architectures. C checks also support CC=clang and sanitizer CFLAGS.
+
+Protocol
+--------
+
+The existing 32-bit ready field carries these states, without moving fields:
+
+  IDLE -> BUSY (publisher reservation) -> PENDING
+       -> BUSY (reader claim) -> ACK -> IDLE (publisher consumption)
+
+Every writer reserves the slot before changing dispatch fields. Cross-kernel
+writers use this atomic reservation in addition to local park_lock ordering.
+The reader's initial APIC comparison is only a filter: after PENDING -> BUSY
+succeeds it re-reads the target and all dispatch data. A wrong-target reader
+returns BUSY -> PENDING with compare/exchange. It cannot undo quarantine.
+
+The reader stages all dispatch registers before BUSY -> ACK. It jumps only
+if that compare/exchange succeeds. A publisher may reuse the dispatch fields
+after consuming ACK, because no successful reader loads them afterward.
+Atomic compare/exchange orders preceding stores before PENDING publication.
+
+ACK is not proof that a CPU has left its old park code or page table. A repark
+to another context still requires an independent self-repark acknowledgment
+from the destination before old-context tracking can be removed.
+
+The bounded wait is one second. After its final ACK-consumption attempt fails,
+the publisher exchanges the state to QUARANTINED. There is no retry loop racing
+wrong-target readers. A just-arrived ACK can lose this last race; the result is
+conservative retention, not a false success. A reader that already ACKed may
+still dispatch, so timeout never authorizes reclaiming its code or data.
+
+Fail-closed scope
+-----------------
+
+Timeout quarantines the selected slot, this kernel's own context and its local
+pool slot when present. A remote wake may still reference this kernel's
+trampoline or pool page tables; an empty free-CPU set does not prove those
+resources idle. This deliberately sacrifices further pool use after uncertainty.
+A spawn's own-context marker is also visible to its parent.
+
+No new writer reserves a quarantined slot. An already-reserved publisher can
+finish stores after a concurrent quarantine, but its final compare/exchange
+cannot republish or reset the marker. Resources remain pinned regardless.
+Setup, spawn, confirmation, repark and pool teardown reject non-idle slots.
+Instance teardown checks the context even if CPU tracking is empty.
+Pool retirement also requires locally owned CPUs to be online: CPUHP may fail
+after the mailbox ACK while the CPU still references pool code. This check
+also conservatively blocks retirement for ordinary offline local CPUs until
+they are onlined. It does not take CPUHP locks under the park lock; resource
+serialization excludes new donations, and ordinary native offlining does not
+send CPUs into pool memory.
+Confirmation selects the recorded slot once; it does not retry on another
+slot after timeout or repair uncertain tracking by guessing a location.
+
+Recovery is a full host reboot. There is no sysfs reset, automatic retry,
+generation reset, or old-peer compatibility mode. CPUHP rollback, absence
+from a CPU set and a late shutdown ACK are not mailbox retirement proofs.
+
+Compatibility and landing
+-------------------------
+
+This changes shared protocol semantics, even though context offsets and size
+are unchanged. Host, spawn and nested kernels must all use the updated reader
+and writers. Different configurations are permitted only with compatible
+context layout and this same protocol; mixing old/new kernels is unsupported.
+The C writers, assembly reader and shared state definitions must land together.
+
+Evidence limits
+---------------
+
+mailbox_test extracts the actual writer/setup functions, using simulated poll
+outcomes. mailbox_lifetime_test executes real release/teardown paths against
+counted allocation boundaries, including empty tracking. mailbox_reader_test
+executes actual primary/secondary reader instructions in userspace, with a
+capture trampoline; it excludes CR3, descriptor setup, MONITOR/MWAIT and repark.
+pool_return_test checks the actual pool retirement predicate with retained
+offline or invalid local CPU ownership, despite empty free/child sets.
+Ownership and repark-arrival fixtures mock the mailbox primitive and cannot
+prove this protocol independently.
+
+These checks and object builds are not live lockdep, native halt, physical CPU
+retirement or end-to-end spawn qualification. Final-stack tests must use fresh
+VMs for quarantined failure cases, and verify retention rather than in-place
+recovery. Earlier v21 runtime results do not qualify this protocol change.

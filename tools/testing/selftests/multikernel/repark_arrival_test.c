@@ -50,6 +50,18 @@ static void mk_cpu_set_del(struct mk_cpu_set *set, mk_phys_cpu_t cpu)
 	assert(cpu == 17);
 	set->tracked = false;
 }
+
+/* Mailbox state ownership is tested separately by mailbox_test.sh. */
+static int mk_slot_begin(struct mk_spawn_context *slot)
+{
+	return slot ? 0 : -ENODEV;
+}
+
+static bool mk_slot_idle(struct mk_spawn_context *slot)
+{
+	(void)slot;
+	return true;
+}
 static int mk_slot_wake(struct mk_spawn_context *slot, u32 cpu, const char *what)
 {
 	(void)what;

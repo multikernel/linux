@@ -712,8 +712,8 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 /**
  * mk_pool_cpus_returned() - Is every pool CPU back in this kernel?
  *
- * True when the pool holds no free CPU and no instance owns one, so
- * nothing can be sitting in a park loop. Pool memory that parked CPUs
+ * True when the pool holds no free CPU, no child instance owns one, and
+ * locally owned CPUs are online. Pool memory that parked CPUs
  * execute from may only be freed once this holds. The answer is only as
  * good as the invariant that a CPU is recorded in the pool set or in an
  * instance's set before it parks, which is why the move paths reserve
@@ -722,10 +722,28 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 bool mk_pool_cpus_returned(void)
 {
 	struct mk_instance *instance;
+	mk_phys_cpu_t phys_cpu;
+	unsigned int i;
 	bool returned = true;
 
+	lockdep_assert_held(&mk_overlay_mutex);
 	if (mk_pool && !mk_cpu_set_empty(mk_pool->cpus))
 		return false;
+
+	/*
+	 * A failed CPUHP handback remains locally owned, even after mailbox ACK.
+	 * Ownership alone cannot prove it left the pool code and page tables.
+	 * Native offlining after an online observation stays in this kernel;
+	 * donation to the pool is excluded by the resource controller lock.
+	 */
+	if (!mk_self || !mk_self->cpus)
+		return false;
+	mk_cpu_set_for_each(i, phys_cpu, mk_self->cpus) {
+		int cpu = arch_cpu_from_physical_id(phys_cpu);
+
+		if (cpu < 0 || (unsigned int)cpu >= nr_cpu_ids || !cpu_online(cpu))
+			return false;
+	}
 
 	mutex_lock(&mk_instance_mutex);
 	list_for_each_entry(instance, &mk_instance_list, list) {

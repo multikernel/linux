@@ -26,6 +26,7 @@ struct mk_pool {
 	struct mk_cpu_set *cpus;
 	struct {
 		unsigned long slot_phys;
+		struct mk_spawn_context *slot;
 		struct mk_ident_pgtable *pgt;
 	} arch;
 	bool park_lock, cpus_lock;
@@ -144,6 +145,28 @@ static unsigned long per_cpu_offset(unsigned int cpu)
 		(p) = (v);                                              \
 		publishes++;                                            \
 	} while (0)
+
+/* Publication protocol itself is covered by mailbox_test.sh. */
+static int mk_slot_begin(struct mk_spawn_context *slot)
+{
+	if (slot->ready)
+		return -EBUSY;
+	slot->ready = 2;
+	return 0;
+}
+
+static bool mk_slot_idle(struct mk_spawn_context *slot)
+{
+	return !slot || !slot->ready;
+}
+
+static int mk_slot_wake(struct mk_spawn_context *slot, u32 cpu, const char *what)
+{
+	assert(slot->ready == 2 && slot->target_apic_id == cpu);
+	WRITE_ONCE(slot->ready, 1);
+	slot->ready = 0;
+	return 0;
+}
 #include "wake-production.h"
 
 static void expect(const char *name, bool passed)
@@ -170,6 +193,7 @@ static void reset(void)
 	park_map_error = 0;
 	pool.park_lock = false;
 	pool.arch.slot_phys = 0x9000;
+	pool.arch.slot = &local;
 	pool.arch.pgt = &park_pgt;
 	free_cpus.present = adopted_cpus.present = false;
 	mk_pool = &pool;
@@ -184,7 +208,7 @@ int main(void)
 		true; /* Local donation supersedes old parent tracking. */
 	ret = multikernel_wakeup_secondary_cpu_64(17, 0, 2);
 	expect("local free CPU wakes on local pool slot",
-	       !ret && local.ready == 1 && !own.ready && !adopted.ready);
+	       !ret && publishes == 1 && !local.ready && !own.ready && !adopted.ready);
 	expect("local mapping paired",
 	       maps == 1 && unmaps == 1 && mapped_phys == 0x9000);
 	expect("dispatch is child kernel, not park kernel",
@@ -207,15 +231,15 @@ int main(void)
 	adopted_cpus.present = true;
 	ret = multikernel_wakeup_secondary_cpu_64(17, 0, 2);
 	expect("adopted parent-slot path preserved",
-	       !ret && adopted.ready && !local.ready && maps == unmaps);
+	       !ret && publishes == 1 && !adopted.ready && !local.ready && maps == unmaps);
 	reset();
 	ret = multikernel_wakeup_secondary_cpu_64(17, 0, 2);
 	expect("ordinary secondary uses own context",
-	       !ret && own.ready && !maps && !unmaps);
+	       !ret && publishes == 1 && !own.ready && !maps && !unmaps);
 	reset();
 	mk_pool = NULL;
 	ret = multikernel_wakeup_secondary_cpu_64(17, 0, 2);
-	expect("initial secondary works before baseline", !ret && own.ready);
+	expect("initial secondary works before baseline", !ret && publishes == 1 && !own.ready);
 	reset();
 	free_cpus.present = true;
 	map_failure = true;
