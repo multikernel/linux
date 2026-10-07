@@ -45,11 +45,20 @@ static void change_cpu_under_node(struct cpu *cpu,
 	cpu->node_id = to_nid;
 }
 
-static int cpu_subsys_online(struct device *dev)
+/* Caller serializes the CPU device with device_hotplug_lock and device_lock. */
+void cpu_device_update_node(struct device *dev, int from_nid)
 {
 	struct cpu *cpu = container_of(dev, struct cpu, dev);
+	int to_nid = cpu_to_node(dev->id);
+
+	if (from_nid != to_nid)
+		change_cpu_under_node(cpu, from_nid, to_nid);
+}
+
+static int cpu_subsys_online(struct device *dev)
+{
 	int cpuid = dev->id;
-	int from_nid, to_nid;
+	int from_nid;
 	int ret;
 	int retries = 0;
 
@@ -79,9 +88,7 @@ retry:
 	 * When hot adding memory to memoryless node and enabling a cpu
 	 * on the node, node number of the cpu may internally change.
 	 */
-	to_nid = cpu_to_node(cpuid);
-	if (from_nid != to_nid)
-		change_cpu_under_node(cpu, from_nid, to_nid);
+	cpu_device_update_node(dev, from_nid);
 
 	return ret;
 }

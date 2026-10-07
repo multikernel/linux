@@ -176,14 +176,6 @@ struct mk_cpu_hotplug_work {
  * it belongs to the mk_send_cpu_* initiator paths of the kernel that
  * manages the pool.
  */
-static void mk_account_cpu_online(mk_phys_cpu_t cpu_id)
-{
-	if (mk_self->cpus && mk_cpu_set_add(mk_self->cpus, cpu_id))
-		pr_warn("Multikernel hotplug: Failed to track CPU %llu\n",
-			cpu_id);
-	mk_instance_ipi_retarget(mk_self);
-}
-
 static void mk_account_cpu_offline(mk_phys_cpu_t cpu_id)
 {
 	mk_cpu_set_del(mk_self->cpus, cpu_id);
@@ -211,10 +203,12 @@ static int mk_cpu_to_logical(mk_phys_cpu_t cpu_id)
 
 static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 {
+	bool owned, attempted = false;
 	int logical_cpu;
 	int ret;
 	struct mk_hotplug_op *op;
 
+	lockdep_assert_held(&mk_overlay_mutex);
 	pr_info("Multikernel hotplug: Adding CPU %llu (numa=%d, flags=0x%x)\n",
 		cpu_id, (int)numa_node, flags);
 
@@ -224,7 +218,7 @@ static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 		 * Not present: this pool CPU has never run here (or was
 		 * removed earlier). It was enumerated at boot from the host
 		 * tree's cpus list, so it has a logical slot in the possible
-		 * map; mark it present again before onlining.
+		 * map. reclaim_cpu() restores presence under native serialization.
 		 */
 		logical_cpu = arch_cpu_from_physical_id(cpu_id);
 		if (logical_cpu < 0) {
@@ -232,35 +226,37 @@ static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 			       cpu_id);
 			return -ENODEV;
 		}
-		set_cpu_present(logical_cpu, true);
 	}
 
-	if (cpu_online(logical_cpu)) {
-		pr_warn("Multikernel hotplug: CPU %d (phys %llu) already online\n",
-			logical_cpu, cpu_id);
-		mk_account_cpu_online(cpu_id);
-		return 0;
-	}
+	if (logical_cpu >= nr_cpu_ids || !cpu_possible(logical_cpu))
+		return -ENODEV;
+	if (!mk_self->cpus)
+		return -EINVAL;
+	owned = mk_cpu_set_contains(mk_self->cpus, cpu_id);
+	ret = mk_cpu_set_add(mk_self->cpus, cpu_id);
+	if (ret)
+		return ret;
 
+	/* Register absent enumerated CPUs before exposing them to native bringup. */
+	lock_device_hotplug();
 	if (!get_cpu_device(logical_cpu)) {
 		struct cpu *c = &per_cpu(cpu_devices, logical_cpu);
-		c->hotpluggable = true;
-		ret = register_cpu(c, logical_cpu);
-		if (ret) {
-			pr_err("Multikernel hotplug: Failed to register CPU %d: %d\n",
-			       logical_cpu, ret);
-			return ret;
-		}
-	}
 
-	ret = add_cpu(logical_cpu);
+		c->hotpluggable = true;
+		ret = cpu_present(logical_cpu) ? -ENODEV : register_cpu(c, logical_cpu);
+	}
+	unlock_device_hotplug();
+	if (ret)
+		goto failed;
+
+	ret = reclaim_cpu(logical_cpu, &attempted);
 	if (ret < 0) {
 		pr_err("Multikernel hotplug: Failed to add CPU %d (phys %llu): %d\n",
 		       logical_cpu, cpu_id, ret);
-		return ret;
+		goto failed;
 	}
 
-	mk_account_cpu_online(cpu_id);
+	mk_instance_ipi_retarget(mk_self);
 
 	/* Track the operation for potential rollback */
 	op = kzalloc(sizeof(*op), GFP_KERNEL);
@@ -278,6 +274,20 @@ static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 		logical_cpu, cpu_id);
 
 	return 0;
+failed:
+	if (!attempted) {
+		if (!owned)
+			mk_cpu_set_del(mk_self->cpus, cpu_id);
+	} else if (mk_pool) {
+		/*
+		 * Keep pool membership until after the wake callback: it selects
+		 * the local park slot. Once bringup was attempted, even a rolled
+		 * back CPU must not become assignable without independent proof.
+		 */
+		guard(mutex)(&mk_pool->cpus_lock);
+		mk_cpu_set_del(mk_pool->cpus, cpu_id);
+	}
+	return ret;
 }
 
 static int mk_do_cpu_remove(mk_phys_cpu_t cpu_id)

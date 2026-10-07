@@ -38,6 +38,10 @@ extern void trap_init(void);
 extern int register_cpu(struct cpu *cpu, int num);
 extern struct device *get_cpu_device(unsigned cpu);
 extern bool cpu_is_hotpluggable(unsigned cpu);
+#ifdef CONFIG_HOTPLUG_CPU
+int reclaim_cpu(unsigned int cpu, bool *attempted);
+void cpu_device_update_node(struct device *dev, int from_nid);
+#endif
 extern bool arch_match_cpu_phys_id(int cpu, u64 phys_id);
 extern bool arch_find_n_match_cpu_physical_id(struct device_node *cpun,
 					      int cpu, unsigned int *thread);
