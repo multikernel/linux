@@ -520,6 +520,7 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 		INIT_LIST_HEAD(&pool->chunks);
 		mutex_init(&pool->mem_lock);
 		mutex_init(&pool->park_lock);
+		mutex_init(&pool->cpus_lock);
 		mk_pool = pool;
 	}
 

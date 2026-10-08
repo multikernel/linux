@@ -596,10 +596,36 @@ static void kimage_free_cma(struct kimage *image)
  * its load-time buffers and its reference on the instance. Also unwinds a
  * load that failed before the image was published.
  */
+int kimage_can_free_multikernel(struct kimage *image)
+{
+#ifdef CONFIG_MULTIKERNEL
+	struct mk_instance *instance = image->mk_instance;
+
+	lockdep_assert_held(&mk_overlay_mutex);
+	/* An unpublished loader candidate has never released a CPU into its Image. */
+	if (!instance || instance->kimage != image)
+		return 0;
+	if (instance->state == MK_STATE_ACTIVE)
+		return -EBUSY;
+	return mk_instance_confirm_parked(instance);
+#else
+	return -EOPNOTSUPP;
+#endif
+}
+
 void kimage_free_multikernel(struct kimage *image)
 {
 	struct mk_instance *instance = image->mk_instance;
 	unsigned long i;
+
+#ifdef CONFIG_MULTIKERNEL
+	lockdep_assert_held(&mk_overlay_mutex);
+#endif
+	/* Published Images reach here only after kimage_free() validated stop. */
+	if (!instance)
+		return;
+	if (instance->kimage == image)
+		mk_instance_ipi_deactivate(instance);
 
 	for (i = 0; i < image->nr_segments; i++)
 		mk_kimage_free(image, phys_to_virt(image->segment[i].mem),
@@ -610,7 +636,6 @@ void kimage_free_multikernel(struct kimage *image)
 
 	if (instance->kimage == image) {
 		/* No kernel left to read the ring */
-		instance->ipi_data = NULL;
 		instance->kimage = NULL;
 		mk_instance_set_state(instance, MK_STATE_READY);
 	}
@@ -618,13 +643,20 @@ void kimage_free_multikernel(struct kimage *image)
 	image->mk_instance = NULL;
 }
 
-void kimage_free(struct kimage *image)
+int kimage_free(struct kimage *image)
 {
 	kimage_entry_t *ptr, entry;
 	kimage_entry_t ind = 0;
+	int ret;
 
 	if (!image)
-		return;
+		return 0;
+	/* All free paths, including future bulk callers, must fail before unlink. */
+	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
+		ret = kimage_can_free_multikernel(image);
+		if (ret)
+			return ret;
+	}
 
 	/* Remove from linked list and update compatibility pointers */
 	kimage_remove_from_list(image);
@@ -681,6 +713,7 @@ void kimage_free(struct kimage *image)
 	}
 
 	kfree(image);
+	return 0;
 }
 
 static kimage_entry_t *kimage_dst_used(struct kimage *image,
@@ -1645,6 +1678,9 @@ struct kimage *kimage_find_by_id(int mk_id)
 	struct mk_instance *instance;
 	struct kimage *image = NULL;
 
+	/* The caller keeps the image alive through its complete operation. */
+	lockdep_assert_held(&mk_overlay_mutex);
+
 	if (mk_id <= 0)
 		return NULL;
 
@@ -1668,6 +1704,8 @@ int multikernel_kexec_by_id(int mk_id)
 	if (!kexec_trylock())
 		return -EBUSY;
 
+	mutex_lock(&mk_overlay_mutex);
+
 	mk_image = kimage_find_by_id(mk_id);
 	if (!mk_image) {
 		pr_err("No multikernel image found with ID %d\n", mk_id);
@@ -1676,6 +1714,12 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	instance = mk_image->mk_instance;
+	/* Execution must not bypass halt settlement, even if CPUs look parked. */
+	if (instance->state == MK_STATE_ACTIVE) {
+		rc = -EBUSY;
+		goto unlock;
+	}
+
 	if (!mk_cpu_set_empty(instance->cpus)) {
 		mk_phys_cpu_t phys_cpu = mk_cpu_set_first(instance->cpus);
 
@@ -1730,10 +1774,11 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	rc = mk_manifest_finalize(mk_image);
-	if (rc)
-		pr_warn("Manifest finalization failed: %d\n", rc);
-	else
-		pr_info("Manifest finalized for multikernel instance\n");
+	if (rc) {
+		pr_err("Manifest finalization failed: %d; refusing start\n", rc);
+		goto unlock;
+	}
+	pr_info("Manifest finalized for multikernel instance\n");
 
 	/*
 	 * Start the instance with an empty ring. It outlives the kernel
@@ -1743,25 +1788,23 @@ int multikernel_kexec_by_id(int mk_id)
 	 * filling this one". Anything left in there was addressed to a
 	 * kernel that is gone.
 	 */
-	if (instance->ipi_data)
-		memset(instance->ipi_data, 0, sizeof(*instance->ipi_data));
+	mk_instance_ipi_reset(instance);
 
 	/*
-	 * Same for the other direction: whatever the halted instance left
-	 * queued for us is addressed from a kernel that no longer exists,
-	 * and a slot it claimed but never published stalls our ring for
-	 * good.
+	 * Do not reset the host receive ring here. It is shared with live
+	 * peers and its IRQ consumer; confirming this instance stopped does
+	 * not quiesce either. A stalled unpublished slot needs a separate
+	 * ownership/quiescence protocol, not a cached-head tail rewind.
 	 */
-	mk_ipi_ring_drop_pending();
 
+	/* A failed start may already have released some CPUs into this Image. */
+	mk_instance_set_state(instance, MK_STATE_ACTIVE);
 	rc = mk_arch_spawn_instance(mk_image, instance, cpu);
-	if (rc == 0) {
-		rc = mk_instance_set_kexec_active(mk_image->mk_id);
-		if (rc)
-			pr_warn("Failed to set instance %d as active: %d\n", mk_image->mk_id, rc);
-	}
+	if (rc)
+		mk_instance_set_state(instance, MK_STATE_FAILED);
 
 unlock:
+	mutex_unlock(&mk_overlay_mutex);
 	kexec_unlock();
 	return rc;
 }

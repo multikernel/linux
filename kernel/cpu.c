@@ -1536,19 +1536,52 @@ EXPORT_SYMBOL_GPL(remove_cpu);
  *
  * Like remove_cpu(), but the takedown ends in CPUHP_DEPARTED instead
  * of CPUHP_OFFLINE: the CPU is handed to another kernel and is not
- * expected back. It stays departed until a later add_cpu() brings it
- * up; a bringup that fails rolls it back to departed.
+ * expected back. On success it is also absent, so native hotplug cannot
+ * bring it back before the owning kernel explicitly restores presence.
+ * A bringup that fails rolls it back to departed.
  *
  * Return: %0 on success or a negative errno code
  */
 int depart_cpu(unsigned int cpu)
 {
+	struct cpuhp_cpu_state *st;
 	int ret;
 
 	lock_device_hotplug();
-	ret = cpu_down(cpu, CPUHP_DEPARTED);
-	if (!ret)
-		cpuhp_offline_cpu_device(cpu);
+	cpu_maps_update_begin();
+
+	ret = -EINVAL;
+	if (!cpu || cpu >= nr_cpu_ids || !cpu_possible(cpu) ||
+	    !cpu_present(cpu) || !cpu_online(cpu))
+		goto out;
+	if (!get_cpu_device(cpu)) {
+		ret = -ENODEV;
+		goto out;
+	}
+	st = per_cpu_ptr(&cpuhp_state, cpu);
+	if (st->state != CPUHP_ONLINE)
+		goto out;
+
+	/*
+	 * Keep native CPU-map serialization across both teardown and presence
+	 * withdrawal. The device-hotplug lock alone does not exclude in-kernel
+	 * CPU bringup, including SMT changes. _cpu_down() takes the CPU write
+	 * lock itself; do not hold it across the teardown callbacks.
+	 */
+	ret = cpu_down_maps_locked(cpu, CPUHP_DEPARTED);
+	if (ret)
+		goto out;
+	if (WARN_ON_ONCE(st->state != CPUHP_DEPARTED || cpu_online(cpu))) {
+		ret = -EIO;
+		goto out;
+	}
+
+	cpus_write_lock();
+	set_cpu_present(cpu, false);
+	cpus_write_unlock();
+	cpuhp_offline_cpu_device(cpu);
+out:
+	cpu_maps_update_done();
 	unlock_device_hotplug();
 
 	return ret;
@@ -1788,6 +1821,95 @@ int add_cpu(unsigned int cpu)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(add_cpu);
+
+#ifdef CONFIG_HOTPLUG_CPU
+static void cpuhp_online_cpu_device(unsigned int cpu);
+
+/**
+ * reclaim_cpu - Bring a CPU into this kernel with serialized presence changes
+ * @cpu: Logical CPU already enumerated and registered in this kernel
+ * @attempted: Set if native bringup was entered, including failed attempts
+ *
+ * The caller must reserve ownership before calling. A failed attempt does not
+ * prove physical quiescence: retain that ownership even if CPUHP rolled back.
+ * Presence is restored on failure only when the CPU is offline; an incomplete
+ * rollback must not make an online CPU absent. Ordinary add_cpu() is unchanged.
+ *
+ * Return: %0 on success or a negative errno code. No automatic retry.
+ */
+int reclaim_cpu(unsigned int cpu, bool *attempted)
+{
+	struct cpuhp_cpu_state *st;
+	struct device *dev;
+	bool was_present;
+	int from_nid, ret;
+
+	*attempted = false;
+	if (cpu >= nr_cpu_ids || !cpu_possible(cpu))
+		return -EINVAL;
+
+	lock_device_hotplug();
+	dev = get_cpu_device(cpu);
+	if (!dev) {
+		ret = -ENODEV;
+		goto out_hotplug;
+	}
+	device_lock(dev);
+	from_nid = cpu_to_node(cpu);
+	if (from_nid == NUMA_NO_NODE) {
+		ret = -ENODEV;
+		goto out_device;
+	}
+	ret = try_online_node(from_nid);
+	if (ret)
+		goto out_node;
+
+	cpu_maps_update_begin();
+	st = per_cpu_ptr(&cpuhp_state, cpu);
+	was_present = cpu_present(cpu);
+	ret = -EINVAL;
+	if (cpu_online(cpu)) {
+		if (was_present && st->state == CPUHP_ONLINE)
+			ret = 0;
+		goto out_maps;
+	}
+	if (st->state != CPUHP_OFFLINE && st->state != CPUHP_DEPARTED)
+		goto out_maps;
+	ret = -EBUSY;
+	if (cpu_hotplug_disabled)
+		goto out_maps;
+	ret = -EPERM;
+	if (!cpu_bootable(cpu))
+		goto out_maps;
+
+	if (!was_present) {
+		cpus_write_lock();
+		set_cpu_present(cpu, true);
+		cpus_write_unlock();
+	}
+	*attempted = true;
+	ret = _cpu_up(cpu, 0, CPUHP_ONLINE);
+	if (!ret && WARN_ON_ONCE(!cpu_online(cpu) || st->state != CPUHP_ONLINE))
+		ret = -EIO;
+	if (ret && !was_present && !cpu_online(cpu)) {
+		cpus_write_lock();
+		set_cpu_present(cpu, false);
+		cpus_write_unlock();
+	}
+out_maps:
+	if (!ret && dev->offline)
+		cpuhp_online_cpu_device(cpu);
+	cpu_maps_update_done();
+out_node:
+	/* As in cpu_subsys_online(), update NUMA links outside the maps lock. */
+	cpu_device_update_node(dev, from_nid);
+out_device:
+	device_unlock(dev);
+out_hotplug:
+	unlock_device_hotplug();
+	return ret;
+}
+#endif /* CONFIG_HOTPLUG_CPU */
 
 /**
  * bringup_hibernate_cpu - Bring up the CPU that we hibernated on
@@ -2106,6 +2228,7 @@ static struct cpuhp_step cpuhp_hp_states[] = {
 		.name			= "departed",
 		.startup.single		= NULL,
 		.teardown.single	= NULL,
+		.cant_stop		= true,
 	},
 #ifdef CONFIG_SMP
 	[CPUHP_CREATE_THREADS]= {
@@ -2692,8 +2815,7 @@ void __cpuhp_remove_state(enum cpuhp_state state, bool invoke)
 }
 EXPORT_SYMBOL(__cpuhp_remove_state);
 
-#ifdef CONFIG_HOTPLUG_SMT
-
+#if defined(CONFIG_HOTPLUG_SMT) || defined(CONFIG_HOTPLUG_CPU)
 static void cpuhp_online_cpu_device(unsigned int cpu)
 {
 	struct device *dev = get_cpu_device(cpu);
@@ -2702,7 +2824,9 @@ static void cpuhp_online_cpu_device(unsigned int cpu)
 	/* Tell user space about the state change */
 	kobject_uevent(&dev->kobj, KOBJ_ONLINE);
 }
+#endif
 
+#ifdef CONFIG_HOTPLUG_SMT
 int cpuhp_smt_disable(enum cpuhp_smt_control ctrlval)
 {
 	int cpu, ret = 0;

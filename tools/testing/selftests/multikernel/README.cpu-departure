@@ -1,0 +1,43 @@
+.. SPDX-License-Identifier: GPL-2.0-only
+
+CPU departure transaction checks
+===============================
+
+Run from a source checkout:
+
+  bash tools/testing/selftests/multikernel/cpu_departure_test.sh
+
+The harness compiles the checkout's depart_cpu(), cpu_down(), target_store(),
+CPUHP_DEPARTED step, physical-to-logical lookup and mk_do_cpu_remove(). Native
+teardown, device notification and locks are test doubles. No live CPU, sysfs
+control or kernel failure injection is used.
+
+The contract is that successful departure leaves the CPU offline, departed and
+absent before native hotplug serialization ends. Only then can the caller update
+ownership. A CPU that was ordinarily offlined cannot be treated as donated:
+its physical stop path differs from departure into the multikernel park area.
+
+Checks cover:
+
+* Continuous device-hotplug and CPU-map exclusion through withdrawal and device
+  bookkeeping, without recursively taking the CPU write lock around teardown.
+* Successful departure, CPU zero, absent/impossible/out-of-range CPUs, missing
+  devices, ordinary offline and intermediate CPUHP states.
+* Native teardown error propagation and rejection of a bad success postcondition.
+* Native state-control rejection of DEPARTED, with ordinary offline/online targets
+  still routed through their normal entry points.
+* Shared multikernel removal accounting on success, offline rejection and error.
+
+The fake native teardown returns EBUSY, EOPNOTSUPP and EIO unchanged; this checks
+propagation, not the native last-CPU, hotplug-disable or callback implementations.
+The optional hotplug operation-log allocation fails in this harness; operation
+logging is not ownership rollback and is not the property under test.
+
+Limits
+------
+
+These are userspace control-flow and lock-contract checks, not scheduler,
+lockdep, architecture park-loop or physical quiescence evidence. Live x86
+lockdep and final-stack x86/RISC-V validation remain separate gates. CPU
+handback and mailbox quarantine are separate changes: this check does not
+qualify either of them.

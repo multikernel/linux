@@ -132,7 +132,11 @@ static int root_device_tree_seq_show(struct seq_file *sf, void *v)
 	size_t dtb_size = 0;
 	int ret;
 
+	/* Teardown holds the resource lock while draining kernfs callbacks. */
+	if (!mutex_trylock(&mk_overlay_mutex))
+		return -EAGAIN;
 	ret = mk_dt_generate_instance_dtb(mk_self, &dtb_data, &dtb_size);
+	mutex_unlock(&mk_overlay_mutex);
 	if (ret) {
 		pr_err("Failed to generate baseline DTB: %d\n", ret);
 		return ret;
@@ -153,7 +157,11 @@ static ssize_t instance_device_tree_read(struct kernfs_open_file *of,
 	size_t to_read;
 	int ret;
 
+	/* Never wait on a controller that may be draining this callback. */
+	if (!mutex_trylock(&mk_overlay_mutex))
+		return -EAGAIN;
 	ret = mk_dt_generate_instance_dtb(instance, &dtb_data, &dtb_size);
+	mutex_unlock(&mk_overlay_mutex);
 	if (ret) {
 		pr_err("Instance '%s': Failed to generate device tree: %d\n",
 		       instance->name, ret);
@@ -277,9 +285,9 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 	}
 
 	if (id < 0)
-		allocated_id = idr_alloc(&mk_instance_idr, instance, 1, INT_MAX, GFP_KERNEL);
+		allocated_id = mk_instance_idr_add(instance, 1, INT_MAX);
 	else
-		allocated_id = idr_alloc(&mk_instance_idr, instance, id, id + 1, GFP_KERNEL);
+		allocated_id = mk_instance_idr_add(instance, id, id + 1);
 
 	if (allocated_id < 0) {
 		pr_err("Failed to register instance '%s' in IDR: %d\n", name, allocated_id);
@@ -310,15 +318,20 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 	return 0;
 
 err_free_resources:
-	mk_instance_free_memory(instance);
 err_free_idr:
-	idr_remove(&mk_instance_idr, instance->id);
+	mk_instance_idr_remove(instance->id);
 err_remove_dir:
+	/* Inactive files still must not be drained under the registry mutex. */
+	mutex_unlock(&mk_instance_mutex);
 	kernfs_remove(kn);
+	instance->kn = NULL;
+	mk_instance_free_memory(instance);
 	mk_instance_put(instance);
+	mutex_lock(&mk_instance_mutex);
 err_free_config:
 	mk_dt_config_free(&config);
-	mk_instance_free(instance);
+	/* A lookup may already have pinned the early IDR publication. */
+	mk_instance_put(instance);
 	return ret;
 }
 
@@ -401,39 +414,51 @@ static int mk_kernfs_rmdir(struct kernfs_node *kn)
  * (CPUs, memory, PCI devices) are automatically returned to the root
  * instance pool, making them available for future instance allocations.
  *
- * Caller must hold mk_instance_mutex.
+ * Caller must hold mk_overlay_mutex and mk_instance_mutex. The registry mutex
+ * is temporarily dropped for stop/repark confirmation and kernfs draining,
+ * then restored before return. Resources are returned before this call exits;
+ * outstanding lookup references defer only the record/boot-page lifetime.
  *
  * Returns 0 on success, negative error code on failure.
  */
 int mk_instance_destroy(struct mk_instance *instance)
 {
+	int ret;
+
 	lockdep_assert_held(&mk_instance_mutex);
+	lockdep_assert_held(&mk_overlay_mutex);
 
 	if (!instance) {
 		pr_err("NULL instance passed to mk_instance_destroy\n");
 		return -EINVAL;
 	}
 
-	if (instance->state == MK_STATE_ACTIVE) {
-		pr_err("Cannot remove active instance '%s' (ID: %d). Instance must be stopped first.\n",
+	if (instance->state != MK_STATE_READY || instance->kimage) {
+		pr_err("Cannot remove instance '%s' (ID: %d) before confirmed stop and unload.\n",
 		       instance->name, instance->id);
 		return -EBUSY;
 	}
 
-	if (instance->state == MK_STATE_LOADED) {
-		pr_err("Cannot remove instance '%s' (ID: %d) with loaded kernel. Unload it first.\n",
-		       instance->name, instance->id);
-		return -EBUSY;
-	}
+	/* The resource mutex pins membership while firmware may sleep. */
+	mutex_unlock(&mk_instance_mutex);
+	ret = mk_instance_prepare_destroy(instance);
+	mutex_lock(&mk_instance_mutex);
+	if (ret)
+		return ret;
 
 	list_del(&instance->list);
-	idr_remove(&mk_instance_idr, instance->id);
+	mk_instance_idr_remove(instance->id);
+	mutex_unlock(&mk_instance_mutex);
+
 	if (instance->kn) {
 		kernfs_remove(instance->kn);
 		instance->kn = NULL;
 		mk_instance_put(instance);
 	}
+	/* Permit later fragments of this same overlay to reuse its resources. */
+	mk_instance_retire_resources(instance);
 	mk_instance_put(instance);
+	mutex_lock(&mk_instance_mutex);
 
 	return 0;
 }
@@ -599,16 +624,30 @@ void mk_kernfs_cleanup(void)
 	struct mk_instance *instance, *tmp;
 
 	/* Remove all instances */
+	mutex_lock(&mk_overlay_mutex);
 	mutex_lock(&mk_instance_mutex);
+	list_for_each_entry(instance, &mk_instance_list, list) {
+		/* No inbox/IRQ retirement contract exists for boot records here. */
+		if (instance == mk_self || instance == host_instance ||
+		    instance->state != MK_STATE_READY || instance->kimage) {
+			pr_err("Bulk kernfs cleanup refused: instance %d is still live\n",
+			       instance->id);
+			mutex_unlock(&mk_instance_mutex);
+			mutex_unlock(&mk_overlay_mutex);
+			return;
+		}
+	}
 	list_for_each_entry_safe(instance, tmp, &mk_instance_list, list) {
-		list_del(&instance->list);
-		idr_remove(&mk_instance_idr, instance->id);
-		mk_instance_put(instance);
+		if (mk_instance_destroy(instance)) {
+			mutex_unlock(&mk_instance_mutex);
+			mutex_unlock(&mk_overlay_mutex);
+			return;
+		}
 	}
 	mutex_unlock(&mk_instance_mutex);
+	mutex_unlock(&mk_overlay_mutex);
 
-	/* Clean up IDR */
-	idr_destroy(&mk_instance_idr);
+	/* The remaining initialized IDR is also safe for RCU lookups. */
 
 	/* Remove sysfs mount point */
 	sysfs_remove_mount_point(fs_kobj, "multikernel");

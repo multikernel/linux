@@ -36,6 +36,8 @@
 #include <linux/percpu.h>
 #include <linux/set_memory.h>
 #include <linux/sched.h>
+#include <linux/panic.h>
+#include <linux/syscore_ops.h>
 
 #include <asm/apic.h>
 #include <asm/page.h>
@@ -137,13 +139,51 @@ struct boot_params *mk_spawn_context_boot_params(struct mk_spawn_context *ctx)
 	return &ctx->bp;
 }
 
-void mk_set_spawn_context(struct mk_spawn_context *ctx,
-			  unsigned long identity_cr3,
-			  unsigned long kernel_entry,
-			  unsigned long trampoline_virt,
-			  unsigned long trampoline_phys,
-			  unsigned long park_phys)
+/* Cross-kernel writers cannot rely on this kernel's park_lock alone. */
+static void mk_slot_quarantine(struct mk_spawn_context *slot)
 {
+	struct mk_spawn_context *own = mk_own_context();
+
+	xchg(&slot->ready, MK_SLOT_QUARANTINED);
+	/* A failed wake can still reference our trampoline and pool page tables. */
+	if (own)
+		xchg(&own->ready, MK_SLOT_QUARANTINED);
+	if (mk_pool && mk_pool->arch.slot)
+		xchg(&mk_pool->arch.slot->ready, MK_SLOT_QUARANTINED);
+}
+
+static int mk_slot_begin(struct mk_spawn_context *slot)
+{
+	u32 state;
+
+	if (!slot)
+		return -ENODEV;
+	state = cmpxchg(&slot->ready, MK_SLOT_IDLE, MK_SLOT_BUSY);
+	if (state == MK_SLOT_IDLE)
+		return 0;
+	if (state == MK_SLOT_QUARANTINED) {
+		mk_slot_quarantine(slot);
+		return -EIO;
+	}
+	return -EBUSY;
+}
+
+static bool mk_slot_idle(struct mk_spawn_context *slot)
+{
+	return !slot || READ_ONCE(slot->ready) == MK_SLOT_IDLE;
+}
+
+int mk_set_spawn_context(struct mk_spawn_context *ctx,
+			 unsigned long identity_cr3,
+			 unsigned long kernel_entry,
+			 unsigned long trampoline_virt,
+			 unsigned long trampoline_phys,
+			 unsigned long park_phys)
+{
+	int ret = mk_slot_begin(ctx);
+
+	if (ret)
+		return ret;
 	ctx->identity_cr3 = identity_cr3;
 	ctx->kernel_entry = kernel_entry;
 	ctx->trampoline_virt = trampoline_virt;
@@ -160,15 +200,16 @@ void mk_set_spawn_context(struct mk_spawn_context *ctx,
 	ctx->gs_base = 0;
 	ctx->stack = 0;
 	ctx->flags = 0;
-	ctx->ready = 0;
+	return cmpxchg(&ctx->ready, MK_SLOT_BUSY, MK_SLOT_IDLE) == MK_SLOT_BUSY ? 0 : -EIO;
 }
 
 /*
  * Publish a wakeup in @slot for the CPU with @apic_id and wait for the
- * parked CPU to claim it. The dispatch fields must be set before the
- * call; parked CPUs stage them in registers before claiming, so once the
- * claim is observed the slot may be reused. On timeout the publication
- * is revoked; if the CPU claims concurrently, the wakeup proceeds.
+ * parked CPU to acknowledge its staged dispatch. The caller first reserves
+ * IDLE -> BUSY, then fills dispatch fields. Readers claim PENDING -> BUSY
+ * before authoritative target/data reads, and ACK only after staging all
+ * fields. Only the publisher consumes ACK -> IDLE. Timeout permanently
+ * quarantines the slot: no retry, rewrite or retirement until host reboot.
  */
 static int mk_slot_wake(struct mk_spawn_context *slot, u32 apic_id,
 			const char *what)
@@ -178,21 +219,18 @@ static int mk_slot_wake(struct mk_spawn_context *slot, u32 apic_id,
 	int ret;
 
 	slot->target_apic_id = apic_id;
-	/* Ensure the publication is visible before setting ready */
-	smp_wmb();
-	WRITE_ONCE(slot->ready, 1);
+	if (cmpxchg(&slot->ready, MK_SLOT_BUSY, MK_SLOT_PENDING) != MK_SLOT_BUSY)
+		return -EIO;
 
-	ret = read_poll_timeout(READ_ONCE, ready, !ready, 100, USEC_PER_SEC,
+	ret = read_poll_timeout(READ_ONCE, ready, ready == MK_SLOT_ACK, 100, USEC_PER_SEC,
 				false, slot->ready);
-	if (ret) {
-		if (cmpxchg(&slot->ready, 1, 0) == 1)
-			pr_err("mk_spawn: %s: CPU (APIC %u) did not claim wakeup on slot %pa - CPU is not parked there\n",
-			       what, apic_id, &slot_phys);
-		else
-			ret = 0;
-	}
-
-	return ret;
+	if (cmpxchg(&slot->ready, MK_SLOT_ACK, MK_SLOT_IDLE) == MK_SLOT_ACK)
+		return 0;
+	/* Bounded even if wrong-target readers repeatedly relinquish BUSY. */
+	mk_slot_quarantine(slot);
+	pr_err("mk_spawn: %s: CPU (APIC %u) unconfirmed on slot %pa; quarantined until host reboot\n",
+	       what, apic_id, &slot_phys);
+	return ret ?: -EIO;
 }
 
 /*
@@ -200,7 +238,7 @@ static int mk_slot_wake(struct mk_spawn_context *slot, u32 apic_id,
  * at the instance's own context, so the spawn kernel can wake them by
  * writing memory inside its own partition.
  */
-/* The instance's set of CPUs parked on its own context, allocated on demand */
+/* CPUs that may use the instance context, including uncertain handoffs. */
 static struct mk_cpu_set *mk_slot_set(struct mk_instance *instance)
 {
 	if (!instance->cpus_on_slot)
@@ -217,13 +255,39 @@ static int mk_publish_repark(struct mk_spawn_context *from, u32 apic_id,
 			     unsigned long park_phys, unsigned long park_cr3,
 			     unsigned long slot_phys, const char *what)
 {
+	struct mk_spawn_context *to = __va(slot_phys);
+	int ret;
+
 	lockdep_assert_held(&mk_pool->park_lock);
 
+	if (!mk_slot_idle(to))
+		return -EBUSY;
+	ret = mk_slot_begin(from);
+	if (ret)
+		return ret;
 	from->repark_park_phys = park_phys;
 	from->repark_park_cr3 = park_cr3;
 	from->repark_slot_phys = slot_phys;
 	from->flags = MK_SPAWN_F_REPARK;
-	return mk_slot_wake(from, apic_id, what);
+	ret = mk_slot_wake(from, apic_id, what);
+	if (ret || from == to)
+		return ret;
+
+	/*
+	 * ACK confirms staged registers, not departure from the
+	 * old park page/page table. Only the destination loop can claim this
+	 * self-repark, after jumping off both. Keep tracking and old allocations
+	 * until that proof arrives. All destinations are host-managed control
+	 * allocations in the direct map; park_lock serializes both mailboxes.
+	 */
+	ret = mk_slot_begin(to);
+	if (ret)
+		return ret;
+	to->repark_park_phys = park_phys;
+	to->repark_park_cr3 = park_cr3;
+	to->repark_slot_phys = slot_phys;
+	to->flags = MK_SPAWN_F_REPARK;
+	return mk_slot_wake(to, apic_id, "confirm repark arrival");
 }
 
 static int mk_repark_to_instance(struct mk_instance *instance,
@@ -239,9 +303,8 @@ static int mk_repark_to_instance(struct mk_instance *instance,
 		return -ENOMEM;
 
 	/*
-	 * Guarantee the tracking add after each successful wake cannot
-	 * fail: a CPU that moved but was not recorded would be woken
-	 * through the wrong mailbox forever after.
+	 * Reserve tracking before publication: a timed-out wake may already
+	 * have moved a CPU, so it must remain recorded even on failure.
 	 */
 	ret = mk_cpu_set_reserve(on_slot, mk_cpu_set_count(instance->cpus));
 	if (ret)
@@ -259,13 +322,15 @@ static int mk_repark_to_instance(struct mk_instance *instance,
 		if (mk_cpu_set_contains(on_slot, phys_cpu))
 			continue;
 
+		ret = mk_cpu_set_add(on_slot, phys_cpu);
+		if (ret)
+			return ret;
+
 		ret = mk_publish_repark(slot, (u32)phys_cpu, ctx->park_phys,
 					ctx->park_cr3, virt_to_phys(ctx),
 					"repark to instance");
 		if (ret)
 			return ret;
-
-		mk_cpu_set_add(on_slot, phys_cpu);
 	}
 
 	return 0;
@@ -285,6 +350,8 @@ int mk_spawn_cpu(struct mk_instance *instance, int cpu,
 
 	guard(mutex)(&mk_pool->park_lock);
 
+	if (!mk_slot_idle(slot) || !mk_slot_idle(ctx))
+		return -EBUSY;
 	/*
 	 * Move every secondary still parked on the host slot onto the
 	 * instance context, where this instance's kernel wakes them. A
@@ -298,26 +365,26 @@ int mk_spawn_cpu(struct mk_instance *instance, int cpu,
 
 	if (mk_cpu_set_contains(instance->cpus_on_slot, apic_id)) {
 		/* The boot CPU parked on this context when the instance halted */
+		ret = mk_slot_begin(ctx);
+		if (ret)
+			return ret;
 		ctx->flags = 0;
 		return mk_slot_wake(ctx, apic_id, "re-spawn boot cpu");
 	}
 
+	/* Record possible execution before touching a shared publication. */
+	ret = mk_cpu_set_add(instance->cpus_on_slot, apic_id);
+	if (ret)
+		return ret;
+	ret = mk_slot_begin(slot);
+	if (ret)
+		return ret;
 	slot->identity_cr3 = ctx->identity_cr3;
 	slot->kernel_entry = ctx->kernel_entry;
 	slot->trampoline_phys = ctx->trampoline_phys;
 	slot->self_phys = virt_to_phys(ctx);
 	slot->flags = 0;
-	ret = mk_slot_wake(slot, apic_id, "first spawn boot cpu");
-	if (!ret) {
-		/*
-		 * It is running the instance's kernel now, and will park on
-		 * that kernel's context when the instance halts. The add
-		 * cannot fail: mk_repark_to_instance() reserved room for
-		 * every CPU of the instance.
-		 */
-		mk_cpu_set_add(instance->cpus_on_slot, apic_id);
-	}
-	return ret;
+	return mk_slot_wake(slot, apic_id, "first spawn boot cpu");
 }
 
 /**
@@ -334,9 +401,9 @@ int mk_spawn_cpu(struct mk_instance *instance, int cpu,
  * never unwound, even when the spawn itself fails: all of them are carved
  * from the instance's control block, which only ever grows, and a partial
  * spawn may already have reparked CPUs onto the new park page, so tearing
- * it down would free memory a CPU is executing. A retry picks up exactly
- * where this attempt stopped; everything is returned to the pool together
- * when the instance's memory is torn down.
+ * it down would free memory a CPU is executing. Only pre-publication failures
+ * may be retried; a mailbox timeout quarantines the retained resources until
+ * host reboot. Ordinary release still requires confirmed destination arrival.
  */
 int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 			   int cpu)
@@ -345,6 +412,11 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 	unsigned long park_phys;
 	void *park_va;
 	int ret;
+
+	/* Never rewrite retained executable state, even with empty CPU tracking. */
+	if (!mk_pool || !mk_slot_idle(mk_pool->arch.slot) ||
+	    !mk_slot_idle(instance->arch.spawn_ctx))
+		return -EBUSY;
 
 	if (!instance->arch.ident_pgt) {
 		struct mk_ident_pgtable *pgt;
@@ -441,12 +513,14 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 	if (ret)
 		return ret;
 
-	mk_set_spawn_context(instance->arch.spawn_ctx,
-			     mk_get_identity_cr3(instance->arch.ident_pgt),
-			     image->arch.mk_kernel_entry,
-			     (unsigned long)instance->arch.trampoline_va,
-			     virt_to_phys(instance->arch.trampoline_va),
-			     park_phys);
+	ret = mk_set_spawn_context(instance->arch.spawn_ctx,
+				   mk_get_identity_cr3(instance->arch.ident_pgt),
+				   image->arch.mk_kernel_entry,
+				   (unsigned long)instance->arch.trampoline_va,
+				   virt_to_phys(instance->arch.trampoline_va),
+				   park_phys);
+	if (ret)
+		return ret;
 	instance->arch.spawn_ctx->boot_lps = cpu_data(cpu).loops_per_jiffy;
 	if (!instance->arch.spawn_ctx->boot_lps)
 		instance->arch.spawn_ctx->boot_lps = loops_per_jiffy;
@@ -519,22 +593,25 @@ int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_c
 	if (!ctx || !slot || !ctx->park_phys || !on_slot)
 		return -ENODEV;
 
-	/* Make the tracking add below infallible before moving the CPU */
+	/* Reserve tracking before moving the CPU, including failed wakeups. */
 	ret = mk_cpu_set_reserve(on_slot, 1);
 	if (ret)
 		return ret;
 
 	guard(mutex)(&mk_pool->park_lock);
 
+	if (!mk_slot_idle(ctx) || !mk_slot_idle(slot))
+		return -EBUSY;
 	if (mk_cpu_set_contains(on_slot, phys_cpu))
 		return 0;
 
-	ret = mk_publish_repark(slot, (u32)phys_cpu, ctx->park_phys,
+	ret = mk_cpu_set_add(on_slot, phys_cpu);
+	if (ret)
+		return ret;
+
+	return mk_publish_repark(slot, (u32)phys_cpu, ctx->park_phys,
 				ctx->park_cr3, instance->arch.spawn_ctx_phys,
 				"repark hot-added cpu");
-	if (!ret)
-		mk_cpu_set_add(on_slot, phys_cpu);
-	return ret;
 }
 
 /**
@@ -551,8 +628,12 @@ int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 	struct mk_spawn_context *ctx = instance->arch.spawn_ctx;
 	int ret;
 
+	if (!mk_pool)
+		return -ENODEV;
 	guard(mutex)(&mk_pool->park_lock);
 
+	if (!mk_slot_idle(ctx) || !mk_slot_idle(mk_pool->arch.slot))
+		return -EBUSY;
 	/* Already on the host slot: nothing watches this context for it */
 	if (!mk_cpu_set_contains(instance->cpus_on_slot, phys_cpu))
 		return 0;
@@ -585,37 +666,24 @@ int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 	struct mk_spawn_context *ctx = instance->arch.spawn_ctx;
 	int ret;
 
-	if (!ctx || !ctx->park_phys)
+	if (!mk_pool || !mk_pool->arch.slot)
 		return -ENODEV;
 
 	guard(mutex)(&mk_pool->park_lock);
 
-	ret = mk_publish_repark(ctx, (u32)phys_cpu, ctx->park_phys,
-				ctx->park_cr3, instance->arch.spawn_ctx_phys,
-				"confirm parked");
-	if (!ret || !mk_pool || !mk_pool->arch.slot)
-		return ret;
-
-	/*
-	 * Not on the context we recorded. It may still be parked on the host
-	 * slot, which our bookkeeping can miss: an instance rebuilt while a
-	 * CPU was elsewhere starts with an empty set. Ask the host slot the
-	 * same way. A claim there answers the question this function exists
-	 * for - the CPU is parked, not running the image we are about to
-	 * overwrite - so believe it and correct the record.
-	 */
-	if (!mk_publish_repark(mk_pool->arch.slot, (u32)phys_cpu,
-			       mk_pool->arch.park_phys, mk_pool->arch.cr3,
-			       mk_pool->arch.slot_phys, "confirm parked (host slot)")) {
-		pr_warn("mk_spawn: CPU %llu was parked on the host slot, not instance %d\n",
-			phys_cpu, instance->id);
-		mk_cpu_set_del(instance->cpus_on_slot, phys_cpu);
-		return 0;
+	if (!mk_slot_idle(ctx) || !mk_slot_idle(mk_pool->arch.slot))
+		return -EBUSY;
+	/* Select once from ownership history; never probe another slot on timeout. */
+	if (mk_cpu_set_contains(instance->cpus_on_slot, phys_cpu)) {
+		if (!ctx || !ctx->park_phys)
+			return -ENODEV;
+		return mk_publish_repark(ctx, (u32)phys_cpu, ctx->park_phys,
+					 ctx->park_cr3, instance->arch.spawn_ctx_phys,
+					 "confirm parked");
 	}
-
-	pr_err("mk_spawn: CPU %llu is parked nowhere: not on instance %d context %pa, not on host slot %pa\n",
-		 phys_cpu, instance->id, &instance->arch.spawn_ctx_phys,
-		 &mk_pool->arch.slot_phys);
+	ret = mk_publish_repark(mk_pool->arch.slot, (u32)phys_cpu,
+				mk_pool->arch.park_phys, mk_pool->arch.cr3,
+				mk_pool->arch.slot_phys, "confirm parked (host slot)");
 	return ret;
 }
 
@@ -638,8 +706,12 @@ int mk_repark_instance_to_host(struct mk_instance *instance)
 	unsigned int i;
 	int failed = 0;
 
-	if (mk_cpu_set_empty(on_slot) || !ctx || !mk_pool || !mk_pool->arch.slot)
+	if (!mk_slot_idle(ctx) || (mk_pool && !mk_slot_idle(mk_pool->arch.slot)))
+		return -EBUSY;
+	if (mk_cpu_set_empty(on_slot))
 		return 0;
+	if (!ctx || !mk_pool || !mk_pool->arch.slot)
+		return -ENODEV;
 
 	guard(mutex)(&mk_pool->park_lock);
 
@@ -910,16 +982,29 @@ static int mk_build_trampoline_pgtable(unsigned long trampoline_va,
  * Wakes a pool CPU to join this spawn kernel as a secondary CPU.
  */
 /*
- * Where to publish a wakeup for @apicid. A CPU the fence parked on the
- * host's slot is woken from that slot, which this kernel adopted as
- * its own after fencing (host_instance->pool_slot_phys); every other
- * secondary is woken from this kernel's own context. The returned slot
- * is memremapped when it differs from @own and must be released with
+ * Where to publish a wakeup for @apicid. A CPU donated to this kernel's
+ * local pool watches the local pool slot, even if this spawn originally
+ * received it on its parent's slot. Otherwise a CPU the fence parked on
+ * the host's slot is woken from that adopted slot; initial secondaries
+ * are woken from this kernel's own boot context. Do not change the boot
+ * context: it still supplies this kernel's dispatch and final halt target.
+ * The caller holds park_lock and cpus_lock while selecting and publishing.
+ * The returned slot is memremapped when it differs from @own and released with
  * mk_put_wake_slot().
  */
 static struct mk_spawn_context *mk_wake_slot(u32 apicid,
 					     struct mk_spawn_context *own)
 {
+	if (mk_pool) {
+		lockdep_assert_held(&mk_pool->park_lock);
+		lockdep_assert_held(&mk_pool->cpus_lock);
+		if (mk_cpu_set_contains(mk_pool->cpus, apicid)) {
+			if (!mk_pool->arch.slot_phys)
+				return NULL;
+			return memremap(mk_pool->arch.slot_phys,
+					sizeof(struct mk_spawn_context), MEMREMAP_WB);
+		}
+	}
 	if (host_instance && host_instance->pool_slot_phys &&
 	    mk_cpu_set_contains(host_instance->cpus_on_slot, apicid))
 		return memremap(host_instance->pool_slot_phys,
@@ -937,6 +1022,7 @@ static void mk_put_wake_slot(struct mk_spawn_context *slot,
 int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 					unsigned int cpu)
 {
+	struct mk_pool *pool = mk_pool;
 	struct mk_spawn_context *own = mk_own_context();
 	struct mk_spawn_context *slot;
 	unsigned long trampoline_phys, trampoline_va;
@@ -952,6 +1038,8 @@ int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 		pr_err("mk_spawn: trampoline not prepared\n");
 		return -ENODEV;
 	}
+	if (!mk_slot_idle(own))
+		return -EBUSY;
 	/* mk_prepare_trampoline() put this kernel's own copy in the page */
 	trampoline_phys = own->trampoline_phys;
 	trampoline_va = (unsigned long)__va(trampoline_phys);
@@ -981,17 +1069,41 @@ int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 	if (ret)
 		return ret;
 
+	/* Initial secondary boot precedes baseline creation (pool == NULL). */
+	if (pool) {
+		mutex_lock(&pool->park_lock);
+		mutex_lock(&pool->cpus_lock);
+		if (!mk_slot_idle(pool->arch.slot)) {
+			ret = -EBUSY;
+			goto out_unlock;
+		}
+	}
+	if (pool && mk_cpu_set_contains(pool->cpus, apicid)) {
+		/*
+		 * The park loop jumps to the physical trampoline before that
+		 * trampoline switches CR3. A nested pool maps only its donated
+		 * chunks; the parent-given boot trampoline can be outside them.
+		 * Map its initial fetch in the OLD park table before publishing.
+		 * The mapping and any allocated table pages live with this pool.
+		 */
+		if (!pool->arch.pgt) {
+			ret = -ENODEV;
+			goto out_unlock;
+		}
+		ret = mk_ident_map_range(pool->arch.pgt, trampoline_phys,
+					 trampoline_phys + PAGE_SIZE);
+		if (ret)
+			goto out_unlock;
+	}
 	slot = mk_wake_slot(apicid, own);
-	if (!slot)
-		return -ENODEV;
+	if (!slot) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
 
-	/*
-	 * Revoke any unconsumed wakeup left over from a failed earlier
-	 * bringup, so a parked CPU cannot wake mid-rewrite and read a mix
-	 * of old and new fields. A CPU that already claimed the context
-	 * still sees the old, consistent snapshot.
-	 */
-	cmpxchg(&slot->ready, 1, 0);
+	ret = mk_slot_begin(slot);
+	if (ret)
+		goto out_slot;
 
 	/*
 	 * The dispatch is this kernel's (its trampoline, its secondary
@@ -1016,11 +1128,15 @@ int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 	 * no IPI is needed and none could be delivered anyway, since
 	 * parked CPUs keep interrupts disabled.
 	 */
-	smp_wmb();
-	WRITE_ONCE(slot->ready, 1);
-
+	ret = mk_slot_wake(slot, apicid, "secondary cpu");
+out_slot:
 	mk_put_wake_slot(slot, own);
-	return 0;
+out_unlock:
+	if (pool) {
+		mutex_unlock(&pool->cpus_lock);
+		mutex_unlock(&pool->park_lock);
+	}
+	return ret;
 }
 
 struct mk_ident_pgtable {
@@ -1411,7 +1527,7 @@ static int __mk_pool_park_setup(void)
 	lockdep_assert_held(&mk_pool->park_lock);
 
 	if (mk_pool->arch.slot)
-		return 0;
+		return mk_slot_idle(mk_pool->arch.slot) ? 0 : -EBUSY;
 
 	if (mk_pool_empty())
 		return -ENODEV;
@@ -1488,6 +1604,8 @@ int mk_arch_pool_chunk_added(phys_addr_t start, size_t size)
 		return -ENODEV;
 
 	guard(mutex)(&mk_pool->park_lock);
+	if (!mk_slot_idle(mk_pool->arch.slot))
+		return -EBUSY;
 
 	/*
 	 * A pool emptied of memory has no park area, so the chunk that
@@ -1648,6 +1766,8 @@ int mk_pool_park_teardown(void)
 	if (!mk_pool->arch.slot)
 		return 0;
 
+	if (!mk_slot_idle(mk_pool->arch.slot) || !mk_slot_idle(mk_own_context()))
+		return -EBUSY;
 	if (!mk_pool_cpus_returned())
 		return -EBUSY;
 
@@ -1826,9 +1946,40 @@ EXPORT_SYMBOL_GPL(multikernel_restore_ap);
  * machine including the host. Park every CPU in the pool wait loop
  * instead, returning them to the multikernel pool.
  */
+static bool mk_halt_quiesced;
+
+static void mk_halt_shutdown_prepare(void *unused)
+{
+	/* Ordinary kexec also runs syscore shutdown, then reopens CPU hotplug. */
+	if (panic_in_progress() || kexec_in_progress)
+		return;
+	if (system_state != SYSTEM_HALT && system_state != SYSTEM_POWER_OFF &&
+	    system_state != SYSTEM_RESTART)
+		return;
+	/*
+	 * migrate_to_reboot_cpu() has already drained native CPU hotplug.
+	 * Exclude local controllers and received resource mutations until park.
+	 * Never wait for a contended controller from this terminal path.
+	 */
+	if (!mutex_trylock(&mk_overlay_mutex))
+		return;
+	/* The machine-stop path acquires this permit before publishing HALTED. */
+	smp_store_release(&mk_halt_quiesced, true);
+}
+
+static const struct syscore_ops mk_halt_syscore_ops = {
+	.shutdown = mk_halt_shutdown_prepare,
+};
+
+static struct syscore mk_halt_syscore = {
+	.ops = &mk_halt_syscore_ops,
+};
+
 static void __noreturn mk_machine_halt(void)
 {
-	mk_halt_to_pool();
+	/* Pair with syscore's permit publication while it retains the mutex. */
+	mk_halt_to_pool(smp_load_acquire(&mk_halt_quiesced) &&
+			!panic_in_progress() && !kexec_in_progress);
 }
 
 static void __noreturn mk_machine_restart(char *cmd)
@@ -1858,11 +2009,12 @@ static int __init mk_spawn_reboot_init(void)
 	machine_ops.restart = mk_machine_restart;
 	machine_ops.emergency_restart = mk_machine_halt;
 	smp_ops.stop_this_cpu = mk_stop_this_cpu;
+	register_syscore(&mk_halt_syscore);
 
 	/*
 	 * A panicked spawn kernel spinning in the panic loop holds its
 	 * CPUs hostage. "Reboot on panic" is mk_machine_halt here, which
-	 * notifies the host and parks, so make it the default; the panic
+	 * parks without authorizing host reuse, so make it the default. Panic
 	 * output has already been flushed to the console by then.
 	 */
 	if (!panic_timeout)
