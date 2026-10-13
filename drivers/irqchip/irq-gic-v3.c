@@ -69,8 +69,6 @@ struct gic_chip_data {
 	struct partition_affinity *parts;
 	unsigned int		nr_parts;
 	bool			tenant;
-	u32			*tenant_spis;
-	unsigned int		nr_tenant_spis;
 };
 
 struct partition_affinity {
@@ -932,26 +930,8 @@ static void __exception_irq_entry gic_handle_irq(struct pt_regs *regs)
  * those of its own CPUs like any other kernel. The distributor exists
  * once: initialising it would disable, regroup and reroute every SPI
  * of the machine, the host's included. A tenant leaves it as the host
- * set it up and only ever touches the per-interrupt state of the SPIs
- * it was granted ("multikernel,spis", <first count> pairs of SPI
- * numbers), so everything else must not even map.
+ * set it up and maps no SPIs; its devices interrupt with MSIs.
  */
-static bool gic_tenant_owns(irq_hw_number_t hw)
-{
-	unsigned int i;
-
-	if (__get_intid_range(hw) != SPI_RANGE)
-		return false;
-
-	for (i = 0; i < gic_data.nr_tenant_spis; i += 2) {
-		u32 first = gic_data.tenant_spis[i] + 32;
-
-		if (hw >= first && hw - first < gic_data.tenant_spis[i + 1])
-			return true;
-	}
-	return false;
-}
-
 static int __init gic_tenant_check_dist(void)
 {
 	u32 need = GICD_CTLR_ARE_NS | GICD_CTLR_ENABLE_G1A;
@@ -963,28 +943,8 @@ static int __init gic_tenant_check_dist(void)
 		return -ENXIO;
 	}
 
-	pr_info("Tenant mode, %u granted SPI range(s)\n",
-		gic_data.nr_tenant_spis / 2);
+	pr_info("Tenant mode: the distributor is another kernel's\n");
 	return 0;
-}
-
-static void __init gic_of_tenant_init(struct device_node *node)
-{
-	int n;
-
-	gic_data.tenant = of_property_read_bool(node, "multikernel,tenant");
-	if (!gic_data.tenant)
-		return;
-
-	n = of_property_count_u32_elems(node, "multikernel,spis");
-	if (n < 2 || n % 2)
-		return;
-
-	gic_data.tenant_spis = kcalloc(n, sizeof(u32), GFP_KERNEL);
-	if (gic_data.tenant_spis &&
-	    !of_property_read_u32_array(node, "multikernel,spis",
-					gic_data.tenant_spis, n))
-		gic_data.nr_tenant_spis = n;
 }
 
 static void __init gic_dist_init(void)
@@ -1661,7 +1621,7 @@ static int gic_irq_domain_map(struct irq_domain *d, unsigned int irq,
 
 	case SPI_RANGE:
 	case ESPI_RANGE:
-		if (gic_data.tenant && !gic_tenant_owns(hw))
+		if (gic_data.tenant)
 			return -EPERM;
 		irq_domain_set_info(d, irq, hw, chip, d->host_data,
 				    handle_fasteoi_irq, NULL, NULL);
@@ -2127,7 +2087,7 @@ static int __init gic_init_bases(phys_addr_t dist_phys_base,
 
 	gic_data.has_rss = !!(typer & GICD_TYPER_RSS);
 
-	/* MBIs are SPIs used as MSIs, and a tenant was granted none for that */
+	/* MBIs are SPIs used as MSIs, and a tenant maps no SPIs */
 	if ((typer & GICD_TYPER_MBIS) && !gic_data.tenant) {
 		err = mbi_init(handle, gic_data.domain);
 		if (err)
@@ -2352,7 +2312,7 @@ static int __init gic_of_init(struct device_node *node, struct device_node *pare
 		redist_stride = 0;
 
 	gic_enable_of_quirks(node, gic_quirks, &gic_data);
-	gic_of_tenant_init(node);
+	gic_data.tenant = of_property_read_bool(node, "multikernel,tenant");
 
 	err = gic_init_bases(dist_phys_base, dist_base, rdist_regs,
 			     nr_redist_regions, redist_stride, &node->fwnode);
