@@ -446,6 +446,7 @@ device_initcall(mk_register_force_stop);
 
 /**
  * mk_force_stop_cpu - Send NMI to a specific CPU to force it to stop
+ * @instance: Instance the CPU belongs to
  * @phys_cpu: Physical CPU ID to stop
  *
  * The target belongs to a different kernel instance, so the NMI goes to
@@ -454,7 +455,7 @@ device_initcall(mk_register_force_stop);
  * through it silently dropped the NMI for CPUs it missed. The ICR must
  * drain first, or back-to-back sends lose all but the first on xAPIC.
  */
-void mk_force_stop_cpu(u64 phys_cpu)
+void mk_force_stop_cpu(struct mk_instance *instance, u64 phys_cpu)
 {
 	safe_apic_wait_icr_idle();
 	apic_icr_write(APIC_DM_NMI | APIC_DEST_PHYSICAL, (u32)phys_cpu);

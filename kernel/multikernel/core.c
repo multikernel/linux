@@ -1605,6 +1605,8 @@ static void mk_instance_settle_halted(struct mk_instance *instance)
 {
 	pr_info("Instance %d (%s) halted, CPUs parking in pool\n",
 		instance->id, instance->name);
+	mk_arch_msi_release(instance);
+	mk_iommu_release(instance);
 	mk_instance_set_state(instance, MK_STATE_LOADED);
 }
 
@@ -1749,6 +1751,8 @@ int multikernel_halt_by_id(int mk_id)
 			pr_warn("Multikernel instance %d halted with CPUs unaccounted for\n",
 				mk_id);
 
+		mk_arch_msi_release(instance);
+		mk_iommu_release(instance);
 		mk_instance_set_state(instance, MK_STATE_LOADED);
 		pr_info("Multikernel instance %d halted (graceful)\n", mk_id);
 	}
@@ -1942,7 +1946,7 @@ int multikernel_force_halt_by_id(int mk_id)
 		pr_err("Failed to arm force-halt marker: %d (sending NMI anyway)\n", ret);
 
 	mk_cpu_set_for_each(i, phys_cpu, targets) {
-		mk_force_stop_cpu(phys_cpu);
+		mk_force_stop_cpu(instance, phys_cpu);
 		cpu_count++;
 	}
 

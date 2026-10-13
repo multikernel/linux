@@ -490,6 +490,13 @@ struct pci_dev {
 	 * itself internal but devices downstream from it are external.
 	 */
 	unsigned int	external_facing:1;
+	/*
+	 * Seen by this kernel, owned by another: a bridge above the devices
+	 * of a multikernel spawn, which the kernel that spawned it keeps
+	 * driving. No driver binds to it and config writes are dropped, as
+	 * if it were read-only. Its owner configured it.
+	 */
+	unsigned int	foreign:1;
 	unsigned int	broken_intx_masking:1;	/* INTx masking can't be used */
 	unsigned int	io_window_1k:1;		/* Intel bridge 1K I/O windows */
 	unsigned int	irq_managed:1;
