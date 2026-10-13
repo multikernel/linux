@@ -6,7 +6,7 @@
  * halves of what x86 splits between boot_params and the manifest: the
  * instance tree the generic code wrote, with its /resources and /chosen,
  * is the base, and the nodes the arm64 boot path itself reads go on top:
- * /memory, /cpus, PSCI, the arch timer and the interrupt controller.
+ * /memory, /cpus, PSCI, the arch timer, the interrupt controller and SDEI.
  *
  * It is rebuilt on every spawn, into the device tree segment the loader
  * left room for: the memory grant and the CPUs can change between load
@@ -212,6 +212,8 @@ int mk_build_boot_dtb(struct kimage *image, struct mk_instance *instance)
 	if (!ret)
 		ret = acpi_disabled ? mk_dtb_add_platform_of(fdt) :
 				      mk_dtb_add_platform_acpi(fdt);
+	if (!ret)
+		ret = mk_dtb_add_sdei(fdt);
 	if (!ret)
 		ret = mk_dtb_add_devices(fdt, instance);
 	if (!ret)
