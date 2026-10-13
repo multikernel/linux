@@ -37,7 +37,7 @@ static bool mk_prop_is_addressing(const char *name)
  * nodes keep working. Addressing is only valid below @np's parent bus,
  * so reg is written again, translated to CPU addresses.
  */
-int mk_dtb_copy_of_node(void *fdt, struct device_node *np)
+static int mk_dtb_copy_of_node(void *fdt, struct device_node *np)
 {
 	u64 reg[2 * MK_DTB_MAX_REG];
 	struct property *pp;

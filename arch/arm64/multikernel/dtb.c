@@ -35,6 +35,29 @@ static const char * const mk_chosen_props[] = {
 	"rng-seed",
 };
 
+/*
+ * Every wired interrupt goes through the one GIC distributor, which stays
+ * the host's, so an instance has no platform devices: its devices are PCI
+ * functions with MSIs. The spawn kernel's GIC driver leaves the
+ * distributor alone and maps no SPIs.
+ */
+static int mk_dtb_add_tenancy(void *fdt, struct mk_instance *instance)
+{
+	int node;
+
+	if (instance->platform_devices_valid &&
+	    !list_empty(&instance->platform_devices)) {
+		pr_err("Instance %d: platform devices cannot be given to an instance on arm64\n",
+		       instance->id);
+		return -FDT_ERR_BADSTATE;
+	}
+
+	node = fdt_node_offset_by_compatible(fdt, -1, "arm,gic-v3");
+	if (node < 0)
+		return node;
+	return fdt_setprop_empty(fdt, node, "multikernel,tenant");
+}
+
 /* @pairs are base,size; the root of the instance tree has two cells for each */
 int mk_dtb_set_reg(void *fdt, int node, const u64 *pairs, int nr)
 {
@@ -211,7 +234,7 @@ int mk_build_boot_dtb(struct kimage *image, struct mk_instance *instance)
 	if (!ret)
 		ret = mk_dtb_add_sdei(fdt);
 	if (!ret)
-		ret = mk_dtb_add_devices(fdt, instance);
+		ret = mk_dtb_add_tenancy(fdt, instance);
 	if (!ret)
 		ret = mk_dtb_add_pci(fdt);
 	if (!ret)
