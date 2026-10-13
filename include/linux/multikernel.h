@@ -131,6 +131,15 @@ struct mk_shared_data {
 	 * the struct on re-exec.
 	 */
 	u8 parked[MK_PARKED_MAX];
+	/*
+	 * CPUs that firmware can stop out of band, indexed like parked[]
+	 * and written by each CPU for itself: set once the architecture's
+	 * firmware stop event can reach it, cleared before it stops being
+	 * reachable. A force halt only asks firmware to stop the CPUs set
+	 * here, because a request to any other CPU may leave it unable to
+	 * take the stop interrupt as well.
+	 */
+	u8 fw_stop[MK_PARKED_MAX];
 };
 
 /* Function pointer type for IPI callbacks */
@@ -1305,7 +1314,7 @@ void __noreturn mk_enter_pool_state(void *info);
  * pseudo-NMI on arm64). Registration may fail where the architecture
  * has nothing suitable; graceful shutdown must keep working without it.
  */
-void mk_force_stop_cpu(mk_phys_cpu_t phys_cpu);
+void mk_force_stop_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
 
 /*
  * Build the boot state for @instance from the loaded @image and start
