@@ -40,16 +40,31 @@ off, instead of leaving them in a WFI loop inside an image the host is
 about to overwrite. The host learns that a CPU has left from
 ``AFFINITY_INFO``, and refuses to load a new image over one that has not.
 
-**Force halt** sends the stop IPI to each CPU of the instance. PSCI has no
-call to turn another CPU off, so the CPU has to take that interrupt and
-turn itself off, and a CPU that spins with interrupts masked only takes it
-as a pseudo-NMI. A spawn kernel therefore has to be built with
+**Force halt** has to make each CPU of the instance turn itself off, as
+PSCI has no call to turn another CPU off. Where firmware implements SDEI,
+every kernel registers SDEI's software-signalled event 0, and the host
+first signals that event to each CPU with ``SDEI_EVENT_SIGNAL``. Firmware
+takes it at EL3 and calls the spawn's handler whatever the CPU has
+masked, all exceptions included. The handler completes the event and
+turns the CPU off. Both kernels need ``CONFIG_ARM_SDE_INTERFACE``.
+
+TF-A (2.12, and its master branch at the time of writing) breaks a CPU
+that receives event 0 while it has SDEI masked: it never ends the
+interrupt, and the CPU takes no non-secure interrupt from then on. A
+kernel masks SDEI on a CPU that is going off and around power-down idle
+states, so each CPU publishes in the instance's shared area whether it
+can take the event, and the host only signals the CPUs that say so. A
+CPU that masks SDEI between the host's check and its signal still loses
+its interrupts.
+
+The host then sends the stop IPI to every CPU of the instance, as it
+does without SDEI. A CPU that spins with interrupts masked only takes it
+as a pseudo-NMI, so a spawn kernel should also be built with
 ``CONFIG_ARM64_PSEUDO_NMI`` and booted with ``irqchip.gicv3_pseudo_nmi=1``;
-``kerf load`` appends the parameter to every spawn's command line. Without
-it such a CPU stays out of reach, and the instance cannot be started again
-until the machine is rebooted: the host refuses to load an image over a
-CPU that is still on. Pseudo-NMIs do not reach a CPU that has masked all
-exceptions. SDEI is not used yet.
+``kerf load`` appends the parameter to every spawn's command line. A CPU
+that neither reaches stays out of reach, and the instance cannot be
+started again until the machine is rebooted: the host refuses to load an
+image over a CPU that is still on.
 
 The Boot Tree
 =============
@@ -72,6 +87,10 @@ instance's current resources, and adds to the instance tree:
 ``/psci``, ``/timer``, the GICv3 node
     Copied from the host's tree, or written from the FADT, GTDT and MADT
     on an ACPI host.
+
+``/firmware/sdei``
+    Written when the host's tree has an SDEI node or its ACPI tables an
+    SDEI table, with the host's conduit.
 
 ``/chosen``
     ``bootargs``, the initrd and the seeds from the ``kexec_file_load()``
@@ -147,3 +166,9 @@ firmware does so against real EL3 firmware and enters the kernels at EL2;
 ``iommu=smmuv3`` with ``iommu_platform=on,disable-legacy=on`` on a virtio
 PCI device puts that device behind an SMMU. A spawn needs no disk: an
 initramfs is enough.
+
+TF-A built with ``SDEI_SUPPORT=1 EL3_EXCEPTION_HANDLING=1`` provides SDEI
+on QEMU, but neither QEMU nor TF-A adds an SDEI node to the tree. Dump
+QEMU's tree with ``-machine ...,dumpdtb=virt.dtb``, add
+``firmware { sdei { compatible = "arm,sdei-1.0"; method = "smc"; }; };``
+and boot the host with ``-dtb``.

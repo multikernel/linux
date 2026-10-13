@@ -43,4 +43,24 @@ static inline int mk_dtb_add_platform_acpi(void *fdt)
 }
 #endif
 
+/* Force halt through SDEI, where firmware has it */
+#ifdef CONFIG_ARM_SDE_INTERFACE
+int mk_dtb_add_sdei(void *fdt);
+void mk_sdei_stop_cpu(struct mk_instance *instance, u64 mpidr);
+void mk_sdei_unreachable(void);
+#else
+static inline int mk_dtb_add_sdei(void *fdt)
+{
+	return 0;
+}
+
+static inline void mk_sdei_stop_cpu(struct mk_instance *instance, u64 mpidr)
+{
+}
+
+static inline void mk_sdei_unreachable(void)
+{
+}
+#endif
+
 #endif /* _ARM64_MULTIKERNEL_INTERNAL_H */
