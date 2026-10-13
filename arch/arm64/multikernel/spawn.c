@@ -71,6 +71,7 @@ void __noreturn mk_enter_pool_state(void *info)
 	const struct cpu_operations *ops = get_cpu_ops(cpu);
 
 	local_daif_mask();
+	mk_sdei_unreachable();
 	sdei_mask_local_cpu();
 
 	if (ops && ops->cpu_die)
@@ -107,16 +108,19 @@ core_initcall(mk_spawn_reboot_init);
 
 /*
  * PSCI cannot turn another CPU off, so a kernel that no longer answers
- * is stopped in band, with the stop IPI its own smp_send_stop() would
- * use. It is sent as IPI_CPU_STOP_NMI: a kernel running with pseudo-NMIs
- * takes that one even with interrupts masked, and to any other kernel it
- * is an ordinary SGI, which a CPU spinning with interrupts off never
- * sees. Without SDEI that is as far as force goes on arm64.
+ * has to be made to turn its CPUs off itself. SDEI reaches a CPU whatever
+ * it has masked, but only one that said it can take the event. The stop
+ * IPI its own smp_send_stop() would use goes to every CPU regardless: as
+ * IPI_CPU_STOP_NMI a kernel running with pseudo-NMIs takes it even with
+ * interrupts masked, and to any other kernel it is an ordinary SGI.
  */
 void mk_force_stop_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {
-	int ret = gic_v3_send_sgi_to_mpidr(phys_cpu, IPI_CPU_STOP_NMI);
+	int ret;
 
+	mk_sdei_stop_cpu(instance, phys_cpu);
+
+	ret = gic_v3_send_sgi_to_mpidr(phys_cpu, IPI_CPU_STOP_NMI);
 	if (ret)
 		pr_err("No stop SGI to CPU 0x%llx: %d\n", phys_cpu, ret);
 }
