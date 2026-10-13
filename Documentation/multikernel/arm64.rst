@@ -112,11 +112,9 @@ a boot tree carries:
 ``multikernel,tenant``
     The GICv3 driver leaves the distributor alone: it only checks that it
     is enabled with affinity routing, and initialises the redistributors
-    and CPU interfaces of its own CPUs.
-
-``multikernel,spis = <first count> ...``
-    The SPIs the instance may map, as SPI numbers. Everything else fails
-    with ``-EPERM``.
+    and CPU interfaces of its own CPUs. It maps no SPIs, which fail with
+    ``-EPERM``, and sets up no LPIs of its own: the redistributors of its
+    CPUs keep the LPI tables the host enabled them with.
 
 The **doorbell** of the message ring is SGI 7. All eight non-secure SGIs
 are in use on arm64, so with ``CONFIG_MULTIKERNEL`` it takes the place of
@@ -126,13 +124,9 @@ Devices
 =======
 
 Platform devices
-    Granted by ``device-name``, the name under
-    ``/sys/bus/platform/devices``, for instance ``a003e00.virtio_mmio``.
-    The host copies the device's node into the boot tree and grants its
-    SPIs, so this takes a host that booted from a device tree, and a
-    device whose node refers to no clocks, resets, power domains or pin
-    controllers, which stay with the host. Unbind the host's driver first;
-    that also disables the SPIs on the host's side.
+    Not supported. Their interrupts are SPIs, and SPIs live in the one
+    distributor, which stays with the host. An instance that has platform
+    devices fails to start.
 
 PCI devices
     The root buses above an instance's devices appear as
