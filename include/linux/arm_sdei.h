@@ -48,11 +48,18 @@ int sdei_mask_local_cpu(void);
 int sdei_unmask_local_cpu(void);
 void __init acpi_sdei_init(void);
 void sdei_handler_abort(void);
+
+/* Only event 0, the software-signalled event, can be signalled */
+int sdei_event_signal(u32 event_num, u64 target_mpidr);
 #else
 static inline int sdei_mask_local_cpu(void) { return 0; }
 static inline int sdei_unmask_local_cpu(void) { return 0; }
 static inline void acpi_sdei_init(void) { }
 static inline void sdei_handler_abort(void) { }
+static inline int sdei_event_signal(u32 event_num, u64 target_mpidr)
+{
+	return -EOPNOTSUPP;
+}
 #endif /* CONFIG_ARM_SDE_INTERFACE */
 
 

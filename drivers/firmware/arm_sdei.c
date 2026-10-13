@@ -467,6 +467,16 @@ int sdei_event_disable(u32 event_num)
 	return err;
 }
 
+/*
+ * Success only means the event is now pending on @target_mpidr: firmware
+ * drops it if that CPU has not registered the event.
+ */
+int sdei_event_signal(u32 event_num, u64 target_mpidr)
+{
+	return invoke_sdei_fn(SDEI_1_0_FN_SDEI_EVENT_SIGNAL, event_num,
+			      target_mpidr, 0, 0, 0, NULL);
+}
+
 static int sdei_api_event_unregister(u32 event_num)
 {
 	return invoke_sdei_fn(SDEI_1_0_FN_SDEI_EVENT_UNREGISTER, event_num, 0,
