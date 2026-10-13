@@ -113,7 +113,7 @@ core_initcall(mk_spawn_reboot_init);
  * is an ordinary SGI, which a CPU spinning with interrupts off never
  * sees. Without SDEI that is as far as force goes on arm64.
  */
-void mk_force_stop_cpu(mk_phys_cpu_t phys_cpu)
+void mk_force_stop_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {
 	int ret = gic_v3_send_sgi_to_mpidr(phys_cpu, IPI_CPU_STOP_NMI);
 
