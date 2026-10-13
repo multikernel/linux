@@ -1393,7 +1393,7 @@ static int gic_starting_cpu(unsigned int cpu)
 	gic_cpu_sys_reg_enable();
 	gic_cpu_init();
 
-	if (gic_dist_supports_lpis())
+	if (gic_dist_supports_lpis() && !gic_data.tenant)
 		its_cpu_init();
 
 	return 0;
@@ -2151,6 +2151,13 @@ static int __init gic_init_bases(phys_addr_t dist_phys_base,
 	gic_enable_nmi_support();
 	gic_smp_init();
 	gic_cpu_pm_init();
+
+	/*
+	 * A tenant's redistributors keep the LPI tables the host enabled
+	 * them with, and the host programs the ITSs for it.
+	 */
+	if (gic_data.tenant)
+		return 0;
 
 	if (gic_dist_supports_lpis()) {
 		its_init(handle, &gic_data.rdists, gic_data.domain, dist_prio_irq);
