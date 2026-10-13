@@ -2005,7 +2005,7 @@ int multikernel_force_halt_by_id(int mk_id)
 		pr_err("Failed to arm force-halt marker: %d (sending NMI anyway)\n", ret);
 
 	mk_cpu_set_for_each(i, phys_cpu, targets) {
-		mk_force_stop_cpu(phys_cpu);
+		mk_force_stop_cpu(instance, phys_cpu);
 		cpu_count++;
 	}
 
