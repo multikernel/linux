@@ -18,6 +18,7 @@
 #include <linux/kprobes.h>
 #include <linux/kvm_host.h>
 #include <linux/list.h>
+#include <linux/multikernel.h>
 #include <linux/mutex.h>
 #include <linux/notifier.h>
 #include <linux/of.h>
@@ -370,6 +371,14 @@ static int sdei_platform_reset(void)
 	int err;
 
 	on_each_cpu(&_ipi_private_reset, NULL, true);
+
+	/*
+	 * Shared events and interrupt bindings are machine-wide, and belong
+	 * to the kernel that spawned this one.
+	 */
+	if (mk_spawned())
+		return 0;
+
 	err = sdei_api_shared_reset();
 	if (err) {
 		pr_err("Failed to reset platform: %d\n", err);
