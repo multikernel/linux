@@ -162,7 +162,9 @@ static int mk_dtb_add_chosen(void *fdt, const void *loader_fdt)
 		if (ret)
 			return ret;
 	}
-	return 0;
+
+	/* BARs and bridge windows are the host's to assign, for every kernel */
+	return fdt_setprop_u32(fdt, to, "linux,pci-probe-only", 1);
 }
 
 static struct kexec_segment *mk_dtb_segment(struct kimage *image)
