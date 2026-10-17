@@ -20,6 +20,7 @@
 #include <linux/sizes.h>
 #include <linux/pci.h>
 #include <linux/cpumask.h>
+#include <linux/pci-ecam.h>
 #if defined(CONFIG_X86) && defined(CONFIG_PCI_MMCONFIG)
 #include <asm/pci_x86.h>
 #endif
@@ -1119,6 +1120,7 @@ static void mk_dt_add_window(struct mk_pci_bus_desc *desc,
 {
 	u64 pci_addr = res->start - offset;
 	u64 size = resource_size(res);
+	u64 cpu_addr;
 	fdt32_t *c;
 
 	if (resource_type(res) != IORESOURCE_IO &&
@@ -1132,12 +1134,21 @@ static void mk_dt_add_window(struct mk_pci_bus_desc *desc,
 		return;
 	}
 
+	/*
+	 * Where I/O space is memory mapped, an I/O resource holds logical
+	 * port numbers, not the CPU address of the window.
+	 */
+	cpu_addr = res->start;
+	if (resource_type(res) == IORESOURCE_IO &&
+	    pci_pio_to_address(res->start) != (phys_addr_t)OF_BAD_ADDR)
+		cpu_addr = pci_pio_to_address(res->start);
+
 	c = &desc->ranges[desc->nr_ranges];
 	c[0] = cpu_to_fdt32(mk_dt_window_flags(res));
 	c[1] = cpu_to_fdt32(upper_32_bits(pci_addr));
 	c[2] = cpu_to_fdt32(lower_32_bits(pci_addr));
-	c[3] = cpu_to_fdt32(upper_32_bits(res->start));
-	c[4] = cpu_to_fdt32(lower_32_bits(res->start));
+	c[3] = cpu_to_fdt32(upper_32_bits(cpu_addr));
+	c[4] = cpu_to_fdt32(lower_32_bits(cpu_addr));
 	c[5] = cpu_to_fdt32(upper_32_bits(size));
 	c[6] = cpu_to_fdt32(lower_32_bits(size));
 	desc->nr_ranges += 7;
@@ -1185,6 +1196,15 @@ static u64 mk_dt_bus_ecam(struct pci_bus *bus)
 		return 0;
 
 	return cfg->address + ((u64)bus->number << 20);
+#elif defined(CONFIG_PCI_ECAM)
+	struct pci_config_window *cfg = pci_find_host_bridge(bus)->bus->sysdata;
+
+	/* Only a bridge on the generic ECAM accessors keeps its window there */
+	if (bus->ops != &pci_generic_ecam_ops.pci_ops ||
+	    bus->number < cfg->busr.start || bus->number > cfg->busr.end)
+		return 0;
+
+	return cfg->res.start + ((u64)(bus->number - cfg->busr.start) << 20);
 #else
 	return 0;
 #endif

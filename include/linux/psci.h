@@ -43,6 +43,9 @@ struct psci_0_1_function_ids {
 
 struct psci_0_1_function_ids get_psci_0_1_function_ids(void);
 
+int psci_cpu_on_context(unsigned long cpuid, unsigned long entry_point,
+			unsigned long context_id);
+
 #if defined(CONFIG_ARM_PSCI_FW)
 int __init psci_dt_init(void);
 #else

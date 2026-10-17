@@ -18,6 +18,7 @@
 #include <linux/kprobes.h>
 #include <linux/kvm_host.h>
 #include <linux/list.h>
+#include <linux/multikernel.h>
 #include <linux/mutex.h>
 #include <linux/notifier.h>
 #include <linux/of.h>
@@ -370,6 +371,14 @@ static int sdei_platform_reset(void)
 	int err;
 
 	on_each_cpu(&_ipi_private_reset, NULL, true);
+
+	/*
+	 * Shared events and interrupt bindings are machine-wide, and belong
+	 * to the kernel that spawned this one.
+	 */
+	if (mk_spawned())
+		return 0;
+
 	err = sdei_api_shared_reset();
 	if (err) {
 		pr_err("Failed to reset platform: %d\n", err);
@@ -465,6 +474,16 @@ int sdei_event_disable(u32 event_num)
 	mutex_unlock(&sdei_events_lock);
 
 	return err;
+}
+
+/*
+ * Success only means the event is now pending on @target_mpidr: firmware
+ * drops it if that CPU has not registered the event.
+ */
+int sdei_event_signal(u32 event_num, u64 target_mpidr)
+{
+	return invoke_sdei_fn(SDEI_1_0_FN_SDEI_EVENT_SIGNAL, event_num,
+			      target_mpidr, 0, 0, 0, NULL);
 }
 
 static int sdei_api_event_unregister(u32 event_num)
