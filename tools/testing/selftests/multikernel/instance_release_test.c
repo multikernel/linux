@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Real last-reference callback; scheduler/resource-release boundaries modeled. */
 #include <assert.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -19,6 +20,7 @@ struct mk_instance {
 	void *kimage;
 };
 static unsigned int released, atomic_releases;
+static int retire_error;
 static bool atomic_context, mk_overlay_mutex;
 static struct work_struct *queued;
 #define mutex_lock(m) do { assert(!*(m)); *(m) = true; } while (0)
@@ -46,11 +48,14 @@ static int mk_instance_prepare_destroy(struct mk_instance *p)
 	release_resource(p);
 	return 0;
 }
-static void mk_instance_retire_resources(struct mk_instance *p)
+static int mk_instance_retire_resources(struct mk_instance *p)
 {
+	if (retire_error)
+		return retire_error;
 	mk_instance_return_pci_devices(p);
 	mk_instance_return_platform_devices(p);
 	mk_instance_free_memory(p);
+	return 0;
 }
 #include "release-production.h"
 
@@ -68,6 +73,13 @@ int main(void)
 	assert(queued == &instance.release_work);
 	queued->func(queued);
 	assert(released == 9 && !mk_overlay_mutex);
+	released = 0;
+	retire_error = -EIO;
+	queued->func(queued);
+	if (released != 1 || mk_overlay_mutex) {
+		fprintf(stderr, "FAIL: final release discarded record after failed unmap\n");
+		return 1;
+	}
 	puts("Instance release: final IPI reference defers reclamation, PASS");
 	return 0;
 }

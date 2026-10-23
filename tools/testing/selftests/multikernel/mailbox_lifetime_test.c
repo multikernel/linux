@@ -10,7 +10,8 @@
 #define PAGE_SIZE 4096
 #define ALIGN(n, a) (((n) + (a) - 1) & ~((a) - 1))
 #define READ_ONCE(x) (x)
-#define WARN_ON_ONCE(x) ((void)(x))
+static bool warn_on_once(bool condition) { return condition; }
+#define WARN_ON_ONCE(x) warn_on_once(x)
 #define pr_info(...) ((void)0)
 #define pr_err(...) ((void)0)
 typedef unsigned long mk_phys_cpu_t;
@@ -49,13 +50,14 @@ struct mk_pool {
 static struct mk_pool pool, *mk_pool = &pool;
 static struct mk_spawn_context ctx, pool_slot;
 static unsigned int frees, unmaps, checks;
+static int unmap_error;
 #define mk_cpu_set_empty(p) (!(p) || !(p)->nr)
 #define mk_cpu_set_count(p) ((p) ? (p)->nr : 0)
 #define mk_cpu_set_format(buf, len, set) ((void)(buf), (void)(len), (void)(set))
 #define mk_cpu_set_free(p) ((void)(p), frees++)
 #define mk_cpu_set_del(p, cpu) ((void)(cpu), (p)->nr = 0)
 #define multikernel_free(phys, size) ((void)(phys), (void)(size), frees++)
-#define mk_pool_unmap(phys, size) ((void)(phys), (void)(size), unmaps++)
+#define mk_pool_unmap(phys, size) ((void)(phys), (void)(size), unmaps++, unmap_error)
 #define mk_free_identity_pgtable(p) ((void)(p), frees++)
 #define set_memory_nx(virt, pages) ((void)(virt), (void)(pages), 0)
 static bool mk_pool_cpus_returned(void)
@@ -133,6 +135,11 @@ int main(void)
 	checks++;
 	reset(&instance, &cpus);
 	assert(!mk_pool_park_teardown() && frees == 3 && unmaps == 2 && !pool.arch.slot);
+	checks++;
+	reset(&instance, &cpus);
+	unmap_error = -EIO;
+	mk_pool_ctrl_free(0x1000, PAGE_SIZE);
+	assert(!frees && unmaps == 1);
 	checks++;
 	printf("Mailbox lifetime: %u checks passed (no live CPU execution)\n",
 	       checks);

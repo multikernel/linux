@@ -325,7 +325,7 @@ err_remove_dir:
 	mutex_unlock(&mk_instance_mutex);
 	kernfs_remove(kn);
 	instance->kn = NULL;
-	mk_instance_free_memory(instance);
+	ret = mk_instance_free_memory(instance) ?: ret;
 	mk_instance_put(instance);
 	mutex_lock(&mk_instance_mutex);
 err_free_config:
@@ -442,6 +442,8 @@ int mk_instance_destroy(struct mk_instance *instance)
 	/* The resource mutex pins membership while firmware may sleep. */
 	mutex_unlock(&mk_instance_mutex);
 	ret = mk_instance_prepare_destroy(instance);
+	if (!ret)
+		ret = mk_instance_retire_resources(instance);
 	mutex_lock(&mk_instance_mutex);
 	if (ret)
 		return ret;
@@ -455,8 +457,6 @@ int mk_instance_destroy(struct mk_instance *instance)
 		instance->kn = NULL;
 		mk_instance_put(instance);
 	}
-	/* Permit later fragments of this same overlay to reuse its resources. */
-	mk_instance_retire_resources(instance);
 	mk_instance_put(instance);
 	mutex_lock(&mk_instance_mutex);
 

@@ -79,3 +79,12 @@ queued notifications across re-spawns, and 50-cycle same/different Image reuse.
 No #7 session protocol, wire-layout change or mixed-peer compatibility claim
 is introduced. RISC-V runtime additionally needs the explicitly separate
 modern #26 loader and #27/#28 test integration dependencies.
+
+Pool unmapping is fallible. Control-block unmap failure retains memory-region
+metadata, the control allocation and the instance pool, and propagates through
+re-reservation and baseline replacement. Destroy attempts retirement before
+removing the record from kernfs/IDR; memory readers remain excluded by the
+controller mutex. CPU/device return can already have completed on an error.
+Unexpected failure after the final reference retains the record/allocations
+as a diagnostic leak; it is not a recovery API. The x86 pool-control wrapper
+also refuses to free physical memory after an unexpected unmap error.

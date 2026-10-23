@@ -22,7 +22,7 @@ struct mk_instance {
 static bool mk_instance_mutex, mk_overlay_mutex = true;
 static int mk_instance_idr;
 static unsigned int ref_drops, retired, removed, locked_drains, checks, failures;
-static int prepare_error;
+static int prepare_error, retire_error;
 #define lockdep_assert_held(m) assert(*(m))
 #define mutex_lock(m) do { assert(!*(m)); *(m) = true; } while (0)
 #define mutex_unlock(m) do { assert(*(m)); *(m) = false; } while (0)
@@ -38,10 +38,11 @@ static __attribute__((unused)) int mk_instance_prepare_destroy(struct mk_instanc
 	assert(mk_overlay_mutex && !mk_instance_mutex);
 	return prepare_error;
 }
-static __attribute__((unused)) void mk_instance_retire_resources(struct mk_instance *p)
+static __attribute__((unused)) int mk_instance_retire_resources(struct mk_instance *p)
 {
 	assert(mk_overlay_mutex && !mk_instance_mutex);
 	retired++;
+	return retire_error;
 }
 #include "destroy-production.h"
 
@@ -98,6 +99,19 @@ int main(void)
 		removed = ref_drops = 0;
 	}
 	prepare_error = 0;
+	retire_error = -EIO;
+	expect("failed unmap refuses destruction", destroy(&p), -EIO);
+	expect("failed unmap retains registry membership", removed, 0);
+	expect("failed unmap retains references", ref_drops, 0);
+	if (removed) {
+		INIT_LIST_HEAD(&instances);
+		INIT_LIST_HEAD(&p.list);
+		list_add(&p.list, &instances);
+		p.kn = &kn;
+		removed = ref_drops = 0;
+	}
+	retired = 0;
+	retire_error = 0;
 	expect("confirmed destruction", destroy(&p), 0);
 	expect("record unregistered once", removed, 1);
 	expect("registry and kernfs references released", ref_drops, 2);

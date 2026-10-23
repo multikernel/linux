@@ -148,15 +148,18 @@ static void mk_baseline_free_pci_list(struct list_head *pci_list)
 	}
 }
 
-static void mk_baseline_clear_resources(struct mk_instance *instance)
+static int mk_baseline_clear_resources(struct mk_instance *instance)
 {
 	struct mk_pci_device *pci_dev, *pci_tmp;
 	struct mk_platform_device *plat_dev, *plat_tmp;
+	int ret;
 
 	if (!instance)
-		return;
+		return 0;
 
-	mk_instance_free_memory(instance);
+	ret = mk_instance_free_memory(instance);
+	if (ret)
+		return ret;
 	list_for_each_entry_safe(pci_dev, pci_tmp, &instance->pci_devices, list) {
 		list_del(&pci_dev->list);
 		kfree(pci_dev);
@@ -170,6 +173,7 @@ static void mk_baseline_clear_resources(struct mk_instance *instance)
 	}
 	instance->platform_device_count = 0;
 	instance->platform_devices_valid = false;
+	return 0;
 }
 
 static int mk_baseline_validate_cpus(const struct mk_cpu_set *requested)
@@ -471,7 +475,9 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 		return -ENOMEM;
 	}
 
-	mk_baseline_clear_resources(mk_self);
+	ret = mk_baseline_clear_resources(mk_self);
+	if (ret)
+		goto out;
 
 	ret = mk_baseline_parse_cpus(fdt, resources_node, requested);
 	if (ret) {

@@ -242,12 +242,12 @@ static void mk_instance_free_boot_pages(struct mk_instance *instance)
 	instance->manifest_phys = 0;
 }
 
-void mk_instance_retire_resources(struct mk_instance *instance)
+int mk_instance_retire_resources(struct mk_instance *instance)
 {
 	lockdep_assert_held(&mk_overlay_mutex);
 	mk_instance_return_pci_devices(instance);
 	mk_instance_return_platform_devices(instance);
-	mk_instance_free_memory(instance);
+	return mk_instance_free_memory(instance);
 }
 
 static void mk_instance_release_work(struct work_struct *work)
@@ -275,7 +275,13 @@ static void mk_instance_release_work(struct work_struct *work)
 		mutex_unlock(&mk_overlay_mutex);
 		return;
 	}
-	mk_instance_retire_resources(instance);
+	ret = mk_instance_retire_resources(instance);
+	if (ret) {
+		pr_err("Instance %d final retirement failed: %d; retaining allocations\n",
+		       instance->id, ret);
+		mutex_unlock(&mk_overlay_mutex);
+		return;
+	}
 	mk_instance_free_boot_pages(instance);
 
 	mk_instance_track_dump(instance, instance->state, MK_STATE_READY);
@@ -1401,8 +1407,7 @@ static int mk_instance_transfer_memory(struct mk_instance *instance, u64 size,
 	return 0;
 
 cleanup:
-	mk_instance_free_memory(instance);
-	return ret;
+	return mk_instance_free_memory(instance) ?: ret;
 }
 
 static int mk_instance_reserve_memory(struct mk_instance *instance,
@@ -1422,21 +1427,33 @@ static int mk_instance_reserve_memory(struct mk_instance *instance,
  * Note: The memory is returned to the global multikernel pool by
  * multikernel_destroy_instance_pool(), which makes it available for
  * future instance allocations (including mk_self).
+ * Return: 0 on success, or an error with memory and metadata retained.
  */
-void mk_instance_free_memory(struct mk_instance *instance)
+int mk_instance_free_memory(struct mk_instance *instance)
 {
 	struct mk_memory_region *region, *tmp;
 	u64 total_freed = 0;
+	int ret;
 
 	if (!instance)
-		return;
+		return 0;
 	/* Never detach metadata or forget the pool when execution is uncertain. */
 	if (instance->resource_uncertain ||
 	    instance->state == MK_STATE_ACTIVE || instance->state == MK_STATE_FAILED ||
 	    instance->kimage || mk_arch_release_instance(instance)) {
 		pr_err("Instance %d memory release refused; retaining pool and metadata\n",
 		       instance->id);
-		return;
+		return -EBUSY;
+	}
+
+	/* Unmap can fail; keep the entire allocation and its metadata on error. */
+	if (instance->ctrl_va) {
+		ret = mk_pool_unmap(instance->ctrl_phys, MK_CTRL_BLOCK_SIZE);
+		if (ret) {
+			pr_err("Instance %d control unmap failed: %d; retaining memory\n",
+			       instance->id, ret);
+			return ret;
+		}
 	}
 
 	list_for_each_entry_safe(region, tmp, &instance->memory_regions, list) {
@@ -1472,7 +1489,6 @@ void mk_instance_free_memory(struct mk_instance *instance)
 		 * goes away.
 		 */
 		if (instance->ctrl_va) {
-			mk_pool_unmap(instance->ctrl_phys, MK_CTRL_BLOCK_SIZE);
 			mk_instance_mem_free(instance, instance->ctrl_va,
 					 MK_CTRL_BLOCK_SIZE);
 			instance->ctrl_va = NULL;
@@ -1487,6 +1503,7 @@ void mk_instance_free_memory(struct mk_instance *instance)
 
 	pr_debug("Freed all memory regions and pool for instance %d (%s)\n",
 		 instance->id, instance->name);
+	return 0;
 }
 
 /**
@@ -1509,8 +1526,10 @@ int mk_instance_reserve_resources(struct mk_instance *instance,
 		return -EINVAL;
 	}
 
-	/* Free any existing memory regions first */
-	mk_instance_free_memory(instance);
+	/* Do not overwrite ownership when the old allocation cannot retire. */
+	ret = mk_instance_free_memory(instance);
+	if (ret)
+		return ret;
 
 	/* Reserve memory regions */
 	ret = mk_instance_reserve_memory(instance, config);

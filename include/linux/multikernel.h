@@ -523,10 +523,11 @@ extern struct mk_pool *mk_pool;
 
 int mk_pool_mem_grow(size_t size, int node, phys_addr_t *out_base);
 int mk_pool_mem_shrink(phys_addr_t start, size_t size);
+/* Caller owns the range. Map failure adds no mappings; unmap failure retains them. */
 int mk_pool_map(phys_addr_t start, size_t size);
-void mk_pool_unmap(phys_addr_t start, size_t size);
+int mk_pool_unmap(phys_addr_t start, size_t size);
 int mk_arch_pool_map(phys_addr_t start, size_t size);
-void mk_arch_pool_unmap(phys_addr_t start, size_t size);
+int mk_arch_pool_unmap(phys_addr_t start, size_t size);
 extern phys_addr_t multikernel_alloc(size_t size, int node);
 extern void multikernel_free(phys_addr_t addr, size_t size);
 struct resource *mk_pool_chunk_resource(phys_addr_t addr);
@@ -992,8 +993,9 @@ int mk_instance_reserve_resources(struct mk_instance *instance,
  *
  * Returns all reserved memory regions back to the multikernel pool
  * and removes them from the resource hierarchy.
+ * Return: 0 on success, or an error with memory and metadata retained.
  */
-void mk_instance_free_memory(struct mk_instance *instance);
+int mk_instance_free_memory(struct mk_instance *instance);
 
 
 int mk_instance_transfer_cpus(struct mk_instance *instance,

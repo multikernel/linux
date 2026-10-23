@@ -1164,7 +1164,8 @@ static void *mk_pool_ctrl_alloc(size_t size)
 
 static void mk_pool_ctrl_free(phys_addr_t phys, size_t size)
 {
-	mk_pool_unmap(phys, size);
+	if (WARN_ON_ONCE(mk_pool_unmap(phys, size)))
+		return;
 	multikernel_free(phys, size);
 }
 
@@ -1619,9 +1620,10 @@ int mk_arch_pool_map(phys_addr_t start, size_t size)
 	return 0;
 }
 
-void mk_arch_pool_unmap(phys_addr_t start, size_t size)
+int mk_arch_pool_unmap(phys_addr_t start, size_t size)
 {
 	kernel_physical_mapping_remove(start, start + size);
+	return 0;
 }
 
 int mk_arch_pool_chunk_added(phys_addr_t start, size_t size)

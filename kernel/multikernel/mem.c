@@ -794,12 +794,15 @@ int mk_pool_map(phys_addr_t start, size_t size)
 	return ret;
 }
 
-void mk_pool_unmap(phys_addr_t start, size_t size)
+int mk_pool_unmap(phys_addr_t start, size_t size)
 {
+	int ret;
+
 	guard(mutex)(&mk_pool_map_lock);
 	get_online_mems();
-	mk_arch_pool_unmap(start, size);
+	ret = mk_arch_pool_unmap(start, size);
 	put_online_mems();
+	return ret;
 }
 
 static void mk_pool_chunk_return(struct mk_pool_chunk *chunk)

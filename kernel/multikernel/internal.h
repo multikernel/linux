@@ -17,7 +17,7 @@ int mk_instance_publish(struct mk_instance *instance);
 int mk_instance_idr_add(struct mk_instance *instance, int start, int end);
 void mk_instance_idr_remove(int id);
 int mk_instance_prepare_destroy(struct mk_instance *instance);
-void mk_instance_retire_resources(struct mk_instance *instance);
+int mk_instance_retire_resources(struct mk_instance *instance);
 void mk_instance_free(struct mk_instance *instance);
 
 /* kernfs.c */

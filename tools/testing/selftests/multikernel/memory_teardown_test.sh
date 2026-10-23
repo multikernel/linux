@@ -12,9 +12,12 @@ if [ -n "${MK_CORE_REV:-}" ]; then
 else
     input="$src/kernel/multikernel/core.c"
 fi
-awk '/^void mk_instance_free_memory\(/ { copy = 1 }
+awk '/^(void|int) mk_instance_(free_memory|reserve_resources)\(/ { copy = 1 }
      copy { print }
      copy && /^}/ { copy = 0 }' "$input" > "$build/memory-production.h"
+awk '/^static (void|int) mk_baseline_clear_resources\(/ { copy = 1 }
+     copy { print }
+     copy && /^}/ { copy = 0 }' "$src/kernel/multikernel/baseline.c" >> "$build/memory-production.h"
 ${CC:-cc} ${CFLAGS:-} -std=gnu11 -Wall -Wextra -Werror -I"$build" \
     -I"$src/tools/include" "$test_dir/memory_teardown_test.c" -o "$build/memory_teardown_test"
 "$build/memory_teardown_test"
