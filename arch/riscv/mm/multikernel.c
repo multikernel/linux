@@ -20,8 +20,9 @@ static int mk_pool_mapping_range(phys_addr_t start, size_t size)
 	if (!chunk || end - 1 > chunk->end ||
 	    start < range.start || end - 1 > range.end)
 		return -EINVAL;
+	/* Early sections can remain pfn_valid after their subsections are removed. */
 	for (addr = start; addr < end; addr += PAGE_SIZE)
-		if (pfn_valid(addr >> PAGE_SHIFT))
+		if (pfn_to_online_page(addr >> PAGE_SHIFT))
 			return -EBUSY;
 	return 0;
 }

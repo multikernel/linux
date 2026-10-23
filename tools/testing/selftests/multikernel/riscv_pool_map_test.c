@@ -34,7 +34,7 @@ struct resource { unsigned long start, end; };
 struct range { unsigned long start, end; };
 static struct resource chunk;
 static struct range mappable;
-static unsigned long valid_pfn;
+static unsigned long online_pfn, early_pfn;
 static bool have_chunk, l4, l5;
 static pgd_t root[512];
 static unsigned int allocs, frees, flushes, fail_alloc, live, checks;
@@ -91,7 +91,8 @@ static pte_t *alloc_table(void)
 #define set_pte(p, x) (*(p) = (x))
 #define ptep_get(p) (*(p))
 #define pte_clear(mm, a, p) ((void)(mm), (void)(a), (p)->val = 0)
-#define pfn_valid(pfn) ((pfn) == valid_pfn)
+#define pfn_valid(pfn) ((pfn) == online_pfn || (pfn) == early_pfn)
+#define pfn_to_online_page(pfn) ((pfn) == online_pfn ? (void *)1 : NULL)
 static pte_t *table(pte_t entry)
 {
 	return (void *)(entry.val & ~(PAGE_SIZE - 1));
@@ -239,7 +240,7 @@ static void reset(unsigned int mode)
 	l5 = mode >= 57;
 	chunk = (struct resource) { 0x40000000, 0x7fffffff };
 	mappable = (struct range) { 0, 0x7fffffffff };
-	valid_pfn = ~0UL;
+	online_pfn = early_pfn = ~0UL;
 	have_chunk = true;
 	allocs = 0;
 	frees = 0;
@@ -290,17 +291,20 @@ int main(void)
 		mappable.end = a - 1;
 		expect("outside direct map", mk_arch_pool_map(a, PAGE_SIZE), -EINVAL);
 		mappable.end = chunk.end;
-		valid_pfn = (a >> PAGE_SHIFT) + 1;
+		online_pfn = (a >> PAGE_SHIFT) + 1;
 		expect("online tail", mk_arch_pool_map(a, 2 * PAGE_SIZE), -EBUSY);
 		assert(!allocs);
-		valid_pfn = ~0UL;
-		expect("map", mk_arch_pool_map(a, PAGE_SIZE), 0);
+		online_pfn = ~0UL;
+		/* An early section keeps struct page storage after subsection removal. */
+		early_pfn = a >> PAGE_SHIFT;
+		assert(pfn_valid(early_pfn) && !pfn_to_online_page(early_pfn));
+		expect("map removed early subsection", mk_arch_pool_map(a, PAGE_SIZE), 0);
 		assert(pte_pfn(*get_pte(a)) == a >> PAGE_SHIFT && flushes);
 		saved = *get_pte(a);
-		valid_pfn = a >> PAGE_SHIFT;
+		online_pfn = a >> PAGE_SHIFT;
 		expect("unmap online RAM", mk_arch_pool_unmap(a, PAGE_SIZE), -EBUSY);
 		assert(get_pte(a)->val == saved.val);
-		valid_pfn = ~0UL;
+		online_pfn = ~0UL;
 		expect("overlap", mk_arch_pool_map(a, 2 * PAGE_SIZE), -EBUSY);
 		assert(get_pte(a)->val == saved.val && pte_none(*get_pte(a + PAGE_SIZE)));
 		expect("neighbor map", mk_arch_pool_map(a + PAGE_SIZE, PAGE_SIZE), 0);
