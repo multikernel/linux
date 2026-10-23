@@ -310,13 +310,29 @@ static void concurrent_cleanup_case(void)
 
 static void admission_case(void)
 {
-	CHECK(mk_register_msg_handler(17, callback, NULL) == -ESHUTDOWN,
-	      "registration before init must fail");
+	CHECK(!mk_register_msg_handler(17, callback, NULL),
+	      "early PCI handler registration must succeed");
 	mk_messaging_cleanup();
 	CHECK(mk_messaging_init() < 0, "cleanup must prevent a later init reopening admission");
 	CHECK(mk_register_msg_handler(18, callback, NULL) == -ESHUTDOWN,
 	      "initialization cannot reopen cleaned-up messaging");
 	mk_messaging_cleanup();
+}
+
+static void early_init_case(void)
+{
+	struct mk_msg_type_handler *early;
+
+	CHECK(!mk_register_msg_handler(17, callback, &readers),
+	      "arch initcall can register before messaging subsys init");
+	early = mk_msg_type_handlers;
+	CHECK(!mk_messaging_init(), "normal messaging initialization succeeds");
+	CHECK(early && mk_msg_type_handlers == early && live_handlers == 1,
+	      "initialization preserves the early handler and its context");
+	CHECK(mk_register_msg_handler(17, callback, NULL) == -EEXIST,
+	      "early handler still excludes duplicate registration after init");
+	mk_messaging_cleanup();
+	CHECK(!mk_msg_type_handlers && !live_handlers, "cleanup retires early handlers");
 }
 
 static void errors_case(void)
@@ -357,7 +373,7 @@ static void context_case(void)
 int main(void)
 {
 	void (*cases[])(void) = { duplicate_case, cleanup_case, unregister_case,
-		concurrent_cleanup_case, admission_case, errors_case, context_case };
+		concurrent_cleanup_case, admission_case, early_init_case, errors_case, context_case };
 	unsigned int i, failed = 0;
 
 	for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -375,9 +391,9 @@ int main(void)
 			failed++;
 	}
 	if (failed) {
-		fprintf(stderr, "Messaging registry: %u/7 scenarios failed\n", failed);
+		fprintf(stderr, "Messaging registry: %u/8 scenarios failed\n", failed);
 		return 1;
 	}
-	puts("Messaging registry: 7 scenarios PASS (non-native IRQ/RCU boundaries)");
+	puts("Messaging registry: 8 scenarios PASS (non-native IRQ/RCU boundaries)");
 	return 0;
 }

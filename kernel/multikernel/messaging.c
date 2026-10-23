@@ -51,7 +51,8 @@ static struct mk_msg_type_handler *mk_msg_type_handlers;
  */
 static DEFINE_MUTEX(mk_msg_type_handlers_lock);
 static bool mk_messaging_initialized;
-static bool mk_messaging_accepting;
+/* PCI registers at arch_initcall, before multikernel's subsys_initcall. */
+static bool mk_messaging_accepting = true;
 
 /**
  * mk_message_type_ipi_callback - IPI callback to handle incoming messages for a specific type
@@ -546,7 +547,6 @@ int __init mk_messaging_init(void)
 		return -EALREADY;
 	}
 	mk_messaging_initialized = true;
-	mk_messaging_accepting = true;
 	mutex_unlock(&mk_msg_type_handlers_lock);
 
 	/* No global IPI handler needed anymore - handlers are registered per message type */

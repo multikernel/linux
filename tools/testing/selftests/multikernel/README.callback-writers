@@ -26,9 +26,10 @@ retirement. Cleanup closes admission before detaching the list and retains the
 mutex until every detached handler is retired. A concurrent cleanup therefore
 cannot report completion while another cleanup still drains callbacks.
 
-Admission begins closed. Init opens it once; cleanup permanently closes it even
-if called before init. Registration while closed returns -ESHUTDOWN; another init
-returns -EALREADY. Allocation failure and duplicate/missing-handler errors leave
+Admission begins open for PCI's arch-init handler registration. Messaging init
+preserves those handlers; cleanup permanently closes admission even if called
+before init. Registration while closed returns -ESHUTDOWN; another init returns
+-EALREADY. Allocation failure and duplicate/missing-handler errors leave
 the mutex usable. No message layout, peer/session protocol or API version changes.
 
 Register, unregister and cleanup require sleepable process context and no
@@ -40,9 +41,10 @@ callbacks must not register/unregister or clean up messaging. Owners retain thei
 callback context until successful unregister or completed cleanup. Production
 multikernel_unregister_handler() supplies the existing RCU grace-period guarantee.
 
-Seven controlled scenarios exercise competing same-type writers, unregister vs
+Eight controlled scenarios exercise competing same-type writers, unregister vs
 replacement, cleanup vs registration, concurrent cleanups, closed admission and
-one-shot init, allocation/error paths, and interrupt-context rejection. An entered
+one-shot init, early PCI registration, allocation/error paths, and interrupt-
+context rejection. An entered
 callback runs the extracted message wrapper while a remover waits at the modeled
 RCU boundary; its context must not be freed before callback return. Checkpoints
 use condition variables and observed lock contention, not scheduling sleeps.
