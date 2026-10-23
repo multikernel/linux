@@ -14,7 +14,7 @@ struct mk_instance {
 };
 struct kimage { int unused; };
 static int lend_error, start_error, starts, unlends, failures;
-static enum mk_instance_state state_at_start;
+static enum mk_instance_state state_at_start, state_at_unlend;
 #define pr_debug(...) do { } while (0)
 #define pr_info(...) do { } while (0)
 #define pr_err(...) do { } while (0)
@@ -30,7 +30,7 @@ static int mk_pciback_lend(struct mk_instance *instance)
 
 static void mk_pciback_unlend(struct mk_instance *instance)
 {
-	(void)instance;
+	state_at_unlend = instance->state;
 	unlends++;
 }
 
@@ -76,6 +76,8 @@ int main(void)
 	/* Caller supplies CPU/work settlement before publishing LOADED. */
 	mk_instance_set_state(&instance, MK_STATE_LOADED);
 	CHECK(unlends == 1, "settled failure retires previously lent devices");
+	CHECK(state_at_unlend == MK_STATE_FAILED,
+	      "PCI retirement completes before publishing reusable state");
 	start_error = 0;
 	CHECK(!mk_instance_start(&instance, &image, 3), "successful start");
 	CHECK(instance.state == MK_STATE_ACTIVE && state_at_start == MK_STATE_ACTIVE,

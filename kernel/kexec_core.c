@@ -624,8 +624,11 @@ void kimage_free_multikernel(struct kimage *image)
 	/* Published Images reach here only after kimage_free() validated stop. */
 	if (!instance)
 		return;
-	if (instance->kimage == image)
+	if (instance->kimage == image) {
+		/* Retire PCI access before returning memory it could still reach. */
+		mk_instance_set_state(instance, MK_STATE_READY);
 		mk_instance_ipi_deactivate(instance);
+	}
 
 	for (i = 0; i < image->nr_segments; i++)
 		mk_kimage_free(image, phys_to_virt(image->segment[i].mem),
@@ -637,7 +640,6 @@ void kimage_free_multikernel(struct kimage *image)
 	if (instance->kimage == image) {
 		/* No kernel left to read the ring */
 		instance->kimage = NULL;
-		mk_instance_set_state(instance, MK_STATE_READY);
 	}
 	mk_instance_put(instance);
 	image->mk_instance = NULL;

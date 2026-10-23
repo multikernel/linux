@@ -40,6 +40,7 @@ static _Thread_local unsigned int held;
 static _Thread_local bool resource_thread;
 static bool is_mk, permitted = true, allocation_fails;
 static bool mapping_fails;
+static bool pci_lent;
 static unsigned int control_page_calls;
 static unsigned int image_work_calls;
 static const char *probe_at, *fail_at;
@@ -207,6 +208,7 @@ static void mk_instance_put(struct mk_instance *instance)
 
 static void mk_kimage_free(struct kimage *image, void *addr, size_t size)
 {
+	expect("PCI retired before Image memory release", pci_lent, 0);
 	stage("free-segment");
 }
 static void kimage_file_post_load_cleanup(struct kimage *image)
@@ -245,8 +247,18 @@ static int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *inst
 	return stage("start");
 }
 /* PCI operations are boundary probes, not device emulation. */
-static int mk_pciback_lend(struct mk_instance *instance) { return stage("lend"); }
-static void mk_pciback_unlend(struct mk_instance *instance) { stage("unlend"); }
+static int mk_pciback_lend(struct mk_instance *instance)
+{
+	int ret = stage("lend");
+
+	pci_lent = !ret;
+	return ret;
+}
+static void mk_pciback_unlend(struct mk_instance *instance)
+{
+	stage("unlend");
+	pci_lent = false;
+}
 #include "image-instance.h"
 #include "image-core.h"
 
@@ -389,6 +401,7 @@ static void reset(bool multikernel)
 	is_mk = multikernel;
 	permitted = true;
 	mapping_fails = false;
+	pci_lent = false;
 	control_page_calls = 0;
 	image_work_calls = 0;
 	allocation_fails = probe_started = attempted = finished = false;
@@ -517,6 +530,12 @@ int main(void)
 		finish_probe();
 		expect("failed exec retains non-reusable state after start", target.state,
 		       !strcmp(exec_fail_stages[i], "start") ? MK_STATE_FAILED : MK_STATE_LOADED);
+		if (!strcmp(exec_fail_stages[i], "start")) {
+			expect("uncertain start retains lent PCI functions", pci_lent, 1);
+			fail_at = NULL;
+			expect("settled start failure can unload", kexec_file_load(0, 0, 0, NULL,
+			       mk_flags | KEXEC_FILE_UNLOAD), 0);
+		}
 	}
 	reset(true);
 	expect("setup invalid CPU exec", kexec_file_load(0, 0, 0, NULL, mk_flags), 0);

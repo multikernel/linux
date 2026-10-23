@@ -428,13 +428,12 @@ void mk_instance_set_state(struct mk_instance *instance,
 	if (old_state == state)
 		return;
 
-	instance->state = state;
-	mk_instance_track_dump(instance, old_state, state);
-
 	/* FAILED retains devices; callers settle execution before READY/LOADED. */
 	if ((old_state == MK_STATE_ACTIVE || old_state == MK_STATE_FAILED) &&
 	    (state == MK_STATE_READY || state == MK_STATE_LOADED))
 		mk_pciback_unlend(instance);
+	instance->state = state;
+	mk_instance_track_dump(instance, old_state, state);
 	pr_debug("Instance %d (%s) state: %s -> %s\n",
 		 instance->id, instance->name,
 		 mk_state_to_string(old_state),

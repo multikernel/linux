@@ -1,0 +1,33 @@
+.. SPDX-License-Identifier: GPL-2.0-only
+
+PCI backend request retirement
+==============================
+
+Run: bash tools/testing/selftests/multikernel/pciback_lifetime_test.sh
+
+The fixture extracts the production request, deferred worker, reference release
+and unlend functions. It uses pthread locks and controlled condition variables
+for the boundaries where the kernel uses locks and a workqueue. PCI config
+access and reset are modeled, not executed against a physical device.
+
+Four scenarios check:
+
+* A queued request pins its original device grant. Unlend followed by a new grant
+  with the same instance ID and BDF cannot redirect that request, or send its ACK
+  into a later boot.
+* A negative reply requires no config access and does not queue an ID lookup.
+* Unlend revokes admission under the registry spinlock, then waits outside that
+  lock for a slow config access and its reply before resetting the function.
+* Direct and deferred config writes preserve the request value; single-function
+  retirement releases the same pins as whole-instance retirement.
+
+The existing startup and image-lock tests also check PCI retirement before
+publishing a reusable instance state and before freeing Image segments.
+
+Limits
+------
+
+These checks do not prove native lockdep behavior, PCI reset/DMA quiescence, or
+RISC-V PCI assignment. They do not cover delayed resource-hotplug ACKs, partial
+overlay rollback, or requests still in a peer's shared ring at retirement.
+Those are separate lifetime gates; a passing fixture is not end-to-end safety.
