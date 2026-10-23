@@ -11,6 +11,9 @@ Actual x86 Kconfig and affected-object build checks:
 
   bash tools/testing/selftests/multikernel/cpu_hotplug_config_test.sh
 
+The configuration test also requires OF and OF_FLATTREE with MULTIKERNEL:
+the current manifest restore path consumes the boot device tree unconditionally.
+
 This rejects UP multikernel without CPU hotplug, builds ordinary UP CPU
 objects, then restores SMP/hotplug multikernel and builds its resource-hotplug
 object. It does not boot a guest or execute CPU transitions.

@@ -14,8 +14,16 @@ configure x86_64_defconfig
 "$src/scripts/config" --file "$build/.config" \
     -e KEXEC_FILE -e CONTIG_ALLOC -e MEMORY_HOTPLUG -e MEMORY_HOTREMOVE -e MULTIKERNEL
 configure olddefconfig
+if grep -qx 'CONFIG_MULTIKERNEL=y' "$build/.config"; then
+    echo 'FAIL: multikernel enabled without boot Device Tree support'
+    exit 1
+fi
+"$src/scripts/config" --file "$build/.config" -e OF -e MULTIKERNEL
+configure olddefconfig
 grep -qx 'CONFIG_MULTIKERNEL=y' "$build/.config"
 grep -qx 'CONFIG_HOTPLUG_CPU=y' "$build/.config"
+grep -qx 'CONFIG_OF=y' "$build/.config"
+grep -qx 'CONFIG_OF_FLATTREE=y' "$build/.config"
 cp "$build/.config" "$build/supported.config"
 "$src/scripts/config" --file "$build/.config" -d SMP -d HOTPLUG_CPU -e MULTIKERNEL
 configure olddefconfig

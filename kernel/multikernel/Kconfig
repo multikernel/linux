@@ -22,6 +22,7 @@ config MULTIKERNEL
 	depends on MEMORY_HOTPLUG
 	depends on MEMORY_HOTREMOVE
 	depends on CONTIG_ALLOC
+	depends on OF && OF_EARLY_FLATTREE
 	select LIBFDT
 	select OF_DYNAMIC if OF
 	help
