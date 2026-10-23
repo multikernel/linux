@@ -47,7 +47,7 @@ struct mk_instance {
 	const char *name;
 	struct mk_cpu_set *cpus, *cpus_on_slot;
 	mk_phys_cpu_t ipi_target;
-	bool ipi_lock;
+	bool ipi_lock, resource_uncertain;
 	struct {
 		struct mk_spawn_context *spawn_ctx;
 		unsigned long spawn_ctx_phys;
@@ -520,6 +520,15 @@ int main(void)
 	confirm_mode = true;
 	expect("before first spawn confirm host park slot",
 	       mk_instance_confirm_parked(&target), 0);
+	target.resource_uncertain = true;
+	expect("parked CPUs do not settle uncertain resource work",
+	       mk_instance_confirm_parked(&target), -EBUSY);
+	expect("uncertain resource blocks CPU removal",
+	       mk_send_cpu_remove(2, test_cpu), -EBUSY);
+	expect("quarantine retains parked CPU ownership",
+	       mk_cpu_set_contains(target.cpus, test_cpu), 1);
+	expect("uncertain resource blocks CPU addition",
+	       mk_send_cpu_add(2, test_cpu + 1, 0, 0), -EBUSY);
 
 	reset();
 	assert(!mk_instance_transfer_cpus(&target, pool.cpus));

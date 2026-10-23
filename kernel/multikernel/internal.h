@@ -42,7 +42,6 @@ int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 /* overlay.c */
 extern struct kernfs_node *mk_overlay_root_kn;
 int mk_overlay_init(void);
-void mk_overlay_exit(void);
 int mk_overlay_rmdir(struct kernfs_node *kn);
 
 /* ipi.c */
@@ -67,6 +66,7 @@ int mk_pool_device_remove(u16 domain, u8 bus, u8 devfn,
 
 /* Root pool bookkeeping for PCI devices, see core.c */
 bool mk_root_has_pci_device(u16 domain, u8 bus, u8 devfn);
+bool mk_pci_device_assigned(u16 domain, u8 bus, u8 devfn);
 int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn, const char *alias);
 int mk_root_del_pci_device(u16 domain, u8 bus, u8 devfn);
 

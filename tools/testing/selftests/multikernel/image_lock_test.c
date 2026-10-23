@@ -130,6 +130,7 @@ struct mk_instance {
 	int id;
 	const char *name;
 	enum mk_instance_state state;
+	bool resource_uncertain;
 	struct mk_cpu_set *cpus;
 	struct kimage *kimage;
 	void *ipi_data;
@@ -372,6 +373,7 @@ static void *resource_operation(void *unused)
 
 	assert(tx);
 	resource_thread = true;
+	tx->status = MK_OVERLAY_TX_APPLIED;
 	INIT_LIST_HEAD(&transactions);
 	list_add(&tx->list, &transactions);
 	expect("competing overlay succeeds after release", mk_overlay_rmdir(&kn), 0);

@@ -1397,6 +1397,9 @@ int mk_pool_device_add(u16 domain, u8 bus, u8 devfn, const char *alias)
 {
 	int ret;
 
+	if (mk_pci_device_assigned(domain, bus, devfn))
+		return -EBUSY;
+
 	ret = mk_do_device_remove(domain, bus, devfn);
 	if (ret)
 		return ret;
@@ -1472,6 +1475,8 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	struct mk_instance *target_instance;
 	int ret;
 
+	lockdep_assert_held(&mk_overlay_mutex);
+
 	/* For self-removal, execute directly (we're in process context) */
 	if (instance_id == mk_self->id) {
 		if (mk_pool)
@@ -1484,7 +1489,8 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 		return -ENODEV;
 
 	/* For non-running instances, return CPU to root using existing API */
-	if (target_instance->state == MK_STATE_FAILED) {
+	if (target_instance->resource_uncertain ||
+	    target_instance->state == MK_STATE_FAILED) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1595,6 +1601,8 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 	struct mk_instance *target_instance;
 	int ret;
 
+	lockdep_assert_held(&mk_overlay_mutex);
+
 	/* For self-addition, execute directly (we're in process context) */
 	if (instance_id == mk_self->id) {
 		if (mk_pool)
@@ -1610,7 +1618,8 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 	}
 
 	/* For non-running instances, transfer CPU from root using existing API */
-	if (target_instance->state == MK_STATE_FAILED) {
+	if (target_instance->resource_uncertain ||
+	    target_instance->state == MK_STATE_FAILED) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1703,7 +1712,9 @@ int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
 	};
 	struct mk_pending_msg *pending;
 	struct mk_instance *target_instance;
-	int ret;
+	int ret, cleanup_ret;
+
+	lockdep_assert_held(&mk_overlay_mutex);
 
 	/* For self-addition, execute directly (we're in process context) */
 	if (instance_id == mk_self->id)
@@ -1713,7 +1724,8 @@ int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
 	if (!target_instance)
 		return -ENODEV;
 
-	if (target_instance->state == MK_STATE_FAILED) {
+	if (target_instance->resource_uncertain ||
+	    target_instance->state == MK_STATE_FAILED) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1737,12 +1749,17 @@ int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
 	}
 
 	ret = mk_msg_pending_wait(pending, 10000);
-	/* Without an answer the kernel may still add it, so it stays its own */
-	if (!ret || ret == -ETIMEDOUT)
-		goto out;
+	/* Even a negative ACK may follow a failed, partial rollback. */
+	if (ret)
+		target_instance->resource_uncertain = true;
+	goto out;
 remove:
-	mk_instance_remove_memory_region(target_instance, PFN_PHYS(start_pfn),
-					 PFN_PHYS(nr_pages));
+	cleanup_ret = mk_instance_remove_memory_region(target_instance, PFN_PHYS(start_pfn),
+						       PFN_PHYS(nr_pages));
+	if (cleanup_ret) {
+		target_instance->resource_uncertain = true;
+		ret = cleanup_ret;
+	}
 out:
 	mk_instance_put(target_instance);
 	return ret;
@@ -1774,6 +1791,8 @@ int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages)
 	struct mk_instance *target_instance;
 	int ret;
 
+	lockdep_assert_held(&mk_overlay_mutex);
+
 	/* For self-removal, execute directly (we're in process context) */
 	if (instance_id == mk_self->id)
 		return mk_do_mem_remove(start_pfn, nr_pages);
@@ -1783,7 +1802,8 @@ int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages)
 		return -ENODEV;
 
 	/* For non-running instances, just remove the memory region from the instance */
-	if (target_instance->state == MK_STATE_FAILED) {
+	if (target_instance->resource_uncertain ||
+	    target_instance->state == MK_STATE_FAILED) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -1817,8 +1837,11 @@ int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages)
 	}
 
 	ret = mk_msg_pending_wait(pending, 10000);
-	if (ret < 0)
-		goto abort;
+	if (ret) {
+		/* A late removal must not race a new allocation from this range. */
+		target_instance->resource_uncertain = true;
+		goto out;
+	}
 
 	mk_instance_finish_memory_removal(target_instance, PFN_PHYS(start_pfn),
 					  PFN_PHYS(nr_pages));
@@ -1860,8 +1883,10 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 	struct mk_pending_msg *pending;
 	struct mk_instance *target_instance;
 	struct pci_dev *pdev;
-	int ret;
+	int ret, cleanup_ret;
 	u32 resource_id;
+
+	lockdep_assert_held(&mk_overlay_mutex);
 
 	if (driver_override)
 		strscpy(payload.driver_override, driver_override, sizeof(payload.driver_override));
@@ -1886,19 +1911,20 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 	if (!target_instance)
 		return -ENODEV;
 
-	if (target_instance->state == MK_STATE_FAILED) {
+	if (target_instance->resource_uncertain ||
+	    target_instance->state == MK_STATE_FAILED) {
 		ret = -EBUSY;
 		goto out;
 	}
-	if (target_instance->state != MK_STATE_ACTIVE) {
-		ret = mk_instance_add_pci_device(target_instance, domain, bus, devfn);
+	/* Reserve ownership before config access or a probe can be admitted. */
+	ret = mk_instance_add_pci_device(target_instance, domain, bus, devfn);
+	if (ret || target_instance->state != MK_STATE_ACTIVE)
 		goto out;
-	}
 
 	/* The instance probes the function as soon as it hears of it */
 	ret = mk_pciback_lend_one(target_instance, domain, bus, devfn);
 	if (ret)
-		goto out;
+		goto remove;
 
 	/* It may not have the function in its tree, nor even its bus */
 	pdev = pci_get_domain_bus_and_slot(domain, bus, devfn);
@@ -1925,22 +1951,24 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 	}
 
 	ret = mk_msg_pending_wait(pending, 10000);
-	if (ret < 0)
-		goto unlend;
-
-	ret = mk_instance_add_pci_device(target_instance, domain, bus, devfn);
-	if (ret < 0) {
-		pr_warn("Device added to target but failed to update tracking: %d\n", ret);
+	if (ret) {
+		target_instance->resource_uncertain = true;
+		goto out;
 	}
 
 	pr_info("Multikernel hotplug: Device %04x:%02x:%02x.%x successfully added to instance %d\n",
 		domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn), instance_id);
 
-	mk_instance_put(target_instance);
-	return 0;
+	goto out;
 
 unlend:
 	mk_pciback_unlend_one(target_instance, domain, bus, devfn);
+remove:
+	cleanup_ret = mk_instance_remove_pci_device(target_instance, domain, bus, devfn);
+	if (cleanup_ret) {
+		target_instance->resource_uncertain = true;
+		ret = cleanup_ret;
+	}
 out:
 	mk_instance_put(target_instance);
 	return ret;
@@ -1974,6 +2002,8 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 	int ret;
 	u32 resource_id;
 
+	lockdep_assert_held(&mk_overlay_mutex);
+
 	payload.driver_override[0] = '\0';
 	resource_id = ((u32)domain << 16) | (bus << 8) | devfn;
 
@@ -1987,7 +2017,8 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 	if (!target_instance)
 		return -ENODEV;
 
-	if (target_instance->state == MK_STATE_FAILED) {
+	if (target_instance->resource_uncertain ||
+	    target_instance->state == MK_STATE_FAILED) {
 		ret = -EBUSY;
 		goto out;
 	}
@@ -2010,14 +2041,18 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 	}
 
 	ret = mk_msg_pending_wait(pending, 10000);
-	if (ret < 0)
+	if (ret) {
+		target_instance->resource_uncertain = true;
 		goto out;
+	}
 
 	mk_pciback_unlend_one(target_instance, domain, bus, devfn);
 
 	ret = mk_instance_remove_pci_device(target_instance, domain, bus, devfn);
 	if (ret < 0) {
 		pr_warn("Device removed from target but failed to update tracking: %d\n", ret);
+		target_instance->resource_uncertain = true;
+		goto out;
 	}
 
 	pr_info("Multikernel hotplug: Device %04x:%02x:%02x.%x successfully removed from instance %d\n",

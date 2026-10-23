@@ -6,7 +6,7 @@
  *
  * Provides /sys/fs/multikernel/overlays/ for dynamic resource adjustments
  * via Device Tree overlays. Each overlay is tracked as an independent
- * transaction that can be applied and rolled back atomically.
+ * transaction. Failed or partial transactions retain their records.
  */
 
 #include <linux/kernel.h>
@@ -1409,17 +1409,6 @@ static int mk_overlay_apply(const void *dtbo_data, size_t dtbo_size)
 
 	guard(mutex)(&mk_overlay_mutex);
 
-	ret = mk_overlay_parse_and_apply(tx, dtbo_data);
-
-	if (ret < 0) {
-		pr_err("Failed to apply overlay transaction %d: %d\n", tx->id, ret);
-		tx->status = MK_OVERLAY_TX_FAILED;
-		/* Continue to create sysfs entry so user can see failure */
-	} else {
-		tx->status = MK_OVERLAY_TX_APPLIED;
-		pr_info("Overlay transaction %d applied successfully\n", tx->id);
-	}
-
 	snprintf(tx_name, sizeof(tx_name), "tx_%d", tx->id);
 	tx->dir_kn = kernfs_create_dir(mk_overlay_root_kn, tx_name, 0755, tx);
 	if (IS_ERR(tx->dir_kn)) {
@@ -1441,38 +1430,22 @@ static int mk_overlay_apply(const void *dtbo_data, size_t dtbo_size)
 		return ret;
 	}
 
+	/* The inactive record must exist before any resource can change. */
+	ret = mk_overlay_parse_and_apply(tx, dtbo_data);
+
+	if (ret < 0) {
+		pr_err("Failed to apply overlay transaction %d: %d\n", tx->id, ret);
+		tx->status = MK_OVERLAY_TX_FAILED;
+	} else {
+		tx->status = MK_OVERLAY_TX_APPLIED;
+		pr_info("Overlay transaction %d applied successfully\n", tx->id);
+	}
+
 	kernfs_activate(tx->dir_kn);
 
 	list_add_tail(&tx->list, &mk_overlay_tx_list);
 
 	return tx->id;
-}
-
-static int mk_overlay_remove_tx(struct mk_overlay_tx *tx)
-{
-	int ret = 0;
-
-	lockdep_assert_held(&mk_overlay_mutex);
-
-	pr_info("Removing overlay transaction %d\n", tx->id);
-
-	ret = mk_overlay_parse_and_rollback(tx, tx->dtbo_data);
-
-	if (ret < 0) {
-		pr_err("Failed to rollback overlay transaction %d: %d\n", tx->id, ret);
-		/* Continue with cleanup even if rollback failed */
-	} else {
-		pr_info("Overlay transaction %d rolled back successfully\n", tx->id);
-	}
-
-	tx->status = MK_OVERLAY_TX_REMOVED;
-
-	list_del(&tx->list);
-	/* The whole overlays directory goes away with the caller */
-	kfree(tx->dtbo_data);
-	kfree(tx);
-
-	return 0;
 }
 
 /**
@@ -1528,7 +1501,7 @@ static ssize_t mk_overlay_new_write(struct kernfs_open_file *of, char *buf,
  * directories are removable, everything else keeps returning -EPERM.
  *
  * A rollback that fails leaves the transaction in place with status
- * "failed", so the user can see what happened and retry.
+ * "failed". There is no per-operation journal to safely retry an inverse.
  */
 int mk_overlay_rmdir(struct kernfs_node *kn)
 {
@@ -1547,6 +1520,9 @@ int mk_overlay_rmdir(struct kernfs_node *kn)
 	scoped_guard(mutex, &mk_overlay_mutex) {
 		if (list_empty(&tx->list))
 			return -ENOENT;
+		/* Never inverse an unapplied item or repeat a partial inverse. */
+		if (tx->status != MK_OVERLAY_TX_APPLIED)
+			return -EBUSY;
 
 		pr_info("Removing overlay transaction %d\n", tx->id);
 
@@ -1605,22 +1581,4 @@ int mk_overlay_init(void)
 
 	pr_info("Multikernel overlay subsystem initialized\n");
 	return 0;
-}
-
-void mk_overlay_exit(void)
-{
-	struct mk_overlay_tx *tx, *tmp;
-
-	pr_info("Cleaning up multikernel overlay subsystem\n");
-
-	mutex_lock(&mk_overlay_mutex);
-	list_for_each_entry_safe(tx, tmp, &mk_overlay_tx_list, list) {
-		mk_overlay_remove_tx(tx);
-	}
-	mutex_unlock(&mk_overlay_mutex);
-
-	if (mk_overlay_root_kn) {
-		kernfs_remove(mk_overlay_root_kn);
-		mk_overlay_root_kn = NULL;
-	}
 }

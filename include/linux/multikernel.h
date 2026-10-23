@@ -451,7 +451,8 @@ static inline int mk_send_irq_forward(int instance_id, u32 irq_number,
 			       &payload, sizeof(payload));
 }
 
-/* CPU resource management - these wait for operation to complete */
+/* Controller resource senders below require mk_overlay_mutex across the wait. */
+/* CPU resource management */
 int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags);
 int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id);
 
@@ -731,6 +732,8 @@ struct mk_instance {
 	int id;                         /* Kernel-assigned instance ID */
 	char *name;                     /* User-provided instance name */
 	enum mk_instance_state state;   /* Current state */
+	/* Protected by mk_overlay_mutex; a failed remote rollback pins grants. */
+	bool resource_uncertain;
 	raw_spinlock_t ipi_lock;         /* Ring writers versus reset/publication */
 
 	/* Resource management - list of reserved memory regions */

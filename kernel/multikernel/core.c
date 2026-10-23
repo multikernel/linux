@@ -494,6 +494,8 @@ int mk_instance_start(struct mk_instance *instance, struct kimage *image,
 	int ret;
 
 	lockdep_assert_held(&mk_overlay_mutex);
+	if (instance->resource_uncertain)
+		return -EBUSY;
 
 	/*
 	 * Start the instance with an empty ring. It outlives the kernel
@@ -576,13 +578,22 @@ bool multikernel_allow_emergency_restart(void)
  * the machine, so callers that are about to rewrite the image wait here
  * first.
  *
- * Returns 0 when every CPU is parked, -EBUSY if any did not get there.
+ * Returns 0 when every CPU is parked and resource ownership is settled,
+ * -EBUSY if CPU or resource retirement remains uncertain.
  */
 int mk_instance_confirm_parked(struct mk_instance *instance)
 {
 	mk_phys_cpu_t phys_cpu;
 	unsigned int i;
 	int ret, failed = 0;
+
+	/*
+	 * CPU stop does not settle remote resource rollback or PCI/DMA state.
+	 * shortcut: quarantine lasts until controller reboot; recovery needs a
+	 * protocol that proves every admitted resource operation has retired.
+	 */
+	if (instance->resource_uncertain)
+		return -EBUSY;
 
 	/* Ownership is authoritative; tracking may be incomplete after a failure. */
 	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
@@ -1027,7 +1038,7 @@ static int mk_instance_reserve_platform_devices(struct mk_instance *instance,
  * @devfn: PCI device and function (combined)
  *
  * Transfers a single PCI device from self instance to the specified instance.
- * Used for dynamic PCI device hotplug to non-running instances.
+ * Reserve ownership before lending config access or publishing a hotplug request.
  *
  * Returns: 0 on success, negative error code on failure
  */
@@ -1180,6 +1191,27 @@ bool mk_root_has_pci_device(u16 domain, u8 bus, u8 devfn)
 			return true;
 	}
 
+	return false;
+}
+
+/* The free-pool path must not duplicate another instance's retained grant. */
+bool mk_pci_device_assigned(u16 domain, u8 bus, u8 devfn)
+{
+	struct mk_instance *instance;
+	struct mk_pci_device *device;
+
+	lockdep_assert_held(&mk_overlay_mutex);
+	guard(mutex)(&mk_instance_mutex);
+	list_for_each_entry(instance, &mk_instance_list, list) {
+		if (instance == mk_self || !instance->pci_devices_valid)
+			continue;
+		list_for_each_entry(device, &instance->pci_devices, list) {
+			if (device->domain == domain && device->bus == bus &&
+			    device->slot == PCI_SLOT(devfn) &&
+			    device->func == PCI_FUNC(devfn))
+				return true;
+		}
+	}
 	return false;
 }
 
@@ -1398,7 +1430,8 @@ void mk_instance_free_memory(struct mk_instance *instance)
 	if (!instance)
 		return;
 	/* Never detach metadata or forget the pool when execution is uncertain. */
-	if (instance->state == MK_STATE_ACTIVE || instance->state == MK_STATE_FAILED ||
+	if (instance->resource_uncertain ||
+	    instance->state == MK_STATE_ACTIVE || instance->state == MK_STATE_FAILED ||
 	    instance->kimage || mk_arch_release_instance(instance)) {
 		pr_err("Instance %d memory release refused; retaining pool and metadata\n",
 		       instance->id);

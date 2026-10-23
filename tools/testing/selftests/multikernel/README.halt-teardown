@@ -26,6 +26,8 @@ assembly execution or a reproduced physical race. The park ABI is unchanged.
 
 Image unload admission is centralized before kimage_free() unlinks anything.
 ACTIVE is refused. FAILED retains its Image until stop confirmation succeeds.
+Uncertain published memory/device operations also pin the instance even after
+CPU stop; README.resource-transfers describes this reboot-only quarantine.
 The Image locking fixture covers these paths plus failed load and manifest
 finalization. Normal/crash callers remain outside the multikernel resource
 lock, and their successful free returns zero.

@@ -10,6 +10,7 @@ enum mk_instance_state { MK_STATE_READY, MK_STATE_LOADED, MK_STATE_ACTIVE,
 struct mk_instance {
 	enum mk_instance_state state;
 	int id;
+	int resource_uncertain;
 	int *ipi_data;
 };
 struct kimage { int unused; };
@@ -55,6 +56,15 @@ int main(void)
 	int ring = 1;
 	struct mk_instance instance = { .state = MK_STATE_LOADED, .ipi_data = &ring };
 	struct kimage image = { 0 };
+
+	instance.resource_uncertain = 1;
+	CHECK(mk_instance_start(&instance, &image, 3) == -EBUSY,
+	      "uncertain resource ownership rejects direct start");
+	CHECK(!starts && ring == 1, "quarantine leaves ring and execution untouched");
+	instance.resource_uncertain = 0;
+	starts = 0;
+	instance.state = MK_STATE_LOADED;
+	ring = 1;
 
 	lend_error = -ENOMEM;
 	CHECK(mk_instance_start(&instance, &image, 3) == -ENOMEM,

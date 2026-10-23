@@ -19,6 +19,7 @@ struct resource { u64 start, end; void *parent; char *name; };
 struct mk_memory_region { struct list_head list; struct resource res; };
 struct mk_instance {
 	int id, state, region_count;
+	int resource_uncertain;
 	const char *name;
 	void *instance_pool, *ctrl_va, *kimage;
 	u64 ctrl_phys;
@@ -67,7 +68,7 @@ int main(void)
 	unsigned int i;
 	int control;
 
-	for (i = 0; i < 5; i++) {
+	for (i = 0; i < 6; i++) {
 		p = (struct mk_instance) { .id = 7, .name = "spawn", .state = MK_STATE_READY,
 			.instance_pool = &p, .pool_size = 4096, .ctrl_va = &control,
 			.ctrl_phys = 0x1000, .ctrl_used = 64, .region_count = 1 };
@@ -86,6 +87,8 @@ int main(void)
 			p.state = MK_STATE_FAILED;
 		if (i == 3)
 			p.kimage = &p;
+		if (i == 5)
+			p.resource_uncertain = 1;
 		mk_instance_free_memory(&p);
 		if (i != 4) {
 			expect("unsafe release retains allocation", p.instance_pool != NULL, 1);
