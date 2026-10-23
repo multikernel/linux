@@ -14,6 +14,7 @@
 #define pr_info(...) ((void)0)
 #define pr_err(...) ((void)0)
 typedef unsigned long mk_phys_cpu_t;
+typedef unsigned long phys_addr_t;
 typedef unsigned int u32;
 
 struct mk_spawn_context {
@@ -47,13 +48,14 @@ struct mk_pool {
 
 static struct mk_pool pool, *mk_pool = &pool;
 static struct mk_spawn_context ctx, pool_slot;
-static unsigned int frees, checks;
+static unsigned int frees, unmaps, checks;
 #define mk_cpu_set_empty(p) (!(p) || !(p)->nr)
 #define mk_cpu_set_count(p) ((p) ? (p)->nr : 0)
 #define mk_cpu_set_format(buf, len, set) ((void)(buf), (void)(len), (void)(set))
 #define mk_cpu_set_free(p) ((void)(p), frees++)
 #define mk_cpu_set_del(p, cpu) ((void)(cpu), (p)->nr = 0)
 #define multikernel_free(phys, size) ((void)(phys), (void)(size), frees++)
+#define mk_pool_unmap(phys, size) ((void)(phys), (void)(size), unmaps++)
 #define mk_free_identity_pgtable(p) ((void)(p), frees++)
 #define set_memory_nx(virt, pages) ((void)(virt), (void)(pages), 0)
 static bool mk_pool_cpus_returned(void)
@@ -103,7 +105,7 @@ static void reset(struct mk_instance *instance, struct mk_cpu_set *cpus)
 	instance->arch.ident_pgt = (void *)1;
 	pool.arch.slot = &pool_slot;
 	pool.arch.pgt = (void *)2;
-	frees = 0;
+	frees = unmaps = 0;
 }
 
 int main(void)
@@ -116,13 +118,13 @@ int main(void)
 		reset(&instance, &cpus);
 		ctx.ready = state;
 		assert(mk_arch_release_instance(&instance) == -EBUSY);
-		assert(!frees && instance.arch.spawn_ctx == &ctx &&
+		assert(!frees && !unmaps && instance.arch.spawn_ctx == &ctx &&
 		       instance.arch.ident_pgt);
 		checks++;
 		reset(&instance, &cpus);
 		pool_slot.ready = state;
 		assert(mk_pool_park_teardown() == -EBUSY);
-		assert(!frees && pool.arch.slot == &pool_slot && pool.arch.pgt);
+		assert(!frees && !unmaps && pool.arch.slot == &pool_slot && pool.arch.pgt);
 		checks++;
 	}
 	reset(&instance, &cpus);
@@ -130,7 +132,7 @@ int main(void)
 	       !instance.arch.spawn_ctx);
 	checks++;
 	reset(&instance, &cpus);
-	assert(!mk_pool_park_teardown() && frees == 3 && !pool.arch.slot);
+	assert(!mk_pool_park_teardown() && frees == 3 && unmaps == 2 && !pool.arch.slot);
 	checks++;
 	printf("Mailbox lifetime: %u checks passed (no live CPU execution)\n",
 	       checks);
