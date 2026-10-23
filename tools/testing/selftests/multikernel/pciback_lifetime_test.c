@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* Actual request/retirement functions; PCI, workqueue and RCU boundaries modeled. */
 #include <assert.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdatomic.h>
@@ -20,7 +21,12 @@ typedef unsigned char u8;
 #define kfree free
 #define lockdep_assert_held(p) ((void)(p))
 
-struct mk_instance { int id; atomic_int refs; };
+struct mk_shared_data;
+struct mk_instance {
+	int id;
+	atomic_int refs;
+	struct mk_shared_data *ipi_data;
+};
 struct pci_bus { int number; };
 struct pci_dev { struct pci_bus *bus; int devfn, dev; };
 struct mk_pci_cfg_payload { int sender_instance_id, result; u16 domain; u8 bus, devfn; u32 val; };
@@ -41,7 +47,9 @@ struct mk_pciback_work {
 };
 static LIST_HEAD(mk_pciback_devs);
 static pthread_mutex_t mk_pciback_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct mk_instance old = { 7, 1 }, replacement = { 7, 1 }, self = { 0, 1 };
+static struct mk_instance old = { .id = 7, .refs = 1 };
+static struct mk_instance replacement = { .id = 7, .refs = 1 };
+static struct mk_instance self = { .id = 0, .refs = 1 };
 static struct mk_instance *mk_self = &self, *lookup = &old, *answer_to;
 static struct pci_bus bus = { 2 };
 static struct pci_dev pdev = { .bus = &bus, .devfn = 3 };
@@ -155,6 +163,212 @@ static void *retire(void *arg)
 	return NULL;
 }
 
+#define MK_IPI_RING_SIZE 8
+#define MK_MAX_DATA_SIZE 64
+#define pr_warn_once(...) do { } while (0)
+#define rcu_read_lock() do { } while (0)
+#define rcu_read_unlock() do { } while (0)
+#define rcu_dereference(p) (p)
+#define atomic_read(p) (*(p))
+/* Controlled arrivals model publication; this fixture does not test barriers. */
+#define smp_load_acquire(p) (*(p))
+#define this_cpu_read(p) (p)
+#define this_cpu_write(p, v) ((p) = (v))
+#define raw_spin_lock_irqsave(m, flags) do { (flags) = 0; mutex_lock(m); } while (0)
+#define raw_spin_unlock_irqrestore(m, flags) do { (void)(flags); mutex_unlock(m); } while (0)
+struct mk_ipi_data {
+	size_t data_size;
+	unsigned long type;
+	char buffer[MK_MAX_DATA_SIZE];
+};
+
+struct mk_shared_data {
+	struct {
+		unsigned int head, tail;
+		struct mk_ipi_data entries[MK_IPI_RING_SIZE];
+	} ring;
+};
+
+typedef void (*mk_ipi_callback_t)(struct mk_ipi_data *, void *);
+struct mk_ipi_handler {
+	unsigned long ipi_type;
+	mk_ipi_callback_t callback;
+	void *context;
+	struct mk_ipi_handler *next;
+};
+
+static struct mk_shared_data inbox;
+static struct mk_ipi_handler *mk_handlers;
+static pthread_mutex_t mk_drain_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Thread_local bool mk_draining;
+static unsigned int peer_callbacks, releases, append_valid, append_invalid;
+static int recursive_result;
+static bool reenter;
+
+static void enqueue(unsigned long type, size_t size)
+{
+	unsigned int head = inbox.ring.head;
+	unsigned int next = (head + 1) % MK_IPI_RING_SIZE;
+	struct mk_ipi_data *slot = &inbox.ring.entries[head];
+
+	assert(next != inbox.ring.tail && !slot->data_size);
+	slot->type = type;
+	memcpy(slot->buffer, &request, sizeof(request));
+	slot->data_size = size;
+	inbox.ring.head = next;
+}
+
+static void atomic_set_release(unsigned int *p, unsigned int value)
+{
+	assert(p == &inbox.ring.tail);
+	assert(!inbox.ring.entries[*p].data_size);
+	*p = value;
+	releases++;
+	if (append_invalid) {
+		append_invalid--;
+		enqueue(9, MK_MAX_DATA_SIZE + 1);
+	}
+}
+
+bool mk_ipi_in_drain(void);
+#include "pciback-ring.h"
+#include "pciback-poll-api.h"
+static int poll_result(void)
+{
+#ifdef POLL_HAS_RESULT
+	return mk_ipi_poll();
+#else
+	mk_ipi_poll();
+	return 0;
+#endif
+}
+
+static void pci_message(struct mk_ipi_data *slot, void *ctx)
+{
+	struct mk_pci_cfg_payload req;
+
+	assert(mk_draining);
+	memcpy(&req, slot->buffer, sizeof(req));
+	mk_pciback_request(&req, 1);
+}
+
+static void peer_message(struct mk_ipi_data *slot, void *ctx)
+{
+	assert(mk_draining);
+	peer_callbacks++;
+	if (append_valid) {
+		append_valid--;
+		enqueue(9, 1);
+	}
+	if (reenter)
+		recursive_result = poll_result();
+}
+
+static void reset_ring(void)
+{
+	static struct mk_ipi_handler peer = { .ipi_type = 9, .callback = peer_message };
+	static struct mk_ipi_handler pci = {
+		.ipi_type = MK_MSG_PCI, .callback = pci_message, .next = &peer,
+	};
+
+	assert(!mk_draining && !queued && list_empty(&mk_pciback_devs));
+	memset(&inbox, 0, sizeof(inbox));
+	self.ipi_data = &inbox;
+	mk_handlers = &pci;
+	peer_callbacks = 0;
+	releases = 0;
+	append_valid = 0;
+	append_invalid = 0;
+	reenter = false;
+	answer_to = NULL;
+	accesses = 0;
+	resets = 0;
+	nested = true;
+}
+
+static void ring_retirement(void)
+{
+	reset_ring();
+	lookup = &old;
+	lend(&old);
+	enqueue(MK_MSG_PCI, sizeof(request));
+	enqueue(9, 1);
+	CHECK(!poll_result(), "queued old PCI request dispatched before retirement");
+	CHECK(queued && peer_callbacks == 1, "retirement preserves another peer's message");
+	mk_pciback_unlend(&old);
+	lookup = &replacement;
+	lend(&replacement);
+	run_work(NULL);
+	CHECK(!accesses && !answer_to, "old ring request cannot reach replacement grant or inbox");
+	mk_pciback_unlend(&replacement);
+
+	reset_ring();
+	lookup = &old;
+	lend(&old);
+	enqueue(9, 0);
+	enqueue(MK_MSG_PCI, sizeof(request));
+	CHECK(poll_result() == -EBUSY, "unpublished slot must refuse retirement");
+	CHECK(!releases && !queued && !resets, "blocked prefix must not skip or retire a grant");
+	CHECK(inbox.ring.head == 2 && !inbox.ring.tail, "blocked shared ring remains intact");
+	inbox.ring.entries[0].data_size = 1;
+	CHECK(!poll_result(), "late publication allows bounded retry");
+	CHECK(peer_callbacks == 1 && queued, "late publication preserves FIFO dispatch");
+	mk_pciback_unlend(&old);
+	run_work(NULL);
+	CHECK(!accesses && !answer_to, "retired late work cannot execute or reply");
+
+	reset_ring();
+	enqueue(9, 1);
+	enqueue(9, 0);
+	enqueue(9, 1);
+	CHECK(poll_result() == -EBUSY && releases == 1 && peer_callbacks == 1,
+	      "completed prefix does not hide a later unpublished slot");
+	CHECK(inbox.ring.tail == 1 && inbox.ring.head == 3,
+	      "partial drain retains blocked and following slots");
+	inbox.ring.entries[1].data_size = 1;
+	CHECK(!poll_result() && releases == 3 && peer_callbacks == 3,
+	      "retry does not dispatch the completed prefix twice");
+
+	reset_ring();
+	inbox.ring.head = MK_IPI_RING_SIZE - 2;
+	inbox.ring.tail = MK_IPI_RING_SIZE - 2;
+	enqueue(9, 1);
+	enqueue(9, 1);
+	enqueue(9, 1);
+	CHECK(!poll_result() && inbox.ring.tail == 1 && peer_callbacks == 3,
+	      "snapshot retirement handles wraparound");
+
+	reset_ring();
+	enqueue(9, 1);
+	enqueue(9, 1);
+	append_valid = MK_IPI_RING_SIZE * 2;
+	CHECK(!poll_result() && peer_callbacks == 2 && releases == 2,
+	      "new peer traffic cannot extend the retirement snapshot");
+	CHECK(inbox.ring.tail != inbox.ring.head, "new peer messages remain queued");
+	append_valid = 0;
+	CHECK(!poll_result() && peer_callbacks == 4 && releases == 4,
+	      "next drain processes new peer traffic exactly once");
+
+	reset_ring();
+	enqueue(9, MK_MAX_DATA_SIZE + 1);
+	enqueue(9, MK_MAX_DATA_SIZE + 1);
+	append_invalid = MK_IPI_RING_SIZE * 2;
+	CHECK(!poll_result() && releases == 2 && !peer_callbacks,
+	      "malformed peer traffic also obeys the snapshot bound");
+
+#ifdef POLL_HAS_RESULT
+	reset_ring();
+	enqueue(9, 1);
+	reenter = true;
+	CHECK(!poll_result() && recursive_result == -EBUSY,
+	      "callback reentry refuses recursive consumer locking");
+#endif
+	reset_ring();
+	self.ipi_data = NULL;
+	CHECK(!poll_result(), "no initialized inbox has nothing to retire");
+	CHECK(old.refs == 1 && replacement.refs == 1, "ring dispatch pins are released");
+}
+
 int main(void)
 {
 	pthread_t worker, reclaimer;
@@ -211,8 +425,9 @@ int main(void)
 	CHECK(!queued && config_value == request.val, "direct config write preserves its value");
 	mk_pciback_unlend_one(&old, 0, 2, 3);
 	CHECK(old.refs == 1 && list_empty(&mk_pciback_devs), "single-device retirement releases pins");
+	ring_retirement();
 	if (failures)
 		return 1;
-	puts("PCI backend lifetime: 4 scenarios PASS (modeled config/workqueue boundaries)");
+	puts("PCI/ring lifetime: PASS (config, IRQ and workqueue modeled)");
 	return 0;
 }

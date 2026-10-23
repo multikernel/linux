@@ -22,7 +22,7 @@ static raw_spinlock_t mk_handlers_lock = __RAW_SPIN_LOCK_UNLOCKED(mk_handlers_lo
 static DEFINE_RAW_SPINLOCK(mk_drain_lock);
 static DEFINE_PER_CPU(bool, mk_draining);
 
-static void mk_ipi_drain_ring(void);
+static int mk_ipi_drain_ring(void);
 
 /*
  * Ring indices live in memory another kernel instance can write, so every
@@ -290,23 +290,23 @@ unlock:
 	return ret;
 }
 
-static void mk_ipi_drain_ring(void)
+static int mk_ipi_drain_ring(void)
 {
 	struct mk_ipi_data *slot;
 	struct mk_ipi_handler *handler;
 	unsigned int head, tail, next_tail;
 	size_t data_size;
-	int messages_processed = 0;
 
 	if (!mk_self || !mk_self->ipi_data)
-		return;
+		return 0;
 
+	/* New peer traffic must not extend this bounded retirement snapshot. */
+	head = mk_ring_idx(atomic_read(&mk_self->ipi_data->ring.head));
 	while (1) {
 		tail = mk_ring_idx(atomic_read(&mk_self->ipi_data->ring.tail));
-		head = mk_ring_idx(atomic_read(&mk_self->ipi_data->ring.head));
 
 		if (tail == head)
-			break;
+			return 0;
 
 		slot = &mk_self->ipi_data->ring.entries[tail];
 
@@ -325,7 +325,7 @@ static void mk_ipi_drain_ring(void)
 		 */
 		data_size = smp_load_acquire(&slot->data_size);
 		if (data_size == 0)
-			break;
+			return -EBUSY;
 
 		if (data_size > MK_MAX_DATA_SIZE) {
 			pr_warn_once("Multikernel IPI slot %u has bad size %zu\n",
@@ -356,10 +356,6 @@ static void mk_ipi_drain_ring(void)
 		next_tail = mk_ring_idx(tail + 1);
 		/* Pair with producers' acquire: clear precedes all future reuse. */
 		atomic_set_release(&mk_self->ipi_data->ring.tail, next_tail);
-		messages_processed++;
-
-		if (messages_processed >= MK_IPI_RING_SIZE)
-			break;
 	}
 }
 
@@ -369,12 +365,15 @@ static void mk_ipi_drain_ring(void)
  * This function is called when a multikernel IPI is received.
  * Messages are drained here, in interrupt context.
  */
-static void multikernel_interrupt_handler(void)
+static int multikernel_interrupt_handler(void)
 {
 	unsigned long flags;
+	int ret;
 
 	if (!mk_self || !mk_self->ipi_data)
-		return;
+		return 0;
+	if (mk_ipi_in_drain())
+		return -EBUSY;
 
 	/*
 	 * Drain here rather than from irq_work. We are already in interrupt
@@ -391,9 +390,10 @@ static void multikernel_interrupt_handler(void)
 	 */
 	raw_spin_lock_irqsave(&mk_drain_lock, flags);
 	this_cpu_write(mk_draining, true);
-	mk_ipi_drain_ring();
+	ret = mk_ipi_drain_ring();
 	this_cpu_write(mk_draining, false);
 	raw_spin_unlock_irqrestore(&mk_drain_lock, flags);
+	return ret;
 }
 
 /**
@@ -414,10 +414,18 @@ bool mk_ipi_in_drain(void)
  * cannot be taken: with interrupts off on the doorbell CPU, or while
  * stop_machine() holds every CPU. Message handlers run in the caller's
  * context, which they are fit for, as they normally run in the interrupt.
+ *
+ * After stopping a peer's CPUs, a successful snapshot drain also ensures its
+ * old requests have reached their handlers before that peer's grants are reused.
+ * Deferred handlers must separately pin identity and reject revoked work.
+ *
+ * Returns 0 if the captured prefix was consumed, -EBUSY if an unpublished slot
+ * blocked it or the caller is already dispatching a message. Other peers may
+ * still be writing; success is not global ring quiescence.
  */
-void mk_ipi_poll(void)
+int mk_ipi_poll(void)
 {
-	multikernel_interrupt_handler();
+	return multikernel_interrupt_handler();
 }
 
 /**

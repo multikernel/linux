@@ -16,6 +16,12 @@ arming failure must not send force-stop interrupts. CPU ownership tests also
 cover an assigned CPU missing from park tracking and the pre-first-spawn host
 park slot.
 
+After CPU confirmation, mk_ipi_poll dispatches one captured local-inbox prefix
+before permitting reuse. A claimed but unpublished slot returns -EBUSY and
+retains resources; it is never skipped or cleared. Existing PCI admission pins
+and revocation then protect dispatched requests across grant/ID reuse. See
+README.pciback-lifetime for the bounded-drain tests and remaining assumptions.
+
 Repark retirement additionally requires a destination-loop self-repark claim.
 The old mailbox clears ready before jumping away, so its claim alone permits
 premature reuse of the old park page/page table. repark_arrival_test.sh exercises

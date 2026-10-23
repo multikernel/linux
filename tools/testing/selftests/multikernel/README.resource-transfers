@@ -57,6 +57,6 @@ the actual reuse gates. image_lock_test checks controller serialization with
 real host mutexes; its transaction begins in APPLIED state.
 
 Remaining qualification: actual delayed/partial receiver work, live lockdep,
-hardware PCI reset/DMA and native/QEMU resource cycles. Old PCI requests still
-in a shared ring need a separate generation/admission contract; pinning a
-queued worker or retaining a grant does not establish that contract.
+hardware PCI reset/DMA and native/QEMU resource cycles. README.pciback-lifetime
+describes the separate stopped-peer inbox drain before PCI grant reuse. It does
+not establish retirement of deferred resource workers or cancel published work.

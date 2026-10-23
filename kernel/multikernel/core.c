@@ -576,7 +576,8 @@ bool multikernel_allow_emergency_restart(void)
  * shutdown path, which lives in the instance's own kernel image. Loading
  * a new image over that memory while a CPU is still executing it kills
  * the machine, so callers that are about to rewrite the image wait here
- * first.
+ * first. Then dispatch the already-queued inbox prefix before old grants can
+ * be retired or an instance ID reused. An abandoned slot must retain resources.
  *
  * Returns 0 when every CPU is parked and resource ownership is settled,
  * -EBUSY if CPU or resource retirement remains uncertain.
@@ -618,7 +619,7 @@ int mk_instance_confirm_parked(struct mk_instance *instance)
 		}
 	}
 
-	return failed ? -EBUSY : 0;
+	return failed ? -EBUSY : mk_ipi_poll();
 }
 
 /**

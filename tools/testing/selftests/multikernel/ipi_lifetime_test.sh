@@ -15,7 +15,7 @@ awk '/^static struct mk_ipi_handler / { print }
      /^static inline unsigned int mk_ring_idx\(/ { copy = 1 }
      /^struct mk_ipi_handler \*multikernel_register_handler\(/ { copy = 1 }
      /^void multikernel_unregister_handler\(/ { copy = 1 }
-     /^static void mk_ipi_drain_ring\(void\)$/ { copy = 1 }
+     /^static (void|int) mk_ipi_drain_ring\(void\)$/ { copy = 1 }
      copy { print }
      copy && /^}/ { copy = 0 }' "$src/kernel/multikernel/ipi.c" \
      > "$build/ipi-production.h"

@@ -182,8 +182,8 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 
 void generic_multikernel_interrupt(void);
 
-/* Drain the message ring where the doorbell interrupt cannot be taken */
-void mk_ipi_poll(void);
+/* Drain one inbox snapshot; -EBUSY for an unpublished slot or callback reentry. */
+int mk_ipi_poll(void);
 bool mk_ipi_in_drain(void);
 
 struct mk_instance;

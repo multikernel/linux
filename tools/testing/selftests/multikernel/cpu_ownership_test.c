@@ -93,6 +93,15 @@ static unsigned int live_pending, sends;
 static bool owned_at_wake, tracked_at_wake, owned_at_send;
 static bool confirm_mode;
 static unsigned int running_probes;
+static int drain_error;
+static unsigned int drains;
+
+int mk_ipi_poll(void)
+{
+	assert(mk_overlay_mutex);
+	drains++;
+	return drain_error;
+}
 static mk_phys_cpu_t test_cpu;
 
 /* Deterministic lock boundary, not a concurrency test. */
@@ -305,6 +314,8 @@ static void reset(void)
 	owned_at_wake = tracked_at_wake = owned_at_send = false;
 	confirm_mode = false;
 	running_probes = 0;
+	drain_error = 0;
+	drains = 0;
 	test_cpu = 65537;
 	target = (struct mk_instance) {
 		.id = 2, .state = MK_STATE_ACTIVE, .name = "spawn",
@@ -512,6 +523,7 @@ int main(void)
 	expect("untracked assigned CPU must not escape confirmation",
 	       mk_instance_confirm_parked(&target), -EBUSY);
 	expect("untracked running CPU probed only on selected slot", running_probes, 1);
+	expect("running peer cannot start inbox retirement", drains, 0);
 	expect("untracked running CPU retains ownership", mk_cpu_set_contains(target.cpus, 7), 1);
 
 	reset();
@@ -520,6 +532,11 @@ int main(void)
 	confirm_mode = true;
 	expect("before first spawn confirm host park slot",
 	       mk_instance_confirm_parked(&target), 0);
+	expect("parked peer retires queued requests", drains, 1);
+	drain_error = -EBUSY;
+	expect("unpublished inbox slot prevents reusable confirmation",
+	       mk_instance_confirm_parked(&target), -EBUSY);
+	drain_error = 0;
 	target.resource_uncertain = true;
 	expect("parked CPUs do not settle uncertain resource work",
 	       mk_instance_confirm_parked(&target), -EBUSY);
