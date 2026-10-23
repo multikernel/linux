@@ -1440,11 +1440,17 @@ int mk_instance_free_memory(struct mk_instance *instance)
 	/* Never detach metadata or forget the pool when execution is uncertain. */
 	if (instance->resource_uncertain ||
 	    instance->state == MK_STATE_ACTIVE || instance->state == MK_STATE_FAILED ||
-	    instance->kimage || mk_arch_release_instance(instance)) {
-		pr_err("Instance %d memory release refused; retaining pool and metadata\n",
-		       instance->id);
-		return -EBUSY;
-	}
+	    instance->kimage)
+		goto busy;
+
+	/* First host baseline has no allocation to retire; its CPUs are running. */
+	if (instance == mk_self && !instance->instance_pool && !instance->ctrl_va &&
+	    list_empty(&instance->memory_regions) &&
+	    mk_cpu_set_empty(instance->cpus_on_slot))
+		return 0;
+
+	if (mk_arch_release_instance(instance))
+		goto busy;
 
 	/* Unmap can fail; keep the entire allocation and its metadata on error. */
 	if (instance->ctrl_va) {
@@ -1504,6 +1510,11 @@ int mk_instance_free_memory(struct mk_instance *instance)
 	pr_debug("Freed all memory regions and pool for instance %d (%s)\n",
 		 instance->id, instance->name);
 	return 0;
+
+busy:
+	pr_err("Instance %d memory release refused; retaining pool and metadata\n",
+	       instance->id);
+	return -EBUSY;
 }
 
 /**

@@ -26,17 +26,25 @@ struct mk_instance {
 	int id, state, region_count;
 	int resource_uncertain;
 	const char *name;
-	void *instance_pool, *ctrl_va, *kimage;
+	void *instance_pool, *ctrl_va, *kimage, *cpus_on_slot;
 	u64 ctrl_phys;
 	size_t pool_size, ctrl_used;
 	struct list_head memory_regions, pci_devices, platform_devices;
 	int pci_device_count, platform_device_count;
 	bool pci_devices_valid, platform_devices_valid;
 };
+static struct mk_instance *mk_self;
+#define mk_cpu_set_empty(p) (!(p))
 static int arch_error, unmap_error;
 static unsigned int frees, removals, pools, controls, unmaps, checks, failures;
+static unsigned int arch_calls;
 #define resource_size(p) ((p)->end - (p)->start + 1)
-static int mk_arch_release_instance(struct mk_instance *p) { (void)p; return arch_error; }
+static int mk_arch_release_instance(struct mk_instance *p)
+{
+	(void)p;
+	arch_calls++;
+	return arch_error;
+}
 static void remove_resource(struct resource *p) { (void)p; removals++; }
 static void kfree(void *p)
 {
@@ -88,6 +96,40 @@ int main(void)
 	int control, ret;
 	struct mk_dt_config config = { 0 };
 	struct mk_pci_device *pci;
+
+	/* The running host has no reserved memory at first baseline admission. */
+	for (i = 0; i < 10; i++) {
+		struct mk_memory_region owned = { 0 };
+
+		p = (struct mk_instance) { .state = MK_STATE_READY };
+		INIT_LIST_HEAD(&p.memory_regions);
+		INIT_LIST_HEAD(&p.pci_devices);
+		INIT_LIST_HEAD(&p.platform_devices);
+		mk_self = i == 9 ? NULL : &p;
+		if (i == 1)
+			p.state = MK_STATE_ACTIVE;
+		if (i == 2)
+			p.state = MK_STATE_FAILED;
+		if (i == 3)
+			p.kimage = &p;
+		if (i == 4)
+			p.resource_uncertain = 1;
+		if (i == 5)
+			p.instance_pool = &p;
+		if (i == 6)
+			p.ctrl_va = &control;
+		if (i == 7)
+			list_add(&owned.list, &p.memory_regions);
+		if (i == 8)
+			p.cpus_on_slot = &p;
+		arch_error = -EBUSY;
+		arch_calls = frees = removals = pools = controls = unmaps = 0;
+		expect("baseline admission", mk_baseline_clear_resources(&p),
+		       i == 0 ? 0 : -EBUSY);
+		expect("only owned or child memory needs stop proof", arch_calls, i >= 5);
+		expect("running host loses no allocation", frees + removals + pools + controls, 0);
+	}
+	mk_self = NULL;
 
 	for (i = 0; i < 7; i++) {
 		p = (struct mk_instance) { .id = 7, .name = "spawn", .state = MK_STATE_READY,
