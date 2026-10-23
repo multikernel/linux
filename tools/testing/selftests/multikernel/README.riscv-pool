@@ -1,0 +1,56 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+RISC-V pool mappings
+===================
+
+Run:
+  bash tools/testing/selftests/multikernel/riscv_pool_map_test.sh
+  bash tools/testing/selftests/multikernel/riscv_map_size_test.sh
+  bash tools/testing/selftests/multikernel/memory_teardown_test.sh
+
+The map fixture executes arch/riscv/mm/multikernel.c with modeled page-table,
+allocator, pool-resource and TLB boundaries. It covers Sv39/Sv48/Sv57 folding,
+alignment/overflow/range rejection, online RAM exclusion, existing leaves,
+neighboring allocations, allocation failure at every level, rollback, missing or
+wrong-PFN unmap rejection, empty-PTE-table retirement and reuse. Freeing a table
+before a global flush after its parent is cleared fails an assertion. This is
+host evidence, not page-table execution or a hot-remove/hot-add runtime result.
+The memory fixture also exercises actual re-reservation and baseline cleanup.
+
+Contract
+--------
+
+Callers own an allocated, page-aligned range contained in one hot-removed pool
+chunk. They keep it allocated through map/use/unmap. The common map mutex and
+online-memory lock serialize page-table updates with other pool mappings and
+hotplug. Range checks do not replace caller ownership or CPU-stop settlement.
+
+Map allocates all page tables before publishing leaf PTEs. Allocation failure
+leaves no new leaf mapping, so callers can return the allocation. Existing PTEs
+or huge leaves are rejected and never split or overwritten. Unmap validates the
+whole range before changing any entry; errors retain its mappings/allocation.
+It clears only requested PTEs, then frees empty PTE tables after a global TLB
+flush. Empty upper tables remain reusable. Their memory consumption is bounded
+by the pool address space visited. The MK-only PMD leaf cap permits those tables
+to remain while RAM is re-added; an empty PTE table cannot remain because it
+would obstruct PMD-sized create_pmd_mapping() in init.c.
+
+Generic instance teardown propagates unmap errors before releasing control
+memory, region metadata or the instance pool. Destruction retains registry and
+kernfs membership on this error; retry is possible after correction. CPU/device
+return may already have completed, so this is memory retention, not an atomic
+rollback of every resource return. Re-reservation and baseline replacement stop
+on refusal. Failed-create/final-reference cleanup retains memory and its record
+if retirement fails; an unreachable record can require reboot for recovery.
+The x86 architecture unmap still returns success after its existing removal;
+an unexpected error at its pool-control wrapper retains the physical allocation.
+
+Remaining runtime gate
+----------------------
+
+On the exact refreshed stack, remove pool RAM, map/use two neighboring grants,
+unmap one without affecting the other, retire both, return RAM, and repeat.
+Inject page-table allocation failure and verify allocator ownership and adjacent
+RAM/mappings remain intact. Test Sv39 and Sv48 with real QEMU/OpenSBI execution
+and record kernel/config/harness hashes. Kernel links and this fixture do not
+satisfy that gate. Lifecycle/doorbell/loader integration is a separate prerequisite.
