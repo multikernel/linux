@@ -77,6 +77,9 @@ struct mk_pciback_work {
 	struct mk_pciback_dev *dev;
 };
 
+/* dev is the busy marker, protected by mk_pciback_lock. */
+static struct mk_pciback_work mk_pciback_requests[MK_IPI_RING_SIZE];
+
 static struct mk_pciback_dev *mk_pciback_find(int instance_id, u16 domain,
 					      u8 bus, u8 devfn)
 {
@@ -319,23 +322,29 @@ static void mk_pciback_work_fn(struct work_struct *work)
 	}
 	mutex_unlock(&d->io_lock);
 	mk_pciback_put(d);
-	kfree(w);
+	/* No request access after release; callback and queue remain unchanged. */
+	scoped_guard(raw_spinlock_irqsave, &mk_pciback_lock)
+		w->dev = NULL;
 }
 
 static void mk_pciback_defer(const struct mk_pci_cfg_payload *req, u32 subtype,
 			     struct mk_pciback_dev *d)
 {
-	struct mk_pciback_work *w = kzalloc(sizeof(*w), GFP_ATOMIC);
+	struct mk_pciback_work *w;
+	int i;
 
 	lockdep_assert_held(&mk_pciback_lock);
-	if (!w)
+	for (i = 0; i < MK_IPI_RING_SIZE; i++) {
+		w = &mk_pciback_requests[i];
+		if (w->dev)
+			continue;
+		refcount_inc(&d->ref);
+		w->dev = d;
+		w->req = *req;
+		w->subtype = subtype;
+		schedule_work(&w->work);
 		return;
-	refcount_inc(&d->ref);
-	w->dev = d;
-	w->req = *req;
-	w->subtype = subtype;
-	INIT_WORK(&w->work, mk_pciback_work_fn);
-	schedule_work(&w->work);
+	}
 }
 
 static void mk_pciback_request(const struct mk_pci_cfg_payload *req,
@@ -372,17 +381,20 @@ static void mk_pciback_request(const struct mk_pci_cfg_payload *req,
 static void mk_pciback_msg_handler(u32 msg_type, u32 subtype, u64 msg_id,
 				   void *payload, u32 payload_len, void *ctx)
 {
-	if (payload_len < sizeof(struct mk_pci_cfg_payload))
+	struct mk_pci_cfg_payload req;
+
+	if (payload_len < sizeof(req))
 		return;
+	/* The wire payload need not align its 64-bit sequence number. */
+	memcpy(&req, payload, sizeof(req));
 
 	switch (subtype) {
 	case MK_PCI_CFG_READ:
 	case MK_PCI_CFG_WRITE:
-		mk_pciback_request(payload, subtype);
+		mk_pciback_request(&req, subtype);
 		break;
 	case MK_PCI_CFG_ACK:
-		mk_request_answer(((struct mk_pci_cfg_payload *)payload)->seq,
-				  payload, sizeof(struct mk_pci_cfg_payload));
+		mk_request_answer(req.seq, &req, sizeof(req));
 		break;
 	}
 }
@@ -515,6 +527,11 @@ int mk_pciback_lend(struct mk_instance *instance)
 /* Answers reach a spawn's front end from its first bus scan, at subsys_initcall */
 static int __init mk_pciback_init(void)
 {
+	int i;
+
+	for (i = 0; i < MK_IPI_RING_SIZE; i++)
+		INIT_WORK(&mk_pciback_requests[i].work, mk_pciback_work_fn);
+
 	return mk_register_msg_handler(MK_MSG_PCI, mk_pciback_msg_handler, NULL);
 }
 arch_initcall(mk_pciback_init);

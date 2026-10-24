@@ -11,14 +11,27 @@
 #include <linux/list.h>
 
 typedef unsigned int u32;
+#define __init
 typedef unsigned short u16;
 typedef unsigned char u8;
+#include "pciback-types.h"
 #define GFP_ATOMIC 0
-#define MK_MSG_PCI 1
-#define MK_PCI_CFG_ACK 2
 #define PCIBIOS_DEVICE_NOT_FOUND 0x86
-#define kzalloc(n, flags) calloc(1, n)
-#define kfree free
+static _Thread_local bool in_receive;
+static bool allocation_fails;
+static unsigned int irq_allocator_calls;
+static __maybe_unused void *test_alloc(size_t n)
+{
+	irq_allocator_calls += in_receive;
+	return allocation_fails ? NULL : calloc(1, n);
+}
+static void test_free(void *p)
+{
+	irq_allocator_calls += in_receive;
+	free(p);
+}
+#define kzalloc(n, flags) ((void)(flags), test_alloc(n))
+#define kfree test_free
 #define lockdep_assert_held(p) ((void)(p))
 
 struct mk_shared_data;
@@ -29,7 +42,6 @@ struct mk_instance {
 };
 struct pci_bus { int number; };
 struct pci_dev { struct pci_bus *bus; int devfn, dev; };
-struct mk_pci_cfg_payload { int sender_instance_id, result; u16 domain; u8 bus, devfn; u32 val; };
 struct work_struct { void (*fn)(struct work_struct *); };
 struct mk_pciback_dev {
 	struct list_head list;
@@ -38,12 +50,6 @@ struct mk_pciback_dev {
 	struct pci_dev *pdev;
 	pthread_mutex_t io_lock;
 	bool revoked;
-};
-struct mk_pciback_work {
-	struct work_struct work;
-	struct mk_pci_cfg_payload req;
-	u32 subtype;
-	struct mk_pciback_dev *dev;
 };
 static LIST_HEAD(mk_pciback_devs);
 static pthread_mutex_t mk_pciback_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -54,12 +60,14 @@ static struct mk_instance *mk_self = &self, *lookup = &old, *answer_to;
 static struct pci_bus bus = { 2 };
 static struct pci_dev pdev = { .bus = &bus, .devfn = 3 };
 static struct work_struct *queued;
+static struct work_struct *jobs[MK_IPI_RING_SIZE + 2];
+static unsigned int nr_jobs;
 static bool nested = true;
 static pthread_mutex_t gate = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t changed = PTHREAD_COND_INITIALIZER;
 static bool hold_access, entered, release_access, retiring, io_active, reset_during_io;
 static _Thread_local bool retire_thread;
-static unsigned int accesses, resets, failures;
+static unsigned int accesses, resets, failures, checks;
 static u32 config_value;
 
 static void mutex_lock(pthread_mutex_t *p)
@@ -85,7 +93,12 @@ static void unlock(pthread_mutex_t **p)
 #define scoped_guard(kind, p) \
 	for (pthread_mutex_t *scope __attribute__((cleanup(unlock))) = lock(p); scope; unlock(&scope))
 #define INIT_WORK(w, f) ((w)->fn = (f))
-static void schedule_work(struct work_struct *w) { assert(!queued); queued = w; }
+static void schedule_work(struct work_struct *w)
+{
+	assert(nr_jobs < MK_IPI_RING_SIZE + 2);
+	jobs[nr_jobs++] = w;
+	queued = jobs[0];
+}
 static struct mk_instance *mk_instance_find(int id)
 {
 	if (!lookup || lookup->id != id)
@@ -131,9 +144,40 @@ static int pci_reset_function(struct pci_dev *p)
 	return 0;
 }
 #define pci_clear_master(p) ((void)(p))
+static u64 answer_seq;
+static struct mk_pci_cfg_payload sync_answer;
+static void mk_request_answer(u64 seq, const void *data, u32 len)
+{
+	assert(len == sizeof(sync_answer));
+	assert((uintptr_t)data % _Alignof(struct mk_pci_cfg_payload) == 0);
+	answer_seq = seq;
+	memcpy(&sync_answer, data, len);
+}
+static int register_error;
+static bool handler_registered;
+static int mk_register_msg_handler(u32 type,
+		void (*fn)(u32, u32, u64, void *, u32, void *), void *ctx)
+{
+	handler_registered = !register_error;
+	return register_error;
+}
 #include "pciback-production.h"
 
-#define CHECK(cond, why) do { if (!(cond)) { failures++; fprintf(stderr, "FAIL: %s\n", why); } } while (0)
+static void receive(const struct mk_pci_cfg_payload *req, u32 subtype)
+{
+	in_receive = true;
+	mk_pciback_request(req, subtype);
+	in_receive = false;
+}
+#define mk_pciback_request receive
+
+#define CHECK(cond, why) do { \
+	checks++; \
+	if (!(cond)) { \
+		failures++; \
+		fprintf(stderr, "FAIL: %s\n", why); \
+	} \
+} while (0)
 static struct mk_pci_cfg_payload request = { .sender_instance_id = 7, .bus = 2, .devfn = 3 };
 static void lend(struct mk_instance *p)
 {
@@ -152,7 +196,10 @@ static void *run_work(void *arg)
 	struct work_struct *work = queued;
 
 	assert(work);
-	queued = NULL;
+	for (unsigned int i = 1; i < nr_jobs; i++)
+		jobs[i - 1] = jobs[i];
+	nr_jobs--;
+	queued = nr_jobs ? jobs[0] : NULL;
 	work->fn(work);
 	return NULL;
 }
@@ -163,7 +210,6 @@ static void *retire(void *arg)
 	return NULL;
 }
 
-#define MK_IPI_RING_SIZE 8
 #define MK_MAX_DATA_SIZE 64
 #define pr_warn_once(...) do { } while (0)
 #define rcu_read_lock() do { } while (0)
@@ -249,7 +295,7 @@ static void pci_message(struct mk_ipi_data *slot, void *ctx)
 
 	assert(mk_draining);
 	memcpy(&req, slot->buffer, sizeof(req));
-	mk_pciback_request(&req, 1);
+	mk_pciback_request(&req, MK_PCI_CFG_WRITE);
 }
 
 static void peer_message(struct mk_ipi_data *slot, void *ctx)
@@ -369,13 +415,119 @@ static void ring_retirement(void)
 	CHECK(old.refs == 1 && replacement.refs == 1, "ring dispatch pins are released");
 }
 
+static void packed_messages(void)
+{
+	_Alignas(struct mk_pci_cfg_payload) unsigned char wire[sizeof(request) + 1];
+	struct mk_pci_cfg_payload req = request;
+
+	req.seq = 0x123456789abcdef0ULL;
+	req.val = 0x89abcdef;
+	memcpy(wire + 1, &req, sizeof(req));
+	mk_pciback_msg_handler(MK_MSG_PCI, MK_PCI_CFG_ACK, 0,
+			       wire + 1, sizeof(req), NULL);
+	CHECK(answer_seq == req.seq && sync_answer.val == req.val,
+	      "packed ACK preserves full sequence and value");
+	answer_seq = 0;
+	mk_pciback_msg_handler(MK_MSG_PCI, MK_PCI_CFG_ACK, 0,
+			       wire + 1, sizeof(req) - 1, NULL);
+	CHECK(!answer_seq, "short ACK does not complete a request");
+	lend(&old);
+	mk_pciback_msg_handler(MK_MSG_PCI, MK_PCI_CFG_WRITE, 0,
+			       wire + 1, sizeof(req), NULL);
+	memset(wire, 0, sizeof(wire));
+	run_work(NULL);
+	CHECK(config_value == req.val, "packed request is copied before callback return");
+	mk_pciback_unlend(&old);
+	accesses = 0;
+	answer_to = NULL;
+}
+
+static void saturation(void)
+{
+	struct work_struct *first;
+	struct mk_pciback_dev *d;
+	unsigned int i;
+
+	assert(!queued && !nr_jobs && list_empty(&mk_pciback_devs));
+	nested = true;
+	lookup = &old;
+	lend(&old);
+	d = mk_pciback_find(7, 0, 2, 3);
+	for (i = 0; i < MK_IPI_RING_SIZE; i++) {
+		request.val = i + 1;
+		mk_pciback_request(&request, MK_PCI_CFG_WRITE);
+	}
+	CHECK(nr_jobs == MK_IPI_RING_SIZE && d->ref == MK_IPI_RING_SIZE + 1,
+	      "full pool pins every admitted grant");
+	answer_to = NULL;
+	request.val = 0xffffffff;
+	mk_pciback_request(&request, MK_PCI_CFG_WRITE);
+	CHECK(nr_jobs == MK_IPI_RING_SIZE && d->ref == MK_IPI_RING_SIZE + 1 && !answer_to,
+	      "overflow neither overwrites work nor pins or acknowledges");
+	first = queued;
+	run_work(NULL);
+	CHECK(config_value == 1, "overflow preserves oldest request");
+	mk_pciback_request(&request, MK_PCI_CFG_WRITE);
+	CHECK(jobs[MK_IPI_RING_SIZE - 1] == first && first->fn == mk_pciback_work_fn,
+	      "released slot reuses its initialized callback on the same queue");
+	for (i = 1; i < MK_IPI_RING_SIZE; i++) {
+		run_work(NULL);
+		CHECK(config_value == i + 1, "admitted request copy remains intact");
+	}
+	run_work(NULL);
+	CHECK(config_value == request.val && d->ref == 1, "reused slot releases its pin");
+	mk_pciback_unlend(&old);
+
+	lend(&old);
+	for (i = 0; i < MK_IPI_RING_SIZE; i++)
+		mk_pciback_request(&request, MK_PCI_CFG_WRITE);
+	mk_pciback_unlend(&old);
+	lookup = &replacement;
+	lend(&replacement);
+	accesses = 0;
+	answer_to = NULL;
+	mk_pciback_request(&request, MK_PCI_CFG_WRITE);
+	CHECK(nr_jobs == MK_IPI_RING_SIZE && !answer_to,
+	      "replacement cannot steal a revoked but occupied slot");
+	while (nr_jobs)
+		run_work(NULL);
+	CHECK(!accesses && !answer_to && old.refs == 1,
+	      "saturated revoked work cannot access or answer through replacement");
+	mk_pciback_request(&request, MK_PCI_CFG_WRITE);
+	run_work(NULL);
+	CHECK(accesses == 1 && answer_to == &replacement,
+	      "replacement gets a fresh request only after capacity returns");
+	mk_pciback_unlend(&replacement);
+	CHECK(replacement.refs == 1 && !irq_allocator_calls,
+	      "all pins retired and no receive allocator calls");
+}
+
 int main(void)
 {
 	pthread_t worker, reclaimer;
 
+	register_error = -EIO;
+	CHECK(mk_pciback_init() == -EIO && !handler_registered,
+	      "early registration error is preserved");
+	register_error = 0;
+	assert(!mk_pciback_init());
+	packed_messages();
+
+	lend(&old);
+	allocation_fails = true;
+	mk_pciback_request(&request, MK_PCI_CFG_WRITE);
+	CHECK(queued, "deferred admission survives allocator exhaustion");
+	CHECK(!irq_allocator_calls, "deferred receive must not call allocator");
+	allocation_fails = false;
+	if (queued)
+		run_work(NULL);
+	mk_pciback_unlend(&old);
+	accesses = 0;
+	answer_to = NULL;
+
 	/* A queued request cannot acquire a replacement grant with the same ID/BDF. */
 	lend(&old);
-	mk_pciback_request(&request, 1);
+	mk_pciback_request(&request, MK_PCI_CFG_WRITE);
 	mk_pciback_unlend(&old);
 	lookup = &replacement;
 	lend(&replacement);
@@ -387,7 +539,7 @@ int main(void)
 
 	/* Negative replies have no config work and never queue an ID lookup. */
 	lookup = &old;
-	mk_pciback_request(&request, 1);
+	mk_pciback_request(&request, MK_PCI_CFG_WRITE);
 	lookup = &replacement;
 	CHECK(!queued && answer_to == &old, "negative reply must not defer an instance ID lookup");
 
@@ -395,7 +547,7 @@ int main(void)
 	lend(&old);
 	hold_access = true;
 	entered = retiring = false;
-	mk_pciback_request(&request, 1);
+	mk_pciback_request(&request, MK_PCI_CFG_WRITE);
 	assert(!pthread_create(&worker, NULL, run_work, NULL));
 	assert(!pthread_mutex_lock(&gate));
 	while (!entered)
@@ -416,18 +568,20 @@ int main(void)
 	hold_access = false;
 	request.val = 0x1234abcd;
 	lend(&old);
-	mk_pciback_request(&request, 1);
+	mk_pciback_request(&request, MK_PCI_CFG_WRITE);
 	run_work(NULL);
 	CHECK(config_value == request.val, "deferred config write preserves its value");
 	nested = false;
 	request.val = 0x4321dcba;
-	mk_pciback_request(&request, 1);
+	mk_pciback_request(&request, MK_PCI_CFG_WRITE);
 	CHECK(!queued && config_value == request.val, "direct config write preserves its value");
 	mk_pciback_unlend_one(&old, 0, 2, 3);
 	CHECK(old.refs == 1 && list_empty(&mk_pciback_devs), "single-device retirement releases pins");
 	ring_retirement();
+	saturation();
 	if (failures)
 		return 1;
-	puts("PCI/ring lifetime: PASS (config, IRQ and workqueue modeled)");
+	printf("PCI/ring lifetime: %u checks, 0 failures (config, IRQ and workqueue modeled)\n",
+	       checks);
 	return 0;
 }

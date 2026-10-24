@@ -5,7 +5,17 @@ test_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 src=$(CDPATH= cd -- "$test_dir/../../../.." && pwd)
 build=$(mktemp -d "${TMPDIR:-/tmp}/mk-pciback-lifetime.XXXXXX")
 trap 'rm -rf -- "$build"' EXIT HUP INT TERM
-awk '/^static struct mk_pciback_dev \*mk_pciback_find\(/ { copy = 1 }
+awk '/^#define MK_IPI_RING_SIZE / { print }
+     /^#define MK_MSG_PCI / { print }
+     /^#define MK_PCI_CFG_/ { print }
+     /^struct mk_pci_cfg_payload \{/ { copy = 1 }
+     copy { print }
+     copy && /^};/ { copy = 0 }' "$src/include/linux/multikernel.h" > "$build/pciback-types.h"
+awk '/^struct mk_pciback_work \{/ { copy = 1 }
+     /^static struct mk_pciback_work mk_pciback_requests\[/ { print }
+     /^static int __init mk_pciback_init\(/ { copy = 1 }
+     /^static void mk_pciback_msg_handler\(/ { copy = 1 }
+     /^static struct mk_pciback_dev \*mk_pciback_find\(/ { copy = 1 }
      /^static void mk_pciback_(put|answer|work_fn|defer|request|free)\(/ { copy = 1 }
      /^void mk_pciback_unlend(_one)?\(/ { copy = 1 }
      copy { print }
