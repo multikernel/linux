@@ -1749,6 +1749,10 @@ struct mk_shutdown_work {
 	int sender_instance_id;
 };
 
+/* Shutdown parks forever; one slot avoids slab allocation under mk_drain_lock. */
+static struct mk_shutdown_work mk_shutdown;
+static atomic_t mk_shutdown_requested = ATOMIC_INIT(0);
+
 /*
  * Notify @target_id that this kernel is going down, while messaging
  * still works, then park every CPU in the pool wait loop. The subtype
@@ -1800,7 +1804,6 @@ static void mk_shutdown_work_fn(struct work_struct *work)
 	int sender_instance_id = sw->sender_instance_id;
 	u64 msg_id = sw->msg_id;
 
-	kfree(sw);
 	/* This worker may sleep; the voluntary machine-halt path may not. */
 	mk_hotplug_quiesce();
 	/* Drain native CPU hotplug and prevent new starts before the ACK. */
@@ -1880,16 +1883,14 @@ static void mk_system_msg_handler(u32 msg_type, u32 subtype, u64 msg_id,
 	switch (subtype) {
 	case MK_SYS_SHUTDOWN: {
 		struct mk_shutdown_payload *req = payload;
-		struct mk_shutdown_work *sw;
+		struct mk_shutdown_work *sw = &mk_shutdown;
 
 		if (payload_len < sizeof(*req))
 			return;
+		if (atomic_cmpxchg(&mk_shutdown_requested, 0, 1))
+			return;
 
 		pr_info("Shutdown requested by instance %d\n", req->sender_instance_id);
-
-		sw = kmalloc(sizeof(*sw), GFP_ATOMIC);
-		if (!sw)
-			return;
 
 		INIT_WORK(&sw->work, mk_shutdown_work_fn);
 		sw->msg_id = msg_id;

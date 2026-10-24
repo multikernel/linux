@@ -44,6 +44,8 @@ awk '/^struct mk_(cpu|mem|device)_hotplug_work \{/ { copy = 1 }
      copy && /^}/ { copy = 0 }' "$src/kernel/multikernel/hotplug.c" \
      > "$build/ack-resource.h"
 awk '/^struct mk_(shutdown_work|halted_work) \{/ { copy = 1 }
+     /^static struct mk_shutdown_work mk_shutdown;/ { print }
+     /^static atomic_t mk_shutdown_requested =/ { print }
      /^static void __noreturn mk_notify_down_and_park\(/ { copy = 1 }
      /^void __noreturn mk_halt_to_pool\(/ { copy = 1 }
      /^static void mk_shutdown_work_fn\(/ { copy = 1 }

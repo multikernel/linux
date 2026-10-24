@@ -9,6 +9,7 @@
 #include <string.h>
 #include <linux/list.h>
 #include <linux/err.h>
+#include <asm-generic/atomic-gcc.h>
 
 /* tools/ uses uint64_t; production printk formats use the kernel's __u64. */
 #define u64 __u64
@@ -16,9 +17,14 @@
 #define GFP_KERNEL 0
 #define GFP_ATOMIC 0
 static bool allocation_fails;
+static bool test_hardirq;
+static unsigned int irq_allocations;
 #define kzalloc(n, flags) \
-	((void)(flags), allocation_fails ? NULL : calloc(1, n))
-#define kmalloc(n, flags) ((void)(flags), allocation_fails ? NULL : malloc(n))
+	((void)(flags), irq_allocations += test_hardirq, \
+	 allocation_fails ? NULL : calloc(1, n))
+#define kmalloc(n, flags) \
+	((void)(flags), irq_allocations += test_hardirq, \
+	 allocation_fails ? NULL : malloc(n))
 #define kfree free
 #define pr_err(...) fprintf(stderr, __VA_ARGS__)
 #define pr_warn(...) fprintf(stderr, __VA_ARGS__)
@@ -28,7 +34,6 @@ static bool allocation_fails;
 #define pr_debug(...) \
 	do {          \
 	} while (0)
-static bool test_hardirq;
 #define DEFINE_SPINLOCK(name) bool name
 #define spin_lock_irqsave(lock, flags) \
 	do {                           \
@@ -534,6 +539,7 @@ static void worker_regressions(void)
 
 			/* Each case represents a fresh receiver, before shutdown closes it. */
 			mk_hotplug_accepting = true;
+			atomic_set(&mk_shutdown_requested, 0);
 
 			if (i < 2) {
 				payload = &cpu;
@@ -617,6 +623,58 @@ static void worker_regressions(void)
 		       ((struct mk_message *)sent.buffer)->msg_subtype ==
 			       MK_SYS_HALTED,
 	       1);
+}
+
+static void shutdown_admission_regressions(void)
+{
+	struct mk_shutdown_payload payload = { .sender_instance_id = 3 };
+	struct mk_ipi_data request;
+	struct work_struct *work;
+	struct mk_shutdown_work *sw;
+	const u64 id = 0x123456789abcdef0ULL;
+
+	assert(!queued);
+	/* Earlier worker cases discarded their parked fixture kernels. */
+	atomic_set(&mk_shutdown_requested, 0);
+	mk_hotplug_accepting = true;
+	assert(!mk_send_message_id(1, MK_MSG_SYSTEM, MK_SYS_SHUTDOWN,
+				   id, &payload, sizeof(payload)));
+	request = sent;
+	irq_allocations = 0;
+	allocation_fails = test_hardirq = true;
+	/* Invalid input must not consume the one valid shutdown opportunity. */
+	((struct mk_message *)request.buffer)->payload_len = 0;
+	dispatch(&request);
+	expect("SHUTDOWN", "short request queues no work", queued == NULL, 1);
+	request = sent;
+	dispatch(&request);
+	allocation_fails = test_hardirq = false;
+	expect("SHUTDOWN", "hard IPI does not enter allocator", irq_allocations, 0);
+	expect("SHUTDOWN", "shutdown survives allocator exhaustion", queued != NULL, 1);
+	if (!queued)
+		return;
+	work = queued;
+	sw = container_of(work, struct mk_shutdown_work, work);
+	payload.sender_instance_id = 9;
+	payload.flags = 7;
+	assert(!mk_send_message_id(1, MK_MSG_SYSTEM, MK_SYS_SHUTDOWN,
+				   id + 1, &payload, sizeof(payload)));
+	test_hardirq = true;
+	dispatch(&sent);
+	test_hardirq = false;
+	expect("SHUTDOWN", "duplicate preserves pending work", queued == work, 1);
+	expect("SHUTDOWN", "duplicate preserves first requester and ID",
+	       sw->msg_id == id && sw->sender_instance_id == 3 && !sw->flags, 1);
+	queued = NULL;
+	/* A running work item is no longer pending, but must not be rearmed. */
+	test_hardirq = true;
+	dispatch(&sent);
+	test_hardirq = false;
+	expect("SHUTDOWN", "duplicate cannot requeue dequeued work", queued == NULL, 1);
+	expect("SHUTDOWN", "duplicates do not enter allocator", irq_allocations, 0);
+	run_work(work, true);
+	expect("SHUTDOWN", "worker acknowledges original request",
+	       sent_to == 3 && ((struct mk_message *)sent.buffer)->msg_id == id, 1);
 }
 
 static void pci_key_regressions(void)
@@ -785,6 +843,8 @@ int main(int argc, char **argv)
 		worker_regressions();
 	if (argc == 1 || !strcmp(argv[1], "workers"))
 		halted_decode_regression();
+	if (argc == 1 || !strcmp(argv[1], "workers"))
+		shutdown_admission_regressions();
 	if (argc == 1 || !strcmp(argv[1], "failure"))
 		failure_regressions();
 	return failures ? 1 : 0;

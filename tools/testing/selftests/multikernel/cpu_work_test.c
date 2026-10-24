@@ -400,14 +400,13 @@ static void shutdown_regressions(void)
 	struct mk_cpu_resource_payload cpu = { .cpu_id = 65537, .sender_instance_id = 3 };
 	struct mk_mem_resource_payload mem = { .start_pfn = 65537, .sender_instance_id = 3 };
 	struct mk_device_resource_payload dev = { .domain = 1, .sender_instance_id = 3 };
-	struct mk_shutdown_work *sw;
+	struct mk_shutdown_work shutdown, *sw = &shutdown;
 
 	reset();
 	expect("init for shutdown", mk_hotplug_init(), 0);
 	expect("CPU accepted before shutdown", mk_handle_cpu_add(&cpu, sizeof(cpu), 48), 0);
 	expect("memory accepted before shutdown", mk_handle_mem_add(&mem, sizeof(mem), 49), 0);
 	expect("device accepted before shutdown", mk_handle_device_add(&dev, sizeof(dev), 50), 0);
-	sw = kmalloc_obj(*sw, GFP_ATOMIC);
 	INIT_WORK(&sw->work, mk_shutdown_work_fn);
 	sw->sender_instance_id = 3;
 	sw->msg_id = 51;

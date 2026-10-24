@@ -44,6 +44,10 @@ Checks include:
 * Allocation/send failures, cancellation before/after completion, concurrent
   outstanding same-tuple requests, the last u64 ID and exhaustion are checked.
 * Voluntary HALTED and the uncorrelated sender retain their zero-ID behavior.
+* Requested shutdown allocates no work item in hard IPI context, even under
+  allocator exhaustion. A short request cannot consume admission; duplicates
+  cannot replace the first requester/ID or requeue work after dequeue. Admission
+  stays closed until this kernel parks forever; each new kernel has its own slot.
 * PCI add/remove ACKs match requester keys for domains 0x8000 and 0xffff;
   signed promotion must not sign-extend the worker's u64 resource key.
 * Receive decoding preserves wire bytes and sizes, accepts maximum-size trailing
@@ -54,6 +58,9 @@ This is controlled interleaving, not a threaded race, kernel memory-ordering,
 transport-delay, boot or physical-runtime test. Pending entries must be removed
 and the lock released after wait/cancel. Sanitizers can check local memory use
 but do not qualify these substituted kernel boundaries.
+
+The shutdown allocation check covers MK_SYS_SHUTDOWN only. HALTED, resource,
+PCI and network receive allocation contexts require separate qualification.
 
 Protocol limits
 ---------------
