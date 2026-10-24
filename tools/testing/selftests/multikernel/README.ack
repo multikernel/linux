@@ -59,8 +59,13 @@ transport-delay, boot or physical-runtime test. Pending entries must be removed
 and the lock released after wait/cancel. Sanitizers can check local memory use
 but do not qualify these substituted kernel boundaries.
 
-The shutdown allocation check covers MK_SYS_SHUTDOWN only. HALTED, resource,
+The allocation checks cover requested shutdown and HALTED admission. Resource,
 PCI and network receive allocation contexts require separate qualification.
+HALTED pins the exact instance before queueing its embedded work item. Short
+payloads, non-shutdown operations, nonzero results, overflowing instance IDs and
+unknown IDs cannot queue it. halt_settlement_test exercises worker identity,
+duplicate coalescing and reference release; start_lifetime_test checks that a
+queued/running notice prevents a new execution generation.
 
 Protocol limits
 ---------------

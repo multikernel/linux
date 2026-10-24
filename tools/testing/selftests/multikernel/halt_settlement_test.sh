@@ -6,8 +6,7 @@ src=$(CDPATH= cd -- "$test_dir/../../../.." && pwd)
 build=$(mktemp -d "${TMPDIR:-/tmp}/mk-halt-settlement.XXXXXX")
 trap 'rm -rf -- "$build"' EXIT HUP INT TERM
 awk '/^static (void|int) mk_instance_settle_halted\(/ { copy = 1 }
-     /^struct mk_halted_work \{/ { copy = 1 }
-     /^static void mk_halted_work_fn\(/ { copy = 1 }
+     /^static void mk_(halted_work_fn|queue_halted)\(/ && !/;$/ { copy = 1 }
      /^int multikernel_(force_)?halt_by_id\(/ { copy = 1 }
      copy { print }
      copy && /^};?/ { copy = 0 }' "$src/kernel/multikernel/core.c" \

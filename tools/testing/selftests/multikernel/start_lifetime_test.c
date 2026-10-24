@@ -11,6 +11,7 @@ struct mk_instance {
 	enum mk_instance_state state;
 	int id;
 	int resource_uncertain;
+	int halted_pending;
 	int *ipi_data;
 };
 struct kimage { int unused; };
@@ -21,6 +22,7 @@ static enum mk_instance_state state_at_start, state_at_unlend;
 #define pr_err(...) do { } while (0)
 #define mk_instance_track_dump(...) do { } while (0)
 #define lockdep_assert_held(...) do { } while (0)
+#define atomic_read(p) (*(p))
 #define mk_instance_ipi_reset(instance) (*(instance)->ipi_data = 0)
 
 static int mk_pciback_lend(struct mk_instance *instance)
@@ -56,6 +58,15 @@ int main(void)
 	int ring = 1;
 	struct mk_instance instance = { .state = MK_STATE_LOADED, .ipi_data = &ring };
 	struct kimage image = { 0 };
+
+	instance.halted_pending = 1;
+	CHECK(mk_instance_start(&instance, &image, 3) == -EBUSY,
+	      "queued halt notice excludes a new execution generation");
+	CHECK(!starts && ring == 1, "pending halt leaves ring and execution untouched");
+	instance.halted_pending = 0;
+	starts = 0;
+	ring = 1;
+	instance.state = MK_STATE_LOADED;
 
 	instance.resource_uncertain = 1;
 	CHECK(mk_instance_start(&instance, &image, 3) == -EBUSY,

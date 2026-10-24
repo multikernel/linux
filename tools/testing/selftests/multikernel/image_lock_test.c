@@ -11,6 +11,7 @@
 #include <time.h>
 #include <linux/list.h>
 
+#define atomic_read(p) atomic_load(p)
 #define u64 __u64
 #define CONFIG_MULTIKERNEL 1
 #define CONFIG_CRASH_DUMP 1
@@ -131,6 +132,7 @@ struct mk_instance {
 	const char *name;
 	enum mk_instance_state state;
 	bool resource_uncertain;
+	atomic_int halted_pending;
 	struct mk_cpu_set *cpus;
 	struct kimage *kimage;
 	void *ipi_data;

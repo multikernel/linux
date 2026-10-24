@@ -2,6 +2,7 @@
 /* See README.ack: real pending/dispatch code, deterministic kernel boundaries. */
 #include <assert.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <setjmp.h>
 #include <stdio.h>
@@ -122,7 +123,14 @@ static unsigned long wait_for_completion_timeout(struct completion *c,
 	return 0;
 }
 
-struct mk_instance { int id; };
+struct work_struct {
+	void (*func)(struct work_struct *work);
+};
+struct mk_instance {
+	int id, refs;
+	struct work_struct halted_work;
+	atomic_t halted_pending;
+};
 #include "ack-types.h"
 
 static struct mk_ipi_data sent;
@@ -150,9 +158,6 @@ static int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data
 #include "ack-messaging.h"
 
 /* Only the hardware mutation, scheduler and final parking are substituted. */
-struct work_struct {
-	void (*func)(struct work_struct *work);
-};
 struct workqueue_struct {
 	int unused;
 };
@@ -212,10 +217,11 @@ static void smp_call_function(void (*fn)(void *), void *arg, int wait)
 	assert(fn == mk_enter_pool_state && !wait);
 }
 
-static void schedule_work(struct work_struct *work)
+static bool schedule_work(struct work_struct *work)
 {
 	assert(!queued);
 	queued = work;
+	return true;
 }
 
 static bool queue_work(struct workqueue_struct *wq, struct work_struct *work)
@@ -232,6 +238,22 @@ static void unexpected_work(struct work_struct *work)
 
 #define INIT_WORK(work, fn) ((work)->func = (fn))
 #define mk_halted_work_fn unexpected_work
+
+static struct mk_instance halted_peer = { .id = 65537 };
+
+static struct mk_instance *mk_instance_find(int id)
+{
+	if (id != halted_peer.id)
+		return NULL;
+	halted_peer.refs++;
+	return &halted_peer;
+}
+
+static void mk_instance_put(struct mk_instance *instance)
+{
+	assert(instance->refs > 0);
+	instance->refs--;
+}
 
 #include "ack-resource.h"
 #include "ack-system.h"
@@ -714,23 +736,30 @@ static void pci_key_regressions(void)
 
 static void halted_decode_regression(void)
 {
-	struct mk_resource_ack ack = { .resource_id = 65537 };
+	struct mk_resource_ack ack = { .operation = MK_SYS_SHUTDOWN, .resource_id = 65537 };
 	struct mk_ipi_data before;
-	struct mk_halted_work *work;
 	size_t len;
 
+	INIT_WORK(&halted_peer.halted_work, mk_halted_work_fn);
 	assert(!mk_send_message(0, MK_MSG_SYSTEM, MK_SYS_HALTED, &ack,
 				sizeof(ack)));
 	before = sent;
+	irq_allocations = 0;
+	allocation_fails = test_hardirq = true;
 	dispatch(&sent);
-	assert(queued);
-	work = container_of(queued, struct mk_halted_work, work);
-	expect("DECODE", "HALTED retains instance ID", work->instance_id,
-	       65537);
+	allocation_fails = test_hardirq = false;
+	expect("HALTED", "hard IPI does not enter allocator", irq_allocations, 0);
+	expect("HALTED", "notification survives allocator exhaustion", queued != NULL, 1);
+	if (!queued)
+		return;
+	expect("DECODE", "HALTED pins exact instance work",
+	       queued == &halted_peer.halted_work && halted_peer.refs == 1, 1);
 	expect("DECODE", "HALTED receive buffer unchanged",
 	       memcmp(&sent, &before, sizeof(sent)) == 0, 1);
 	queued = NULL;
-	free(work);
+	/* Only admission/decoding here; halt_settlement_test runs the real worker. */
+	atomic_set(&halted_peer.halted_pending, 0);
+	mk_instance_put(&halted_peer);
 
 	for (len = 0; len < sizeof(ack); len++) {
 		assert(!mk_send_message(0, MK_MSG_SYSTEM, MK_SYS_HALTED, &ack,
@@ -739,6 +768,22 @@ static void halted_decode_regression(void)
 		assert(!queued);
 	}
 	expect("DECODE", "short HALTED queues no work", queued == NULL, 1);
+	for (unsigned int invalid = 0; invalid < 4; invalid++) {
+		struct mk_resource_ack bad = ack;
+
+		if (invalid == 0)
+			bad.operation++;
+		else if (invalid == 1)
+			bad.result = -EIO;
+		else if (invalid == 2)
+			bad.resource_id += 1ULL << 32;
+		else
+			bad.resource_id++;
+		assert(!mk_send_message(0, MK_MSG_SYSTEM, MK_SYS_HALTED, &bad, sizeof(bad)));
+		dispatch(&sent);
+		expect("DECODE", "invalid or unknown HALTED queues no work",
+		       !queued && !halted_peer.refs, 1);
+	}
 }
 
 static void failure_regressions(void)

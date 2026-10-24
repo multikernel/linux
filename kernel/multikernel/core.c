@@ -317,6 +317,8 @@ void mk_instance_put(struct mk_instance *instance)
 		kref_put(&instance->refcount, mk_instance_release);
 }
 
+static void mk_halted_work_fn(struct work_struct *work);
+
 /**
  * mk_instance_alloc - Construct an unpublished instance record
  * @id: Instance ID to record (a later publish may reassign it)
@@ -354,6 +356,8 @@ struct mk_instance *mk_instance_alloc(int id, const char *name)
 	INIT_LIST_HEAD(&instance->pci_devices);
 	INIT_LIST_HEAD(&instance->platform_devices);
 	kref_init(&instance->refcount);
+	INIT_WORK(&instance->halted_work, mk_halted_work_fn);
+	atomic_set(&instance->halted_pending, 0);
 
 	return instance;
 
@@ -500,7 +504,8 @@ int mk_instance_start(struct mk_instance *instance, struct kimage *image,
 	int ret;
 
 	lockdep_assert_held(&mk_overlay_mutex);
-	if (instance->resource_uncertain)
+	/* A delayed halt notice must retire before this record runs a new Image. */
+	if (instance->resource_uncertain || atomic_read(&instance->halted_pending))
 		return -EBUSY;
 
 	/*
@@ -1832,35 +1837,40 @@ static int mk_instance_settle_halted(struct mk_instance *instance)
 	return 0;
 }
 
-struct mk_halted_work {
-	struct work_struct work;
-	int instance_id;
-};
-
 static void mk_halted_work_fn(struct work_struct *work)
 {
-	struct mk_halted_work *aw =
-		container_of(work, struct mk_halted_work, work);
-	struct mk_instance *instance;
+	struct mk_instance *instance =
+		container_of(work, struct mk_instance, halted_work);
 	int ret;
 
 	guard(mutex)(&mk_overlay_mutex);
 
-	instance = mk_instance_find(aw->instance_id);
-	if (instance) {
-		if (instance->state == MK_STATE_ACTIVE || instance->state == MK_STATE_FAILED) {
-			ret = mk_instance_settle_halted(instance);
-			if (ret)
-				pr_warn("Instance %d halt remains unconfirmed: %d\n",
-					instance->id, ret);
-		}
-		mk_instance_put(instance);
-	} else {
-		pr_warn("Shutdown ACK from unknown instance %d\n",
-			aw->instance_id);
+	if (instance->state == MK_STATE_ACTIVE || instance->state == MK_STATE_FAILED) {
+		ret = mk_instance_settle_halted(instance);
+		if (ret)
+			pr_warn("Instance %d halt remains unconfirmed: %d\n",
+				instance->id, ret);
 	}
 
-	kfree(aw);
+	atomic_set(&instance->halted_pending, 0);
+	mk_instance_put(instance);
+}
+
+static void mk_queue_halted(int id)
+{
+	struct mk_instance *instance = mk_instance_find(id);
+
+	if (!instance)
+		return;
+	/* Pin identity and coalesce notices without allocating under mk_drain_lock. */
+	if (atomic_cmpxchg(&instance->halted_pending, 0, 1)) {
+		mk_instance_put(instance);
+		return;
+	}
+	if (!schedule_work(&instance->halted_work)) {
+		atomic_set(&instance->halted_pending, 0);
+		mk_instance_put(instance);
+	}
 }
 
 static void mk_system_msg_handler(u32 msg_type, u32 subtype, u64 msg_id,
@@ -1915,25 +1925,13 @@ static void mk_system_msg_handler(u32 msg_type, u32 subtype, u64 msg_id,
 	}
 	case MK_SYS_HALTED: {
 		struct mk_resource_ack *ack = payload;
-		struct mk_halted_work *aw;
 
-		if (payload_len < sizeof(*ack))
+		if (payload_len < sizeof(*ack) || ack->operation != MK_SYS_SHUTDOWN ||
+		    ack->result || ack->resource_id > INT_MAX)
 			return;
 
-		/*
-		 * The instance halted itself; nobody is waiting on it, so
-		 * settle its state from here. Deferred to a workqueue
-		 * because instance lookup takes a mutex and the CPUs still
-		 * need time to reach the park loop, while this runs in IPI
-		 * context.
-		 */
-		aw = kmalloc(sizeof(*aw), GFP_ATOMIC);
-		if (!aw)
-			break;
-
-		INIT_WORK(&aw->work, mk_halted_work_fn);
-		aw->instance_id = ack->resource_id;
-		schedule_work(&aw->work);
+		/* Lookup is IRQ-safe; stop confirmation still needs process context. */
+		mk_queue_halted(ack->resource_id);
 		break;
 	}
 	default:

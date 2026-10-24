@@ -73,6 +73,17 @@ contract. Unexpected final-reference release without stop proof retains
 allocations rather than reclaiming executing memory; that diagnostic fallback
 is not a recoverable management API or proof of leak-free error handling.
 
+Voluntary HALTED work is allocated with the instance record, before publication.
+IRQ admission takes a reference to that exact record and coalesces duplicates
+through an atomic pending flag; it does not allocate or resolve the ID later.
+The pending flag remains set while the worker holds the resource mutex and
+attempts stop confirmation. It excludes a new start, including a start after
+another controller has settled the same record. Completion clears the flag and
+drops the reference. Failed confirmation retains ACTIVE/FAILED and allocations;
+a queue rejection drops the reference without publishing a reusable state.
+The execute caller must still confirm stop and drain the inbox before copying
+an Image, as before. This is not a wire session or peer-authentication protocol.
+
 Remaining qualification gates include native x86 concurrency/lockdep, QEMU
 OpenSBI HSM transitions, foreign ring producers, driver/DMA quiescence, stale
 queued notifications across re-spawns, and 50-cycle same/different Image reuse.

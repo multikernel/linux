@@ -50,6 +50,7 @@ awk '/^struct mk_(shutdown_work|halted_work) \{/ { copy = 1 }
      /^void __noreturn mk_halt_to_pool\(/ { copy = 1 }
      /^static void mk_shutdown_work_fn\(/ { copy = 1 }
      /^static void mk_system_msg_handler\(/ { copy = 1 }
+     /^static void mk_queue_halted\(/ { copy = 1 }
      copy { print }
      copy && /^}/ { copy = 0 }' "$src/kernel/multikernel/core.c" \
      > "$build/ack-system.h"

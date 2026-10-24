@@ -835,6 +835,8 @@ struct mk_instance {
 	/* Reference counting */
 	struct kref refcount;           /* Reference count for cleanup */
 	struct work_struct release_work; /* Last reference may be put from an IPI */
+	struct work_struct halted_work; /* Holds a reference while settling a notice */
+	atomic_t halted_pending;       /* Excludes restart until the notice retires */
 };
 
 /**

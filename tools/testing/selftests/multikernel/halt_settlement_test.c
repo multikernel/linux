@@ -28,12 +28,30 @@ struct mk_cpu_set { unsigned int nr; mk_phys_cpu_t ids[2]; };
 #define mk_cpu_set_for_each(i, cpu, set) \
 	for ((i) = 0; (i) < (set)->nr && (((cpu) = (set)->ids[i]), true); (i)++)
 #define mk_cpu_set_empty(p) (!(p)->nr)
-struct mk_instance { int id, state; const char *name; };
 struct work_struct { int unused; };
+struct mk_instance {
+	int id, state;
+	const char *name;
+	unsigned int refs;
+	struct work_struct halted_work;
+	int halted_pending;
+};
+#define atomic_set(p, v) (*(p) = (v))
+static int atomic_cmpxchg(int *p, int old, int new)
+{
+	int value = *p;
+
+	if (value == old)
+		*p = new;
+	return value;
+}
 struct mk_shutdown_payload { u32 flags; int sender_instance_id; };
 struct mk_pending_msg { int unused; };
-static struct mk_instance instance = { 7, MK_STATE_ACTIVE, "spawn" };
-static struct mk_instance self = { 0, MK_STATE_ACTIVE, "host" }, *mk_self = &self;
+static struct mk_instance instance = { .id = 7, .state = MK_STATE_ACTIVE, .name = "spawn" };
+static struct mk_instance replacement = { .id = 7, .state = MK_STATE_ACTIVE, .name = "new" };
+static struct mk_instance *lookup_instance = &instance;
+static struct mk_instance self = { .id = 0, .state = MK_STATE_ACTIVE, .name = "host" };
+static struct mk_instance *mk_self = &self;
 static struct mk_instance *host_instance;
 static struct mk_pending_msg pending;
 static struct mk_cpu_set targets;
@@ -41,6 +59,17 @@ static bool force_supported = true, mk_overlay_mutex;
 static int confirm_error, send_error, wait_error, arm_error, fence_error;
 static unsigned int refs, stopped, confirms, unlocked_confirms, failures, checks;
 static unsigned int host_fenced;
+static struct work_struct *queued;
+static bool queue_rejected, duplicate_during_confirm;
+static void mk_queue_halted(int id);
+static bool schedule_work(struct work_struct *work)
+{
+	if (queue_rejected)
+		return false;
+	assert(!queued);
+	queued = work;
+	return true;
+}
 #define mutex_lock(m) do { assert(!*(m)); *(m) = true; } while (0)
 #define mutex_unlock(m) do { assert(*(m)); *(m) = false; } while (0)
 #define lockdep_assert_held(m) assert(*(m))
@@ -51,17 +80,28 @@ static __attribute__((unused)) void scoped_unlock(bool **m) { mutex_unlock(*m); 
 
 static struct mk_instance *mk_instance_find(int id)
 {
-	if (id != 7)
+	if (!lookup_instance || id != lookup_instance->id)
 		return NULL;
 	refs++;
-	return &instance;
+	lookup_instance->refs++;
+	return lookup_instance;
 }
-static void mk_instance_put(struct mk_instance *p) { assert(refs); refs--; }
+static void mk_instance_put(struct mk_instance *p)
+{
+	assert(refs && p->refs);
+	refs--;
+	p->refs--;
+}
 static void mk_instance_set_state(struct mk_instance *p, int state) { p->state = state; }
 static int mk_instance_confirm_parked(struct mk_instance *p)
 {
 	confirms++;
 	unlocked_confirms += !mk_overlay_mutex;
+	if (duplicate_during_confirm) {
+		assert(p->halted_pending);
+		mk_queue_halted(p->id);
+		assert(!queued && p->refs == 1);
+	}
 	return confirm_error;
 }
 static struct mk_pending_msg *mk_msg_pending_add(u32 type, u32 op, int id) { return &pending; }
@@ -97,17 +137,27 @@ static void expect(const char *name, int got, int want)
 }
 static void reset(void)
 {
-	assert(!refs && !mk_overlay_mutex);
+	assert(!refs && !mk_overlay_mutex && !queued);
 	instance.state = MK_STATE_ACTIVE;
+	instance.halted_pending = 0;
+	lookup_instance = &instance;
+	queue_rejected = duplicate_during_confirm = false;
 	confirm_error = send_error = wait_error = arm_error = fence_error = 0;
 	stopped = confirms = host_fenced = 0;
 	force_supported = true;
 	host_instance = NULL;
 }
+static void run_halted(void)
+{
+	struct work_struct *work = queued;
+
+	assert(work);
+	queued = NULL;
+	mk_halted_work_fn(work);
+}
+
 int main(void)
 {
-	struct mk_halted_work event = { .instance_id = 7 };
-
 	reset();
 	confirm_error = -EBUSY;
 	expect("shutdown ACK is not stop proof", multikernel_halt_by_id(7), -EBUSY);
@@ -121,12 +171,46 @@ int main(void)
 	expect("lost ACK retains active state", instance.state, MK_STATE_ACTIVE);
 	reset();
 	confirm_error = -EBUSY;
-	mk_halted_work_fn(&event.work);
+	mk_queue_halted(7);
+	run_halted();
 	expect("voluntary HALTED must confirm", confirms, 1);
 	expect("failed voluntary confirmation retains active state", instance.state, MK_STATE_ACTIVE);
 	reset();
-	mk_halted_work_fn(&event.work);
+	mk_queue_halted(7);
+	run_halted();
 	expect("confirmed voluntary halt", instance.state, MK_STATE_LOADED);
+	expect("completed notice releases restart gate", instance.halted_pending, 0);
+	reset();
+	mk_queue_halted(7);
+	mk_queue_halted(7);
+	expect("duplicate notice keeps one reference", refs, 1);
+	expect("notice excludes restart until retirement", instance.halted_pending, 1);
+	duplicate_during_confirm = true;
+	run_halted();
+	expect("duplicates do not add confirmations", confirms, 1);
+	expect("worker releases its reference", refs, 0);
+	reset();
+	mk_queue_halted(7);
+	lookup_instance = &replacement;
+	run_halted();
+	expect("queued notice retains original identity", instance.state, MK_STATE_LOADED);
+	expect("ID reuse cannot settle replacement", replacement.state, MK_STATE_ACTIVE);
+	expect("replacement gets no stale reference", replacement.refs, 0);
+	reset();
+	queue_rejected = true;
+	mk_queue_halted(7);
+	expect("queue rejection drops admission reference", refs, 0);
+	expect("queue rejection releases restart gate", instance.halted_pending, 0);
+	expect("queue rejection cannot publish reusable state", instance.state, MK_STATE_ACTIVE);
+	reset();
+	lookup_instance = NULL;
+	mk_queue_halted(7);
+	expect("removed ID queues nothing", queued == NULL && !refs, 1);
+	reset();
+	instance.state = MK_STATE_LOADED;
+	mk_queue_halted(7);
+	run_halted();
+	expect("already settled notice does not reconfirm", confirms, 0);
 	reset();
 	confirm_error = -EBUSY;
 	expect("force halt must confirm", multikernel_force_halt_by_id(7), -EBUSY);
