@@ -207,12 +207,10 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 	return ret;
 }
 
-/*
- * The same for a caller that already holds a reference to @instance.
- * Both send routes serialize against ring reset without sleeping.
- */
-int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
-				 size_t data_size, unsigned long type)
+/* All producers retain the instance and publish under the same ring lock. */
+static int mk_send_ipi_data(struct mk_instance *instance, const void *data,
+			    size_t data_size, unsigned long type,
+			    const struct mk_message *message)
 {
 	struct mk_shared_data *ipi_data;
 	struct mk_ipi_data *slot;
@@ -220,9 +218,11 @@ int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
 	unsigned int head, next_head, tail;
 	mk_phys_cpu_t target;
 	unsigned long flags;
+	size_t header_size = message ? sizeof(*message) : 0;
+	size_t offset = 0;
 	int ret;
 
-	if (data_size > MK_MAX_DATA_SIZE)
+	if (data_size > MK_MAX_DATA_SIZE - header_size)
 		return -EINVAL;
 
 	raw_spin_lock_irqsave(&instance->ipi_lock, flags);
@@ -270,16 +270,22 @@ int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
 	slot->sender_cpu = arch_cpu_physical_id(smp_processor_id());
 	slot->type = type;
 
+	if (message) {
+		/* The flexible payload can start before sizeof(*message). */
+		offset = offsetof(struct mk_message, payload);
+		memset(slot->buffer, 0, header_size + data_size);
+		memcpy(slot->buffer, message, offset);
+	}
 	if (data && data_size > 0)
-		memcpy(slot->buffer, data, data_size);
+		memcpy(slot->buffer + offset, data, data_size);
 
 	/*
 	 * data_size publishes the slot: the reader treats a zero as "the
 	 * producer has claimed this slot but has not filled it yet" and
 	 * waits. Claiming the slot advanced head, so a reader can already
-	 * be looking at it; everything above must be visible first.
+	 * be looking at it; the header and payload must be visible first.
 	 */
-	smp_store_release(&slot->data_size, data_size);
+	smp_store_release(&slot->data_size, header_size + data_size);
 	raw_spin_unlock_irqrestore(&instance->ipi_lock, flags);
 
 	mk_arch_send_ipi(target);
@@ -287,6 +293,34 @@ int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
 
 unlock:
 	raw_spin_unlock_irqrestore(&instance->ipi_lock, flags);
+	return ret;
+}
+
+/*
+ * The same for a caller that already holds a reference to @instance.
+ * Both send routes serialize against ring reset without sleeping.
+ */
+int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
+				 size_t data_size, unsigned long type)
+{
+	return mk_send_ipi_data(instance, data, data_size, type, NULL);
+}
+
+int mk_send_message_ipi(int instance_id, struct mk_instance *instance,
+			const struct mk_message *message, const void *payload)
+{
+	bool lookup = !instance;
+	int ret;
+
+	if (lookup)
+		instance = mk_instance_find(instance_id);
+	if (!instance)
+		return -EINVAL;
+
+	ret = mk_send_ipi_data(instance, payload, message->payload_len,
+			      message->msg_type, message);
+	if (lookup)
+		mk_instance_put(instance);
 	return ret;
 }
 

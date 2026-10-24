@@ -32,6 +32,15 @@ but release it before ringing a doorbell or logging. Reset closes publication
 under that lock, clears the persistent ring with IRQs enabled, then republishes
 it and a cached physical target. Atomic senders do not walk a mutable CPU set.
 The fixture exercises send, closed admission and reset/republication ordering.
+Message sends now build the header and payload directly in the reserved slot,
+under the same producer lock, without slab allocation or a full-size stack
+buffer. Publication follows both copies. Raw IPI callers keep their existing
+interface. The wire size remains sizeof(struct mk_message) plus payload length,
+with payload at its original flexible-array offset and zero tail padding.
+NULL payloads retain the previous zero-fill behavior. A held-instance send does
+not acquire or drop the caller's reference; an ID send pins through publication.
+The fixture checks 16 size/NULL-payload/route combinations, full-size messages,
+overflow rejection, queue/deactivation errors and bytes at release publication.
 The target cache is refreshed at publication/reset and local CPU ownership
 changes, except for the firmware-described parent doorbell target. Runtime
 boot-hart reassignment remains a hardware qualification gate.

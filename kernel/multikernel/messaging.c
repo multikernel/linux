@@ -17,6 +17,7 @@
 #include <linux/interrupt.h>
 #include <linux/mutex.h>
 #include <linux/multikernel.h>
+#include "internal.h"
 
 /* Pending message tracking for request-response pattern */
 struct mk_pending_msg {
@@ -245,45 +246,23 @@ static int mk_build_and_send(int instance_id, struct mk_instance *instance,
 			     u32 msg_type, u32 subtype, u64 msg_id, void *payload,
 			     u32 payload_len)
 {
-	struct mk_message *msg;
-	size_t total_size;
+	struct mk_message msg = {
+		.msg_type = msg_type,
+		.msg_subtype = subtype,
+		.msg_id = msg_id,
+		.payload_len = payload_len,
+	};
 	int ret;
 
-	/* Calculate total message size */
-	total_size = sizeof(struct mk_message) + payload_len;
-
 	/* Check if message fits in IPI buffer */
-	if (total_size > MK_MAX_DATA_SIZE) {
-		pr_err("Multikernel message too large: %zu > %d bytes\n",
-		       total_size, MK_MAX_DATA_SIZE);
+	if (payload_len > MK_MAX_DATA_SIZE - sizeof(msg)) {
+		pr_err("Multikernel message payload too large: %u bytes\n",
+		       payload_len);
 		return -EMSGSIZE;
 	}
 
-	/* Allocate temporary buffer for message */
-	msg = kzalloc(total_size, GFP_ATOMIC);
-	if (!msg)
-		return -ENOMEM;
-
-	/* Fill in message header */
-	msg->msg_type = msg_type;
-	msg->msg_subtype = subtype;
-	msg->msg_id = msg_id;
-	msg->payload_len = payload_len;
-
-	/* Copy payload if provided */
-	if (payload && payload_len > 0)
-		memcpy(msg->payload, payload, payload_len);
-
-	/* Send via IPI using the message type as IPI type */
-	if (instance)
-		ret = multikernel_send_ipi_data_to(instance, msg, total_size,
-						   msg_type);
-	else
-		ret = multikernel_send_ipi_data(instance_id, msg, total_size,
-						msg_type);
-
-	/* Clean up temporary buffer */
-	kfree(msg);
+	/* Assemble in the reserved ring slot, including from raw-locked callbacks. */
+	ret = mk_send_message_ipi(instance_id, instance, &msg, payload);
 
 	if (ret < 0) {
 		pr_err("Failed to send multikernel message: %d\n", ret);

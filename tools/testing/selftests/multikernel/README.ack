@@ -1,5 +1,11 @@
 .. SPDX-License-Identifier: GPL-2.0-only
 
+The message builder no longer allocates a temporary wire buffer. The transport
+assembles in its reserved slot; ACK tests require send success under allocator
+exhaustion and zero hard-IPI allocation attempts. Transport publication and wire
+padding are checked separately by ipi_writer_test.sh. This does not remove the
+remaining resource/PCI work allocations or VSOCK receive allocation.
+
 ACK correlation checks
 ======================
 

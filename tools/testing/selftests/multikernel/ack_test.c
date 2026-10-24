@@ -138,21 +138,21 @@ static int sent_to;
 static int send_error;
 
 /* Transport boundary: capture real mk_send_message() output for replay. */
-static int multikernel_send_ipi_data(int instance_id, void *data, size_t size,
-				     unsigned long type)
+static int mk_send_message_ipi(int instance_id, struct mk_instance *instance,
+			       const struct mk_message *message, const void *payload)
 {
-	assert(size <= sizeof(sent.buffer));
-	sent_to = instance_id;
-	sent.type = type;
-	sent.data_size = size;
-	memcpy(sent.buffer, data, size);
-	return send_error;
-}
+	size_t size = sizeof(*message) + message->payload_len;
+	struct mk_message *msg = (struct mk_message *)sent.buffer;
 
-static int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
-				      size_t size, unsigned long type)
-{
-	return multikernel_send_ipi_data(instance->id, data, size, type);
+	assert(size <= sizeof(sent.buffer));
+	sent_to = instance ? instance->id : instance_id;
+	sent.type = message->msg_type;
+	sent.data_size = size;
+	memset(sent.buffer, 0, size);
+	memcpy(msg, message, offsetof(struct mk_message, payload));
+	if (payload)
+		memcpy(msg->payload, payload, message->payload_len);
+	return send_error;
 }
 
 #include "ack-messaging.h"
@@ -811,9 +811,13 @@ static void failure_regressions(void)
 
 	p = pending(MK_MSG_RESOURCE, MK_RES_CPU_ADD);
 	allocation_fails = true;
+	test_hardirq = true;
+	irq_allocations = 0;
 	ret = mk_send_message_id(1, MK_MSG_RESOURCE, MK_RES_CPU_ADD, current_id,
 				 NULL, 0);
-	expect("FAILURE", "send allocation error", ret, -ENOMEM);
+	expect("REGRESSION", "send survives allocator exhaustion", ret, 0);
+	expect("REGRESSION", "hard-IPI send does not allocate", irq_allocations, 0);
+	test_hardirq = false;
 	allocation_fails = false;
 	mk_msg_pending_cancel(p);
 	cpu_ack();
@@ -830,6 +834,9 @@ static void failure_regressions(void)
 	cpu_ack();
 	assert(list_empty(&mk_pending_msgs) && !mk_pending_msgs_lock.held);
 	send_error = 0;
+	expect("FAILURE", "oversized payload rejected before arithmetic",
+	       mk_send_message(1, MK_MSG_NETWORK, MK_NET_VSOCK_PKT, NULL, UINT_MAX),
+	       -EMSGSIZE);
 	assert(!mk_send_message(1, MK_MSG_NETWORK, MK_NET_VSOCK_PKT, NULL, 0));
 	expect("REGRESSION", "uncorrelated sender keeps zero ID",
 	       ((struct mk_message *)sent.buffer)->msg_id == 0, 1);
