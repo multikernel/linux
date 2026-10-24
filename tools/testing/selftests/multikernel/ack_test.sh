@@ -8,7 +8,8 @@ src=$(CDPATH= cd -- "$test_dir/../../../.." && pwd)
 build=$(mktemp -d "${TMPDIR:-/tmp}/mk-ack.XXXXXX")
 trap 'rm -rf -- "$build"' EXIT HUP INT TERM
 
-awk '/^#define MK_MAX_DATA_SIZE / { print }
+awk '/^#define MK_IPI_RING_SIZE / { print }
+     /^#define MK_MAX_DATA_SIZE / { print }
      /^struct mk_ipi_data \{/ { copy = 1 }
      copy { print }
      copy && /^};/ { copy = 0 }
@@ -28,15 +29,16 @@ awk '/^struct mk_(pending_msg|msg_type_handler) \{/ { copy = 1 }
      copy { print }
      copy && /^}/ { copy = 0 }' "$src/kernel/multikernel/messaging.c" \
      > "$build/ack-messaging.h"
-awk '/^struct mk_(cpu|mem|device)_hotplug_work \{/ { copy = 1 }
+awk '/^struct mk_hotplug_work \{/ { copy = 1 }
      /^static DEFINE_(RAW_)?SPINLOCK\(mk_cpu_hotplug_lock\);/ { print }
      /^static struct workqueue_struct \*mk_cpu_hotplug_wq;/ { print }
      /^static (bool mk_hotplug_accepting|unsigned int mk_hotplug_inflight)/ { print }
      /^static DECLARE_WAIT_QUEUE_HEAD\(mk_hotplug_wait\);/ { print }
-     /^static int mk_queue_hotplug_work\(/ { copy = 1 }
+     /^static int mk_queue_hotplug_request\(/ { copy = 1 }
      /^static (void|bool) mk_hotplug_(work_done|idle)\(/ { copy = 1 }
+     /^static struct mk_hotplug_work mk_(cpu|other)_requests\[/ { print }
+     /^static void mk_hotplug_work_fn\(/ { copy = 1 }
      /^void mk_hotplug_quiesce\(/ { copy = 1 }
-     /^static int mk_queue_cpu_work\(/ { copy = 1 }
      /^static void mk_(cpu|mem|device)_(add|remove)_work_fn\(/ { copy = 1 }
      /^(static )?int mk_handle_(cpu|mem|device)_(add|remove)\(/ { copy = 1 }
      /^static void mk_resource_msg_handler\(/ { copy = 1 }

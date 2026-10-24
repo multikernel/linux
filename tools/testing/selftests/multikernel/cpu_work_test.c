@@ -51,7 +51,7 @@ static bool online[2];
 static int add_error, remove_error;
 static int send_error;
 static bool hard_irq;
-static unsigned int rt_atomic_lock_errors;
+static unsigned int rt_atomic_lock_errors, irq_allocator_calls;
 static unsigned int unlocked_mutations;
 static mk_phys_cpu_t ids[] = { 65537, 0x123456789abcdef0ULL };
 static bool memory_added, device_added, shutdown_sent, parked_cpus;
@@ -86,10 +86,11 @@ static void unlock_irq(struct irq_lock *lock)
 	lock->held = false;
 }
 
-static void *kmalloc(size_t n, unsigned int flags)
+static __maybe_unused void *kmalloc(size_t n, unsigned int flags)
 {
 	void *p;
 
+	irq_allocator_calls += hard_irq;
 	if (allocation_fails)
 		return NULL;
 	p = malloc(n);
@@ -100,6 +101,7 @@ static void *kmalloc(size_t n, unsigned int flags)
 
 static void kfree(void *p)
 {
+	irq_allocator_calls += hard_irq;
 	if (p) {
 		assert(allocations);
 		allocations--;
@@ -112,7 +114,7 @@ struct work_struct { void (*func)(struct work_struct *work); };
 struct workqueue_struct {
 	bool ordered;
 	unsigned int nr;
-	struct work_struct *jobs[8];
+	struct work_struct *jobs[2 * MK_IPI_RING_SIZE + 8];
 };
 static struct workqueue_struct system_queue;
 static struct workqueue_struct *cpu_queue;
@@ -132,7 +134,7 @@ static __maybe_unused struct workqueue_struct *alloc_ordered_workqueue(const cha
 
 static bool queue_work(struct workqueue_struct *queue, struct work_struct *work)
 {
-	assert(queue && queue->nr < 8);
+	assert(queue && queue->nr < 2 * MK_IPI_RING_SIZE + 8);
 	queue->jobs[queue->nr++] = work;
 	return true;
 }
@@ -228,7 +230,7 @@ struct reply {
 	u64 id;
 	struct mk_resource_ack ack;
 };
-static struct reply replies[32];
+static struct reply replies[4 * MK_IPI_RING_SIZE];
 static unsigned int nr_replies;
 
 static int mk_send_message_id(int to, u32 type, u32 subtype, u64 id,
@@ -246,7 +248,7 @@ static int mk_send_message_id(int to, u32 type, u32 subtype, u64 id,
 	}
 	reply = &replies[nr_replies++];
 	assert(type == MK_MSG_RESOURCE && subtype == MK_RES_ACK);
-	assert(len == sizeof(reply->ack) && nr_replies <= 32);
+	assert(len == sizeof(reply->ack) && nr_replies <= 4 * MK_IPI_RING_SIZE);
 	reply->to = to;
 	reply->id = id;
 	memcpy(&reply->ack, payload, len);
@@ -513,6 +515,93 @@ static void controller_regressions(void)
 	reset();
 }
 
+static int receive_resource(unsigned int op, u64 id)
+{
+	struct mk_cpu_resource_payload cpu = { .cpu_id = 65537, .sender_instance_id = 3 };
+	struct mk_mem_resource_payload mem = { .start_pfn = 65537, .sender_instance_id = 3 };
+	struct mk_device_resource_payload dev = { .domain = 1, .sender_instance_id = 3 };
+	int ret;
+
+	hard_irq = true;
+	switch (op) {
+	case 0:
+		ret = mk_handle_cpu_add(&cpu, sizeof(cpu), id);
+		break;
+	case 1:
+		ret = mk_handle_cpu_remove(&cpu, sizeof(cpu), id);
+		break;
+	case 2:
+		ret = mk_handle_mem_add(&mem, sizeof(mem), id);
+		break;
+	case 3:
+		ret = mk_handle_mem_remove(&mem, sizeof(mem), id);
+		break;
+	case 4:
+		ret = mk_handle_device_add(&dev, sizeof(dev), id);
+		break;
+	default:
+		ret = mk_handle_device_remove(&dev, sizeof(dev), id);
+		break;
+	}
+	hard_irq = false;
+	return ret;
+}
+
+static void preallocation_regressions(void)
+{
+	struct mk_cpu_resource_payload cpu = { .cpu_id = 65537, .sender_instance_id = 3 };
+	struct work_struct *slot;
+	unsigned int i;
+
+	reset();
+	expect("init for raw receive", mk_hotplug_init(), 0);
+	allocation_fails = true;
+	for (i = 0; i < 6; i++)
+		expect("all request types avoid allocation", receive_resource(i, 100 + i), 0);
+	drain(cpu_queue);
+	drain(&system_queue);
+	expect("all request types reply", nr_replies, 6);
+	for (i = 0; i < nr_replies; i++)
+		expect("copied sender survives callback return", replies[i].to, 3);
+	expect("first CPU request admitted", mk_handle_cpu_add(&cpu, sizeof(cpu), 200), 0);
+	cpu.cpu_id = ids[1];
+	cpu.sender_instance_id = 9;
+	drain(cpu_queue);
+	expect("worker does not retain callback payload", replies[6].ack.resource_id == ids[0], 1);
+	expect("copied sender remains unchanged", replies[6].to, 3);
+	mk_hotplug_cleanup();
+	for (i = 0; i < 6; i++)
+		expect("closed request avoids allocation",
+		       receive_resource(i, 300 + i), -ESHUTDOWN);
+	expect("no IRQ allocator calls including rejected paths", irq_allocator_calls, 0);
+	reset();
+
+	expect("init for saturation", mk_hotplug_init(), 0);
+	for (i = 0; i < MK_IPI_RING_SIZE; i++) {
+		expect("fill CPU slots", receive_resource(i % 2, 400 + i), 0);
+		expect("fill memory/device slots", receive_resource(2 + i % 4, 500 + i), 0);
+	}
+	for (i = 0; i < 6; i++)
+		expect("full class rejects without overwriting",
+		       receive_resource(i, 600 + i), -ENOMEM);
+	expect("both classes counted through ACK", mk_hotplug_inflight, 2 * MK_IPI_RING_SIZE);
+	slot = cpu_queue->jobs[0];
+	run_one(cpu_queue);
+	expect("CPU slot recycled after ACK", receive_resource(1, 700), 0);
+	expect("reused slot stays on same queue", cpu_queue->jobs[MK_IPI_RING_SIZE - 1] == slot, 1);
+	expect("callback remains initialized", slot->func == mk_hotplug_work_fn, 1);
+	send_error = -EIO;
+	mk_hotplug_cleanup();
+	expect("cleanup drains saturated classes despite lost ACK",
+	       nr_replies, 2 * MK_IPI_RING_SIZE + 1);
+	for (i = 0; i < MK_IPI_RING_SIZE; i++)
+		expect("CPU admission order and ID preserved", replies[i].id == 400 + i, 1);
+	expect("requeued CPU follows prior admitted requests",
+	       replies[MK_IPI_RING_SIZE].id == 700, 1);
+	expect("quiescence retires all slots", mk_hotplug_inflight, 0);
+	reset();
+}
+
 int main(void)
 {
 	struct mk_cpu_resource_payload payload = {
@@ -566,7 +655,11 @@ int main(void)
 	expect("ACK targets requester", replies[1].to, 3);
 	payload.cpu_id = ids[0];
 	allocation_fails = true;
-	expect("work allocation error", mk_handle_cpu_add(&payload, sizeof(payload), 23), -ENOMEM);
+	expect("receive uses preallocated storage",
+	       mk_handle_cpu_add(&payload, sizeof(payload), 23), 0);
+	drain(active_queue());
+	/* Keep subsequent error checks independent of this new reply. */
+	nr_replies = 2;
 	allocation_fails = false;
 	expect("short add", mk_handle_cpu_add(&payload, 0, 24), -EINVAL);
 	expect("short remove", mk_handle_cpu_remove(&payload, 0, 25), -EINVAL);
@@ -605,8 +698,10 @@ int main(void)
 	reset();
 	shutdown_regressions();
 	controller_regressions();
+	preallocation_regressions();
 	expect("incoming mutation excludes direct controller/pool changes", unlocked_mutations, 0);
 	expect("hard-IPI admission never takes an RT sleeping lock", rt_atomic_lock_errors, 0);
+	expect("hard-IPI receive never enters allocator", irq_allocator_calls, 0);
 	printf("CPU work ordering: %u checks, %u failures\n", checks, failures);
 	return failures ? EXIT_FAILURE : EXIT_SUCCESS;
 }

@@ -6,7 +6,8 @@ src=$(CDPATH= cd -- "$test_dir/../../../.." && pwd)
 build=$(mktemp -d "${TMPDIR:-/tmp}/mk-cpu-work.XXXXXX")
 trap 'rm -rf -- "$build"' EXIT HUP INT TERM
 
-awk '/^#define MK_MSG_IO / { copy = 1 }
+awk '/^#define MK_IPI_RING_SIZE / { print }
+     /^#define MK_MSG_IO / { copy = 1 }
      /^\/\* Opaque type/ { copy = 0 }
      copy { print }' "$src/include/linux/multikernel.h" > "$build/work-types.h"
 awk '/^struct mk_hotplug_op \{/ { copy = 1 }
@@ -17,11 +18,12 @@ awk '/^struct mk_hotplug_op \{/ { copy = 1 }
      /^static (bool mk_hotplug_accepting|unsigned int mk_hotplug_inflight)/ { print }
      /^static DECLARE_WAIT_QUEUE_HEAD\(mk_hotplug_wait\);/ { print }
      /^static (int|struct workqueue_struct \*)mk_cpu_hotplug_/ { copy = 1 }
-     /^static int mk_queue_cpu_work\(/ { copy = 1 }
-     /^static int mk_queue_hotplug_work\(/ { copy = 1 }
+     /^static int mk_queue_hotplug_request\(/ { copy = 1 }
      /^static (void|bool) mk_hotplug_(work_done|idle)\(/ { copy = 1 }
+     /^static struct mk_hotplug_work mk_(cpu|other)_requests\[/ { print }
+     /^static void mk_hotplug_work_fn\(/ { copy = 1 }
      /^void mk_hotplug_quiesce\(/ { copy = 1 }
-     /^struct mk_(cpu|mem|device)_hotplug_work \{/ { copy = 1 }
+     /^struct mk_hotplug_work \{/ { copy = 1 }
      /^static void mk_(cpu|mem|device)_(add|remove)_work_fn\(/ { copy = 1 }
      /^(static )?int mk_handle_(cpu|mem|device)_(add|remove)\(/ { copy = 1 }
      /^int __init mk_hotplug_init\(/ { copy = 1 }

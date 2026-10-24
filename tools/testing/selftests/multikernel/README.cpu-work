@@ -46,13 +46,13 @@ Submission and admission closure share an IRQ-safe raw spinlock. Cleanup closes
 admission and waits before detaching the CPU queue and unregistering;
 destroy_workqueue finishes releasing the CPU queue. Init failure does not
 publish a resource handler without its
-CPU queue. Rejected work is freed and returns -ESHUTDOWN to the receive dispatch;
+CPU queue. Rejected requests return -ESHUTDOWN to the receive dispatch;
 no success ACK is fabricated. The existing dispatcher logs that error rather
 than replying, so a requester may time out and must retain uncertain ownership.
 
 Requested shutdown now closes incoming resource admission and waits for every
 accepted CPU, memory and device worker to finish its mutation, ACK attempt and
-work allocation release before sending SHUTDOWN_ACK and entering the park path.
+request-slot retirement before sending SHUTDOWN_ACK and entering the park path.
 Cleanup also drains these jobs before freeing tracking. Memory/device jobs
 remain on their existing system queue; CPU jobs retain FIFO ordering. Handler
 registration exposes shutdown only after hotplug admission is initialized.
@@ -65,7 +65,7 @@ during drain. It does not exercise native wait-queue wakeups or kernel schedulin
 Registration/unwind and mixed-resource cleanup with lost ACKs are also covered.
 
 Admission closure and the in-flight count share the raw lock. Completion is
-published only after freeing work; the idle predicate takes the same lock.
+published only after retiring the request slot; the idle predicate takes the same lock.
 Quiescence waits without controller, registry, tracking or admission locks held.
 If an accepted operation never returns, no successful shutdown ACK is sent.
 No timeout is used to pretend the operation was cancelled.
@@ -121,3 +121,36 @@ ring/image lifetime, other shutdown quiescence and cross-kernel dependencies rem
 release gates. All parked CPUs or a reset ring alone are not a queued-work
 cancellation proof. Kernel lockdep, x86 runtime/concurrency, QEMU/OpenSBI and
 same/different-Image 50-cycle failure/stress tests remain required.
+
+Allocation-free receive admission
+---------------------------------
+
+CPU and memory/device requests each have MK_IPI_RING_SIZE preinitialized slots.
+They retain their ordered CPU queue and existing system queue respectively.
+Under the admission raw lock, a handler claims a free slot, copies the complete
+payload and request ID, counts the request and queues it. All six receive paths
+and their rejection paths avoid allocation, freeing and work initialization.
+Short payloads return -EINVAL; a closed subsystem returns -ESHUTDOWN; a full
+class returns -ENOMEM without modifying or overwriting an admitted request.
+No success ACK is synthesized for rejection: the existing sender timeout and
+uncertain-ownership retention behavior applies. Capacity is deliberately bounded
+at one receive-ring length per class; this is not unlimited burst admission.
+
+Each slot remains busy through mutation and its correlated ACK attempt, even
+when delivery fails. Retirement drops busy/in-flight under the admission lock,
+then wakes waiters in process context. No worker reads its payload afterward.
+A requeued slot keeps the same callback and queue and is never reinitialized in
+receive context; this satisfies the workqueue non-reentrancy contract even when
+submission races the tail of the previous callback. Storage is static and is
+not freed while workqueue bookkeeping can still reference the work item.
+The pool is initialized once before publishing the receive handler.
+
+The cpu_work fixture additionally covers all six receives with allocation
+unavailable, copied payload/sender lifetime, both full classes, no overwrite on
+rejection, reuse on the same queue, FIFO request IDs, and saturated cleanup with
+lost ACKs. It instruments allocator entry in modeled hard-IPI context, including
+closed-admission paths. The queue scheduling and non-reentrancy guarantee are
+modeled boundaries; native lockdep and actual resource hotplug remain separate
+qualification requirements. The retained process-context tracking allocations
+are not removed by this change. Deferred PCI and VSOCK receive paths are also
+outside this change.

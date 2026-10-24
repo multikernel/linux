@@ -871,6 +871,10 @@ int main(int argc, char **argv)
 	assert(list_empty(&mk_pending_msgs) && !mk_pending_msgs_lock.held);
 
 	/* Queue creation/lifetime is exercised by cpu_work_test, not this fixture. */
+	for (size_t slot = 0; slot < MK_IPI_RING_SIZE; slot++) {
+		INIT_WORK(&mk_cpu_requests[slot].work, mk_hotplug_work_fn);
+		INIT_WORK(&mk_other_requests[slot].work, mk_hotplug_work_fn);
+	}
 	mk_cpu_hotplug_wq = &cpu_queue;
 	mk_hotplug_accepting = true;
 
