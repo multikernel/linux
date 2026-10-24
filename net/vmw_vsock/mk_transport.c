@@ -17,6 +17,7 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
+#include <linux/kfifo.h>
 #include <linux/multikernel.h>
 #include <net/sock.h>
 #include <net/af_vsock.h>
@@ -29,9 +30,9 @@ static struct vsock_transport mk_transport;
 
 struct mk_vsock {
 	struct workqueue_struct *workqueue;
-	struct sk_buff_head pkt_queue;
+	STRUCT_KFIFO_REC_2(MK_IPI_RING_SIZE * MK_MAX_DATA_SIZE) rx_fifo;
 	struct work_struct rx_work;
-	spinlock_t rx_lock;
+	raw_spinlock_t rx_lock;
 };
 
 static struct mk_vsock mk_vsock_dev;
@@ -116,17 +117,6 @@ static void mk_vsock_send_rst(struct virtio_vsock_hdr *hdr)
 
 	mk_send_pkt(skb);
 	kfree_skb(skb);
-}
-
-static void mk_queue_rx_pkt(struct sk_buff *skb)
-{
-	struct mk_vsock *mk = &mk_vsock_dev;
-
-	spin_lock(&mk->rx_lock);
-	skb_queue_tail(&mk->pkt_queue, skb);
-	spin_unlock(&mk->rx_lock);
-
-	queue_work(mk->workqueue, &mk->rx_work);
 }
 
 static void mk_vsock_rx_pkt(struct sk_buff *skb)
@@ -282,44 +272,60 @@ reset:
 static void mk_vsock_rx_work(struct work_struct *work)
 {
 	struct mk_vsock *mk = container_of(work, struct mk_vsock, rx_work);
-	struct sk_buff_head pkts;
+	unsigned int budget = MK_IPI_RING_SIZE, len, copied;
 	struct sk_buff *skb;
 	unsigned long flags;
 
-	skb_queue_head_init(&pkts);
+	while (budget--) {
+		raw_spin_lock_irqsave(&mk->rx_lock, flags);
+		len = kfifo_peek_len(&mk->rx_fifo);
+		raw_spin_unlock_irqrestore(&mk->rx_lock, flags);
+		if (!len)
+			return;
 
-	spin_lock_irqsave(&mk->rx_lock, flags);
-	skb_queue_splice_init(&mk->pkt_queue, &pkts);
-	spin_unlock_irqrestore(&mk->rx_lock, flags);
+		/* This work is the only consumer, so the head survives allocation. */
+		skb = alloc_skb(len, GFP_KERNEL);
+		raw_spin_lock_irqsave(&mk->rx_lock, flags);
+		if (skb)
+			copied = kfifo_out(&mk->rx_fifo, skb_put(skb, len), len);
+		else
+			kfifo_skip(&mk->rx_fifo);
+		raw_spin_unlock_irqrestore(&mk->rx_lock, flags);
+		if (skb) {
+			if (copied == len)
+				mk_vsock_rx_pkt(skb);
+			else
+				kfree_skb(skb);
+		}
+	}
 
-	while ((skb = __skb_dequeue(&pkts)))
-		mk_vsock_rx_pkt(skb);
+	raw_spin_lock_irqsave(&mk->rx_lock, flags);
+	if (!kfifo_is_empty(&mk->rx_fifo))
+		queue_work(mk->workqueue, &mk->rx_work);
+	raw_spin_unlock_irqrestore(&mk->rx_lock, flags);
 }
 
 static void mk_vsock_ipi_handler(u32 msg_type, u32 subtype, u64 msg_id,
 				 void *payload, u32 payload_len, void *ctx)
 {
-	struct sk_buff *skb;
-	struct virtio_vsock_hdr *hdr;
+	struct mk_vsock *mk = &mk_vsock_dev;
+	struct virtio_vsock_hdr hdr;
+	unsigned long flags;
 
 	if (msg_type != MK_MSG_NETWORK || subtype != MK_NET_VSOCK_PKT)
 		return;
 
-	if (payload_len < sizeof(struct virtio_vsock_hdr)) {
-		pr_warn("mk_vsock: packet too small (%u bytes)\n", payload_len);
+	if (payload_len < sizeof(hdr) || payload_len > MK_VSOCK_MAX_PKT_SIZE)
 		return;
-	}
-
-	skb = alloc_skb(payload_len, GFP_ATOMIC);
-	if (!skb) {
-		pr_err("mk_vsock: failed to allocate skb\n");
+	memcpy(&hdr, payload, sizeof(hdr));
+	if (le32_to_cpu(hdr.len) > payload_len - sizeof(hdr))
 		return;
-	}
 
-	skb_put_data(skb, payload, payload_len);
-
-	hdr = (struct virtio_vsock_hdr *)skb->data;
-	mk_queue_rx_pkt(skb);
+	/* The dispatcher releases the shared message slot on callback return. */
+	raw_spin_lock_irqsave(&mk->rx_lock, flags);
+	if (kfifo_in(&mk->rx_fifo, payload, payload_len))
+		queue_work(mk->workqueue, &mk->rx_work);
+	raw_spin_unlock_irqrestore(&mk->rx_lock, flags);
 }
 
 /*
@@ -747,8 +753,8 @@ static int __init mk_vsock_transport_init(void)
 	struct mk_vsock *mk = &mk_vsock_dev;
 	int ret;
 
-	spin_lock_init(&mk->rx_lock);
-	skb_queue_head_init(&mk->pkt_queue);
+	raw_spin_lock_init(&mk->rx_lock);
+	INIT_KFIFO(mk->rx_fifo);
 	INIT_WORK(&mk->rx_work, mk_vsock_rx_work);
 
 	mk->workqueue = alloc_workqueue("mk_vsock_wq", WQ_UNBOUND, 0);
@@ -757,17 +763,17 @@ static int __init mk_vsock_transport_init(void)
 		return -ENOMEM;
 	}
 
-	ret = mk_register_msg_handler(MK_MSG_NETWORK, mk_vsock_ipi_handler, NULL);
+	ret = vsock_core_register(&mk_transport, VSOCK_TRANSPORT_F_MULTIKERNEL);
 	if (ret < 0) {
-		pr_err("mk_vsock: failed to register message handler: %d\n", ret);
+		pr_err("mk_vsock: failed to register transport: %d\n", ret);
 		destroy_workqueue(mk->workqueue);
 		return ret;
 	}
 
-	ret = vsock_core_register(&mk_transport, VSOCK_TRANSPORT_F_MULTIKERNEL);
+	ret = mk_register_msg_handler(MK_MSG_NETWORK, mk_vsock_ipi_handler, NULL);
 	if (ret < 0) {
-		pr_err("mk_vsock: failed to register transport: %d\n", ret);
-		mk_unregister_msg_handler(MK_MSG_NETWORK, mk_vsock_ipi_handler);
+		pr_err("mk_vsock: failed to register message handler: %d\n", ret);
+		vsock_core_unregister(&mk_transport);
 		destroy_workqueue(mk->workqueue);
 		return ret;
 	}
@@ -780,7 +786,6 @@ static void __exit mk_vsock_transport_exit(void)
 {
 	struct mk_vsock *mk = &mk_vsock_dev;
 
-	vsock_core_unregister(&mk_transport);
 	mk_unregister_msg_handler(MK_MSG_NETWORK, mk_vsock_ipi_handler);
 
 	if (mk->workqueue) {
@@ -788,7 +793,7 @@ static void __exit mk_vsock_transport_exit(void)
 		destroy_workqueue(mk->workqueue);
 	}
 
-	skb_queue_purge(&mk->pkt_queue);
+	vsock_core_unregister(&mk_transport);
 	pr_info("Multikernel vsock transport unregistered\n");
 }
 
