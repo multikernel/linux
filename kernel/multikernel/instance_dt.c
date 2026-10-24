@@ -297,6 +297,11 @@ static int __init mk_restore_instance_ipi(struct mk_instance *instance)
 		return 0;
 	}
 	ipi_size = (size_t)ipi_pages << PAGE_SHIFT;
+	if (ipi_size < sizeof(struct mk_shared_data)) {
+		pr_err("IPI buffer is too small: %zu < %zu\n", ipi_size,
+		       sizeof(struct mk_shared_data));
+		return -EINVAL;
+	}
 
 	instance->ipi_data = memremap(ipi_phys, ipi_size, MEMREMAP_WB);
 	if (!instance->ipi_data) {
@@ -316,38 +321,58 @@ static int __init mk_restore_instance_ipi(struct mk_instance *instance)
 static int __init mk_restore_host_instance(void)
 {
 	struct mk_instance *hi;
-	phys_addr_t host_ipi_phys;
-	u32 host_ipi_pages;
-	size_t host_ipi_size;
+	phys_addr_t halt_phys;
+	u32 halt_pages;
+	u32 parent_id;
+	size_t halt_size;
 	u64 host_ipi_cpu;
+	int ret;
 
-	if (!mk_chosen_ring("host-ipi", &host_ipi_phys, &host_ipi_pages) ||
+	if (!mk_self || !mk_self->ipi_data ||
+	    of_property_read_u32(of_chosen, "multikernel,parent-id", &parent_id) ||
 	    of_property_read_u64(of_chosen, "multikernel,host-ipi-cpu",
-				 &host_ipi_cpu)) {
-		pr_warn("No host IPI buffer in the boot tree (spawn won't be able to send to host)\n");
+				 &host_ipi_cpu) ||
+	    !mk_chosen_ring("host-ipi", &halt_phys, &halt_pages)) {
+		pr_warn("Incomplete parent IPI data in the boot tree\n");
 		return -ENOENT;
 	}
-	host_ipi_size = (size_t)host_ipi_pages << PAGE_SHIFT;
+	if (parent_id > INT_MAX || parent_id == mk_self->id ||
+	    host_ipi_cpu == MK_PHYS_CPU_INVALID) {
+		pr_err("Invalid parent endpoint: id=%u, doorbell=%llu\n",
+		       parent_id, host_ipi_cpu);
+		return -EINVAL;
+	}
 
-	hi = mk_instance_alloc(0, "host");
+	halt_size = (size_t)halt_pages << PAGE_SHIFT;
+	if (halt_size < sizeof(struct mk_shared_data) ||
+	    halt_phys == mk_self->ipi_phys) {
+		pr_err("Invalid parent force-halt area: phys=0x%llx, pages=%u\n",
+		       (unsigned long long)halt_phys, halt_pages);
+		return -EINVAL;
+	}
+
+	hi = mk_instance_alloc(parent_id, "host");
 	if (!hi)
 		return -ENOMEM;
 
 	hi->ipi_target = host_ipi_cpu;
-
-	hi->ipi_data = memremap(host_ipi_phys, host_ipi_size, MEMREMAP_WB);
-	if (!hi->ipi_data) {
-		pr_err("Failed to map host IPI buffer at 0x%llx\n",
-		       (unsigned long long)host_ipi_phys);
+	hi->ipi_data = mk_self->ipi_data;
+	hi->ipi_phys = mk_self->ipi_phys;
+	hi->ipi_pages = mk_self->ipi_pages;
+	hi->halt_data = memremap(halt_phys, halt_size, MEMREMAP_WB);
+	if (!hi->halt_data) {
+		pr_err("Failed to map parent force-halt area at 0x%llx\n",
+		       (unsigned long long)halt_phys);
+		ret = -ENOMEM;
 		goto err_free;
 	}
-	hi->ipi_phys = host_ipi_phys;
-	hi->ipi_pages = host_ipi_pages;
 
-	if (mk_instance_publish(hi)) {
-		memunmap(hi->ipi_data);
+	ret = mk_ipi_endpoint_register(hi, false, host_ipi_cpu);
+	if (ret)
 		goto err_free;
-	}
+	ret = mk_instance_publish(hi);
+	if (ret)
+		goto err_endpoint;
 	/* The host is running, or this kernel would not be */
 	mk_instance_set_state(hi, MK_STATE_ACTIVE);
 
@@ -362,15 +387,16 @@ static int __init mk_restore_host_instance(void)
 
 	host_instance = hi;
 
-	pr_info("Restored host IPI buffer: phys=0x%llx, pages=%u\n",
-		(unsigned long long)host_ipi_phys, host_ipi_pages);
-	pr_info("Registered host instance (ID 0) for spawn→host communication\n");
+	pr_info("Registered parent instance %u on the duplex IPI link\n",
+		parent_id);
 
 	return 0;
 
+err_endpoint:
+	mk_ipi_endpoint_unregister(hi);
 err_free:
 	mk_instance_free(hi);
-	return -ENOMEM;
+	return ret;
 }
 
 /**

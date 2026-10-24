@@ -2,6 +2,7 @@
 /*
  * Copyright (C) 2025 Multikernel Technologies, Inc. All rights reserved
  */
+#include <linux/atomic.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -13,8 +14,11 @@
 #include <linux/kexec.h>
 #include <linux/multikernel.h>
 #include <linux/pci.h>
+#include <linux/suspend.h>
 #include <linux/vmalloc.h>
 #include "internal.h"
+
+static atomic64_t mk_ipi_start_sequence = ATOMIC64_INIT(0);
 
 static void mk_instance_return_all_cpus(struct mk_instance *instance)
 {
@@ -217,6 +221,8 @@ static void mk_instance_release(struct kref *kref)
 
 	pr_info("Releasing multikernel instance %d (%s), returning resources to root\n",
 		instance->id, instance->name);
+	WARN_ON_ONCE(READ_ONCE(instance->ipi_endpoint.registered));
+	WARN_ON_ONCE(instance->ipi_endpoint.tx || instance->ipi_endpoint.rx);
 
 	mk_instance_return_all_cpus(instance);
 	mk_instance_return_pci_devices(instance);
@@ -225,6 +231,8 @@ static void mk_instance_release(struct kref *kref)
 	mk_instance_free_boot_pages(instance);
 
 	mk_instance_track_dump(instance, instance->state, MK_STATE_READY);
+	if (instance->halt_data)
+		memunmap(instance->halt_data);
 	kfree(instance->host_tree);
 	mk_cpu_set_free(instance->cpus);
 	kfree(instance->name);
@@ -278,6 +286,9 @@ struct mk_instance *mk_instance_alloc(int id, const char *name)
 
 	instance->state = MK_STATE_READY;
 	instance->ipi_target = MK_PHYS_CPU_INVALID;
+	raw_spin_lock_init(&instance->ipi_endpoint.tx_lock);
+	raw_spin_lock_init(&instance->ipi_endpoint.rx_lock);
+	INIT_LIST_HEAD(&instance->ipi_endpoint.rx_node);
 	INIT_LIST_HEAD(&instance->memory_regions);
 	INIT_LIST_HEAD(&instance->list);
 	INIT_LIST_HEAD(&instance->pci_devices);
@@ -344,6 +355,8 @@ void mk_instance_free(struct mk_instance *instance)
 		list_del(&plat_dev->list);
 		kfree(plat_dev);
 	}
+	if (instance->halt_data)
+		memunmap(instance->halt_data);
 	kfree(instance->host_tree);
 	mk_cpu_set_free(instance->cpus);
 	kfree(instance->name);
@@ -361,12 +374,14 @@ void mk_instance_set_state(struct mk_instance *instance,
 	if (old_state == state)
 		return;
 
+	/* Retire transport readers before stopped state permits another exec. */
+	if (old_state == MK_STATE_ACTIVE) {
+		mk_ipi_endpoint_unregister(instance);
+		mk_pciback_unlend(instance);
+	}
+
 	instance->state = state;
 	mk_instance_track_dump(instance, old_state, state);
-
-	/* Whatever stopped it, its functions are no longer its to reach */
-	if (old_state == MK_STATE_ACTIVE)
-		mk_pciback_unlend(instance);
 	pr_debug("Instance %d (%s) state: %s -> %s\n",
 		 instance->id, instance->name,
 		 mk_state_to_string(old_state),
@@ -427,34 +442,26 @@ int mk_instance_start(struct mk_instance *instance, struct kimage *image,
 	int ret;
 
 	/*
-	 * Start the instance with an empty ring. It outlives the kernel
-	 * that was using it, so a new instance would otherwise inherit that
-	 * kernel's indices and any slot it left half written - which stalls
-	 * the reader, since an unpublished slot means "the sender is still
-	 * filling this one". Anything left in there was addressed to a
-	 * kernel that is gone.
+	 * The exec caller has confirmed park, retired old callbacks, and reset
+	 * this link. An old HALTED work item cannot belong to this new start.
 	 */
-	if (instance->ipi_data)
-		memset(instance->ipi_data, 0, sizeof(*instance->ipi_data));
-
-	/*
-	 * Same for the other direction: whatever the halted instance left
-	 * queued for us is addressed from a kernel that no longer exists,
-	 * and a slot it claimed but never published stalls our ring for
-	 * good.
-	 */
-	mk_ipi_ring_drop_pending();
+	instance->ipi_start_sequence = atomic64_inc_return(&mk_ipi_start_sequence);
+	ret = mk_ipi_endpoint_register(instance, true, arch_cpu_physical_id(cpu));
+	if (ret)
+		return ret;
 
 	ret = mk_pciback_lend(instance);
 	if (ret) {
 		pr_err("Instance %d: its PCI functions cannot be lent: %d\n",
 		       instance->id, ret);
+		mk_ipi_endpoint_unregister(instance);
 		return ret;
 	}
 
 	ret = mk_arch_spawn_instance(image, instance, cpu);
 	if (ret) {
 		mk_pciback_unlend(instance);
+		mk_ipi_endpoint_unregister(instance);
 		return ret;
 	}
 
@@ -1629,7 +1636,12 @@ static void __noreturn mk_notify_down_and_park(int target_id, u32 subtype)
  */
 void __noreturn mk_halt_to_pool(void)
 {
-	mk_notify_down_and_park(0, MK_SYS_HALTED);
+	int parent_id;
+
+	if (!host_instance)
+		panic("multikernel: spawned kernel has no parent instance");
+	parent_id = READ_ONCE(host_instance->id);
+	mk_notify_down_and_park(parent_id, MK_SYS_HALTED);
 }
 
 static void mk_shutdown_work_fn(struct work_struct *work)
@@ -1658,6 +1670,7 @@ static void mk_instance_settle_halted(struct mk_instance *instance)
 struct mk_halted_work {
 	struct work_struct work;
 	int instance_id;
+	u64 received_start_sequence;
 };
 
 static void mk_halted_work_fn(struct work_struct *work)
@@ -1666,14 +1679,19 @@ static void mk_halted_work_fn(struct work_struct *work)
 		container_of(work, struct mk_halted_work, work);
 	struct mk_instance *instance;
 
+	/* Exec and the synchronous halt paths already hold this mutex. */
+	mutex_lock(&system_transition_mutex);
 	instance = mk_instance_find(aw->instance_id);
 	if (instance) {
-		mk_instance_settle_halted(instance);
+		if (instance->state == MK_STATE_ACTIVE &&
+		    instance->ipi_start_sequence <= aw->received_start_sequence)
+			mk_instance_settle_halted(instance);
 		mk_instance_put(instance);
 	} else {
 		pr_warn("Shutdown ACK from unknown instance %d\n",
 			aw->instance_id);
 	}
+	mutex_unlock(&system_transition_mutex);
 
 	kfree(aw);
 }
@@ -1738,6 +1756,8 @@ static void mk_system_msg_handler(u32 msg_type, u32 subtype,
 
 		INIT_WORK(&aw->work, mk_halted_work_fn);
 		aw->instance_id = ack->resource_id;
+		/* Exec's unregister grace puts this snapshot before the next start. */
+		aw->received_start_sequence = atomic64_read(&mk_ipi_start_sequence);
 		schedule_work(&aw->work);
 		break;
 	}
@@ -1875,7 +1895,7 @@ EXPORT_SYMBOL_GPL(mk_cpu_rank);
 static int mk_fence_missing(struct mk_instance *instance,
 			    struct mk_cpu_set *targets)
 {
-	struct mk_shared_data *sd = instance->ipi_data;
+	struct mk_shared_data *sd = mk_instance_halt_data(instance);
 	mk_phys_cpu_t phys;
 	unsigned int i;
 	int missing = 0;
@@ -1900,7 +1920,7 @@ static int mk_fence_missing(struct mk_instance *instance,
 static int mk_confirm_fenced(struct mk_instance *instance,
 			     struct mk_cpu_set *targets)
 {
-	struct mk_shared_data *sd = instance->ipi_data;
+	struct mk_shared_data *sd = mk_instance_halt_data(instance);
 	mk_phys_cpu_t phys;
 	unsigned int i;
 	int missing, ret;
@@ -2007,8 +2027,10 @@ int multikernel_force_halt_by_id(int mk_id)
 	 */
 	if (instance == host_instance) {
 		ret = mk_confirm_fenced(instance, targets);
-		if (!ret)
+		if (!ret) {
+			mk_ipi_endpoint_unregister(instance);
 			mk_pcifront_host_fenced();
+		}
 	} else {
 		mk_instance_settle_halted(instance);
 	}
@@ -2017,6 +2039,8 @@ int multikernel_force_halt_by_id(int mk_id)
 	mk_instance_put(instance);
 	return ret;
 }
+
+static bool multikernel_initialized __initdata;
 
 static int __init multikernel_init(void)
 {
@@ -2052,9 +2076,21 @@ static int __init multikernel_init(void)
 		return ret;
 	}
 
+	multikernel_initialized = true;
+
 	pr_info("Multikernel support initialized\n");
+	return 0;
+}
+
+static int __init multikernel_ipi_enable(void)
+{
+	if (!multikernel_initialized)
+		return 0;
+
+	mk_ipi_handlers_enable();
 	return 0;
 }
 
 /* Initialize multikernel after core kernel subsystems are ready */
 subsys_initcall(multikernel_init);
+late_initcall(multikernel_ipi_enable);

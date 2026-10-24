@@ -426,6 +426,7 @@ int mk_instance_destroy(struct mk_instance *instance)
 		return -EBUSY;
 	}
 
+	mk_ipi_endpoint_unregister(instance);
 	list_del(&instance->list);
 	idr_remove(&mk_instance_idr, instance->id);
 	if (instance->kn) {
@@ -601,6 +602,7 @@ void mk_kernfs_cleanup(void)
 	/* Remove all instances */
 	mutex_lock(&mk_instance_mutex);
 	list_for_each_entry_safe(instance, tmp, &mk_instance_list, list) {
+		mk_ipi_endpoint_unregister(instance);
 		list_del(&instance->list);
 		idr_remove(&mk_instance_idr, instance->id);
 		mk_instance_put(instance);
