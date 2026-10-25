@@ -704,6 +704,7 @@ static int mk_handle_mem_remove(struct mk_instance *from,
 static int mk_do_device_add(u16 domain, u8 bus, u8 devfn,
 			    const char *driver_override, u32 flags)
 {
+#ifdef CONFIG_PCI
 	struct pci_dev *pdev;
 	struct pci_bus *pci_bus;
 	struct device_driver *drv;
@@ -823,10 +824,14 @@ static int mk_do_device_add(u16 domain, u8 bus, u8 devfn,
 		domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
 
 	return 0;
+#else
+	return -EOPNOTSUPP;
+#endif
 }
 
 static int mk_do_device_remove(u16 domain, u8 bus, u8 devfn)
 {
+#ifdef CONFIG_PCI
 	struct pci_dev *pdev;
 	struct pci_bus *pci_bus;
 	struct mk_hotplug_op *op;
@@ -880,6 +885,9 @@ static int mk_do_device_remove(u16 domain, u8 bus, u8 devfn)
 		domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
 
 	return 0;
+#else
+	return -EOPNOTSUPP;
+#endif
 }
 
 struct mk_device_hotplug_work {
