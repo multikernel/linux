@@ -6,7 +6,9 @@
 #define _LINUX_MULTIKERNEL_H
 
 #include <linux/types.h>
-#include <linux/irq_work.h>
+#include <linux/list.h>
+#include <linux/rcupdate.h>
+#include <linux/spinlock.h>
 #include <linux/kobject.h>
 #include <linux/kernfs.h>
 #include <linux/ioport.h>
@@ -88,6 +90,7 @@ static inline mk_phys_cpu_t mk_cpu_set_first(const struct mk_cpu_set *set)
 
 /* Data structure for passing parameters via IPI */
 struct mk_ipi_data {
+	u32 ready;
 	u64 sender_cpu;          /* Physical ID of the CPU that sent this IPI */
 	unsigned int type;      /* User-defined type identifier */
 	size_t data_size;        /* Size of the data */
@@ -96,8 +99,6 @@ struct mk_ipi_data {
 
 /* IPI ring buffer for queuing messages */
 struct mk_ipi_ring {
-	atomic_t head;                          /* Producer index */
-	atomic_t tail;                          /* Consumer index */
 	struct mk_ipi_data entries[MK_IPI_RING_SIZE]; /* Ring buffer entries */
 };
 
@@ -109,9 +110,10 @@ struct mk_ipi_ring {
 /* Presence table capacity, in CPUs (see mk_cpu_rank) */
 #define MK_PARKED_MAX 512
 
-/* Shared memory structures - per-instance design */
+/* One duplex link per parent/child pair. Each ring has one kernel producer. */
 struct mk_shared_data {
-	struct mk_ipi_ring ring;  /* IPI message ring buffer */
+	struct mk_ipi_ring to_child;
+	struct mk_ipi_ring to_parent;
 	/*
 	 * Force-halt marker, host-owned. Armed before the host NMIs the
 	 * instance's CPUs and cleared with the rest of this struct when
@@ -133,6 +135,22 @@ struct mk_shared_data {
 	u8 parked[MK_PARKED_MAX];
 };
 
+struct mk_instance;
+
+struct mk_ipi_endpoint {
+	struct mk_ipi_ring *tx;
+	struct mk_ipi_ring *rx;
+	raw_spinlock_t tx_lock;
+	raw_spinlock_t rx_lock;
+	u32 tx_head;
+	u32 rx_tail;
+	mk_phys_cpu_t doorbell_cpu;
+	bool tx_enabled;
+	bool rx_dispatching;
+	bool registered;
+	struct list_head rx_node;
+};
+
 /* Function pointer type for IPI callbacks */
 typedef void (*mk_ipi_callback_t)(struct mk_ipi_data *data, void *ctx);
 
@@ -140,7 +158,7 @@ struct mk_ipi_handler {
 	mk_ipi_callback_t callback;
 	void *context;
 	unsigned int ipi_type;       /* IPI type this handler is registered for */
-	struct mk_ipi_handler *next;
+	struct list_head node;
 };
 
 /**
@@ -156,6 +174,9 @@ struct mk_ipi_handler *multikernel_register_handler(mk_ipi_callback_t callback, 
 /**
  * multikernel_unregister_handler - Unregister a multikernel IPI callback
  * @handler: Handler pointer returned from multikernel_register_handler
+ *
+ * Must be called from process context and not from a multikernel IPI
+ * callback.
  */
 void multikernel_unregister_handler(struct mk_ipi_handler *handler);
 
@@ -166,8 +187,8 @@ void multikernel_unregister_handler(struct mk_ipi_handler *handler);
  * @data_size: Size of data
  * @type: User-defined type identifier
  *
- * This function copies the data to per-CPU storage and sends an IPI
- * to the target CPU.
+ * This function copies the data into the target instance's duplex ring and
+ * sends an IPI to its doorbell CPU.
  *
  * Returns 0 on success, negative error code on failure
  */
@@ -183,8 +204,40 @@ struct mk_instance;
 int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
 				 size_t data_size, unsigned long type);
 
-/* Discard everything queued in this kernel's ring (instance re-spawn) */
-void mk_ipi_ring_drop_pending(void);
+#ifdef CONFIG_MULTIKERNEL
+int mk_ipi_endpoint_register(struct mk_instance *instance, bool parent_side,
+			     mk_phys_cpu_t doorbell_cpu);
+void mk_ipi_endpoint_unregister(struct mk_instance *instance);
+int mk_ipi_link_reset(struct mk_instance *instance);
+void mk_ipi_handlers_enable(void);
+struct mk_shared_data *mk_instance_halt_data(struct mk_instance *instance);
+#else
+static inline int mk_ipi_endpoint_register(struct mk_instance *instance,
+					   bool parent_side,
+					   mk_phys_cpu_t doorbell_cpu)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void mk_ipi_endpoint_unregister(struct mk_instance *instance)
+{
+}
+
+static inline int mk_ipi_link_reset(struct mk_instance *instance)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void mk_ipi_handlers_enable(void)
+{
+}
+
+static inline struct mk_shared_data *
+mk_instance_halt_data(struct mk_instance *instance)
+{
+	return NULL;
+}
+#endif
 
 /*
  * Multikernel Messaging System
@@ -739,6 +792,13 @@ struct mk_instance {
 	phys_addr_t ipi_phys;           /* IPI buffer physical address */
 	u32 ipi_pages;                  /* IPI buffer size in pages */
 	/*
+	 * A spawn's separate mapping of its parent's force-halt area.
+	 * Ordinary child records keep this NULL and use @ipi_data.
+	 */
+	struct mk_shared_data *halt_data;
+	struct mk_ipi_endpoint ipi_endpoint;
+	u64 ipi_start_sequence; /* Local start identity for deferred halt work */
+	/*
 	 * Host side only: the page the instance's boot tree is written to at
 	 * each exec. It and the IPI ring are allocated on the first load and
 	 * freed with the instance; a zero here means the host owns neither.
@@ -1157,6 +1217,7 @@ static inline void mk_register_cpus_from_manifest(void)
 static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 {
 }
+
 #endif
 
 /**

@@ -278,6 +278,11 @@ static int mk_manifest_chosen(void *fdt, void *data)
 	if (ret)
 		return ret;
 
+	ret = fdt_property_u32(fdt, "multikernel,parent-id", mk_self->id);
+	if (ret)
+		return ret;
+
+	/* The parent's self area carries force-halt and parked-CPU state. */
 	if (mk_self->ipi_data) {
 		ret = fdt_property_u64(fdt, "multikernel,host-ipi-buffer",
 				       mk_self->ipi_phys);

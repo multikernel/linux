@@ -1676,6 +1676,10 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	instance = mk_image->mk_instance;
+	if (instance->state != MK_STATE_LOADED) {
+		rc = -EBUSY;
+		goto unlock;
+	}
 	if (!mk_cpu_set_empty(instance->cpus)) {
 		mk_phys_cpu_t phys_cpu = mk_cpu_set_first(instance->cpus);
 
@@ -1704,6 +1708,13 @@ int multikernel_kexec_by_id(int mk_id)
 	if (rc) {
 		pr_err("Instance %d still has running CPUs, refusing to reload its image\n",
 		       mk_id);
+		goto unlock;
+	}
+
+	mk_ipi_endpoint_unregister(instance);
+	rc = mk_ipi_link_reset(instance);
+	if (rc) {
+		pr_err("Failed to reset instance %d IPI link: %d\n", mk_id, rc);
 		goto unlock;
 	}
 

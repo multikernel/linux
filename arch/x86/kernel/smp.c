@@ -342,6 +342,8 @@ DEFINE_IDTENTRY_SYSVEC(sysvec_multikernel)
  */
 void mk_arch_send_ipi(u64 phys_cpu)
 {
+	/* Order shared-memory publication before ringing the x2APIC doorbell. */
+	weak_wrmsr_fence();
 	apic_icr_write(APIC_DM_FIXED | APIC_DEST_PHYSICAL | MULTIKERNEL_VECTOR,
 		       (u32)phys_cpu);
 }
