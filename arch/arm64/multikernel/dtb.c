@@ -17,6 +17,7 @@
 #define pr_fmt(fmt) "mk_dtb: " fmt
 
 #include <linux/acpi.h>
+#include <linux/io.h>
 #include <linux/kexec.h>
 #include <linux/libfdt.h>
 #include <linux/multikernel.h>
@@ -184,7 +185,8 @@ static struct kexec_segment *mk_dtb_segment(struct kimage *image)
  * Everything that adds to the tree returns libfdt error codes, which
  * share their values with errnos and must not be mixed with them.
  *
- * Returns 0, -ENOSPC when the segment is too small, or -EINVAL.
+ * Returns 0, -ENOSPC when the segment is too small, -ENOMEM when it cannot
+ * be mapped, or -EINVAL.
  */
 int mk_build_boot_dtb(struct kimage *image, struct mk_instance *instance)
 {
@@ -195,7 +197,9 @@ int mk_build_boot_dtb(struct kimage *image, struct mk_instance *instance)
 	if (!seg || !image->arch.dtb || !instance->manifest_phys)
 		return -EINVAL;
 
-	fdt = phys_to_virt(seg->mem);
+	fdt = memremap(seg->mem, seg->memsz, MEMREMAP_WB);
+	if (!fdt)
+		return -ENOMEM;
 	ret = fdt_open_into(phys_to_virt(instance->manifest_phys), fdt, seg->memsz);
 	if (!ret)
 		ret = mk_dtb_add_memory(fdt, instance);
@@ -210,10 +214,11 @@ int mk_build_boot_dtb(struct kimage *image, struct mk_instance *instance)
 		ret = fdt_pack(fdt);
 	if (ret) {
 		pr_err("Instance %d: %s\n", instance->id, fdt_strerror(ret));
-		return ret == -FDT_ERR_NOSPACE ? -ENOSPC : -EINVAL;
+		ret = ret == -FDT_ERR_NOSPACE ? -ENOSPC : -EINVAL;
+	} else {
+		pr_info("Instance %d boots from a %u byte tree at %#lx\n",
+			instance->id, fdt_totalsize(fdt), seg->mem);
 	}
-
-	pr_info("Instance %d boots from a %u byte tree at %#lx\n",
-		instance->id, fdt_totalsize(fdt), seg->mem);
-	return 0;
+	memunmap(fdt);
+	return ret;
 }
