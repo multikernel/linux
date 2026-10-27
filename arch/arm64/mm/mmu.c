@@ -1412,17 +1412,24 @@ void __init paging_init(void)
 static void free_hotplug_page_range(struct page *page, size_t size,
 				    struct vmem_altmap *altmap)
 {
+	unsigned long i;
+
 	if (altmap) {
 		vmem_altmap_free(altmap, size >> PAGE_SHIFT);
+	} else if (PageReserved(page)) {
+		/* The page tables and vmemmap of boot memory come from memblock */
+		for (i = 0; i < size >> PAGE_SHIFT; i++)
+			free_reserved_page(page + i);
 	} else {
-		WARN_ON(PageReserved(page));
 		__free_pages(page, get_order(size));
 	}
 }
 
 static void free_hotplug_pgtable_page(struct page *page)
 {
-	pagetable_dtor(page_ptdesc(page));
+	/* Boot page tables come from memblock, without a constructor */
+	if (!PageReserved(page))
+		pagetable_dtor(page_ptdesc(page));
 	free_hotplug_page_range(page, PAGE_SIZE, NULL);
 }
 
