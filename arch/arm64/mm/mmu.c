@@ -2119,6 +2119,42 @@ static bool can_unmap_without_split(unsigned long pfn, unsigned long nr_pages)
 	return true;
 }
 
+#ifdef CONFIG_MEMORY_HOTREMOVE
+/*
+ * An early section keeps the memmap of the part of it that goes, so only
+ * the memmap of a section that was added back can be split at an edge.
+ */
+static bool memmap_edge_splits_leaf(unsigned long edge_pfn,
+				    unsigned long section_pfn)
+{
+	if (early_section(__pfn_to_section(section_pfn)))
+		return false;
+	return addr_splits_kernel_leaf((unsigned long)pfn_to_page(edge_pfn));
+}
+
+/*
+ * Only BBML2 lets a live leaf of the linear map be split; elsewhere the
+ * range must end on leaves as they are. The vmemmap is never split.
+ */
+int arch_prepare_remove_subsections(u64 start, u64 size)
+{
+	unsigned long start_pfn = PHYS_PFN(start);
+	unsigned long end_pfn = PHYS_PFN(start + size);
+	unsigned long addr = (unsigned long)__phys_to_virt(start);
+
+	if (memmap_edge_splits_leaf(start_pfn, start_pfn) ||
+	    memmap_edge_splits_leaf(end_pfn, end_pfn - 1))
+		return -EBUSY;
+
+	if (system_supports_bbml2_noabort())
+		return split_kernel_leaf_mapping(addr, addr + size);
+
+	if (addr_splits_kernel_leaf(addr) || addr_splits_kernel_leaf(addr + size))
+		return -EBUSY;
+	return 0;
+}
+#endif
+
 /*
  * This memory hotplug notifier helps prevent boot memory from being
  * inadvertently removed as it blocks pfn range offlining process in
