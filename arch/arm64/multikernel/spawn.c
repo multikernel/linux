@@ -14,6 +14,7 @@
 #include <linux/arm_sdei.h>
 #include <linux/errno.h>
 #include <linux/init.h>
+#include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/irqflags.h>
 #include <linux/kexec.h>
@@ -123,11 +124,15 @@ static int mk_wait_cpu_off(mk_phys_cpu_t mpidr)
  * The spawn reads these with the MMU and caches off, so what the host
  * wrote through its cacheable mapping has to be in memory by then.
  */
-static void mk_clean_to_poc(phys_addr_t start, size_t size)
+static int mk_clean_to_poc(phys_addr_t start, size_t size)
 {
-	unsigned long va = (unsigned long)phys_to_virt(start);
+	void *va = memremap(start, size, MEMREMAP_WB);
 
-	dcache_clean_inval_poc(va, va + size);
+	if (!va)
+		return -ENOMEM;
+	dcache_clean_inval_poc((unsigned long)va, (unsigned long)va + size);
+	memunmap(va);
+	return 0;
 }
 
 /*
@@ -135,12 +140,18 @@ static void mk_clean_to_poc(phys_addr_t start, size_t size)
  * Image and the device tree. The manifest and the message ring are only
  * touched with the caches on, where both kernels see the same memory.
  */
-static void mk_clean_image_to_poc(struct kimage *image)
+static int mk_clean_image_to_poc(struct kimage *image)
 {
 	unsigned long i;
+	int ret;
 
-	for (i = 0; i < image->nr_segments; i++)
-		mk_clean_to_poc(image->segment[i].mem, image->segment[i].memsz);
+	for (i = 0; i < image->nr_segments; i++) {
+		ret = mk_clean_to_poc(image->segment[i].mem,
+				      image->segment[i].memsz);
+		if (ret)
+			return ret;
+	}
+	return 0;
 }
 
 /**
@@ -184,7 +195,9 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 		return ret;
 	}
 
-	mk_clean_image_to_poc(image);
+	ret = mk_clean_image_to_poc(image);
+	if (ret)
+		return ret;
 
 	guard(mutex)(&mk_pool->park_lock);
 
