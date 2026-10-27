@@ -2018,6 +2018,29 @@ void arch_remove_memory(u64 start, u64 size, struct vmem_altmap *altmap)
 	__remove_pgd_mapping(swapper_pg_dir, __phys_to_virt(start), size);
 }
 
+/*
+ * Map part of memory that is not in the linear map back at its linear
+ * address, with pages only, so that unmap_linear_range() can take it
+ * away again without splitting anything.
+ */
+int map_linear_range(phys_addr_t start, phys_addr_t size)
+{
+	int ret;
+
+	ret = __create_pgd_mapping(swapper_pg_dir, start, __phys_to_virt(start),
+				   size, PAGE_KERNEL, pgd_pgtable_alloc_init_mm,
+				   NO_BLOCK_MAPPINGS | NO_CONT_MAPPINGS |
+				   NO_EXEC_MAPPINGS);
+	if (ret)
+		__remove_pgd_mapping(swapper_pg_dir, __phys_to_virt(start), size);
+	return ret;
+}
+
+void unmap_linear_range(phys_addr_t start, phys_addr_t size)
+{
+	__remove_pgd_mapping(swapper_pg_dir, __phys_to_virt(start), size);
+}
+
 
 static bool addr_splits_kernel_leaf(unsigned long addr)
 {
