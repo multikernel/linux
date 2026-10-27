@@ -2501,6 +2501,22 @@ static void remove_empty_block_devices(u64 start, u64 size)
 }
 
 /**
+ * arch_prepare_remove_subsections - make a range removable on its own
+ * @start: physical address of the range
+ * @size: size of the range
+ *
+ * arch_remove_memory() cannot fail, so an architecture whose direct map
+ * may cover the range together with memory that stays splits it here,
+ * or refuses the range if it cannot.
+ *
+ * Return: 0 if the range can be removed, or a negative errno.
+ */
+int __weak arch_prepare_remove_subsections(u64 start, u64 size)
+{
+	return 0;
+}
+
+/**
  * offline_and_remove_subsections - remove part of online memory blocks
  * @start: physical address of the range, MHP_SUBSECTIONS_ALIGN aligned
  * @size: size of the range, MHP_SUBSECTIONS_ALIGN aligned
@@ -2541,6 +2557,10 @@ int offline_and_remove_subsections(u64 start, u64 size)
 	/* Emptying a node would take tearing the node down as well */
 	ret = -EBUSY;
 	if (nr_pages >= pgdat->node_present_pages)
+		goto out;
+
+	ret = arch_prepare_remove_subsections(start, size);
+	if (ret)
 		goto out;
 
 	ret = alloc_contig_range(start_pfn, start_pfn + nr_pages,
