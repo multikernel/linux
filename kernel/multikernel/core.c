@@ -38,6 +38,13 @@ static void mk_instance_return_pci_devices(struct mk_instance *instance)
 	if (instance == mk_self || instance->id == 0)
 		return;
 
+	/* A CPU still on may drive them, BARs mapped: they stay with nobody */
+	if (!mk_cpu_set_empty(instance->cpus_on_slot)) {
+		pr_warn("Instance %d (%s): keeping its PCI devices, a CPU of it is still on\n",
+			instance->id, instance->name);
+		goto cleanup;
+	}
+
 	if (!mk_self) {
 		pr_warn("Cannot return PCI devices from instance %d (%s): no self instance\n",
 			instance->id, instance->name);
@@ -219,11 +226,10 @@ static void mk_instance_release(struct kref *kref)
 		instance->id, instance->name);
 
 	mk_instance_return_all_cpus(instance);
-	mk_instance_return_pci_devices(instance);
 	mk_instance_return_platform_devices(instance);
 	mk_instance_free_memory(instance);
 	/* After the memory, which is where the CPUs are seen off */
-	mk_iommu_release(instance);
+	mk_instance_return_pci_devices(instance);
 	mk_instance_free_boot_pages(instance);
 
 	mk_instance_track_dump(instance, instance->state, MK_STATE_READY);
@@ -366,9 +372,6 @@ void mk_instance_set_state(struct mk_instance *instance,
 	instance->state = state;
 	mk_instance_track_dump(instance, old_state, state);
 
-	/* Whatever stopped it, its functions are no longer its to reach */
-	if (old_state == MK_STATE_ACTIVE)
-		mk_pciback_unlend(instance);
 	pr_debug("Instance %d (%s) state: %s -> %s\n",
 		 instance->id, instance->name,
 		 mk_state_to_string(old_state),
@@ -417,9 +420,9 @@ struct mk_instance *mk_instance_find(int mk_id)
  * @cpu: Logical CPU it boots on
  *
  * Gives the instance what it reaches from its first instruction on, its
- * rings and the config space of its PCI functions, then starts it. What
- * it was given is taken back when it leaves MK_STATE_ACTIVE, see
- * mk_instance_set_state(), or here if it never gets there.
+ * rings and leases on its PCI functions, then starts it. The leases end
+ * when it halts, see mk_instance_settle_halted(), or here if it never
+ * starts.
  *
  * Returns 0 once the instance runs, or a negative error code.
  */
@@ -447,28 +450,20 @@ int mk_instance_start(struct mk_instance *instance, struct kimage *image,
 	 */
 	mk_ipi_ring_drop_pending();
 
-	/* A previous run that died without a word left its MSIs routed */
+	/* A previous run that died without a word left its leases and MSIs */
+	mk_instance_fence_devices(instance);
 	mk_arch_msi_release(instance);
 
-	ret = mk_pciback_lend(instance);
+	ret = mk_instance_grant_devices(instance);
 	if (ret) {
 		pr_err("Instance %d: its PCI functions cannot be lent: %d\n",
 		       instance->id, ret);
 		return ret;
 	}
 
-	ret = mk_iommu_contain(instance);
-	if (ret) {
-		pr_err("Instance %d: devices not confined to its memory: %d\n",
-		       instance->id, ret);
-		mk_pciback_unlend(instance);
-		return ret;
-	}
-
 	ret = mk_arch_spawn_instance(image, instance, cpu);
 	if (ret) {
-		mk_pciback_unlend(instance);
-		mk_iommu_fence(instance);
+		mk_instance_fence_devices(instance);
 		return ret;
 	}
 
@@ -1666,10 +1661,8 @@ static void mk_instance_settle_halted(struct mk_instance *instance)
 {
 	pr_info("Instance %d (%s) halted, CPUs parking in pool\n",
 		instance->id, instance->name);
-	/* Stop the devices while their DMA is still confined to the instance */
-	mk_pciback_unlend(instance);
+	mk_instance_fence_devices(instance);
 	mk_arch_msi_release(instance);
-	mk_iommu_fence(instance);
 	mk_instance_set_state(instance, MK_STATE_LOADED);
 }
 

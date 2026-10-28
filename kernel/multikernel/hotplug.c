@@ -1699,21 +1699,31 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 		goto out;
 	}
 
-	/* The instance probes the function as soon as it hears of it */
-	ret = mk_pciback_lend_one(target_instance, domain, bus, devfn);
-	if (ret)
+	/* Not one kept with an instance that may still be running */
+	if (!mk_root_has_pci_device(domain, bus, devfn)) {
+		pr_err("Multikernel hotplug: Device %04x:%02x:%02x.%x is not free in the pool\n",
+		       domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
+		ret = -EBUSY;
 		goto out;
+	}
 
-	/* It may not have the function in its tree, nor even its bus */
 	pdev = pci_get_domain_bus_and_slot(domain, bus, devfn);
 	if (!pdev) {
 		ret = -ENODEV;
-		goto unlend;
+		goto out;
 	}
+
+	/* The instance probes the function as soon as it hears of it */
+	ret = mk_lease_grant(target_instance, pdev);
+	if (ret) {
+		pci_err(pdev, "not lent to instance %d: %d\n", instance_id, ret);
+		goto put;
+	}
+
+	/* It may not have the function in its tree, nor even its bus */
 	payload.vendor = pdev->vendor;
 	payload.device = pdev->device;
 	mk_pci_bus_describe(pdev->bus, &payload.bus_desc);
-	pci_dev_put(pdev);
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_DEVICE_ADD, resource_id);
 	if (!pending) {
@@ -1740,11 +1750,14 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 	pr_info("Multikernel hotplug: Device %04x:%02x:%02x.%x successfully added to instance %d\n",
 		domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn), instance_id);
 
+	pci_dev_put(pdev);
 	mk_instance_put(target_instance);
 	return 0;
 
 unlend:
-	mk_pciback_unlend_one(target_instance, domain, bus, devfn);
+	mk_lease_fence(target_instance, pdev);
+put:
+	pci_dev_put(pdev);
 out:
 	mk_instance_put(target_instance);
 	return ret;
@@ -1775,6 +1788,7 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 	};
 	struct mk_pending_msg *pending;
 	struct mk_instance *target_instance;
+	struct pci_dev *pdev;
 	int ret;
 	u32 resource_id;
 
@@ -1792,6 +1806,13 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 		return -ENODEV;
 
 	if (target_instance->state != MK_STATE_ACTIVE) {
+		/* A CPU of a halted instance still on may drive the function */
+		ret = mk_instance_confirm_parked(target_instance);
+		if (ret) {
+			pr_err("Multikernel hotplug: Device %04x:%02x:%02x.%x stays with instance %d, a CPU of it is still on\n",
+			       domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn), instance_id);
+			goto out;
+		}
 		ret = mk_instance_remove_pci_device(target_instance, domain, bus, devfn);
 		goto out;
 	}
@@ -1813,7 +1834,11 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 	if (ret < 0)
 		goto out;
 
-	mk_pciback_unlend_one(target_instance, domain, bus, devfn);
+	pdev = pci_get_domain_bus_and_slot(domain, bus, devfn);
+	if (pdev) {
+		mk_lease_fence(target_instance, pdev);
+		pci_dev_put(pdev);
+	}
 
 	ret = mk_instance_remove_pci_device(target_instance, domain, bus, devfn);
 	if (ret < 0) {

@@ -201,9 +201,7 @@ struct pci_dev;
 #ifdef CONFIG_MULTIKERNEL_IOMMU
 int mk_iommu_claim(struct pci_dev *pdev, void *owner);
 void mk_iommu_unclaim(struct pci_dev *pdev);
-int mk_iommu_contain(struct mk_instance *instance);
-void mk_iommu_fence(struct mk_instance *instance);
-void mk_iommu_release(struct mk_instance *instance);
+int mk_iommu_confine(struct mk_instance *instance, struct pci_dev *pdev);
 int mk_iommu_map(struct mk_instance *instance, phys_addr_t start, size_t size);
 void mk_iommu_unmap(struct mk_instance *instance, phys_addr_t start, size_t size);
 #else
@@ -214,15 +212,10 @@ static inline int mk_iommu_claim(struct pci_dev *pdev, void *owner)
 static inline void mk_iommu_unclaim(struct pci_dev *pdev)
 {
 }
-static inline int mk_iommu_contain(struct mk_instance *instance)
+static inline int mk_iommu_confine(struct mk_instance *instance,
+				   struct pci_dev *pdev)
 {
 	return 0;
-}
-static inline void mk_iommu_fence(struct mk_instance *instance)
-{
-}
-static inline void mk_iommu_release(struct mk_instance *instance)
-{
 }
 static inline int mk_iommu_map(struct mk_instance *instance,
 			       phys_addr_t start, size_t size)
@@ -1119,10 +1112,21 @@ static inline void mk_pcifront_host_fenced(void)
 }
 #endif
 
-/* PCI functions this kernel let go of, held for instances */
+/*
+ * PCI functions this kernel let go of, held for instances. A lease gives
+ * one instance a function from its start, or its hot add, to its halt,
+ * or the function's hot remove.
+ */
 #ifdef CONFIG_PCI
 int mk_lease_bind(struct pci_dev *pdev);
 int mk_lease_unbind(struct pci_dev *pdev);
+int mk_lease_grant(struct mk_instance *instance, struct pci_dev *pdev);
+void mk_lease_fence(struct mk_instance *instance, struct pci_dev *pdev);
+int mk_instance_grant_devices(struct mk_instance *instance);
+void mk_instance_fence_devices(struct mk_instance *instance);
+
+/* Config space of a leased function, served to its instance */
+int mk_pciback_lend(struct mk_instance *instance, struct pci_dev *pdev);
 #else
 static inline int mk_lease_bind(struct pci_dev *pdev)
 {
@@ -1132,31 +1136,20 @@ static inline int mk_lease_unbind(struct pci_dev *pdev)
 {
 	return 0;
 }
-#endif
-
-/* Config space of the PCI functions lent to a running instance */
-#ifdef CONFIG_PCI
-int mk_pciback_lend(struct mk_instance *instance);
-void mk_pciback_unlend(struct mk_instance *instance);
-int mk_pciback_lend_one(struct mk_instance *instance, u16 domain, u8 bus,
-			u8 devfn);
-void mk_pciback_unlend_one(struct mk_instance *instance, u16 domain, u8 bus,
-			   u8 devfn);
-#else
-static inline int mk_pciback_lend(struct mk_instance *instance)
+static inline int mk_lease_grant(struct mk_instance *instance,
+				 struct pci_dev *pdev)
+{
+	return -ENODEV;
+}
+static inline void mk_lease_fence(struct mk_instance *instance,
+				  struct pci_dev *pdev)
+{
+}
+static inline int mk_instance_grant_devices(struct mk_instance *instance)
 {
 	return 0;
 }
-static inline void mk_pciback_unlend(struct mk_instance *instance)
-{
-}
-static inline int mk_pciback_lend_one(struct mk_instance *instance, u16 domain,
-				      u8 bus, u8 devfn)
-{
-	return 0;
-}
-static inline void mk_pciback_unlend_one(struct mk_instance *instance,
-					 u16 domain, u8 bus, u8 devfn)
+static inline void mk_instance_fence_devices(struct mk_instance *instance)
 {
 }
 #endif
