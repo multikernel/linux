@@ -222,6 +222,8 @@ static void mk_instance_release(struct kref *kref)
 	mk_instance_return_pci_devices(instance);
 	mk_instance_return_platform_devices(instance);
 	mk_instance_free_memory(instance);
+	/* After the memory, which is where the CPUs are seen off */
+	mk_iommu_release(instance);
 	mk_instance_free_boot_pages(instance);
 
 	mk_instance_track_dump(instance, instance->state, MK_STATE_READY);
@@ -466,7 +468,7 @@ int mk_instance_start(struct mk_instance *instance, struct kimage *image,
 	ret = mk_arch_spawn_instance(image, instance, cpu);
 	if (ret) {
 		mk_pciback_unlend(instance);
-		mk_iommu_release(instance);
+		mk_iommu_fence(instance);
 		return ret;
 	}
 
@@ -1667,7 +1669,7 @@ static void mk_instance_settle_halted(struct mk_instance *instance)
 	/* Stop the devices while their DMA is still confined to the instance */
 	mk_pciback_unlend(instance);
 	mk_arch_msi_release(instance);
-	mk_iommu_release(instance);
+	mk_iommu_fence(instance);
 	mk_instance_set_state(instance, MK_STATE_LOADED);
 }
 

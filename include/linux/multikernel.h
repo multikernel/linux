@@ -198,6 +198,7 @@ int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
  */
 #ifdef CONFIG_MULTIKERNEL_IOMMU
 int mk_iommu_contain(struct mk_instance *instance);
+void mk_iommu_fence(struct mk_instance *instance);
 void mk_iommu_release(struct mk_instance *instance);
 int mk_iommu_map(struct mk_instance *instance, phys_addr_t start, size_t size);
 void mk_iommu_unmap(struct mk_instance *instance, phys_addr_t start, size_t size);
@@ -205,6 +206,9 @@ void mk_iommu_unmap(struct mk_instance *instance, phys_addr_t start, size_t size
 static inline int mk_iommu_contain(struct mk_instance *instance)
 {
 	return 0;
+}
+static inline void mk_iommu_fence(struct mk_instance *instance)
+{
 }
 static inline void mk_iommu_release(struct mk_instance *instance)
 {

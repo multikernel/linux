@@ -13,8 +13,13 @@
  * it the MSI doorbell of the ITS behind that device. The device works
  * untranslated, and cannot reach anything else. The domain follows the
  * grant as memory is added and removed, and goes away when the instance
- * halts, which returns the device to the host's default domain for a host
- * driver to bind.
+ * halts.
+ *
+ * A halted instance may not be gone: a CPU that missed its halt still
+ * runs its kernel, with the device's BARs mapped. So the device stays
+ * claimed, which leaves it in the IOMMU's blocking domain, and goes back
+ * to the host's default domain only once the instance is released with
+ * all of its CPUs off. Under passthrough that domain reaches everything.
  *
  * A device without an IOMMU is left alone: its DMA is unrestricted, as
  * it always was.
@@ -44,16 +49,65 @@ static int mk_iommu_prot(struct mk_iommu_dev *d)
 	       (dev_is_dma_coherent(&d->pdev->dev) ? IOMMU_CACHE : 0);
 }
 
+static struct mk_iommu_dev *mk_iommu_find_dev(struct pci_dev *pdev)
+{
+	struct mk_iommu_dev *d;
+
+	list_for_each_entry(d, &mk_iommu_devs, list) {
+		if (d->pdev == pdev)
+			return d;
+	}
+	return NULL;
+}
+
+/* Leaves the device claimed, so it falls to the blocking domain */
+static void mk_iommu_detach_dev(struct mk_iommu_dev *d)
+{
+	if (!d->domain)
+		return;
+	iommu_detach_device(d->domain, &d->pdev->dev);
+	iommu_domain_free(d->domain);
+	d->domain = NULL;
+}
+
 static void mk_iommu_free_dev(struct mk_iommu_dev *d)
 {
-	if (d->domain) {
-		iommu_detach_device(d->domain, &d->pdev->dev);
-		iommu_domain_free(d->domain);
-	}
+	mk_iommu_detach_dev(d);
 	iommu_device_release_dma_owner(&d->pdev->dev);
 	pci_dev_put(d->pdev);
 	list_del(&d->list);
 	kfree(d);
+}
+
+/*
+ * Kept from an earlier run of the same instance, or claimed afresh. A
+ * device another instance still holds, or one whose instance was
+ * released with a CPU on, is not to be had.
+ */
+static struct mk_iommu_dev *mk_iommu_claim_dev(struct mk_instance *instance,
+					       struct pci_dev *pdev)
+{
+	struct mk_iommu_dev *d = mk_iommu_find_dev(pdev);
+	int ret;
+
+	if (d)
+		return d->instance == instance ? d : ERR_PTR(-EBUSY);
+
+	d = kzalloc_obj(*d);
+	if (!d)
+		return ERR_PTR(-ENOMEM);
+
+	/* Fails while a host driver is bound, which must not share the device */
+	ret = iommu_device_claim_dma_owner(&pdev->dev, instance);
+	if (ret) {
+		kfree(d);
+		return ERR_PTR(ret);
+	}
+
+	d->instance = instance;
+	d->pdev = pci_dev_get(pdev);
+	list_add(&d->list, &mk_iommu_devs);
+	return d;
 }
 
 static int mk_iommu_contain_dev(struct mk_instance *instance,
@@ -64,27 +118,15 @@ static int mk_iommu_contain_dev(struct mk_instance *instance,
 	struct mk_iommu_dev *d;
 	int ret;
 
-	d = kzalloc_obj(*d);
-	if (!d)
-		return -ENOMEM;
-	d->instance = instance;
-	d->pdev = pci_dev_get(pdev);
-	list_add(&d->list, &mk_iommu_devs);
-
-	/* Fails while a host driver is bound, which must not share the device */
-	ret = iommu_device_claim_dma_owner(&pdev->dev, instance);
-	if (ret) {
-		pci_dev_put(d->pdev);
-		list_del(&d->list);
-		kfree(d);
-		return ret;
-	}
+	d = mk_iommu_claim_dev(instance, pdev);
+	if (IS_ERR(d))
+		return PTR_ERR(d);
 
 	d->domain = iommu_paging_domain_alloc(&pdev->dev);
 	if (IS_ERR(d->domain)) {
 		ret = PTR_ERR(d->domain);
 		d->domain = NULL;
-		goto err;
+		return ret;
 	}
 
 	list_for_each_entry(region, &instance->memory_regions, list) {
@@ -110,8 +152,6 @@ static int mk_iommu_contain_dev(struct mk_instance *instance,
 err_domain:
 	iommu_domain_free(d->domain);
 	d->domain = NULL;
-err:
-	mk_iommu_free_dev(d);
 	return ret;
 }
 
@@ -128,7 +168,7 @@ int mk_iommu_contain(struct mk_instance *instance)
 	struct mk_pci_device *mine;
 	int ret = 0;
 
-	mk_iommu_release(instance);
+	mk_iommu_fence(instance);
 
 	if (!instance->pci_devices_valid)
 		return 0;
@@ -157,22 +197,53 @@ int mk_iommu_contain(struct mk_instance *instance)
 	mutex_unlock(&mk_iommu_lock);
 
 	if (ret)
-		mk_iommu_release(instance);
+		mk_iommu_fence(instance);
 	return ret;
 }
 
 /**
- * mk_iommu_release - Return an instance's devices to the host's domain
+ * mk_iommu_fence - Cut an instance's devices off all memory
  * @instance: Instance that has halted, or is about to be started afresh
+ *
+ * The devices stay claimed, in the IOMMU's blocking domain, for the next
+ * run of the instance or until it is released.
+ */
+void mk_iommu_fence(struct mk_instance *instance)
+{
+	struct mk_iommu_dev *d;
+
+	mutex_lock(&mk_iommu_lock);
+	list_for_each_entry(d, &mk_iommu_devs, list) {
+		if (d->instance == instance)
+			mk_iommu_detach_dev(d);
+	}
+	mutex_unlock(&mk_iommu_lock);
+}
+
+/**
+ * mk_iommu_release - Return an instance's devices to the host
+ * @instance: Instance being released
+ *
+ * Only once every CPU of the instance is off. With one still on, the
+ * devices stay blocked for good, claimed by nobody that can let go.
  */
 void mk_iommu_release(struct mk_instance *instance)
 {
+	bool cpus_off = mk_cpu_set_empty(instance->cpus_on_slot);
 	struct mk_iommu_dev *d, *tmp;
 
 	mutex_lock(&mk_iommu_lock);
 	list_for_each_entry_safe(d, tmp, &mk_iommu_devs, list) {
-		if (d->instance == instance)
+		if (d->instance != instance)
+			continue;
+		if (cpus_off) {
 			mk_iommu_free_dev(d);
+		} else {
+			mk_iommu_detach_dev(d);
+			d->instance = NULL;
+			pci_warn(d->pdev, "kept blocked, instance %d may still drive it\n",
+				 instance->id);
+		}
 	}
 	mutex_unlock(&mk_iommu_lock);
 }
@@ -192,7 +263,7 @@ int mk_iommu_map(struct mk_instance *instance, phys_addr_t start, size_t size)
 
 	mutex_lock(&mk_iommu_lock);
 	list_for_each_entry(d, &mk_iommu_devs, list) {
-		if (d->instance != instance)
+		if (d->instance != instance || !d->domain)
 			continue;
 		ret = iommu_map(d->domain, start, start, size, mk_iommu_prot(d),
 				GFP_KERNEL);
@@ -218,7 +289,7 @@ void mk_iommu_unmap(struct mk_instance *instance, phys_addr_t start, size_t size
 
 	mutex_lock(&mk_iommu_lock);
 	list_for_each_entry(d, &mk_iommu_devs, list) {
-		if (d->instance == instance)
+		if (d->instance == instance && d->domain)
 			iommu_unmap(d->domain, start, size);
 	}
 	mutex_unlock(&mk_iommu_lock);
