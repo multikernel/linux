@@ -21,10 +21,7 @@
 #include <linux/pci.h>
 #include <linux/cpumask.h>
 #include <linux/memory_hotplug.h>
-#include <linux/pci-ecam.h>
-#if defined(CONFIG_X86) && defined(CONFIG_PCI_MMCONFIG)
-#include <asm/pci_x86.h>
-#endif
+#include <linux/of_address.h>
 #include <linux/numa.h>
 #include <linux/multikernel.h>
 
@@ -1181,34 +1178,65 @@ static void mk_dt_bus_windows(struct pci_bus *bus, struct mk_pci_bus_desc *desc)
 	}
 }
 
+/**
+ * mk_pci_ecam_window - The window of a bus in an ECAM region
+ * @res: The region
+ * @first: The bus at the start of @res
+ * @busnr: The bus
+ *
+ * Returns: the physical address of the bus's 1MB window, or 0 if @res
+ * does not cover it
+ */
+u64 mk_pci_ecam_window(const struct resource *res, u64 first,
+		       unsigned int busnr)
+{
+	u64 offset;
+
+	if (busnr < first)
+		return 0;
+
+	offset = (busnr - first) << 20;
+	if (offset + SZ_1M > resource_size(res))
+		return 0;
+
+	return res->start + offset;
+}
+
+/**
+ * mk_arch_pci_bus_ecam - The ECAM window of a bus firmware other than a
+ * device tree describes
+ * @bus: A bus of this kernel
+ *
+ * Returns: the physical address of the bus's 1MB window, or 0 if none
+ */
+u64 __weak mk_arch_pci_bus_ecam(struct pci_bus *bus)
+{
+	return 0;
+}
+
+/* Bridges whose reg is an ECAM region, read with the generic accessors */
+static const struct of_device_id mk_dt_ecam_bridges[] = {
+	{ .compatible = "pci-host-ecam-generic" },
+	{ .compatible = MK_PCI_HOST_BRIDGE },
+	{ }
+};
+
 /*
  * The ECAM window of a bus, for a spawn kernel to reach it directly once
- * this kernel is lost. A spawn passes on the window it was given.
+ * this kernel is lost.
  */
 static u64 mk_dt_bus_ecam(struct pci_bus *bus)
 {
-	if (mk_manifest_phys())
-		return mk_pcifront_ecam(pci_domain_nr(bus), bus->number);
-#if defined(CONFIG_X86) && defined(CONFIG_PCI_MMCONFIG)
-	struct pci_mmcfg_region *cfg;
+	struct device_node *np = pci_bus_to_OF_node(pci_find_host_bridge(bus)->bus);
+	struct resource res;
+	u32 first = 0;
 
-	cfg = pci_mmconfig_lookup(pci_domain_nr(bus), bus->number);
-	if (!cfg)
-		return 0;
+	if (!np || !of_match_node(mk_dt_ecam_bridges, np) ||
+	    of_address_to_resource(np, 0, &res))
+		return mk_arch_pci_bus_ecam(bus);
 
-	return cfg->address + ((u64)bus->number << 20);
-#elif defined(CONFIG_PCI_ECAM)
-	struct pci_config_window *cfg = pci_find_host_bridge(bus)->bus->sysdata;
-
-	/* Only a bridge on the generic ECAM accessors keeps its window there */
-	if (bus->ops != &pci_generic_ecam_ops.pci_ops ||
-	    bus->number < cfg->busr.start || bus->number > cfg->busr.end)
-		return 0;
-
-	return cfg->res.start + ((u64)(bus->number - cfg->busr.start) << 20);
-#else
-	return 0;
-#endif
+	of_property_read_u32_index(np, "bus-range", 0, &first);
+	return mk_pci_ecam_window(&res, first, bus->number);
 }
 
 /**

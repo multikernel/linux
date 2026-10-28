@@ -9,6 +9,9 @@
  * config mechanism of its own: the 0xCF8 ports and ECAM are shared with
  * every other kernel on the machine. The raw accessors, which x86 code
  * uses by address, go through the host as well.
+ *
+ * A kernel that lends devices passes the MMCONFIG window of their buses
+ * on, for when it is lost.
  */
 #include <linux/pci.h>
 #include <linux/init.h>
@@ -16,6 +19,18 @@
 #include <linux/multikernel.h>
 
 #include <asm/pci_x86.h>
+
+u64 mk_arch_pci_bus_ecam(struct pci_bus *bus)
+{
+#ifdef CONFIG_PCI_MMCONFIG
+	struct pci_mmcfg_region *cfg;
+
+	cfg = pci_mmconfig_lookup(pci_domain_nr(bus), bus->number);
+	if (cfg)
+		return cfg->address + ((u64)bus->number << 20);
+#endif
+	return 0;
+}
 
 int mk_arch_pcifront_prepare(struct pci_host_bridge *bridge, int domain)
 {
