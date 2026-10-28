@@ -13,7 +13,6 @@
  * it creates, for buses it boots with and buses it is handed later alike.
  */
 
-#include <linux/dma-map-ops.h>
 #include <linux/irqchip/arm-gic-v3.h>
 #include <linux/libfdt.h>
 #include <linux/multikernel.h>
@@ -58,53 +57,7 @@ static bool mk_dtb_its_serves_pci(void)
 	return false;
 }
 
-/*
- * Devices inherit DMA coherency from their host bridge node, and a tree
- * that is silent about it makes them all non-coherent. Asked of a device
- * on the host's side of the same bus.
- */
-static int mk_dtb_first_dev_coherent(struct pci_dev *pdev, void *data)
-{
-	*(bool *)data = dev_is_dma_coherent(&pdev->dev);
-	return 1;
-}
-
-static bool mk_dtb_root_bus_coherent(void *fdt, int node)
-{
-	const fdt32_t *domain = fdt_getprop(fdt, node, "linux,pci-domain", NULL);
-	const fdt32_t *range = fdt_getprop(fdt, node, "bus-range", NULL);
-	struct pci_bus *bus = NULL;
-	bool coherent = false;
-
-	if (range)
-		bus = pci_find_bus(domain ? fdt32_to_cpu(*domain) : 0,
-				   fdt32_to_cpu(range[0]));
-	if (bus)
-		pci_walk_bus(bus, mk_dtb_first_dev_coherent, &coherent);
-	return coherent;
-}
-
-#define mk_dtb_for_each_root_bus(fdt, node)					\
-	for (node = fdt_node_offset_by_compatible(fdt, -1, MK_PCI_HOST_BRIDGE);	\
-	     node >= 0;								\
-	     node = fdt_node_offset_by_compatible(fdt, node, MK_PCI_HOST_BRIDGE))
-
 int mk_dtb_add_pci(void *fdt)
 {
-	int node, ret;
-
-	if (mk_dtb_its_serves_pci()) {
-		ret = mk_dtb_add_its_proxy(fdt);
-		if (ret)
-			return ret;
-	}
-
-	mk_dtb_for_each_root_bus(fdt, node) {
-		if (!mk_dtb_root_bus_coherent(fdt, node))
-			continue;
-		ret = fdt_setprop_empty(fdt, node, "dma-coherent");
-		if (ret)
-			return ret;
-	}
-	return 0;
+	return mk_dtb_its_serves_pci() ? mk_dtb_add_its_proxy(fdt) : 0;
 }

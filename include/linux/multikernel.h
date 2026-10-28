@@ -305,11 +305,14 @@ struct mk_mem_resource_payload {
 
 /*
  * A PCI bus as a root bus of another kernel: its windows as the cells of
- * a devicetree "ranges" property, and the base of its 1MB ECAM window.
+ * a devicetree "ranges" property, the base of its 1MB ECAM window, and
+ * whether its DMA is coherent.
  */
 #define MK_PCI_BUS_MAX_WINDOWS	16
+#define MK_PCI_BUS_COHERENT	BIT(0)
 struct mk_pci_bus_desc {
 	u64 ecam;               /* 0 if none */
+	u32 flags;              /* MK_PCI_BUS_* */
 	u32 nr_ranges;          /* Cells used in ranges */
 	__be32 ranges[MK_PCI_BUS_MAX_WINDOWS * 7];
 };

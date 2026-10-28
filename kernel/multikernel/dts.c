@@ -1095,7 +1095,7 @@ static int mk_dt_emit_pci_devices(struct mk_instance *instance,
 	return 0;
 }
 
-/* The reg and ranges of a bus node, from mk_pci_bus_describe() */
+/* The reg, ranges and coherence of a bus node, from mk_pci_bus_describe() */
 static int mk_dt_emit_bus_desc(void *fdt, const struct mk_pci_bus_desc *desc)
 {
 	int ret = 0;
@@ -1112,6 +1112,8 @@ static int mk_dt_emit_bus_desc(void *fdt, const struct mk_pci_bus_desc *desc)
 	if (!ret && desc->nr_ranges)
 		ret = fdt_property(fdt, "ranges", desc->ranges,
 				   desc->nr_ranges * sizeof(fdt32_t));
+	if (!ret && (desc->flags & MK_PCI_BUS_COHERENT))
+		ret = fdt_property(fdt, "dma-coherent", NULL, 0);
 	return ret;
 }
 
