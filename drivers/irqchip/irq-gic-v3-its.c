@@ -3806,7 +3806,8 @@ static const struct irq_domain_ops its_domain_ops = {
  * its_foreign_lock is what such a move holds against the device going away
  * under it.
  *
- * @owner keeps the devices of different kernels apart. The ITS is the one
+ * @owner is what the caller holds a device under for the other kernel,
+ * and keeps the devices of different kernels apart. The ITS is the one
  * behind the device, named by the device's MSI domain: a machine has one
  * per socket or more, each with DeviceIDs, collections and a doorbell of
  * its own.
@@ -3853,9 +3854,17 @@ static struct its_collection *its_foreign_collection(struct its_node *its,
 	return &its->collections[cpu];
 }
 
+static void its_foreign_free(struct its_device *dev)
+{
+	its_lpi_free(dev->event_map.lpi_map, dev->event_map.lpi_base,
+		     dev->event_map.nr_lpis);
+	its_send_mapd(dev, 0);
+	its_free_device(dev);
+}
+
 /**
  * its_foreign_move - Move a mapped event to another CPU of the other kernel
- * @owner: the other kernel, as given to its_foreign_map()
+ * @owner: as given to its_foreign_map()
  * @domain: MSI domain of the device
  * @dev_id: DeviceID as that ITS sees it
  * @event: event to move, which its_foreign_map() has mapped
@@ -3893,7 +3902,7 @@ int its_foreign_move(void *owner, struct irq_domain *domain, u32 dev_id,
 
 /**
  * its_foreign_map - Route a device's event to a CPU of another kernel
- * @owner: the other kernel, as the caller names it
+ * @owner: what the caller holds the device under for the other kernel
  * @domain: MSI domain of the device, which names the ITS behind it
  * @dev_id: DeviceID as that ITS sees it
  * @event: event (MSI data) to map
@@ -3930,6 +3939,11 @@ int its_foreign_map(void *owner, struct irq_domain *domain, u32 dev_id,
 					roundup_pow_of_two(max(nvecs, 1U)), true);
 		if (!dev)
 			return -ENOMEM;
+		/* The ITS may give fewer than asked for */
+		if (event >= dev->event_map.nr_lpis) {
+			its_foreign_free(dev);
+			return -ERANGE;
+		}
 		dev->foreign = owner;
 	}
 	if (event >= dev->event_map.nr_lpis)
@@ -3951,7 +3965,7 @@ int its_foreign_map(void *owner, struct irq_domain *domain, u32 dev_id,
 
 /**
  * its_foreign_unmap - Drop everything mapped for a device of another kernel
- * @owner: the other kernel, as given to its_foreign_map()
+ * @owner: as given to its_foreign_map()
  * @domain: MSI domain of the device
  * @dev_id: DeviceID as that ITS sees it
  *
@@ -3983,10 +3997,7 @@ void its_foreign_unmap(void *owner, struct irq_domain *domain, u32 dev_id)
 		its_send_discard(dev, event);
 	}
 
-	its_lpi_free(dev->event_map.lpi_map, dev->event_map.lpi_base,
-		     dev->event_map.nr_lpis);
-	its_send_mapd(dev, 0);
-	its_free_device(dev);
+	its_foreign_free(dev);
 }
 
 /*
