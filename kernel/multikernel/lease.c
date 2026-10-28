@@ -17,10 +17,11 @@
  * hot remove. Whatever this kernel sets up for the instance's use of the
  * function, config access, an IOMMU domain, MSI routes, is a devres
  * action in a group of the lease's own, opened when it is granted. Ending
- * the lease resets the function, so that it stops whatever the instance
- * left it doing while its DMA is still confined, and then releases the
- * group, last set up first. That returns the function to how it was
- * before the lease, held and blocked.
+ * the lease releases the group, last set up first, which returns the
+ * function to how it was before the lease, held and blocked. Only then is
+ * it reset, to stop whatever the instance left it doing: with its MSIs
+ * gone, its DMA blocked and its config requests unanswered, nothing the
+ * instance still does can interleave with the reset.
  */
 
 #define pr_fmt(fmt) "mk_lease: " fmt
@@ -80,11 +81,12 @@ static void mk_lease_end(struct mk_lease *lease, bool reset)
 	if (!lease->holder)
 		return;
 
+	devres_release_group(&lease->pdev->dev, lease);
+
 	/* Only tries for the device lock: remove holds it while it waits for ours */
 	if (reset && pci_try_reset_function(lease->pdev))
 		pci_clear_master(lease->pdev);
 
-	devres_release_group(&lease->pdev->dev, lease);
 	mk_instance_put(lease->holder);
 	lease->holder = NULL;
 }
