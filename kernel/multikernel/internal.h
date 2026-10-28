@@ -94,7 +94,7 @@ static inline void mk_of_pci_take_back(u16 domain, u8 bus, u8 devfn)
 /* manifest.c */
 phys_addr_t mk_manifest_phys(void);
 
-/* dts.c */
+/* pci.c, dts.c */
 struct pci_bus;
 #ifdef CONFIG_PCI
 void mk_pci_bus_describe(struct pci_bus *bus, struct mk_pci_bus_desc *desc);
