@@ -24,11 +24,8 @@
  * the header outside the Command register and a few scratch fields is
  * read only, and SR-IOV is not offered.
  *
- * A function taken back from an instance, however the instance stopped,
- * is reset, after xen-pciback too, or has its bus mastering cleared when
- * it has no reset: whatever the instance left it doing, its DMA into
- * memory the pool hands out again included, stops here, and the next
- * kernel to be given it meets it clean.
+ * Access is part of an instance's lease on the function (lease.c), and
+ * ends with it.
  *
  * Requests are answered from the doorbell interrupt, which is what lets
  * an instance wait for the answer with interrupts off. A kernel that is
@@ -390,121 +387,44 @@ static void mk_pciback_msg_handler(u32 msg_type, u32 subtype, void *payload,
 	}
 }
 
+static void mk_pciback_unlend(void *data)
+{
+	struct mk_pciback_dev *d = data;
+
+	scoped_guard(raw_spinlock_irqsave, &mk_pciback_lock)
+		list_del(&d->list);
+	mk_pciback_put(d);
+}
+
 /**
- * mk_pciback_lend_one - Let a running instance reach a function's config space
+ * mk_pciback_lend - Let an instance reach a function's config space
  * @instance: The instance
- * @domain: PCI domain
- * @bus: PCI bus
- * @devfn: PCI device and function
+ * @pdev: The function, which a lease being granted holds
+ *
+ * Lent until the lease ends.
  *
  * Returns: 0 on success, or a negative error code
  */
-int mk_pciback_lend_one(struct mk_instance *instance, u16 domain, u8 bus,
-			u8 devfn)
+int mk_pciback_lend(struct mk_instance *instance, struct pci_dev *pdev)
 {
 	struct mk_pciback_dev *d;
-	struct pci_dev *pdev;
-
-	pdev = pci_get_domain_bus_and_slot(domain, bus, devfn);
-	if (!pdev) {
-		pr_warn("Instance %d: no PCI function %04x:%02x:%02x.%x here to lend\n",
-			instance->id, domain, bus, PCI_SLOT(devfn),
-			PCI_FUNC(devfn));
-		return -ENODEV;
-	}
 
 	d = kzalloc(sizeof(*d), GFP_KERNEL);
-	if (!d) {
-		pci_dev_put(pdev);
+	if (!d)
 		return -ENOMEM;
-	}
 
 	/* Config cycles to a function in D3cold come back as all ones */
 	pm_runtime_get_sync(&pdev->dev);
 
 	refcount_set(&d->ref, 1);
-	d->pdev = pdev;
+	d->pdev = pci_dev_get(pdev);
 	d->sriov = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_SRIOV);
-	d->instance = instance;
-	mk_instance_get(instance);
+	d->instance = mk_instance_get(instance);
 
 	scoped_guard(raw_spinlock_irqsave, &mk_pciback_lock)
 		list_add(&d->list, &mk_pciback_devs);
-	return 0;
-}
 
-static void mk_pciback_free(struct list_head *gone)
-{
-	struct mk_pciback_dev *d, *tmp;
-
-	list_for_each_entry_safe(d, tmp, gone, list) {
-		if (pci_reset_function(d->pdev))
-			pci_clear_master(d->pdev);
-		mk_pciback_put(d);
-	}
-}
-
-/**
- * mk_pciback_unlend_one - Take back one function from an instance
- */
-void mk_pciback_unlend_one(struct mk_instance *instance, u16 domain, u8 bus,
-			   u8 devfn)
-{
-	struct mk_pciback_dev *d;
-	LIST_HEAD(gone);
-
-	scoped_guard(raw_spinlock_irqsave, &mk_pciback_lock) {
-		d = mk_pciback_find(instance->id, domain, bus, devfn);
-		if (d)
-			list_move(&d->list, &gone);
-	}
-	mk_pciback_free(&gone);
-}
-
-/**
- * mk_pciback_unlend - Take back every function an instance could reach
- * @instance: The instance, which no longer runs
- */
-void mk_pciback_unlend(struct mk_instance *instance)
-{
-	struct mk_pciback_dev *d, *tmp;
-	LIST_HEAD(gone);
-
-	scoped_guard(raw_spinlock_irqsave, &mk_pciback_lock) {
-		list_for_each_entry_safe(d, tmp, &mk_pciback_devs, list) {
-			if (d->instance == instance)
-				list_move(&d->list, &gone);
-		}
-	}
-	mk_pciback_free(&gone);
-}
-
-/**
- * mk_pciback_lend - Let an instance about to start reach its functions
- * @instance: The instance
- *
- * Returns: 0 on success, or a negative error code, in which case nothing
- * is lent and the instance must not be started
- */
-int mk_pciback_lend(struct mk_instance *instance)
-{
-	struct mk_pci_device *dev;
-	int ret;
-
-	mk_pciback_unlend(instance);
-
-	if (!instance->pci_devices_valid)
-		return 0;
-
-	list_for_each_entry(dev, &instance->pci_devices, list) {
-		ret = mk_pciback_lend_one(instance, dev->domain, dev->bus,
-					  PCI_DEVFN(dev->slot, dev->func));
-		if (ret) {
-			mk_pciback_unlend(instance);
-			return ret;
-		}
-	}
-	return 0;
+	return devm_add_action_or_reset(&pdev->dev, mk_pciback_unlend, d);
 }
 
 /* Answers reach a spawn's front end from its first bus scan, at subsys_initcall */
