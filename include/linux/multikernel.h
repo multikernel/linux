@@ -131,6 +131,15 @@ struct mk_shared_data {
 	 * the struct on re-exec.
 	 */
 	u8 parked[MK_PARKED_MAX];
+	/*
+	 * CPUs that firmware can stop out of band, indexed like parked[]
+	 * and written by each CPU for itself: set once the architecture's
+	 * firmware stop event can reach it, cleared before it stops being
+	 * reachable. A force halt only asks firmware to stop the CPUs set
+	 * here, because a request to any other CPU may leave it unable to
+	 * take the stop interrupt as well.
+	 */
+	u8 fw_stop[MK_PARKED_MAX];
 };
 
 /* Function pointer type for IPI callbacks */
@@ -207,6 +216,10 @@ void mk_ipi_ring_drop_pending(void);
 #define MK_IO_IRQ_BALANCE   (MK_MSG_IO + 2)
 #define MK_IO_IRQ_MASK      (MK_MSG_IO + 3)
 #define MK_IO_IRQ_UNMASK    (MK_MSG_IO + 4)
+/* MSI routing through the host, where the arch needs it: payload is the arch's */
+#define MK_IO_MSI_MAP       (MK_MSG_IO + 5)  /* Route a device's MSI to one of my CPUs */
+#define MK_IO_MSI_ACK       (MK_MSG_IO + 6)  /* Answer: the interrupt number, or an error */
+#define MK_IO_MSI_MOVE      (MK_MSG_IO + 7)  /* Move a routed MSI to another of my CPUs */
 
 /* Resource management subtypes */
 #define MK_RES_CPU_ADD      (MK_MSG_RESOURCE + 1)
@@ -292,11 +305,14 @@ struct mk_mem_resource_payload {
 
 /*
  * A PCI bus as a root bus of another kernel: its windows as the cells of
- * a devicetree "ranges" property, and the base of its 1MB ECAM window.
+ * a devicetree "ranges" property, the base of its 1MB ECAM window, and
+ * whether its DMA is coherent.
  */
 #define MK_PCI_BUS_MAX_WINDOWS	16
+#define MK_PCI_BUS_COHERENT	BIT(0)
 struct mk_pci_bus_desc {
 	u64 ecam;               /* 0 if none */
+	u32 flags;              /* MK_PCI_BUS_* */
 	u32 nr_ranges;          /* Cells used in ranges */
 	__be32 ranges[MK_PCI_BUS_MAX_WINDOWS * 7];
 };
@@ -775,13 +791,14 @@ struct mk_instance {
 	size_t ctrl_used;
 
 	/*
-	 * CPUs parked inside this instance's memory (its arch park area)
-	 * rather than in the host pool. They must be confirmed parked before
-	 * the image is rewritten and they pin the pool until they leave.
-	 * Membership is per CPU because it changes one CPU at a time:
-	 * hotplug moves CPUs in and out while the instance runs, and a
-	 * stopped instance can gain CPUs that still sit in the host pool.
-	 * Always empty where firmware holds parked CPUs.
+	 * CPUs the host pool cannot reach yet: parked inside this instance's
+	 * memory (its arch park area), or, where firmware holds parked CPUs,
+	 * handed to this instance's kernel and not seen off since. They must
+	 * be confirmed parked before the image is rewritten and they pin the
+	 * pool until they leave. Membership is per CPU because it changes one
+	 * CPU at a time: hotplug moves CPUs in and out while the instance
+	 * runs, and a stopped instance can gain CPUs that still sit in the
+	 * host pool.
 	 */
 	struct mk_cpu_set *cpus_on_slot;
 
@@ -1019,6 +1036,12 @@ void mk_instance_set_state(struct mk_instance *instance,
 /* The PCI root buses of a spawn kernel's tree */
 #define MK_PCI_HOST_BRIDGE	"multikernel,pci-host-bridge"
 
+/* The ECAM windows of this kernel's buses, for a spawn's tree */
+struct resource;
+u64 mk_pci_ecam_window(const struct resource *res, u64 first,
+		       unsigned int busnr);
+u64 mk_arch_pci_bus_ecam(struct pci_bus *bus);
+
 /* PCI buses of a spawn kernel, config space reached through its host */
 struct pci_host_bridge;
 int mk_arch_pcifront_prepare(struct pci_host_bridge *bridge, int domain);
@@ -1027,7 +1050,6 @@ int mk_pcifront_init(void);
 int mk_pcifront_config(unsigned int domain, unsigned int bus,
 		       unsigned int devfn, int where, int size, u32 *val,
 		       bool write);
-u64 mk_pcifront_ecam(unsigned int domain, unsigned int bus);
 void mk_pcifront_host_fenced(void);
 int mk_pcifront_add_function(u16 domain, u8 bus, u8 devfn, u16 vendor,
 			     u16 device, const struct mk_pci_bus_desc *desc);
@@ -1042,10 +1064,6 @@ static inline int mk_pcifront_config(unsigned int domain, unsigned int bus,
 				     u32 *val, bool write)
 {
 	return -ENODEV;
-}
-static inline u64 mk_pcifront_ecam(unsigned int domain, unsigned int bus)
-{
-	return 0;
 }
 static inline int mk_pcifront_add_function(u16 domain, u8 bus, u8 devfn,
 					   u16 vendor, u16 device,
@@ -1062,32 +1080,17 @@ static inline void mk_pcifront_host_fenced(void)
 }
 #endif
 
-/* Config space of the PCI functions lent to a running instance */
-#ifdef CONFIG_PCI
-int mk_pciback_lend(struct mk_instance *instance);
-void mk_pciback_unlend(struct mk_instance *instance);
-int mk_pciback_lend_one(struct mk_instance *instance, u16 domain, u8 bus,
-			u8 devfn);
-void mk_pciback_unlend_one(struct mk_instance *instance, u16 domain, u8 bus,
-			   u8 devfn);
-#else
-static inline int mk_pciback_lend(struct mk_instance *instance)
-{
-	return 0;
-}
-static inline void mk_pciback_unlend(struct mk_instance *instance)
-{
-}
-static inline int mk_pciback_lend_one(struct mk_instance *instance, u16 domain,
-				      u8 bus, u8 devfn)
-{
-	return 0;
-}
-static inline void mk_pciback_unlend_one(struct mk_instance *instance,
-					 u16 domain, u8 bus, u8 devfn)
-{
-}
-#endif
+/*
+ * PCI functions this kernel let go of, held for instances. A lease gives
+ * one instance a function from its start, or its hot add, to its halt,
+ * or the function's hot remove. What an architecture sets up for the
+ * instance's use of the function hangs off the lease.
+ */
+struct mk_lease;
+struct mk_lease *mk_lease_lock(struct mk_instance *instance,
+			       struct pci_dev *pdev);
+void mk_lease_unlock(struct mk_lease *lease);
+int mk_lease_allow_msi(struct mk_lease *lease, phys_addr_t doorbell);
 
 /* Kimage-based access to the instance memory pool */
 void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align);
@@ -1102,6 +1105,9 @@ void mk_register_cpus_from_manifest(void);
 
 /* Accept the manifest handed over at boot (spawn kernels) */
 void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len);
+
+/* True in a kernel another kernel spawned, i.e. one that booted with a manifest */
+bool mk_spawned(void);
 
 /* Build the manifest for a spawn (host, kexec path) */
 int mk_manifest_finalize(struct kimage *image);
@@ -1156,6 +1162,10 @@ static inline void mk_register_cpus_from_manifest(void)
 }
 static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 {
+}
+static inline bool mk_spawned(void)
+{
+	return false;
 }
 #endif
 
@@ -1271,7 +1281,7 @@ void __noreturn mk_enter_pool_state(void *info);
  * pseudo-NMI on arm64). Registration may fail where the architecture
  * has nothing suitable; graceful shutdown must keep working without it.
  */
-void mk_force_stop_cpu(mk_phys_cpu_t phys_cpu);
+void mk_force_stop_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
 
 /*
  * Build the boot state for @instance from the loaded @image and start

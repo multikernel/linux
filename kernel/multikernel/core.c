@@ -13,6 +13,8 @@
 #include <linux/kexec.h>
 #include <linux/multikernel.h>
 #include <linux/pci.h>
+#include <linux/reboot.h>
+#include <linux/suspend.h>
 #include <linux/vmalloc.h>
 #include "internal.h"
 
@@ -37,6 +39,13 @@ static void mk_instance_return_pci_devices(struct mk_instance *instance)
 
 	if (instance == mk_self || instance->id == 0)
 		return;
+
+	/* A CPU still on may drive them, BARs mapped: they stay with nobody */
+	if (!mk_cpu_set_empty(instance->cpus_on_slot)) {
+		pr_warn("Instance %d (%s): keeping its PCI devices, a CPU of it is still on\n",
+			instance->id, instance->name);
+		goto cleanup;
+	}
 
 	if (!mk_self) {
 		pr_warn("Cannot return PCI devices from instance %d (%s): no self instance\n",
@@ -219,9 +228,10 @@ static void mk_instance_release(struct kref *kref)
 		instance->id, instance->name);
 
 	mk_instance_return_all_cpus(instance);
-	mk_instance_return_pci_devices(instance);
 	mk_instance_return_platform_devices(instance);
 	mk_instance_free_memory(instance);
+	/* After the memory, which is where the CPUs are seen off */
+	mk_instance_return_pci_devices(instance);
 	mk_instance_free_boot_pages(instance);
 
 	mk_instance_track_dump(instance, instance->state, MK_STATE_READY);
@@ -364,9 +374,6 @@ void mk_instance_set_state(struct mk_instance *instance,
 	instance->state = state;
 	mk_instance_track_dump(instance, old_state, state);
 
-	/* Whatever stopped it, its functions are no longer its to reach */
-	if (old_state == MK_STATE_ACTIVE)
-		mk_pciback_unlend(instance);
 	pr_debug("Instance %d (%s) state: %s -> %s\n",
 		 instance->id, instance->name,
 		 mk_state_to_string(old_state),
@@ -415,9 +422,9 @@ struct mk_instance *mk_instance_find(int mk_id)
  * @cpu: Logical CPU it boots on
  *
  * Gives the instance what it reaches from its first instruction on, its
- * rings and the config space of its PCI functions, then starts it. What
- * it was given is taken back when it leaves MK_STATE_ACTIVE, see
- * mk_instance_set_state(), or here if it never gets there.
+ * rings and leases on its PCI functions, then starts it. The leases end
+ * when it halts, see mk_instance_settle_halted(), or here if it never
+ * starts.
  *
  * Returns 0 once the instance runs, or a negative error code.
  */
@@ -445,7 +452,10 @@ int mk_instance_start(struct mk_instance *instance, struct kimage *image,
 	 */
 	mk_ipi_ring_drop_pending();
 
-	ret = mk_pciback_lend(instance);
+	/* A previous run that died without a word left its leases */
+	mk_instance_fence_devices(instance);
+
+	ret = mk_instance_grant_devices(instance);
 	if (ret) {
 		pr_err("Instance %d: its PCI functions cannot be lent: %d\n",
 		       instance->id, ret);
@@ -454,7 +464,7 @@ int mk_instance_start(struct mk_instance *instance, struct kimage *image,
 
 	ret = mk_arch_spawn_instance(image, instance, cpu);
 	if (ret) {
-		mk_pciback_unlend(instance);
+		mk_instance_fence_devices(instance);
 		return ret;
 	}
 
@@ -1618,27 +1628,42 @@ static void __noreturn mk_notify_down_and_park(int target_id, u32 subtype)
 	mk_enter_pool_state(NULL);
 }
 
+/* The kernel that asked this one to shut down, or -1 */
+static int mk_halt_requester = -1;
+
 /**
  * mk_halt_to_pool - Halt this spawn kernel, returning its CPUs to the pool
  *
- * Called from the spawn kernel's machine halt path. A voluntary exit
- * cannot stay contained in this kernel: the parent owns the instance's
- * lifecycle, and without notice it would consider the instance running
- * forever. Send the parent (instance 0) a HALTED event, then park every
- * CPU in the pool wait loop.
+ * Called from the spawn kernel's machine halt path, once its devices are
+ * shut down. A halt that a kernel asked for is answered to that kernel.
+ * A voluntary exit cannot stay contained in this kernel: the parent owns
+ * the instance's lifecycle, and without notice it would consider the
+ * instance running forever. Send the parent (instance 0) a HALTED event.
+ * Then park every CPU in the pool wait loop.
  */
 void __noreturn mk_halt_to_pool(void)
 {
+	int requester = READ_ONCE(mk_halt_requester);
+
+	if (requester >= 0)
+		mk_notify_down_and_park(requester, MK_SYS_SHUTDOWN_ACK);
 	mk_notify_down_and_park(0, MK_SYS_HALTED);
 }
 
+/* As reboot(2) halts, so that this kernel's drivers shut their devices down */
 static void mk_shutdown_work_fn(struct work_struct *work)
 {
 	struct mk_shutdown_work *sw = container_of(work, struct mk_shutdown_work, work);
 	int sender_instance_id = sw->sender_instance_id;
 
 	kfree(sw);
-	mk_notify_down_and_park(sender_instance_id, MK_SYS_SHUTDOWN_ACK);
+
+	/* Only the first request is answered, the halt it starts answers it */
+	if (cmpxchg(&mk_halt_requester, -1, sender_instance_id) != -1)
+		return;
+
+	mutex_lock(&system_transition_mutex);
+	kernel_halt();
 }
 
 /*
@@ -1652,6 +1677,7 @@ static void mk_instance_settle_halted(struct mk_instance *instance)
 {
 	pr_info("Instance %d (%s) halted, CPUs parking in pool\n",
 		instance->id, instance->name);
+	mk_instance_fence_devices(instance);
 	mk_instance_set_state(instance, MK_STATE_LOADED);
 }
 
@@ -1691,6 +1717,14 @@ static void mk_system_msg_handler(u32 msg_type, u32 subtype,
 
 		if (payload_len < sizeof(*req))
 			return;
+
+		/* Only the kernel that spawned this one may stop it */
+		if (!host_instance ||
+		    req->sender_instance_id != host_instance->id) {
+			pr_warn("Shutdown requested by instance %d, which did not spawn this kernel\n",
+				req->sender_instance_id);
+			return;
+		}
 
 		pr_info("Shutdown requested by instance %d\n", req->sender_instance_id);
 
@@ -1796,7 +1830,7 @@ int multikernel_halt_by_id(int mk_id)
 			pr_warn("Multikernel instance %d halted with CPUs unaccounted for\n",
 				mk_id);
 
-		mk_instance_set_state(instance, MK_STATE_LOADED);
+		mk_instance_settle_halted(instance);
 		pr_info("Multikernel instance %d halted (graceful)\n", mk_id);
 	}
 
@@ -1989,7 +2023,7 @@ int multikernel_force_halt_by_id(int mk_id)
 		pr_err("Failed to arm force-halt marker: %d (sending NMI anyway)\n", ret);
 
 	mk_cpu_set_for_each(i, phys_cpu, targets) {
-		mk_force_stop_cpu(phys_cpu);
+		mk_force_stop_cpu(instance, phys_cpu);
 		cpu_count++;
 	}
 

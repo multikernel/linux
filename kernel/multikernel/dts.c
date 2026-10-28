@@ -21,9 +21,6 @@
 #include <linux/pci.h>
 #include <linux/cpumask.h>
 #include <linux/memory_hotplug.h>
-#if defined(CONFIG_X86) && defined(CONFIG_PCI_MMCONFIG)
-#include <asm/pci_x86.h>
-#endif
 #include <linux/numa.h>
 #include <linux/multikernel.h>
 
@@ -1098,115 +1095,7 @@ static int mk_dt_emit_pci_devices(struct mk_instance *instance,
 	return 0;
 }
 
-static u32 mk_dt_window_flags(const struct resource *res)
-{
-	u32 hi;
-
-	if (res->flags & IORESOURCE_IO)
-		hi = 0x01000000;
-	else if ((res->flags & IORESOURCE_MEM_64) || res->end > U32_MAX)
-		hi = 0x03000000;
-	else
-		hi = 0x02000000;
-
-	if (res->flags & IORESOURCE_PREFETCH)
-		hi |= 0x40000000;
-
-	return hi;
-}
-
-static void mk_dt_add_window(struct mk_pci_bus_desc *desc,
-			     const struct resource *res, resource_size_t offset)
-{
-	u64 pci_addr = res->start - offset;
-	u64 size = resource_size(res);
-	fdt32_t *c;
-
-	if (resource_type(res) != IORESOURCE_IO &&
-	    resource_type(res) != IORESOURCE_MEM)
-		return;
-	if (!size || (res->flags & IORESOURCE_UNSET))
-		return;
-	if (desc->nr_ranges + 7 > ARRAY_SIZE(desc->ranges)) {
-		pr_warn("A PCI bus has more than %d windows, rest not described\n",
-			MK_PCI_BUS_MAX_WINDOWS);
-		return;
-	}
-
-	c = &desc->ranges[desc->nr_ranges];
-	c[0] = cpu_to_fdt32(mk_dt_window_flags(res));
-	c[1] = cpu_to_fdt32(upper_32_bits(pci_addr));
-	c[2] = cpu_to_fdt32(lower_32_bits(pci_addr));
-	c[3] = cpu_to_fdt32(upper_32_bits(res->start));
-	c[4] = cpu_to_fdt32(lower_32_bits(res->start));
-	c[5] = cpu_to_fdt32(upper_32_bits(size));
-	c[6] = cpu_to_fdt32(lower_32_bits(size));
-	desc->nr_ranges += 7;
-}
-
-/*
- * What @bus decodes: the windows of its host bridge for a root bus, of
- * the bridge above it otherwise. Either covers the BARs of every device
- * on it.
- */
-static void mk_dt_bus_windows(struct pci_bus *bus, struct mk_pci_bus_desc *desc)
-{
-	struct resource_entry *entry;
-	struct pci_bus_region region;
-	struct resource *res;
-
-	if (pci_is_root_bus(bus)) {
-		resource_list_for_each_entry(entry,
-					     &pci_find_host_bridge(bus)->windows)
-			mk_dt_add_window(desc, entry->res, entry->offset);
-		return;
-	}
-
-	pci_bus_for_each_resource(bus, res) {
-		if (!res || !res->flags)
-			continue;
-		pcibios_resource_to_bus(bus, &region, res);
-		mk_dt_add_window(desc, res, res->start - region.start);
-	}
-}
-
-/*
- * The ECAM window of a bus, for a spawn kernel to reach it directly once
- * this kernel is lost. A spawn passes on the window it was given.
- */
-static u64 mk_dt_bus_ecam(struct pci_bus *bus)
-{
-	if (mk_manifest_phys())
-		return mk_pcifront_ecam(pci_domain_nr(bus), bus->number);
-#if defined(CONFIG_X86) && defined(CONFIG_PCI_MMCONFIG)
-	struct pci_mmcfg_region *cfg;
-
-	cfg = pci_mmconfig_lookup(pci_domain_nr(bus), bus->number);
-	if (!cfg)
-		return 0;
-
-	return cfg->address + ((u64)bus->number << 20);
-#else
-	return 0;
-#endif
-}
-
-/**
- * mk_pci_bus_describe - What a kernel needs to make @bus a root bus of its own
- * @bus: A bus of this kernel
- * @desc: Filled with the windows of @bus and its ECAM window
- *
- * The same description goes into an instance's boot tree and into the
- * message that hands it a device on a bus it did not boot with.
- */
-void mk_pci_bus_describe(struct pci_bus *bus, struct mk_pci_bus_desc *desc)
-{
-	memset(desc, 0, sizeof(*desc));
-	desc->ecam = mk_dt_bus_ecam(bus);
-	mk_dt_bus_windows(bus, desc);
-}
-
-/* The reg and ranges of a bus node, from mk_pci_bus_describe() */
+/* The reg, ranges and coherence of a bus node, from mk_pci_bus_describe() */
 static int mk_dt_emit_bus_desc(void *fdt, const struct mk_pci_bus_desc *desc)
 {
 	int ret = 0;
@@ -1223,6 +1112,8 @@ static int mk_dt_emit_bus_desc(void *fdt, const struct mk_pci_bus_desc *desc)
 	if (!ret && desc->nr_ranges)
 		ret = fdt_property(fdt, "ranges", desc->ranges,
 				   desc->nr_ranges * sizeof(fdt32_t));
+	if (!ret && (desc->flags & MK_PCI_BUS_COHERENT))
+		ret = fdt_property(fdt, "dma-coherent", NULL, 0);
 	return ret;
 }
 

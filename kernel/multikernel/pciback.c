@@ -21,14 +21,19 @@
  * Writes are filtered, after xen-pciback: the instance owns what the
  * function does, while the lending kernel keeps what places it on the
  * fabric. BARs stay where they were assigned and only appear to size,
- * the header outside the Command register and a few scratch fields is
- * read only, and SR-IOV is not offered.
+ * and the header outside the Command register and a few scratch fields
+ * is read only. Beyond the header, only the capabilities a driver
+ * programs to run the function are writable: MSI, MSI-X, power
+ * management, the vendor-specific ones, and part of Device Control.
+ * Everything else, ACS, Resizable BAR, ATS, AER, SR-IOV and whatever
+ * the spec adds next, decides how the function sits on the fabric and
+ * behind the IOMMU, which the instance must not change.
  *
- * A function taken back from an instance, however the instance stopped,
- * is reset, after xen-pciback too, or has its bus mastering cleared when
- * it has no reset: whatever the instance left it doing, its DMA into
- * memory the pool hands out again included, stops here, and the next
- * kernel to be given it meets it clean.
+ * A fenced host filters nothing: from then on the instance writes
+ * config space directly (pcifront.c).
+ *
+ * Access is part of an instance's lease on the function (lease.c), and
+ * ends with it.
  *
  * Requests are answered from the doorbell interrupt, which is what lets
  * an instance wait for the answer with interrupts off. A kernel that is
@@ -51,6 +56,20 @@
 			 PCI_COMMAND_MASTER | PCI_COMMAND_PARITY |	\
 			 PCI_COMMAND_SERR | PCI_COMMAND_INTX_DISABLE)
 
+/*
+ * Bits of Device Control an instance may change. MPS, MRRS, extended
+ * tags and phantom functions must agree with the rest of the hierarchy
+ * or change the requester IDs the IOMMU knows, and error reporting
+ * feeds the host's AER.
+ */
+#define MK_PCIBACK_DEVCTL	(PCI_EXP_DEVCTL_RELAX_EN |		\
+				 PCI_EXP_DEVCTL_AUX_PME |		\
+				 PCI_EXP_DEVCTL_NOSNOOP_EN |		\
+				 PCI_EXP_DEVCTL_BCR_FLR)
+
+/* Capabilities beyond these stay read only */
+#define MK_PCIBACK_CAPS		8
+
 /* Bit of the ROM BAR in mk_pciback_dev.sizing, after the six BARs */
 #define MK_PCIBACK_ROM	PCI_STD_NUM_BARS
 
@@ -61,7 +80,11 @@ struct mk_pciback_dev {
 	struct mk_instance *instance;
 	struct pci_dev *pdev;
 	unsigned long sizing;	/* BARs written with something else than their value */
-	u16 sriov;		/* SR-IOV capability, or 0 */
+	struct {
+		u16 start;
+		u16 end;
+	} caps[MK_PCIBACK_CAPS];	/* Capabilities the instance may write */
+	unsigned int nr_caps;
 };
 
 static LIST_HEAD(mk_pciback_devs);
@@ -180,14 +203,32 @@ static u32 mk_pciback_bar_sized(const struct pci_dev *pdev, int slot, u32 cur)
 	       (cur & ~PCI_BASE_ADDRESS_MEM_MASK);
 }
 
+/* A capability need not end on a dword */
+static u32 mk_pciback_cap_wmask(const struct mk_pciback_dev *d, int reg)
+{
+	u32 mask = 0;
+	unsigned int i, b;
+
+	for (i = 0; i < d->nr_caps; i++) {
+		for (b = 0; b < 4; b++) {
+			if (reg + b >= d->caps[i].start &&
+			    reg + b < d->caps[i].end)
+				mask |= 0xffU << (b * 8);
+		}
+	}
+	return mask;
+}
+
 /* The bits of a dword, outside the BARs, that an instance may write */
 static u32 mk_pciback_wmask(const struct mk_pciback_dev *d, int reg)
 {
+	u8 pcie = d->pdev->pcie_cap;
+
 	if (reg >= PCI_STD_HEADER_SIZEOF) {
-		if (d->sriov && reg >= d->sriov &&
-		    reg < d->sriov + PCI_EXT_CAP_SRIOV_SIZEOF)
-			return 0;
-		return ~0U;
+		/* Device Status is write-one-to-clear, and only the function's own */
+		if (pcie && reg == pcie + PCI_EXP_DEVCTL)
+			return MK_PCIBACK_DEVCTL | 0xffff0000;
+		return mk_pciback_cap_wmask(d, reg);
 	}
 
 	switch (reg) {
@@ -390,121 +431,96 @@ static void mk_pciback_msg_handler(u32 msg_type, u32 subtype, void *payload,
 	}
 }
 
+static void mk_pciback_unlend(void *data)
+{
+	struct mk_pciback_dev *d = data;
+
+	scoped_guard(raw_spinlock_irqsave, &mk_pciback_lock)
+		list_del(&d->list);
+	mk_pciback_put(d);
+}
+
+static void mk_pciback_own(struct mk_pciback_dev *d, u16 start, u16 len)
+{
+	if (!start || !len)
+		return;
+	if (d->nr_caps == ARRAY_SIZE(d->caps)) {
+		pci_warn(d->pdev, "capability at %#x stays read only for instances\n",
+			 start);
+		return;
+	}
+	d->caps[d->nr_caps].start = start;
+	d->caps[d->nr_caps].end = start + len;
+	d->nr_caps++;
+}
+
+static u16 mk_pciback_msi_size(struct pci_dev *pdev)
+{
+	bool is64;
+	u16 flags;
+
+	pci_read_config_word(pdev, pdev->msi_cap + PCI_MSI_FLAGS, &flags);
+	is64 = flags & PCI_MSI_FLAGS_64BIT;
+	if (flags & PCI_MSI_FLAGS_MASKBIT)
+		return (is64 ? PCI_MSI_PENDING_64 : PCI_MSI_PENDING_32) + 4;
+	return (is64 ? PCI_MSI_DATA_64 : PCI_MSI_DATA_32) + 2;
+}
+
+/* Read once: the capability lists are the function's hardware, and fixed */
+static void mk_pciback_find_caps(struct mk_pciback_dev *d)
+{
+	struct pci_dev *pdev = d->pdev;
+	u16 pos;
+	u32 hdr;
+	u8 cap, len;
+
+	if (pdev->msi_cap)
+		mk_pciback_own(d, pdev->msi_cap, mk_pciback_msi_size(pdev));
+	mk_pciback_own(d, pdev->msix_cap, PCI_CAP_MSIX_SIZEOF);
+	mk_pciback_own(d, pdev->pm_cap, PCI_PM_SIZEOF);
+
+	for (cap = pci_find_capability(pdev, PCI_CAP_ID_VNDR); cap;
+	     cap = pci_find_next_capability(pdev, cap, PCI_CAP_ID_VNDR)) {
+		pci_read_config_byte(pdev, cap + PCI_CAP_FLAGS, &len);
+		mk_pciback_own(d, cap, len);
+	}
+
+	for (pos = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_VNDR); pos;
+	     pos = pci_find_next_ext_capability(pdev, pos, PCI_EXT_CAP_ID_VNDR)) {
+		pci_read_config_dword(pdev, pos + PCI_VNDR_HEADER, &hdr);
+		mk_pciback_own(d, pos, PCI_VNDR_HEADER_LEN(hdr));
+	}
+}
+
 /**
- * mk_pciback_lend_one - Let a running instance reach a function's config space
+ * mk_pciback_lend - Let an instance reach a function's config space
  * @instance: The instance
- * @domain: PCI domain
- * @bus: PCI bus
- * @devfn: PCI device and function
+ * @pdev: The function, which a lease being granted holds
+ *
+ * Lent until the lease ends.
  *
  * Returns: 0 on success, or a negative error code
  */
-int mk_pciback_lend_one(struct mk_instance *instance, u16 domain, u8 bus,
-			u8 devfn)
+int mk_pciback_lend(struct mk_instance *instance, struct pci_dev *pdev)
 {
 	struct mk_pciback_dev *d;
-	struct pci_dev *pdev;
-
-	pdev = pci_get_domain_bus_and_slot(domain, bus, devfn);
-	if (!pdev) {
-		pr_warn("Instance %d: no PCI function %04x:%02x:%02x.%x here to lend\n",
-			instance->id, domain, bus, PCI_SLOT(devfn),
-			PCI_FUNC(devfn));
-		return -ENODEV;
-	}
 
 	d = kzalloc(sizeof(*d), GFP_KERNEL);
-	if (!d) {
-		pci_dev_put(pdev);
+	if (!d)
 		return -ENOMEM;
-	}
 
 	/* Config cycles to a function in D3cold come back as all ones */
 	pm_runtime_get_sync(&pdev->dev);
 
 	refcount_set(&d->ref, 1);
-	d->pdev = pdev;
-	d->sriov = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_SRIOV);
-	d->instance = instance;
-	mk_instance_get(instance);
+	d->pdev = pci_dev_get(pdev);
+	mk_pciback_find_caps(d);
+	d->instance = mk_instance_get(instance);
 
 	scoped_guard(raw_spinlock_irqsave, &mk_pciback_lock)
 		list_add(&d->list, &mk_pciback_devs);
-	return 0;
-}
 
-static void mk_pciback_free(struct list_head *gone)
-{
-	struct mk_pciback_dev *d, *tmp;
-
-	list_for_each_entry_safe(d, tmp, gone, list) {
-		if (pci_reset_function(d->pdev))
-			pci_clear_master(d->pdev);
-		mk_pciback_put(d);
-	}
-}
-
-/**
- * mk_pciback_unlend_one - Take back one function from an instance
- */
-void mk_pciback_unlend_one(struct mk_instance *instance, u16 domain, u8 bus,
-			   u8 devfn)
-{
-	struct mk_pciback_dev *d;
-	LIST_HEAD(gone);
-
-	scoped_guard(raw_spinlock_irqsave, &mk_pciback_lock) {
-		d = mk_pciback_find(instance->id, domain, bus, devfn);
-		if (d)
-			list_move(&d->list, &gone);
-	}
-	mk_pciback_free(&gone);
-}
-
-/**
- * mk_pciback_unlend - Take back every function an instance could reach
- * @instance: The instance, which no longer runs
- */
-void mk_pciback_unlend(struct mk_instance *instance)
-{
-	struct mk_pciback_dev *d, *tmp;
-	LIST_HEAD(gone);
-
-	scoped_guard(raw_spinlock_irqsave, &mk_pciback_lock) {
-		list_for_each_entry_safe(d, tmp, &mk_pciback_devs, list) {
-			if (d->instance == instance)
-				list_move(&d->list, &gone);
-		}
-	}
-	mk_pciback_free(&gone);
-}
-
-/**
- * mk_pciback_lend - Let an instance about to start reach its functions
- * @instance: The instance
- *
- * Returns: 0 on success, or a negative error code, in which case nothing
- * is lent and the instance must not be started
- */
-int mk_pciback_lend(struct mk_instance *instance)
-{
-	struct mk_pci_device *dev;
-	int ret;
-
-	mk_pciback_unlend(instance);
-
-	if (!instance->pci_devices_valid)
-		return 0;
-
-	list_for_each_entry(dev, &instance->pci_devices, list) {
-		ret = mk_pciback_lend_one(instance, dev->domain, dev->bus,
-					  PCI_DEVFN(dev->slot, dev->func));
-		if (ret) {
-			mk_pciback_unlend(instance);
-			return ret;
-		}
-	}
-	return 0;
+	return devm_add_action_or_reset(&pdev->dev, mk_pciback_unlend, d);
 }
 
 /* Answers reach a spawn's front end from its first bus scan, at subsys_initcall */

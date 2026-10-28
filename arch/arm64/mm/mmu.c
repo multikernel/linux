@@ -1412,16 +1412,24 @@ void __init paging_init(void)
 static void free_hotplug_page_range(struct page *page, size_t size,
 				    struct vmem_altmap *altmap)
 {
+	unsigned long i;
+
 	if (altmap) {
 		vmem_altmap_free(altmap, size >> PAGE_SHIFT);
+	} else if (PageReserved(page)) {
+		/* The page tables and vmemmap of boot memory come from memblock */
+		for (i = 0; i < size >> PAGE_SHIFT; i++)
+			free_reserved_page(page + i);
 	} else {
-		WARN_ON(PageReserved(page));
 		__free_pages(page, get_order(size));
 	}
 }
 
 static void free_hotplug_pgtable_page(struct page *page)
 {
+	/* Boot page tables come from memblock, without a constructor */
+	if (!PageReserved(page))
+		pagetable_dtor(page_ptdesc(page));
 	free_hotplug_page_range(page, PAGE_SIZE, NULL);
 }
 
@@ -2011,6 +2019,166 @@ void arch_remove_memory(u64 start, u64 size, struct vmem_altmap *altmap)
 }
 
 /*
+ * Map part of memory that is not in the linear map back at its linear
+ * address, with pages only, so that unmap_linear_range() can take it
+ * away again without splitting anything.
+ */
+int map_linear_range(phys_addr_t start, phys_addr_t size)
+{
+	int ret;
+
+	ret = __create_pgd_mapping(swapper_pg_dir, start, __phys_to_virt(start),
+				   size, PAGE_KERNEL, pgd_pgtable_alloc_init_mm,
+				   NO_BLOCK_MAPPINGS | NO_CONT_MAPPINGS |
+				   NO_EXEC_MAPPINGS);
+	if (ret)
+		__remove_pgd_mapping(swapper_pg_dir, __phys_to_virt(start), size);
+	return ret;
+}
+
+void unmap_linear_range(phys_addr_t start, phys_addr_t size)
+{
+	__remove_pgd_mapping(swapper_pg_dir, __phys_to_virt(start), size);
+}
+
+
+static bool addr_splits_kernel_leaf(unsigned long addr)
+{
+	pgd_t *pgdp, pgd;
+	p4d_t *p4dp, p4d;
+	pud_t *pudp, pud;
+	pmd_t *pmdp, pmd;
+	pte_t *ptep, pte;
+
+	/*
+	 * If the given address points at a the start address of
+	 * a possible leaf, we certainly won't split. Otherwise,
+	 * check if we would actually split a leaf by traversing
+	 * the page tables further.
+	 */
+	if (IS_ALIGNED(addr, PGDIR_SIZE))
+		return false;
+
+	pgdp = pgd_offset_k(addr);
+	pgd = pgdp_get(pgdp);
+	if (!pgd_present(pgd))
+		return false;
+
+	if (IS_ALIGNED(addr, P4D_SIZE))
+		return false;
+
+	p4dp = p4d_offset(pgdp, addr);
+	p4d = p4dp_get(p4dp);
+	if (!p4d_present(p4d))
+		return false;
+
+	if (IS_ALIGNED(addr, PUD_SIZE))
+		return false;
+
+	pudp = pud_offset(p4dp, addr);
+	pud = pudp_get(pudp);
+	if (!pud_present(pud))
+		return false;
+
+	if (pud_leaf(pud))
+		return true;
+
+	if (IS_ALIGNED(addr, CONT_PMD_SIZE))
+		return false;
+
+	pmdp = pmd_offset(pudp, addr);
+	pmd = pmdp_get(pmdp);
+	if (!pmd_present(pmd))
+		return false;
+
+	if (pmd_cont(pmd))
+		return true;
+
+	if (IS_ALIGNED(addr, PMD_SIZE))
+		return false;
+
+	if (pmd_leaf(pmd))
+		return true;
+
+	if (IS_ALIGNED(addr, CONT_PTE_SIZE))
+		return false;
+
+	ptep = pte_offset_kernel(pmdp, addr);
+	pte = __ptep_get(ptep);
+	if (!pte_present(pte))
+		return false;
+
+	if (pte_cont(pte))
+		return true;
+
+	return !IS_ALIGNED(addr, PAGE_SIZE);
+}
+
+static bool can_unmap_without_split(unsigned long pfn, unsigned long nr_pages)
+{
+	unsigned long phys_start, phys_end, start, end;
+
+	phys_start = PFN_PHYS(pfn);
+	phys_end = phys_start + nr_pages * PAGE_SIZE;
+
+	/* PFN range's linear map edges are leaf entry aligned */
+	start = __phys_to_virt(phys_start);
+	end =  __phys_to_virt(phys_end);
+	if (addr_splits_kernel_leaf(start) || addr_splits_kernel_leaf(end)) {
+		pr_warn("[%lx %lx] splits a leaf entry in linear map\n",
+			phys_start, phys_end);
+		return false;
+	}
+
+	/* PFN range's vmemmap edges are leaf entry aligned */
+	BUILD_BUG_ON(!IS_ENABLED(CONFIG_SPARSEMEM_VMEMMAP));
+	start = (unsigned long)pfn_to_page(pfn);
+	end = (unsigned long)pfn_to_page(pfn + nr_pages);
+	if (addr_splits_kernel_leaf(start) || addr_splits_kernel_leaf(end)) {
+		pr_warn("[%lx %lx] splits a leaf entry in vmemmap\n",
+			phys_start, phys_end);
+		return false;
+	}
+	return true;
+}
+
+#ifdef CONFIG_MEMORY_HOTREMOVE
+/*
+ * An early section keeps the memmap of the part of it that goes, so only
+ * the memmap of a section that was added back can be split at an edge.
+ */
+static bool memmap_edge_splits_leaf(unsigned long edge_pfn,
+				    unsigned long section_pfn)
+{
+	if (early_section(__pfn_to_section(section_pfn)))
+		return false;
+	return addr_splits_kernel_leaf((unsigned long)pfn_to_page(edge_pfn));
+}
+
+/*
+ * Only BBML2 lets a live leaf of the linear map be split; elsewhere the
+ * range must end on leaves as they are. The vmemmap is never split.
+ */
+int arch_prepare_remove_subsections(u64 start, u64 size)
+{
+	unsigned long start_pfn = PHYS_PFN(start);
+	unsigned long end_pfn = PHYS_PFN(start + size);
+	unsigned long addr = (unsigned long)__phys_to_virt(start);
+
+	if (memmap_edge_splits_leaf(start_pfn, start_pfn) ||
+	    memmap_edge_splits_leaf(end_pfn, end_pfn - 1))
+		return -EBUSY;
+
+	if (system_supports_bbml2_noabort())
+		return split_kernel_leaf_mapping(addr, addr + size);
+
+	if (addr_splits_kernel_leaf(addr) || addr_splits_kernel_leaf(addr + size))
+		return -EBUSY;
+	return 0;
+}
+#endif
+
+/*
  * This memory hotplug notifier helps prevent boot memory from being
  * inadvertently removed as it blocks pfn range offlining process in
  * __offline_pages(). Hence this prevents both offlining as well as
@@ -2018,8 +2186,11 @@ void arch_remove_memory(u64 start, u64 size, struct vmem_altmap *altmap)
  * In future if and when boot memory could be removed, this notifier
  * should be dropped and free_hotplug_page_range() should handle any
  * reserved pages allocated during boot.
+ *
+ * This also blocks any memory remove that would have caused a split
+ * in leaf entry in kernel linear or vmemmap mapping.
  */
-static int prevent_bootmem_remove_notifier(struct notifier_block *nb,
+static int prevent_memory_remove_notifier(struct notifier_block *nb,
 					   unsigned long action, void *data)
 {
 	struct mem_section *ms;
@@ -2065,11 +2236,15 @@ static int prevent_bootmem_remove_notifier(struct notifier_block *nb,
 			return NOTIFY_DONE;
 		}
 	}
+
+	if (!can_unmap_without_split(arg->start_pfn, arg->nr_pages))
+		return NOTIFY_BAD;
+
 	return NOTIFY_OK;
 }
 
-static struct notifier_block prevent_bootmem_remove_nb = {
-	.notifier_call = prevent_bootmem_remove_notifier,
+static struct notifier_block prevent_memory_remove_nb = {
+	.notifier_call = prevent_memory_remove_notifier,
 };
 
 /*
@@ -2119,7 +2294,7 @@ static void validate_bootmem_online(void)
 	}
 }
 
-static int __init prevent_bootmem_remove_init(void)
+static int __init prevent_memory_remove_init(void)
 {
 	int ret = 0;
 
@@ -2127,13 +2302,13 @@ static int __init prevent_bootmem_remove_init(void)
 		return ret;
 
 	validate_bootmem_online();
-	ret = register_memory_notifier(&prevent_bootmem_remove_nb);
+	ret = register_memory_notifier(&prevent_memory_remove_nb);
 	if (ret)
 		pr_err("%s: Notifier registration failed %d\n", __func__, ret);
 
 	return ret;
 }
-early_initcall(prevent_bootmem_remove_init);
+early_initcall(prevent_memory_remove_init);
 #endif
 
 pte_t modify_prot_start_ptes(struct vm_area_struct *vma, unsigned long addr,

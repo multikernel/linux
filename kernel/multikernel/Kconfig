@@ -33,3 +33,9 @@ config MULTIKERNEL
 	    boot channel, describing its resources and message rings
 
 	  If unsure, say N.
+
+
+# Confine the DMA of an instance's PCI devices to its memory. x86 runs
+# them without an IOMMU so far.
+config MULTIKERNEL_IOMMU
+	def_bool MULTIKERNEL && IOMMU_API && PCI && ARM64

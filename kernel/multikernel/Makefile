@@ -5,10 +5,11 @@
 
 obj-y += core.o cpuset.o mem.o kernfs.o dts.o instance_dt.o manifest.o ipi.o messaging.o overlay.o hotplug.o baseline.o
 obj-$(CONFIG_OF) += of_devices.o
-obj-$(CONFIG_PCI) += pciback.o
+obj-$(CONFIG_PCI) += pci.o pciback.o lease.o
 ifdef CONFIG_PCI
 obj-$(CONFIG_OF) += pcifront.o
 endif
+obj-$(CONFIG_MULTIKERNEL_IOMMU) += iommu.o
 
 # DMA-BUF heap for multikernel memory allocation
 obj-$(CONFIG_DMABUF_HEAPS) += dma_heap.o

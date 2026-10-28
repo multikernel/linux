@@ -275,6 +275,7 @@ extern int remove_memory(u64 start, u64 size);
 extern void __remove_memory(u64 start, u64 size);
 extern int offline_and_remove_memory(u64 start, u64 size);
 extern int offline_and_remove_subsections(u64 start, u64 size);
+int arch_prepare_remove_subsections(u64 start, u64 size);
 extern int add_and_online_subsections(int nid, u64 start, u64 size,
 				      int online_type, const char *resource_name);
 
