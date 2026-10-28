@@ -192,47 +192,6 @@ struct mk_instance;
 int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
 				 size_t data_size, unsigned long type);
 
-struct pci_dev;
-
-/*
- * Host side: keep the DMA of an instance's PCI devices inside its memory
- * while it runs, where the devices sit behind an IOMMU.
- */
-#ifdef CONFIG_MULTIKERNEL_IOMMU
-int mk_iommu_claim(struct pci_dev *pdev, void *owner);
-void mk_iommu_unclaim(struct pci_dev *pdev);
-int mk_iommu_confine(struct mk_instance *instance, struct pci_dev *pdev);
-int mk_iommu_allow_msi(struct pci_dev *pdev, phys_addr_t doorbell);
-int mk_iommu_map(struct mk_instance *instance, phys_addr_t start, size_t size);
-void mk_iommu_unmap(struct mk_instance *instance, phys_addr_t start, size_t size);
-#else
-static inline int mk_iommu_claim(struct pci_dev *pdev, void *owner)
-{
-	return 0;
-}
-static inline void mk_iommu_unclaim(struct pci_dev *pdev)
-{
-}
-static inline int mk_iommu_confine(struct mk_instance *instance,
-				   struct pci_dev *pdev)
-{
-	return 0;
-}
-static inline int mk_iommu_allow_msi(struct pci_dev *pdev, phys_addr_t doorbell)
-{
-	return 0;
-}
-static inline int mk_iommu_map(struct mk_instance *instance,
-			       phys_addr_t start, size_t size)
-{
-	return 0;
-}
-static inline void mk_iommu_unmap(struct mk_instance *instance,
-				  phys_addr_t start, size_t size)
-{
-}
-#endif
-
 /* Discard everything queued in this kernel's ring (instance re-spawn) */
 void mk_ipi_ring_drop_pending(void);
 
@@ -1121,49 +1080,14 @@ static inline void mk_pcifront_host_fenced(void)
 /*
  * PCI functions this kernel let go of, held for instances. A lease gives
  * one instance a function from its start, or its hot add, to its halt,
- * or the function's hot remove.
+ * or the function's hot remove. What an architecture sets up for the
+ * instance's use of the function hangs off the lease.
  */
 struct mk_lease;
-
-#ifdef CONFIG_PCI
-int mk_lease_bind(struct pci_dev *pdev);
-int mk_lease_unbind(struct pci_dev *pdev);
-int mk_lease_grant(struct mk_instance *instance, struct pci_dev *pdev);
-void mk_lease_fence(struct mk_instance *instance, struct pci_dev *pdev);
-int mk_instance_grant_devices(struct mk_instance *instance);
-void mk_instance_fence_devices(struct mk_instance *instance);
 struct mk_lease *mk_lease_lock(struct mk_instance *instance,
 			       struct pci_dev *pdev);
 void mk_lease_unlock(struct mk_lease *lease);
-
-/* Config space of a leased function, served to its instance */
-int mk_pciback_lend(struct mk_instance *instance, struct pci_dev *pdev);
-#else
-static inline int mk_lease_bind(struct pci_dev *pdev)
-{
-	return 0;
-}
-static inline int mk_lease_unbind(struct pci_dev *pdev)
-{
-	return 0;
-}
-static inline int mk_lease_grant(struct mk_instance *instance,
-				 struct pci_dev *pdev)
-{
-	return -ENODEV;
-}
-static inline void mk_lease_fence(struct mk_instance *instance,
-				  struct pci_dev *pdev)
-{
-}
-static inline int mk_instance_grant_devices(struct mk_instance *instance)
-{
-	return 0;
-}
-static inline void mk_instance_fence_devices(struct mk_instance *instance)
-{
-}
-#endif
+int mk_lease_allow_msi(struct mk_lease *lease, phys_addr_t doorbell);
 
 /* Kimage-based access to the instance memory pool */
 void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align);

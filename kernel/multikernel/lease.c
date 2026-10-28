@@ -248,6 +248,21 @@ void mk_lease_unlock(struct mk_lease *lease)
 	mutex_unlock(&lease->lock);
 }
 
+/**
+ * mk_lease_allow_msi - Let a leased function write to an MSI doorbell
+ * @lease: The lease, locked
+ * @doorbell: Address the function writes its MSIs to
+ *
+ * Allowed until the lease ends.
+ *
+ * Returns: 0 on success, or a negative error code
+ */
+int mk_lease_allow_msi(struct mk_lease *lease, phys_addr_t doorbell)
+{
+	lockdep_assert_held(&lease->lock);
+	return mk_iommu_allow_msi(lease->pdev, doorbell);
+}
+
 static struct pci_dev *mk_lease_find_pdev(const struct mk_pci_device *mine)
 {
 	return pci_get_domain_bus_and_slot(mine->domain, mine->bus,
@@ -313,6 +328,72 @@ void mk_instance_fence_devices(struct mk_instance *instance)
 			pci_dev_put(pdev);
 		}
 	}
+}
+
+/**
+ * mk_instance_unmap_devices - Cut the leased functions of a running
+ * instance off memory it lost
+ * @instance: The instance
+ * @start: Physical address of the range
+ * @size: Size of the range
+ */
+void mk_instance_unmap_devices(struct mk_instance *instance,
+			       phys_addr_t start, size_t size)
+{
+	struct mk_pci_device *mine;
+
+	list_for_each_entry(mine, &instance->pci_devices, list) {
+		struct pci_dev *pdev = mk_lease_find_pdev(mine);
+		struct mk_lease *lease;
+
+		if (!pdev)
+			continue;
+		lease = mk_lease_lock(instance, pdev);
+		if (lease) {
+			mk_iommu_unmap(pdev, start, size);
+			mk_lease_unlock(lease);
+		}
+		pci_dev_put(pdev);
+	}
+}
+
+/**
+ * mk_instance_map_devices - Let the leased functions of a running instance
+ * reach memory it gains
+ * @instance: The instance
+ * @start: Physical address of the range
+ * @size: Size of the range
+ *
+ * To be called before the instance is told about the memory.
+ *
+ * Returns: 0 on success, or a negative error code, in which case none
+ * of them reaches it
+ */
+int mk_instance_map_devices(struct mk_instance *instance, phys_addr_t start,
+			    size_t size)
+{
+	struct mk_pci_device *mine;
+	int ret = 0;
+
+	list_for_each_entry(mine, &instance->pci_devices, list) {
+		struct pci_dev *pdev = mk_lease_find_pdev(mine);
+		struct mk_lease *lease;
+
+		if (!pdev)
+			continue;
+		lease = mk_lease_lock(instance, pdev);
+		if (lease) {
+			ret = mk_iommu_map(pdev, start, size);
+			mk_lease_unlock(lease);
+		}
+		pci_dev_put(pdev);
+		if (ret)
+			break;
+	}
+
+	if (ret)
+		mk_instance_unmap_devices(instance, start, size);
+	return ret;
 }
 
 static int __init mk_lease_init(void)

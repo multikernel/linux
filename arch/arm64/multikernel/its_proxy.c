@@ -117,13 +117,14 @@ static void mk_msi_drop_route(void *data)
  * the ACK, which the instance waits for to program the vector.
  */
 static int mk_msi_add_route(struct mk_instance *instance, struct pci_dev *pdev,
+			    struct mk_lease *lease,
 			    const struct mk_io_msi_payload *req,
 			    struct irq_domain *msi_domain, u32 dev_id)
 {
 	struct mk_msi_route *route;
 	int ret;
 
-	ret = mk_iommu_allow_msi(pdev, req->doorbell);
+	ret = mk_lease_allow_msi(lease, req->doorbell);
 	if (ret)
 		goto unmap;
 
@@ -199,8 +200,8 @@ static int mk_msi_map_for(struct mk_instance *instance,
 	req->doorbell = doorbell;
 
 	if (first) {
-		int err = mk_msi_add_route(instance, pdev, req, msi_domain,
-					   dev_id);
+		int err = mk_msi_add_route(instance, pdev, lease, req,
+					   msi_domain, dev_id);
 
 		if (err)
 			ret = err;
