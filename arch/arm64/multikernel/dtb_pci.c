@@ -22,8 +22,6 @@
 
 #include "internal.h"
 
-#define MK_ITS_PROXY	"multikernel,gic-v3-its"
-
 static int mk_dtb_add_its_proxy(void *fdt, u32 *phandle)
 {
 	int node, ret;
@@ -36,7 +34,7 @@ static int mk_dtb_add_its_proxy(void *fdt, u32 *phandle)
 	if (node < 0)
 		return node;
 
-	ret = fdt_setprop_string(fdt, node, "compatible", MK_ITS_PROXY);
+	ret = fdt_setprop_string(fdt, node, "compatible", MK_ITS_PROXY_COMPATIBLE);
 	if (!ret)
 		ret = fdt_setprop_empty(fdt, node, "msi-controller");
 	if (!ret)

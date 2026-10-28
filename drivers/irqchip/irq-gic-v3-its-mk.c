@@ -37,8 +37,6 @@
 #include "irq-gic-its-msi-parent.h"
 #include <linux/irqchip/irq-msi-lib.h>
 
-#define MK_ITS_COMPATIBLE	"multikernel,gic-v3-its"
-
 struct mk_its_device {
 	u32 domain;
 	u32 rid;
@@ -247,7 +245,7 @@ static int __init mk_its_init(void)
 	struct device_node *np, *gic;
 	int ret = -ENODEV;
 
-	np = of_find_compatible_node(NULL, NULL, MK_ITS_COMPATIBLE);
+	np = of_find_compatible_node(NULL, NULL, MK_ITS_PROXY_COMPATIBLE);
 	if (!np)
 		return 0;
 

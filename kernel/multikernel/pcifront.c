@@ -259,7 +259,8 @@ static struct pci_ops mk_pcifront_ops = {
  * @domain: Its PCI domain
  *
  * An architecture whose PCI code expects its own sysdata on a root bus
- * provides it here.
+ * provides it here, and one whose MSIs leave through a domain of its own
+ * ties the bridge to it.
  */
 int __weak mk_arch_pcifront_prepare(struct pci_host_bridge *bridge, int domain)
 {
