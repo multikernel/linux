@@ -19,7 +19,7 @@ int mk_dtb_set_reg(void *fdt, int node, const u64 *pairs, int nr);
 /* reg entries a copied node may have; a GIC has one per redistributor region */
 #define MK_DTB_MAX_REG		16
 
-/* The driver and the MSI controller for the instance's PCI root buses */
+/* The MSI proxy, and how the instance's PCI root buses do DMA */
 int mk_dtb_add_pci(void *fdt);
 
 /*
