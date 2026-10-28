@@ -110,4 +110,95 @@ static inline int mk_dt_emit_pci_buses(void *fdt)
 }
 #endif
 
+/* lease.c */
+struct pci_dev;
+#ifdef CONFIG_PCI
+int mk_lease_bind(struct pci_dev *pdev);
+int mk_lease_unbind(struct pci_dev *pdev);
+int mk_lease_grant(struct mk_instance *instance, struct pci_dev *pdev);
+void mk_lease_fence(struct mk_instance *instance, struct pci_dev *pdev);
+int mk_instance_grant_devices(struct mk_instance *instance);
+void mk_instance_fence_devices(struct mk_instance *instance);
+int mk_instance_map_devices(struct mk_instance *instance, phys_addr_t start,
+			    size_t size);
+void mk_instance_unmap_devices(struct mk_instance *instance,
+			       phys_addr_t start, size_t size);
+
+/* pciback.c: config space of a leased function, served to its instance */
+int mk_pciback_lend(struct mk_instance *instance, struct pci_dev *pdev);
+#else
+static inline int mk_lease_bind(struct pci_dev *pdev)
+{
+	return 0;
+}
+static inline int mk_lease_unbind(struct pci_dev *pdev)
+{
+	return 0;
+}
+static inline int mk_lease_grant(struct mk_instance *instance,
+				 struct pci_dev *pdev)
+{
+	return -ENODEV;
+}
+static inline void mk_lease_fence(struct mk_instance *instance,
+				  struct pci_dev *pdev)
+{
+}
+static inline int mk_instance_grant_devices(struct mk_instance *instance)
+{
+	return 0;
+}
+static inline void mk_instance_fence_devices(struct mk_instance *instance)
+{
+}
+static inline int mk_instance_map_devices(struct mk_instance *instance,
+					  phys_addr_t start, size_t size)
+{
+	return 0;
+}
+static inline void mk_instance_unmap_devices(struct mk_instance *instance,
+					     phys_addr_t start, size_t size)
+{
+}
+#endif
+
+/*
+ * iommu.c: keep the DMA of a leased PCI function inside its instance's
+ * memory, where it sits behind an IOMMU. Called with the lease held.
+ */
+#ifdef CONFIG_MULTIKERNEL_IOMMU
+int mk_iommu_claim(struct pci_dev *pdev, void *owner);
+void mk_iommu_unclaim(struct pci_dev *pdev);
+int mk_iommu_confine(struct mk_instance *instance, struct pci_dev *pdev);
+int mk_iommu_allow_msi(struct pci_dev *pdev, phys_addr_t doorbell);
+int mk_iommu_map(struct pci_dev *pdev, phys_addr_t start, size_t size);
+void mk_iommu_unmap(struct pci_dev *pdev, phys_addr_t start, size_t size);
+#else
+static inline int mk_iommu_claim(struct pci_dev *pdev, void *owner)
+{
+	return 0;
+}
+static inline void mk_iommu_unclaim(struct pci_dev *pdev)
+{
+}
+static inline int mk_iommu_confine(struct mk_instance *instance,
+				   struct pci_dev *pdev)
+{
+	return 0;
+}
+static inline int mk_iommu_allow_msi(struct pci_dev *pdev, phys_addr_t doorbell)
+{
+	return 0;
+}
+static inline int mk_iommu_map(struct pci_dev *pdev, phys_addr_t start,
+			       size_t size)
+{
+	return 0;
+}
+static inline void mk_iommu_unmap(struct pci_dev *pdev, phys_addr_t start,
+				  size_t size)
+{
+}
+#endif
+
 #endif /* _KERNEL_MULTIKERNEL_INTERNAL_H */

@@ -1531,8 +1531,8 @@ int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
 	}
 
 	/* Its devices must reach the memory by the time the instance uses it */
-	ret = mk_iommu_map(target_instance, PFN_PHYS(start_pfn),
-			   PFN_PHYS(nr_pages));
+	ret = mk_instance_map_devices(target_instance, PFN_PHYS(start_pfn),
+				      PFN_PHYS(nr_pages));
 	if (ret < 0) {
 		mk_msg_pending_wait(pending, 0);
 		goto remove;
@@ -1550,7 +1550,8 @@ int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
 	if (!ret || ret == -ETIMEDOUT)
 		goto out;
 unmap:
-	mk_iommu_unmap(target_instance, PFN_PHYS(start_pfn), PFN_PHYS(nr_pages));
+	mk_instance_unmap_devices(target_instance, PFN_PHYS(start_pfn),
+				  PFN_PHYS(nr_pages));
 remove:
 	mk_instance_remove_memory_region(target_instance, PFN_PHYS(start_pfn),
 					 PFN_PHYS(nr_pages));
@@ -1627,7 +1628,8 @@ int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages)
 	if (ret < 0)
 		goto abort;
 
-	mk_iommu_unmap(target_instance, PFN_PHYS(start_pfn), PFN_PHYS(nr_pages));
+	mk_instance_unmap_devices(target_instance, PFN_PHYS(start_pfn),
+				  PFN_PHYS(nr_pages));
 	mk_instance_finish_memory_removal(target_instance, PFN_PHYS(start_pfn),
 					  PFN_PHYS(nr_pages));
 	goto out;

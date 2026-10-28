@@ -14,7 +14,8 @@
  * behind the device. The device works untranslated, and cannot reach
  * anything else.
  * The domain follows the grant as memory is added and removed, and goes
- * away with the lease.
+ * away with the lease. Everything here is called with the lease held, so
+ * the domain attached to the device is the lease's.
  *
  * Outside a lease the device's DMA belongs to mk_pciback, which holds
  * every function this kernel let go of, and the device sits in the
@@ -30,22 +31,27 @@
 #include <linux/iommu.h>
 #include <linux/multikernel.h>
 #include <linux/pci.h>
-#include <linux/slab.h>
 
-struct mk_iommu_dev {
-	struct list_head list;
-	struct mk_instance *instance;
-	struct pci_dev *pdev;
-	struct iommu_domain *domain;
-};
+#include "internal.h"
 
-static LIST_HEAD(mk_iommu_devs);
-static DEFINE_MUTEX(mk_iommu_lock);
-
-static int mk_iommu_prot(struct mk_iommu_dev *d)
+static int mk_iommu_prot(struct pci_dev *pdev)
 {
 	return IOMMU_READ | IOMMU_WRITE |
-	       (dev_is_dma_coherent(&d->pdev->dev) ? IOMMU_CACHE : 0);
+	       (dev_is_dma_coherent(&pdev->dev) ? IOMMU_CACHE : 0);
+}
+
+/* The domain of the lease on @pdev, or NULL for a device without an IOMMU */
+static struct iommu_domain *mk_iommu_domain(struct pci_dev *pdev)
+{
+	struct iommu_domain *domain;
+
+	if (!device_iommu_mapped(&pdev->dev))
+		return NULL;
+
+	domain = iommu_get_domain_for_dev(&pdev->dev);
+	if (WARN_ON_ONCE(!domain || domain->type != IOMMU_DOMAIN_UNMANAGED))
+		return NULL;
+	return domain;
 }
 
 /**
@@ -78,34 +84,13 @@ void mk_iommu_unclaim(struct pci_dev *pdev)
 /* The claim keeps the device in the blocking domain from here on */
 static void mk_iommu_unconfine(void *data)
 {
-	struct mk_iommu_dev *d = data;
+	struct pci_dev *pdev = data;
+	struct iommu_domain *domain = mk_iommu_domain(pdev);
 
-	scoped_guard(mutex, &mk_iommu_lock)
-		list_del(&d->list);
-	iommu_detach_device(d->domain, &d->pdev->dev);
-	iommu_domain_free(d->domain);
-	kfree(d);
-}
-
-static int mk_iommu_confine_locked(struct mk_iommu_dev *d)
-{
-	struct mk_memory_region *region;
-	int ret;
-
-	lockdep_assert_held(&mk_iommu_lock);
-
-	list_for_each_entry(region, &d->instance->memory_regions, list) {
-		ret = iommu_map(d->domain, region->res.start, region->res.start,
-				resource_size(&region->res), mk_iommu_prot(d),
-				GFP_KERNEL);
-		if (ret)
-			return ret;
-	}
-
-	ret = iommu_attach_device(d->domain, &d->pdev->dev);
-	if (!ret)
-		list_add(&d->list, &mk_iommu_devs);
-	return ret;
+	if (!domain)
+		return;
+	iommu_detach_device(domain, &pdev->dev);
+	iommu_domain_free(domain);
 }
 
 /**
@@ -120,7 +105,8 @@ static int mk_iommu_confine_locked(struct mk_iommu_dev *d)
  */
 int mk_iommu_confine(struct mk_instance *instance, struct pci_dev *pdev)
 {
-	struct mk_iommu_dev *d;
+	struct mk_memory_region *region;
+	struct iommu_domain *domain;
 	int ret;
 
 	if (!device_iommu_mapped(&pdev->dev)) {
@@ -129,105 +115,83 @@ int mk_iommu_confine(struct mk_instance *instance, struct pci_dev *pdev)
 		return 0;
 	}
 
-	d = kzalloc_obj(*d);
-	if (!d)
-		return -ENOMEM;
-	d->instance = instance;
-	d->pdev = pdev;
-
-	d->domain = iommu_paging_domain_alloc(&pdev->dev);
-	if (IS_ERR(d->domain)) {
-		ret = PTR_ERR(d->domain);
+	domain = iommu_paging_domain_alloc(&pdev->dev);
+	if (IS_ERR(domain)) {
+		ret = PTR_ERR(domain);
 		goto err;
 	}
 
-	scoped_guard(mutex, &mk_iommu_lock)
-		ret = mk_iommu_confine_locked(d);
-	if (ret) {
-		iommu_domain_free(d->domain);
-		goto err;
+	list_for_each_entry(region, &instance->memory_regions, list) {
+		ret = iommu_map(domain, region->res.start, region->res.start,
+				resource_size(&region->res), mk_iommu_prot(pdev),
+				GFP_KERNEL);
+		if (ret)
+			goto free;
 	}
 
-	return devm_add_action_or_reset(&pdev->dev, mk_iommu_unconfine, d);
+	ret = iommu_attach_device(domain, &pdev->dev);
+	if (ret)
+		goto free;
 
+	return devm_add_action_or_reset(&pdev->dev, mk_iommu_unconfine, pdev);
+
+free:
+	iommu_domain_free(domain);
 err:
 	pci_err(pdev, "DMA not confined to instance %d: %d\n", instance->id, ret);
-	kfree(d);
 	return ret;
 }
 
 /**
  * mk_iommu_allow_msi - Let a leased device write to an MSI doorbell
- * @pdev: The device, whose lease the caller holds locked
+ * @pdev: The device
  * @doorbell: Address the device writes its MSIs to
  *
- * Allowed until the lease ends, with the domain. Nothing to do for a
- * device without an IOMMU.
+ * Allowed until the lease ends, with the domain.
  *
  * Returns: 0 on success, or a negative error code
  */
 int mk_iommu_allow_msi(struct pci_dev *pdev, phys_addr_t doorbell)
 {
+	struct iommu_domain *domain = mk_iommu_domain(pdev);
 	phys_addr_t page = doorbell & PAGE_MASK;
-	struct mk_iommu_dev *d;
 
-	guard(mutex)(&mk_iommu_lock);
+	/* A MAP that failed after opening it opened it already */
+	if (!domain || iommu_iova_to_phys(domain, page) == page)
+		return 0;
 
-	list_for_each_entry(d, &mk_iommu_devs, list) {
-		if (d->pdev != pdev)
-			continue;
-		/* A MAP that failed after opening it opened it already */
-		if (iommu_iova_to_phys(d->domain, page) == page)
-			return 0;
-		return iommu_map(d->domain, page, page, PAGE_SIZE,
-				 IOMMU_WRITE | IOMMU_MMIO, GFP_KERNEL);
-	}
-	return 0;
+	return iommu_map(domain, page, page, PAGE_SIZE,
+			 IOMMU_WRITE | IOMMU_MMIO, GFP_KERNEL);
 }
 
 /**
- * mk_iommu_map - Let a running instance's devices reach memory it gains
- * @instance: Instance the memory is being added to
+ * mk_iommu_map - Let a leased device reach memory its instance gains
+ * @pdev: The device
  * @start: Physical address of the range
  * @size: Size of the range
  *
- * To be called before the instance is told about the memory.
+ * Returns: 0 on success, or a negative error code
  */
-int mk_iommu_map(struct mk_instance *instance, phys_addr_t start, size_t size)
+int mk_iommu_map(struct pci_dev *pdev, phys_addr_t start, size_t size)
 {
-	struct mk_iommu_dev *d;
-	int ret = 0;
+	struct iommu_domain *domain = mk_iommu_domain(pdev);
 
-	mutex_lock(&mk_iommu_lock);
-	list_for_each_entry(d, &mk_iommu_devs, list) {
-		if (d->instance != instance)
-			continue;
-		ret = iommu_map(d->domain, start, start, size, mk_iommu_prot(d),
-				GFP_KERNEL);
-		if (ret)
-			break;
-	}
-	mutex_unlock(&mk_iommu_lock);
-
-	if (ret)
-		mk_iommu_unmap(instance, start, size);
-	return ret;
+	if (!domain)
+		return 0;
+	return iommu_map(domain, start, start, size, mk_iommu_prot(pdev),
+			 GFP_KERNEL);
 }
 
 /**
- * mk_iommu_unmap - Cut a running instance's devices off memory it lost
- * @instance: Instance the memory was removed from
+ * mk_iommu_unmap - Cut a leased device off memory its instance lost
+ * @pdev: The device
  * @start: Physical address of the range
  * @size: Size of the range
  */
-void mk_iommu_unmap(struct mk_instance *instance, phys_addr_t start, size_t size)
+void mk_iommu_unmap(struct pci_dev *pdev, phys_addr_t start, size_t size)
 {
-	struct mk_iommu_dev *d;
+	struct iommu_domain *domain = mk_iommu_domain(pdev);
 
-	mutex_lock(&mk_iommu_lock);
-	list_for_each_entry(d, &mk_iommu_devs, list) {
-		if (d->instance == instance)
-			iommu_unmap(d->domain, start, size);
-	}
-	mutex_unlock(&mk_iommu_lock);
+	if (domain)
+		iommu_unmap(domain, start, size);
 }
