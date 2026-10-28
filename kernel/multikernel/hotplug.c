@@ -713,6 +713,14 @@ static int mk_do_device_add(u16 domain, u8 bus, u8 devfn,
 		return -ENODEV;
 	}
 
+	ret = mk_lease_unbind(pdev);
+	if (ret) {
+		pr_err("Multikernel hotplug: Device %04x:%02x:%02x.%x is still in use by an instance: %d\n",
+		       domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn), ret);
+		pci_dev_put(pdev);
+		return ret;
+	}
+
 	/*
 	 * A device coming back from the pool arrives driverless: adding it
 	 * has to bind the host driver, not unbind one. Only an explicit
@@ -808,6 +816,7 @@ static int mk_do_device_remove(u16 domain, u8 bus, u8 devfn)
 	struct pci_bus *pci_bus;
 	struct mk_hotplug_op *op;
 	char prev_driver[64] = {0};
+	int ret;
 
 	pr_info("Multikernel hotplug: Removing device %04x:%02x:%02x.%x\n",
 		domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
@@ -830,6 +839,12 @@ static int mk_do_device_remove(u16 domain, u8 bus, u8 devfn)
 		pr_info("Multikernel hotplug: Unbinding device from %s\n", prev_driver);
 		device_release_driver(&pdev->dev);
 	}
+
+	/* Held, so that no driver of this kernel takes it back by itself */
+	ret = mk_lease_bind(pdev);
+	if (ret)
+		pr_warn("Multikernel hotplug: Device %04x:%02x:%02x.%x not held for instances: %d\n",
+			domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn), ret);
 
 	pci_dev_put(pdev);
 

@@ -192,17 +192,28 @@ struct mk_instance;
 int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
 				 size_t data_size, unsigned long type);
 
+struct pci_dev;
+
 /*
  * Host side: keep the DMA of an instance's PCI devices inside its memory
  * while it runs, where the devices sit behind an IOMMU.
  */
 #ifdef CONFIG_MULTIKERNEL_IOMMU
+int mk_iommu_claim(struct pci_dev *pdev, void *owner);
+void mk_iommu_unclaim(struct pci_dev *pdev);
 int mk_iommu_contain(struct mk_instance *instance);
 void mk_iommu_fence(struct mk_instance *instance);
 void mk_iommu_release(struct mk_instance *instance);
 int mk_iommu_map(struct mk_instance *instance, phys_addr_t start, size_t size);
 void mk_iommu_unmap(struct mk_instance *instance, phys_addr_t start, size_t size);
 #else
+static inline int mk_iommu_claim(struct pci_dev *pdev, void *owner)
+{
+	return 0;
+}
+static inline void mk_iommu_unclaim(struct pci_dev *pdev)
+{
+}
 static inline int mk_iommu_contain(struct mk_instance *instance)
 {
 	return 0;
@@ -1105,6 +1116,21 @@ static inline int mk_pcifront_adopt_function(u16 domain, u8 bus, u8 devfn)
 }
 static inline void mk_pcifront_host_fenced(void)
 {
+}
+#endif
+
+/* PCI functions this kernel let go of, held for instances */
+#ifdef CONFIG_PCI
+int mk_lease_bind(struct pci_dev *pdev);
+int mk_lease_unbind(struct pci_dev *pdev);
+#else
+static inline int mk_lease_bind(struct pci_dev *pdev)
+{
+	return 0;
+}
+static inline int mk_lease_unbind(struct pci_dev *pdev)
+{
+	return 0;
 }
 #endif
 
