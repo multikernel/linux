@@ -202,6 +202,7 @@ struct pci_dev;
 int mk_iommu_claim(struct pci_dev *pdev, void *owner);
 void mk_iommu_unclaim(struct pci_dev *pdev);
 int mk_iommu_confine(struct mk_instance *instance, struct pci_dev *pdev);
+int mk_iommu_allow_msi(struct pci_dev *pdev, phys_addr_t doorbell);
 int mk_iommu_map(struct mk_instance *instance, phys_addr_t start, size_t size);
 void mk_iommu_unmap(struct mk_instance *instance, phys_addr_t start, size_t size);
 #else
@@ -214,6 +215,10 @@ static inline void mk_iommu_unclaim(struct pci_dev *pdev)
 }
 static inline int mk_iommu_confine(struct mk_instance *instance,
 				   struct pci_dev *pdev)
+{
+	return 0;
+}
+static inline int mk_iommu_allow_msi(struct pci_dev *pdev, phys_addr_t doorbell)
 {
 	return 0;
 }
@@ -1117,6 +1122,8 @@ static inline void mk_pcifront_host_fenced(void)
  * one instance a function from its start, or its hot add, to its halt,
  * or the function's hot remove.
  */
+struct mk_lease;
+
 #ifdef CONFIG_PCI
 int mk_lease_bind(struct pci_dev *pdev);
 int mk_lease_unbind(struct pci_dev *pdev);
@@ -1124,6 +1131,9 @@ int mk_lease_grant(struct mk_instance *instance, struct pci_dev *pdev);
 void mk_lease_fence(struct mk_instance *instance, struct pci_dev *pdev);
 int mk_instance_grant_devices(struct mk_instance *instance);
 void mk_instance_fence_devices(struct mk_instance *instance);
+struct mk_lease *mk_lease_lock(struct mk_instance *instance,
+			       struct pci_dev *pdev);
+void mk_lease_unlock(struct mk_lease *lease);
 
 /* Config space of a leased function, served to its instance */
 int mk_pciback_lend(struct mk_instance *instance, struct pci_dev *pdev);
@@ -1327,8 +1337,6 @@ void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
  *  - CONFIG_ARCH_HAS_MK_HOST_PARK and the pool park functions declared
  *    with the pool chunk API above, for architectures that park CPUs in
  *    software rather than in firmware.
- *  - CONFIG_ARCH_HAS_MK_MSI_PROXY and the two functions below, for
- *    architectures where an instance cannot route its own MSIs.
  */
 
 /* Doorbell for the message ring: IPI a CPU owned by another kernel */
@@ -1375,26 +1383,5 @@ int mk_repark_instance_to_host(struct mk_instance *instance);
 /* Move one parked CPU between the host pool and a live instance */
 int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
 int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
-
-/*
- * MSIs that the host has to route for an instance (a GICv3 ITS has one
- * command queue). The generic code only needs to know when to let go and
- * what an IOMMU in front of a device has to let through.
- */
-#ifdef CONFIG_ARCH_HAS_MK_MSI_PROXY
-/* Drop every MSI routed for @instance: it halted, or is about to be started */
-void mk_arch_msi_release(struct mk_instance *instance);
-/* The address @pdev writes its MSIs to when an instance owns it, 0 if none */
-phys_addr_t mk_arch_msi_doorbell(struct pci_dev *pdev);
-#else
-static inline void mk_arch_msi_release(struct mk_instance *instance)
-{
-}
-
-static inline phys_addr_t mk_arch_msi_doorbell(struct pci_dev *pdev)
-{
-	return 0;
-}
-#endif
 
 #endif /* _LINUX_MULTIKERNEL_H */
