@@ -3806,10 +3806,10 @@ static const struct irq_domain_ops its_domain_ops = {
  * its_foreign_lock is what such a move holds against the device going away
  * under it.
  *
- * @owner keeps the devices of different kernels apart and names what
- * its_foreign_release() tears down. The ITS is the one behind the device,
- * named by the device's MSI domain: a machine has one per socket or more,
- * each with DeviceIDs, collections and a doorbell of its own.
+ * @owner keeps the devices of different kernels apart. The ITS is the one
+ * behind the device, named by the device's MSI domain: a machine has one
+ * per socket or more, each with DeviceIDs, collections and a doorbell of
+ * its own.
  */
 static DEFINE_RAW_SPINLOCK(its_foreign_lock);
 
@@ -3949,48 +3949,44 @@ int its_foreign_map(void *owner, struct irq_domain *domain, u32 dev_id,
 	return dev->event_map.lpi_base + event;
 }
 
-static void its_foreign_release_on(struct its_node *its, void *owner)
+/**
+ * its_foreign_unmap - Drop everything mapped for a device of another kernel
+ * @owner: the other kernel, as given to its_foreign_map()
+ * @domain: MSI domain of the device
+ * @dev_id: DeviceID as that ITS sees it
+ *
+ * For when that kernel no longer has the device, or is gone, whether it
+ * let go in order or not: the device must not raise its LPIs any more.
+ * Nothing happens unless @owner mapped the device.
+ */
+void its_foreign_unmap(void *owner, struct irq_domain *domain, u32 dev_id)
 {
-	struct its_device *dev, *tmp;
+	struct its_node *its = its_foreign_its(domain);
+	struct its_device *dev;
 	unsigned int event;
+
+	if (!its)
+		return;
 
 	guard(mutex)(&its->dev_alloc_lock);
 
-	list_for_each_entry_safe(dev, tmp, &its->its_device_list, entry) {
-		if (dev->foreign != owner)
-			continue;
+	dev = its_find_device(its, dev_id);
+	if (!dev || dev->foreign != owner)
+		return;
 
-		/* No move finds the device from here on, and none is under way */
-		scoped_guard(raw_spinlock_irqsave, &its_foreign_lock)
-			dev->foreign = NULL;
+	/* No move finds the device from here on, and none is under way */
+	scoped_guard(raw_spinlock_irqsave, &its_foreign_lock)
+		dev->foreign = NULL;
 
-		for_each_set_bit(event, dev->event_map.lpi_map,
-				 dev->event_map.nr_lpis) {
-			its_foreign_config(dev, event, false);
-			its_send_discard(dev, event);
-		}
-
-		its_lpi_free(dev->event_map.lpi_map, dev->event_map.lpi_base,
-			     dev->event_map.nr_lpis);
-		its_send_mapd(dev, 0);
-		its_free_device(dev);
+	for_each_set_bit(event, dev->event_map.lpi_map, dev->event_map.nr_lpis) {
+		its_foreign_config(dev, event, false);
+		its_send_discard(dev, event);
 	}
-}
 
-/**
- * its_foreign_release - Drop everything mapped for another kernel
- * @owner: the other kernel, as given to its_foreign_map()
- *
- * For when that kernel is gone or about to be started afresh, whether it
- * shut down in order or not: nothing of it must keep raising LPIs.
- */
-void its_foreign_release(void *owner)
-{
-	struct its_node *its;
-
-	/* ITSs are only ever added, and that during boot */
-	list_for_each_entry(its, &its_nodes, entry)
-		its_foreign_release_on(its, owner);
+	its_lpi_free(dev->event_map.lpi_map, dev->event_map.lpi_base,
+		     dev->event_map.nr_lpis);
+	its_send_mapd(dev, 0);
+	its_free_device(dev);
 }
 
 /*

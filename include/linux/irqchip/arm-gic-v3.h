@@ -645,7 +645,7 @@ int its_foreign_map(void *owner, struct irq_domain *domain, u32 dev_id,
 		    phys_addr_t *doorbell);
 int its_foreign_move(void *owner, struct irq_domain *domain, u32 dev_id,
 		     u32 event, unsigned int cpu);
-void its_foreign_release(void *owner);
+void its_foreign_unmap(void *owner, struct irq_domain *domain, u32 dev_id);
 phys_addr_t its_foreign_doorbell(struct irq_domain *domain);
 int its_init(struct fwnode_handle *handle, struct rdists *rdists,
 	     struct irq_domain *domain, u8 irq_prio);

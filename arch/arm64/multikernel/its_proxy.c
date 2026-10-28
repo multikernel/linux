@@ -173,7 +173,13 @@ static int mk_msi_map_for(struct mk_instance *instance,
 		return ret;
 
 	req->doorbell = doorbell;
-	return mk_msi_remember_route(instance, req, msi_domain, dev_id) ?: ret;
+
+	/* Only a remembered device is unmapped when the instance halts */
+	if (mk_msi_remember_route(instance, req, msi_domain, dev_id)) {
+		its_foreign_unmap(instance, msi_domain, dev_id);
+		return -ENOMEM;
+	}
+	return ret;
 }
 
 static void mk_msi_map_work(struct work_struct *work)
@@ -242,11 +248,10 @@ void mk_arch_msi_release(struct mk_instance *instance)
 	}
 
 	list_for_each_entry_safe(route, tmp, &gone, list) {
+		its_foreign_unmap(instance, route->msi_domain, route->dev_id);
 		mk_instance_put(route->instance);
 		kfree(route);
 	}
-
-	its_foreign_release(instance);
 }
 
 phys_addr_t mk_arch_msi_doorbell(struct pci_dev *pdev)
