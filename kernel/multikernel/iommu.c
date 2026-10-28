@@ -15,11 +15,12 @@
  * grant as memory is added and removed, and goes away when the instance
  * halts.
  *
- * A halted instance may not be gone: a CPU that missed its halt still
- * runs its kernel, with the device's BARs mapped. So the device stays
- * claimed, which leaves it in the IOMMU's blocking domain, and goes back
- * to the host's default domain only once the instance is released with
- * all of its CPUs off. Under passthrough that domain reaches everything.
+ * The function's DMA belongs to mk_pciback, which holds every function
+ * this kernel let go of (lease.c), so in between it sits in the IOMMU's
+ * blocking domain. A halted instance may not be gone: a CPU that missed
+ * its halt still runs its kernel, with the device's BARs mapped. So a
+ * function goes back to an instance only once that instance is released
+ * with all of its CPUs off.
  *
  * A device without an IOMMU is left alone: its DMA is unrestricted, as
  * it always was.
@@ -73,14 +74,13 @@ static void mk_iommu_detach_dev(struct mk_iommu_dev *d)
 static void mk_iommu_free_dev(struct mk_iommu_dev *d)
 {
 	mk_iommu_detach_dev(d);
-	iommu_device_release_dma_owner(&d->pdev->dev);
 	pci_dev_put(d->pdev);
 	list_del(&d->list);
 	kfree(d);
 }
 
 /*
- * Kept from an earlier run of the same instance, or claimed afresh. A
+ * Kept from an earlier run of the same instance, or taken afresh. A
  * device another instance still holds, or one whose instance was
  * released with a CPU on, is not to be had.
  */
@@ -93,16 +93,14 @@ static struct mk_iommu_dev *mk_iommu_claim_dev(struct mk_instance *instance,
 	if (d)
 		return d->instance == instance ? d : ERR_PTR(-EBUSY);
 
+	/* Fails while a host driver is bound, which must not share the device */
+	ret = mk_lease_bind(pdev);
+	if (ret)
+		return ERR_PTR(ret);
+
 	d = kzalloc_obj(*d);
 	if (!d)
 		return ERR_PTR(-ENOMEM);
-
-	/* Fails while a host driver is bound, which must not share the device */
-	ret = iommu_device_claim_dma_owner(&pdev->dev, instance);
-	if (ret) {
-		kfree(d);
-		return ERR_PTR(ret);
-	}
 
 	d->instance = instance;
 	d->pdev = pci_dev_get(pdev);
@@ -202,6 +200,33 @@ int mk_iommu_contain(struct mk_instance *instance)
 }
 
 /**
+ * mk_iommu_claim - Take the DMA of a function this kernel let go of
+ * @pdev: The function
+ * @owner: Its holder, which is never an instance
+ *
+ * Leaves the function in the blocking domain until an instance's domain
+ * is attached.
+ *
+ * Returns: 0 on success, or a negative error code
+ */
+int mk_iommu_claim(struct pci_dev *pdev, void *owner)
+{
+	if (!device_iommu_mapped(&pdev->dev))
+		return 0;
+	return iommu_device_claim_dma_owner(&pdev->dev, owner);
+}
+
+/**
+ * mk_iommu_unclaim - Return a function's DMA to this kernel
+ * @pdev: The function, which mk_iommu_claim() took
+ */
+void mk_iommu_unclaim(struct pci_dev *pdev)
+{
+	if (device_iommu_mapped(&pdev->dev))
+		iommu_device_release_dma_owner(&pdev->dev);
+}
+
+/**
  * mk_iommu_fence - Cut an instance's devices off all memory
  * @instance: Instance that has halted, or is about to be started afresh
  *
@@ -221,11 +246,11 @@ void mk_iommu_fence(struct mk_instance *instance)
 }
 
 /**
- * mk_iommu_release - Return an instance's devices to the host
+ * mk_iommu_release - Free an instance's devices for other instances
  * @instance: Instance being released
  *
  * Only once every CPU of the instance is off. With one still on, the
- * devices stay blocked for good, claimed by nobody that can let go.
+ * devices stay with nobody, for good.
  */
 void mk_iommu_release(struct mk_instance *instance)
 {
