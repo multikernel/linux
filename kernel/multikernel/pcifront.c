@@ -57,7 +57,6 @@ struct mk_pcifront_bus {
 	struct list_head list;
 	u16 domain;
 	u8 busnr;
-	phys_addr_t ecam_phys;
 	void __iomem *ecam;	/* For when the host is fenced, or NULL */
 	DECLARE_BITMAP(devfns, 256);	/* The functions of this kernel's tree */
 };
@@ -232,32 +231,6 @@ int mk_pcifront_config(unsigned int domain, unsigned int bus,
 	return ret;
 }
 
-/**
- * mk_pcifront_ecam - The ECAM window of a bus of this kernel's tree
- * @domain: PCI domain
- * @bus: Bus number
- *
- * Passed on to the tree of an instance of this kernel, for when both its
- * host and this kernel are fenced.
- *
- * Returns: the physical address of the bus's 1MB window, or 0 if none
- */
-u64 mk_pcifront_ecam(unsigned int domain, unsigned int bus)
-{
-	struct mk_pcifront_bus *fb;
-	u64 ecam = 0;
-
-	rcu_read_lock();
-	list_for_each_entry_rcu(fb, &mk_pcifront_buses, list) {
-		if (fb->domain == domain && fb->busnr == bus) {
-			ecam = fb->ecam ? fb->ecam_phys : 0;
-			break;
-		}
-	}
-	rcu_read_unlock();
-	return ecam;
-}
-
 /* Mapped now: nothing can be mapped under the PCI core's lock, where it is used */
 static void mk_pcifront_map_ecam(struct device_node *np,
 					struct mk_pcifront_bus *fb)
@@ -273,8 +246,6 @@ static void mk_pcifront_map_ecam(struct device_node *np,
 	}
 
 	fb->ecam = ioremap(ecam.start, SZ_1M);
-	if (fb->ecam)
-		fb->ecam_phys = ecam.start;
 }
 
 static struct pci_ops mk_pcifront_ops = {

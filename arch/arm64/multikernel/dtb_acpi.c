@@ -6,6 +6,7 @@
  * from its tables is written out in the generic bindings: PSCI's conduit
  * from the FADT, the arch timer's PPIs from the GTDT, and the GICv3
  * frames from the MADT. SBSA guarantees the generic drivers bind to it.
+ * The ECAM window of a bus comes from the MCFG.
  */
 
 #define pr_fmt(fmt) "mk_dtb: " fmt
@@ -15,6 +16,10 @@
 #include <linux/irq.h>
 #include <linux/irqchip/arm-gic-v3.h>
 #include <linux/libfdt.h>
+#include <linux/multikernel.h>
+#include <linux/pci.h>
+#include <linux/pci-acpi.h>
+#include <linux/pci-ecam.h>
 #include <linux/psci.h>
 
 #include "internal.h"
@@ -240,3 +245,23 @@ int mk_dtb_add_platform_acpi(void *fdt)
 		ret = mk_dtb_add_gic(fdt);
 	return ret;
 }
+
+#ifdef CONFIG_ACPI_MCFG
+u64 mk_arch_pci_bus_ecam(struct pci_bus *bus)
+{
+	struct acpi_device *adev = ACPI_COMPANION(&pci_find_host_bridge(bus)->dev);
+	const struct pci_ecam_ops *ops;
+	struct acpi_pci_root *root;
+	struct resource res;
+
+	if (!adev)
+		return 0;
+
+	/* A quirk's accessors may not read the region as plain ECAM */
+	root = acpi_driver_data(adev);
+	if (pci_mcfg_lookup(root, &res, &ops) || ops != &pci_generic_ecam_ops)
+		return 0;
+
+	return mk_pci_ecam_window(&res, root->secondary.start, bus->number);
+}
+#endif

@@ -1074,6 +1074,12 @@ void mk_instance_set_state(struct mk_instance *instance,
 /* The PCI root buses of a spawn kernel's tree */
 #define MK_PCI_HOST_BRIDGE	"multikernel,pci-host-bridge"
 
+/* The ECAM windows of this kernel's buses, for a spawn's tree */
+struct resource;
+u64 mk_pci_ecam_window(const struct resource *res, u64 first,
+		       unsigned int busnr);
+u64 mk_arch_pci_bus_ecam(struct pci_bus *bus);
+
 /* PCI buses of a spawn kernel, config space reached through its host */
 struct pci_host_bridge;
 int mk_arch_pcifront_prepare(struct pci_host_bridge *bridge, int domain);
@@ -1082,7 +1088,6 @@ int mk_pcifront_init(void);
 int mk_pcifront_config(unsigned int domain, unsigned int bus,
 		       unsigned int devfn, int where, int size, u32 *val,
 		       bool write);
-u64 mk_pcifront_ecam(unsigned int domain, unsigned int bus);
 void mk_pcifront_host_fenced(void);
 int mk_pcifront_add_function(u16 domain, u8 bus, u8 devfn, u16 vendor,
 			     u16 device, const struct mk_pci_bus_desc *desc);
@@ -1097,10 +1102,6 @@ static inline int mk_pcifront_config(unsigned int domain, unsigned int bus,
 				     u32 *val, bool write)
 {
 	return -ENODEV;
-}
-static inline u64 mk_pcifront_ecam(unsigned int domain, unsigned int bus)
-{
-	return 0;
 }
 static inline int mk_pcifront_add_function(u16 domain, u8 bus, u8 devfn,
 					   u16 vendor, u16 device,
