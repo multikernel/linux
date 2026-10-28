@@ -450,9 +450,8 @@ int mk_instance_start(struct mk_instance *instance, struct kimage *image,
 	 */
 	mk_ipi_ring_drop_pending();
 
-	/* A previous run that died without a word left its leases and MSIs */
+	/* A previous run that died without a word left its leases */
 	mk_instance_fence_devices(instance);
-	mk_arch_msi_release(instance);
 
 	ret = mk_instance_grant_devices(instance);
 	if (ret) {
@@ -1662,7 +1661,6 @@ static void mk_instance_settle_halted(struct mk_instance *instance)
 	pr_info("Instance %d (%s) halted, CPUs parking in pool\n",
 		instance->id, instance->name);
 	mk_instance_fence_devices(instance);
-	mk_arch_msi_release(instance);
 	mk_instance_set_state(instance, MK_STATE_LOADED);
 }
 

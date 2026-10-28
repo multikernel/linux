@@ -19,8 +19,9 @@
  *    interrupt, which takes a cache of what MAP resolved: neither the PCI
  *    device nor the instance can be looked up there.
  *
- * Both answers are MK_IO_MSI_ACK. There is no unmap: the host drops
- * everything when the instance halts, and again before it is started.
+ * Both answers are MK_IO_MSI_ACK. There is no unmap: what the host maps
+ * for a device, its events and the doorbell window in the device's IOMMU
+ * domain, is part of the instance's lease on the device and goes with it.
  *
  * Both ends live here. The ITS side of the host is its_foreign_*() in the
  * ITS driver, the interrupt domain of the instance is irq-gic-v3-its-mk.
@@ -100,30 +101,51 @@ static struct mk_msi_route *mk_msi_find_route(int instance_id, u32 domain, u32 r
 	return NULL;
 }
 
-static int mk_msi_remember_route(struct mk_instance *instance,
-				 const struct mk_io_msi_payload *req,
-				 struct irq_domain *msi_domain, u32 dev_id)
+static void mk_msi_drop_route(void *data)
+{
+	struct mk_msi_route *route = data;
+
+	scoped_guard(raw_spinlock_irqsave, &mk_msi_routes_lock)
+		list_del(&route->list);
+	its_foreign_unmap(route->instance, route->msi_domain, route->dev_id);
+	mk_instance_put(route->instance);
+	kfree(route);
+}
+
+/*
+ * The first MAP of a device in a lease. The doorbell window opens before
+ * the ACK, which the instance waits for to program the vector.
+ */
+static int mk_msi_add_route(struct mk_instance *instance, struct pci_dev *pdev,
+			    const struct mk_io_msi_payload *req,
+			    struct irq_domain *msi_domain, u32 dev_id)
 {
 	struct mk_msi_route *route;
+	int ret;
 
-	scoped_guard(raw_spinlock_irqsave, &mk_msi_routes_lock) {
-		if (mk_msi_find_route(instance->id, req->domain, req->rid))
-			return 0;
-	}
+	ret = mk_iommu_allow_msi(pdev, req->doorbell);
+	if (ret)
+		goto unmap;
 
 	route = kzalloc_obj(*route);
-	if (!route)
-		return -ENOMEM;
+	if (!route) {
+		ret = -ENOMEM;
+		goto unmap;
+	}
 	route->instance = mk_instance_get(instance);
 	route->domain = req->domain;
 	route->rid = req->rid;
 	route->msi_domain = msi_domain;
 	route->dev_id = dev_id;
 
-	/* One work item at a time maps for a device, so nobody got in between */
 	scoped_guard(raw_spinlock_irqsave, &mk_msi_routes_lock)
 		list_add(&route->list, &mk_msi_routes);
-	return 0;
+
+	return devm_add_action_or_reset(&pdev->dev, mk_msi_drop_route, route);
+
+unmap:
+	its_foreign_unmap(instance, msi_domain, dev_id);
+	return ret;
 }
 
 /* Every vector the device has: the instance's driver may use any of them */
@@ -132,26 +154,19 @@ static u32 mk_msi_max_vectors(struct pci_dev *pdev)
 	return max3(pci_msix_vec_count(pdev), pci_msi_vec_count(pdev), 1);
 }
 
-/* Only a device the instance was given, only a CPU it owns */
+/* Only a device the instance holds a lease on, only a CPU it owns */
 static int mk_msi_map_for(struct mk_instance *instance,
 			  struct mk_io_msi_payload *req)
 {
 	struct irq_domain *msi_domain;
-	struct mk_pci_device *mine;
 	phys_addr_t doorbell = 0;
+	struct mk_lease *lease;
 	struct pci_dev *pdev;
-	bool owned = false;
+	bool first;
 	int cpu, ret;
 	u32 dev_id;
 
-	list_for_each_entry(mine, &instance->pci_devices, list) {
-		if (mine->domain == req->domain && mine->bus == req->rid >> 8 &&
-		    PCI_DEVFN(mine->slot, mine->func) == (req->rid & 0xff)) {
-			owned = true;
-			break;
-		}
-	}
-	if (!owned || !mk_cpu_set_contains(instance->cpus, req->phys_cpu))
+	if (!mk_cpu_set_contains(instance->cpus, req->phys_cpu))
 		return -EPERM;
 
 	cpu = arch_cpu_from_physical_id(req->phys_cpu);
@@ -163,22 +178,38 @@ static int mk_msi_map_for(struct mk_instance *instance,
 	if (!pdev)
 		return -ENODEV;
 
+	/* Held across the mapping, so that nothing is mapped after the lease */
+	lease = mk_lease_lock(instance, pdev);
+	if (!lease) {
+		ret = -EPERM;
+		goto put;
+	}
+
 	/* The device's MSI domain names the ITS behind it, of possibly several */
 	msi_domain = dev_get_msi_domain(&pdev->dev);
 	dev_id = pci_msi_domain_get_msi_rid(msi_domain, pdev);
+
+	scoped_guard(raw_spinlock_irqsave, &mk_msi_routes_lock)
+		first = !mk_msi_find_route(instance->id, req->domain, req->rid);
+
 	ret = its_foreign_map(instance, msi_domain, dev_id, req->event,
 			      mk_msi_max_vectors(pdev), cpu, &doorbell);
-	pci_dev_put(pdev);
 	if (ret < 0)
-		return ret;
-
+		goto unlock;
 	req->doorbell = doorbell;
 
-	/* Only a remembered device is unmapped when the instance halts */
-	if (mk_msi_remember_route(instance, req, msi_domain, dev_id)) {
-		its_foreign_unmap(instance, msi_domain, dev_id);
-		return -ENOMEM;
+	if (first) {
+		int err = mk_msi_add_route(instance, pdev, req, msi_domain,
+					   dev_id);
+
+		if (err)
+			ret = err;
 	}
+
+unlock:
+	mk_lease_unlock(lease);
+put:
+	pci_dev_put(pdev);
 	return ret;
 }
 
@@ -207,9 +238,9 @@ static void mk_msi_map_work(struct work_struct *work)
 
 /*
  * In the doorbell interrupt. The route keeps the instance alive, and the
- * lock keeps the route: mk_arch_msi_release() takes it to unlink. Without
+ * lock keeps the route: the end of the lease takes it to unlink. Without
  * a route there is nobody to answer: the instance never mapped the device,
- * or has halted since, and its request times out.
+ * or no longer holds it, and its request times out.
  */
 static void mk_msi_move(const struct mk_io_msi_payload *req)
 {
@@ -233,30 +264,6 @@ static void mk_msi_move(const struct mk_io_msi_payload *req)
 	ack.sender_instance_id = mk_self->id;
 	mk_send_message_to(route->instance, MK_MSG_IO, MK_IO_MSI_ACK, &ack,
 			   sizeof(ack));
-}
-
-void mk_arch_msi_release(struct mk_instance *instance)
-{
-	struct mk_msi_route *route, *tmp;
-	LIST_HEAD(gone);
-
-	scoped_guard(raw_spinlock_irqsave, &mk_msi_routes_lock) {
-		list_for_each_entry_safe(route, tmp, &mk_msi_routes, list) {
-			if (route->instance == instance)
-				list_move(&route->list, &gone);
-		}
-	}
-
-	list_for_each_entry_safe(route, tmp, &gone, list) {
-		its_foreign_unmap(instance, route->msi_domain, route->dev_id);
-		mk_instance_put(route->instance);
-		kfree(route);
-	}
-}
-
-phys_addr_t mk_arch_msi_doorbell(struct pci_dev *pdev)
-{
-	return its_foreign_doorbell(dev_get_msi_domain(&pdev->dev));
 }
 
 /*

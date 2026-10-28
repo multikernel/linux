@@ -1628,7 +1628,6 @@ config ARCH_SUPPORTS_MULTIKERNEL
 # An ITS has one command queue, so the host maps MSIs for its instances
 config MULTIKERNEL_ITS_PROXY
 	def_bool MULTIKERNEL && ARM_GIC_V3_ITS && PCI_MSI
-	select ARCH_HAS_MK_MSI_PROXY
 
 config ARCH_SUPPORTS_CRASH_DUMP
 	def_bool y

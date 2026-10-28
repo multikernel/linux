@@ -218,6 +218,36 @@ void mk_lease_fence(struct mk_instance *instance, struct pci_dev *pdev)
 		mk_lease_end(lease, true);
 }
 
+/**
+ * mk_lease_lock - Keep an instance's lease on a function from ending
+ * @instance: The instance
+ * @pdev: The function
+ *
+ * For what hangs state off the lease, as devres actions on @pdev.
+ *
+ * Returns: the lease, locked, or NULL if @instance holds none on @pdev
+ */
+struct mk_lease *mk_lease_lock(struct mk_instance *instance,
+			       struct pci_dev *pdev)
+{
+	struct mk_lease *lease = mk_lease_of(pdev);
+
+	if (!lease)
+		return NULL;
+
+	mutex_lock(&lease->lock);
+	if (lease->holder != instance) {
+		mutex_unlock(&lease->lock);
+		return NULL;
+	}
+	return lease;
+}
+
+void mk_lease_unlock(struct mk_lease *lease)
+{
+	mutex_unlock(&lease->lock);
+}
+
 static struct pci_dev *mk_lease_find_pdev(const struct mk_pci_device *mine)
 {
 	return pci_get_domain_bus_and_slot(mine->domain, mine->bus,

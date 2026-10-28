@@ -10,8 +10,9 @@
  *
  * So while an instance holds a lease on a device (lease.c), the device is
  * attached to a domain of its own that maps the instance's memory grant
- * onto itself, and with it the MSI doorbell of the ITS behind that
- * device. The device works untranslated, and cannot reach anything else.
+ * onto itself, and once the instance maps an MSI, the doorbell of the ITS
+ * behind the device. The device works untranslated, and cannot reach
+ * anything else.
  * The domain follows the grant as memory is added and removed, and goes
  * away with the lease.
  *
@@ -88,7 +89,6 @@ static void mk_iommu_unconfine(void *data)
 
 static int mk_iommu_confine_locked(struct mk_iommu_dev *d)
 {
-	phys_addr_t doorbell = mk_arch_msi_doorbell(d->pdev);
 	struct mk_memory_region *region;
 	int ret;
 
@@ -98,14 +98,6 @@ static int mk_iommu_confine_locked(struct mk_iommu_dev *d)
 		ret = iommu_map(d->domain, region->res.start, region->res.start,
 				resource_size(&region->res), mk_iommu_prot(d),
 				GFP_KERNEL);
-		if (ret)
-			return ret;
-	}
-
-	if (doorbell) {
-		ret = iommu_map(d->domain, doorbell & PAGE_MASK,
-				doorbell & PAGE_MASK, PAGE_SIZE,
-				IOMMU_WRITE | IOMMU_MMIO, GFP_KERNEL);
 		if (ret)
 			return ret;
 	}
@@ -162,6 +154,35 @@ err:
 	pci_err(pdev, "DMA not confined to instance %d: %d\n", instance->id, ret);
 	kfree(d);
 	return ret;
+}
+
+/**
+ * mk_iommu_allow_msi - Let a leased device write to an MSI doorbell
+ * @pdev: The device, whose lease the caller holds locked
+ * @doorbell: Address the device writes its MSIs to
+ *
+ * Allowed until the lease ends, with the domain. Nothing to do for a
+ * device without an IOMMU.
+ *
+ * Returns: 0 on success, or a negative error code
+ */
+int mk_iommu_allow_msi(struct pci_dev *pdev, phys_addr_t doorbell)
+{
+	phys_addr_t page = doorbell & PAGE_MASK;
+	struct mk_iommu_dev *d;
+
+	guard(mutex)(&mk_iommu_lock);
+
+	list_for_each_entry(d, &mk_iommu_devs, list) {
+		if (d->pdev != pdev)
+			continue;
+		/* A MAP that failed after opening it opened it already */
+		if (iommu_iova_to_phys(d->domain, page) == page)
+			return 0;
+		return iommu_map(d->domain, page, page, PAGE_SIZE,
+				 IOMMU_WRITE | IOMMU_MMIO, GFP_KERNEL);
+	}
+	return 0;
 }
 
 /**
