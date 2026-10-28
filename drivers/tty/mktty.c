@@ -214,9 +214,9 @@ static ssize_t mktty_host_write(struct file *filp, const char __user *buf,
 		msg->len = chunk;
 		msg->reserved = 0;
 
-		ret = multikernel_send_ipi_data(conn->instance_id, msg,
-						sizeof(*msg) - MKTTY_MAX_DATA + chunk,
-						MKTTY_IPI_TYPE);
+		ret = mk_ipi_send_by_id(conn->instance_id, msg,
+					sizeof(*msg) - MKTTY_MAX_DATA + chunk,
+					MKTTY_IPI_TYPE);
 		if (ret < 0) {
 			kfree(msg);
 			return sent > 0 ? sent : ret;
@@ -394,9 +394,9 @@ static ssize_t mktty_spawn_write(struct tty_struct *tty, const u8 *buf,
 		msg->reserved = 0;
 		memcpy(msg->data, buf + sent, chunk);
 
-		ret = multikernel_send_ipi_data_to(host_instance, msg,
-				sizeof(*msg) - MKTTY_MAX_DATA + chunk,
-				MKTTY_IPI_TYPE);
+		ret = mk_ipi_send(host_instance, msg,
+				  sizeof(*msg) - MKTTY_MAX_DATA + chunk,
+				  MKTTY_IPI_TYPE);
 		if (ret < 0) {
 			kfree(msg);
 			return sent > 0 ? sent : ret;
@@ -462,9 +462,9 @@ static void mktty_spawn_console_write(struct console *con, const char *s,
 		mktty_console_msg.reserved = 0;
 		memcpy(mktty_console_msg.data, s, chunk);
 
-		multikernel_send_ipi_data_to(host_instance, &mktty_console_msg,
-				sizeof(mktty_console_msg) - MKTTY_MAX_DATA + chunk,
-				MKTTY_IPI_TYPE);
+		mk_ipi_send(host_instance, &mktty_console_msg,
+			    sizeof(mktty_console_msg) - MKTTY_MAX_DATA + chunk,
+			    MKTTY_IPI_TYPE);
 		s += chunk;
 		count -= chunk;
 	}

@@ -227,11 +227,9 @@ static int mk_build_and_send(int instance_id, struct mk_instance *instance,
 
 	/* Send via IPI using the message type as IPI type */
 	if (instance)
-		ret = multikernel_send_ipi_data_to(instance, msg, total_size,
-						   msg_type);
+		ret = mk_ipi_send(instance, msg, total_size, msg_type);
 	else
-		ret = multikernel_send_ipi_data(instance_id, msg, total_size,
-						msg_type);
+		ret = mk_ipi_send_by_id(instance_id, msg, total_size, msg_type);
 
 	/* Clean up temporary buffer */
 	kfree(msg);

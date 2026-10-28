@@ -155,7 +155,7 @@ int mk_arm_force_halt(struct mk_instance *instance)
 }
 
 /**
- * multikernel_send_ipi_data - Send data to another CPU via IPI
+ * mk_ipi_send_by_id - Send data to another instance via IPI
  * @instance_id: Target multikernel instance ID
  * @data: Pointer to data to send
  * @data_size: Size of data
@@ -166,7 +166,7 @@ int mk_arm_force_halt(struct mk_instance *instance)
  *
  * Returns 0 on success, negative error code on failure
  */
-int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, unsigned long type)
+int mk_ipi_send_by_id(int instance_id, void *data, size_t data_size, unsigned long type)
 {
 	struct mk_instance *instance = mk_instance_find(instance_id);
 	int ret;
@@ -174,7 +174,7 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 	if (!instance)
 		return -EINVAL;
 
-	ret = multikernel_send_ipi_data_to(instance, data, data_size, type);
+	ret = mk_ipi_send(instance, data, data_size, type);
 	mk_instance_put(instance);
 	return ret;
 }
@@ -184,8 +184,8 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
  * instance up by ID takes a mutex; this does not sleep, so it is the one
  * to use with interrupts off.
  */
-int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
-				 size_t data_size, unsigned long type)
+int mk_ipi_send(struct mk_instance *instance, void *data, size_t data_size,
+		unsigned long type)
 {
 	struct mk_shared_data *ipi_data;
 	struct mk_ipi_ring *ring;
@@ -288,7 +288,7 @@ static void mk_ipi_drain_ring(struct mk_ipi_ring *ring)
 		slot = &ring->entries[tail];
 
 		/*
-		 * Pairs with the store_release in multikernel_send_ipi_data().
+		 * Pairs with the store_release in mk_ipi_send().
 		 * Zero means the sender claimed this slot but has not
 		 * finished writing it. Leave it alone: skipping it would
 		 * drop the message it is about to publish. Its own IPI, or

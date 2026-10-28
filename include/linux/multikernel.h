@@ -174,18 +174,19 @@ struct mk_ipi_handler *multikernel_register_handler(mk_ipi_callback_t callback, 
 void multikernel_unregister_handler(struct mk_ipi_handler *handler);
 
 /**
- * multikernel_send_ipi_data - Send data to another CPU via IPI
+ * mk_ipi_send_by_id - Send data to another instance via IPI
  * @instance_id: Target multikernel instance ID
  * @data: Pointer to data to send
  * @data_size: Size of data
  * @type: User-defined type identifier
  *
- * This function copies the data to per-CPU storage and sends an IPI
- * to the target CPU.
+ * This function queues the data on the ring to the target instance and
+ * sends an IPI to its doorbell CPU. Looking the ID up takes a mutex, so
+ * use mk_ipi_send() with interrupts off.
  *
  * Returns 0 on success, negative error code on failure
  */
-int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, unsigned long type);
+int mk_ipi_send_by_id(int instance_id, void *data, size_t data_size, unsigned long type);
 
 void generic_multikernel_interrupt(void);
 
@@ -194,8 +195,8 @@ void mk_ipi_poll(void);
 bool mk_ipi_in_drain(void);
 
 struct mk_instance;
-int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
-				 size_t data_size, unsigned long type);
+int mk_ipi_send(struct mk_instance *instance, void *data, size_t data_size,
+		unsigned long type);
 
 void mk_ipi_rx_add(struct mk_instance *instance);
 void mk_ipi_rx_del(struct mk_instance *instance);
