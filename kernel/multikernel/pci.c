@@ -11,6 +11,7 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/pci.h>
+#include <linux/property.h>
 #include <linux/sizes.h>
 
 #include "internal.h"
@@ -158,10 +159,23 @@ static u64 mk_pci_bus_ecam(struct pci_bus *bus)
 	return mk_pci_ecam_window(&res, first, bus->number);
 }
 
+/*
+ * What firmware says of the host bridge, where pci_dma_configure() looks:
+ * a device's own coherence is set only once a driver binds it.
+ */
+static bool mk_pci_bus_coherent(struct pci_bus *bus)
+{
+	struct device *dev = &pci_find_host_bridge(bus)->dev;
+
+	if (dev->parent && dev_of_node(dev->parent))
+		dev = dev->parent;
+	return device_get_dma_attr(dev) == DEV_DMA_COHERENT;
+}
+
 /**
  * mk_pci_bus_describe - What a kernel needs to make @bus a root bus of its own
  * @bus: A bus of this kernel
- * @desc: Filled with the windows of @bus and its ECAM window
+ * @desc: Filled with the windows of @bus, its ECAM window and coherence
  *
  * The same description goes into an instance's boot tree and into the
  * message that hands it a device on a bus it did not boot with.
@@ -170,5 +184,7 @@ void mk_pci_bus_describe(struct pci_bus *bus, struct mk_pci_bus_desc *desc)
 {
 	memset(desc, 0, sizeof(*desc));
 	desc->ecam = mk_pci_bus_ecam(bus);
+	if (mk_pci_bus_coherent(bus))
+		desc->flags |= MK_PCI_BUS_COHERENT;
 	mk_pci_bus_windows(bus, desc);
 }

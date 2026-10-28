@@ -432,6 +432,8 @@ mk_pcifront_new_bus_node(struct of_changeset *cs, u16 domain, u8 busnr,
 		ret = of_changeset_add_prop_u32_array(cs, np, "reg", reg, 4);
 	if (!ret && nr)
 		ret = of_changeset_add_prop_u32_array(cs, np, "ranges", ranges, nr);
+	if (!ret && (desc->flags & MK_PCI_BUS_COHERENT))
+		ret = of_changeset_add_prop_bool(cs, np, "dma-coherent");
 	return ret ? ERR_PTR(ret) : np;
 }
 
@@ -621,6 +623,8 @@ static int mk_pcifront_host_bus(u16 domain, u8 bus, struct mk_pci_bus_desc *desc
 	memset(desc, 0, sizeof(*desc));
 	if (!of_property_read_u32_array(np, "reg", reg, 4))
 		desc->ecam = (u64)reg[0] << 32 | reg[1];
+	if (of_property_read_bool(np, "dma-coherent"))
+		desc->flags |= MK_PCI_BUS_COHERENT;
 	ranges = of_get_property(np, "ranges", &len);
 	if (ranges) {
 		desc->nr_ranges = min_t(u32, len / sizeof(*ranges),
