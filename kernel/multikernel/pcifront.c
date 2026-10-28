@@ -45,6 +45,7 @@
 #include <linux/of_address.h>
 #include <linux/of_pci.h>
 #include <linux/pci.h>
+#include <linux/platform_device.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
 
@@ -69,6 +70,9 @@ struct mk_pcifront_bus {
 static LIST_HEAD(mk_pcifront_buses);
 
 static bool mk_pcifront_direct_access;
+
+/* Serializes the functions and buses this kernel is handed while running */
+static DEFINE_MUTEX(mk_pcifront_mutex);
 
 static struct mk_pcifront_bus *mk_pcifront_of(struct pci_bus *bus)
 {
@@ -294,8 +298,13 @@ static void mk_pcifront_add_windows(struct device_node *np,
 	}
 }
 
-static int mk_pcifront_add_bus(struct device_node *np)
+/*
+ * Each bus node is a host bridge of its own, and its platform device is
+ * the bridge's parent, from which the PCI core configures DMA.
+ */
+static int mk_pcifront_probe(struct platform_device *pdev)
 {
+	struct device_node *np = pdev->dev.of_node;
 	struct pci_host_bridge *bridge;
 	struct resource_entry *entry;
 	struct mk_pcifront_bus *fb;
@@ -334,6 +343,7 @@ static int mk_pcifront_add_bus(struct device_node *np)
 	pci_add_resource(&bridge->windows, bus_res);
 	mk_pcifront_add_windows(np, bridge);
 
+	bridge->dev.parent = &pdev->dev;
 	/* The bus binds to its node by identity, not by a bus number search */
 	bridge->dev.of_node = of_node_get(np);
 	bridge->busnr = range[0];
@@ -345,9 +355,12 @@ static int mk_pcifront_add_bus(struct device_node *np)
 	if (ret)
 		goto err_node;
 
+	pci_lock_rescan_remove();
 	ret = pci_scan_root_bus_bridge(bridge);
-	if (ret)
+	if (ret) {
+		pci_unlock_rescan_remove();
 		goto err_node;
+	}
 
 	/* A bus scan skips the slot of a function 0 that is not ours */
 	for_each_set_bit(devfn, fb->devfns, 256)
@@ -358,6 +371,7 @@ static int mk_pcifront_add_bus(struct device_node *np)
 
 	list_add_tail_rcu(&fb->list, &mk_pcifront_buses);
 	pci_bus_add_devices(bridge->bus);
+	pci_unlock_rescan_remove();
 	pr_info("Root bus %04x:%02x from %pOF\n", domain, range[0], np);
 	return 0;
 
@@ -522,6 +536,20 @@ static int mk_pcifront_scan_function(u16 domain, u8 busnr, u8 devfn)
 	return 0;
 }
 
+static bool mk_pcifront_has_function(u16 domain, u8 busnr, u8 devfn)
+{
+	struct pci_bus *bus;
+	struct pci_dev *pdev;
+
+	pci_lock_rescan_remove();
+	bus = pci_find_bus(domain, busnr);
+	pdev = bus ? pci_get_slot(bus, devfn) : NULL;
+	pci_unlock_rescan_remove();
+
+	pci_dev_put(pdev);
+	return pdev;
+}
+
 /**
  * mk_pcifront_add_function - Take a function handed over while running
  * @domain: PCI domain
@@ -541,35 +569,32 @@ int mk_pcifront_add_function(u16 domain, u8 bus, u8 devfn, u16 vendor,
 			     u16 device, const struct mk_pci_bus_desc *desc)
 {
 	struct device_node *bus_np;
-	struct pci_bus *pbus;
-	struct pci_dev *pdev;
 	bool new_bus;
-	int ret;
+	int ret = 0;
 
 	if (!mk_manifest_phys() || !host_instance)
 		return -ENODEV;
 
-	pci_lock_rescan_remove();
-	pbus = pci_find_bus(domain, bus);
-	pdev = pbus ? pci_get_slot(pbus, devfn) : NULL;
-	if (pdev) {
-		pci_dev_put(pdev);
-		ret = 0;
+	mutex_lock(&mk_pcifront_mutex);
+	if (mk_pcifront_has_function(domain, bus, devfn))
 		goto unlock;
-	}
 
+	/* A new bus node probes as it is added, and takes the rescan lock */
 	ret = mk_pcifront_add_node(domain, bus, devfn, vendor, device, desc,
 				   &bus_np, &new_bus);
 	if (ret)
 		goto unlock;
-
-	if (new_bus)
-		ret = mk_pcifront_add_bus(bus_np);
-	else
-		ret = mk_pcifront_scan_function(domain, bus, devfn);
 	of_node_put(bus_np);
+
+	if (new_bus) {
+		ret = pci_find_bus(domain, bus) ? 0 : -ENODEV;
+	} else {
+		pci_lock_rescan_remove();
+		ret = mk_pcifront_scan_function(domain, bus, devfn);
+		pci_unlock_rescan_remove();
+	}
 unlock:
-	pci_unlock_rescan_remove();
+	mutex_unlock(&mk_pcifront_mutex);
 	return ret;
 }
 
@@ -684,19 +709,39 @@ int mk_pcifront_adopt_function(u16 domain, u8 bus, u8 devfn)
 	return ret;
 }
 
+static const struct of_device_id mk_pcifront_of_match[] = {
+	{ .compatible = MK_PCI_HOST_BRIDGE },
+	{ }
+};
+
+/*
+ * A bus is never given back, and a hot add relies on its bus being there
+ * once the bus node is added.
+ */
+static struct platform_driver mk_pcifront_driver = {
+	.probe = mk_pcifront_probe,
+	.driver = {
+		.name = "mk_pcifront",
+		.of_match_table = mk_pcifront_of_match,
+		.suppress_bind_attrs = true,
+		.probe_type = PROBE_FORCE_SYNCHRONOUS,
+	},
+};
+
 /**
  * mk_pcifront_init - Create the PCI buses of a spawn kernel
  *
  * Runs once. An architecture may call it from where its PCI init order
- * wants the buses; it runs at subsys_initcall otherwise.
+ * wants the buses; it runs at subsys_initcall otherwise. Either way the
+ * bus nodes' platform devices exist by then, and the driver binds them
+ * at once.
  *
  * Returns: 0, also when this kernel is not a spawn or has no PCI buses
  */
 int __init mk_pcifront_init(void)
 {
 	static bool done;
-	struct device_node *np;
-	int scanned = 0;
+	int ret;
 
 	if (done || !mk_manifest_phys())
 		return 0;
@@ -707,14 +752,9 @@ int __init mk_pcifront_init(void)
 		return 0;
 	}
 
-	pci_lock_rescan_remove();
-	for_each_compatible_node(np, NULL, MK_PCI_HOST_BRIDGE)
-		if (!mk_pcifront_add_bus(np))
-			scanned++;
-	pci_unlock_rescan_remove();
-
-	if (!scanned)
-		pr_info("No PCI buses described for this instance\n");
+	ret = platform_driver_register(&mk_pcifront_driver);
+	if (ret)
+		pr_err("No PCI for this instance: %d\n", ret);
 	return 0;
 }
 
