@@ -35,6 +35,7 @@
 #include <linux/irqdomain.h>
 #include <linux/msi.h>
 #include <linux/multikernel.h>
+#include <linux/of.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
@@ -345,6 +346,28 @@ static int mk_msi_request(struct mk_io_msi_payload *req,
 		return ret;
 	*req = r.msg;
 	return req->result;
+}
+
+/*
+ * Every bus of an instance is one of pcifront's, and every MSI of it goes
+ * through the proxy, the host picking the ITS behind each device at MAP
+ * time. So the proxy is the MSI domain of each bridge pcifront creates,
+ * at boot or later, rather than something the tree says bus by bus.
+ */
+int mk_arch_pcifront_prepare(struct pci_host_bridge *bridge, int domain)
+{
+	struct irq_domain *msi_domain = NULL;
+	struct device_node *np;
+
+	np = of_find_compatible_node(NULL, NULL, MK_ITS_PROXY_COMPATIBLE);
+	if (np) {
+		msi_domain = irq_find_matching_fwnode(of_fwnode_handle(np),
+						      DOMAIN_BUS_PCI_MSI);
+		of_node_put(np);
+	}
+	if (msi_domain)
+		dev_set_msi_domain(&bridge->dev, msi_domain);
+	return 0;
 }
 
 /**

@@ -86,4 +86,7 @@ int mk_msi_proxy_move(u32 domain, u32 rid, u32 event, u64 phys_cpu);
 /* Nothing of arm64's lives in the control block, so it is never allocated */
 #define MK_CTRL_BLOCK_SIZE	PAGE_SIZE
 
+/* The node an instance reaches its host's ITSs through, for its MSIs */
+#define MK_ITS_PROXY_COMPATIBLE	"multikernel,gic-v3-its"
+
 #endif /* _ASM_ARM64_MULTIKERNEL_H */
