@@ -109,9 +109,14 @@ struct mk_ipi_ring {
 /* Presence table capacity, in CPUs (see mk_cpu_rank) */
 #define MK_PARKED_MAX 512
 
-/* Shared memory structures - per-instance design */
+/*
+ * Shared with one child instance. Each ring has producers in one kernel
+ * only, so a kernel that dies mid-send can wedge nothing but its own link,
+ * which is cleared when the child is executed again.
+ */
 struct mk_shared_data {
-	struct mk_ipi_ring ring;  /* IPI message ring buffer */
+	struct mk_ipi_ring to_child;
+	struct mk_ipi_ring to_parent;
 	/*
 	 * Force-halt marker, host-owned. Armed before the host NMIs the
 	 * instance's CPUs and cleared with the rest of this struct when
@@ -192,8 +197,8 @@ struct mk_instance;
 int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
 				 size_t data_size, unsigned long type);
 
-/* Discard everything queued in this kernel's ring (instance re-spawn) */
-void mk_ipi_ring_drop_pending(void);
+void mk_ipi_rx_add(struct mk_instance *instance);
+void mk_ipi_rx_del(struct mk_instance *instance);
 
 /*
  * Multikernel Messaging System
@@ -756,6 +761,7 @@ struct mk_instance {
 	struct mk_shared_data *ipi_data; /* IPI shared memory buffer (virtual address) */
 	phys_addr_t ipi_phys;           /* IPI buffer physical address */
 	u32 ipi_pages;                  /* IPI buffer size in pages */
+	struct list_head ipi_rx_node;   /* On the parent's drain list while running */
 	/*
 	 * Host side only: the page the instance's boot tree is written to at
 	 * each exec. It and the IPI ring are allocated on the first load and

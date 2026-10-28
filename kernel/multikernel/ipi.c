@@ -21,7 +21,8 @@ static raw_spinlock_t mk_handlers_lock = __RAW_SPIN_LOCK_UNLOCKED(mk_handlers_lo
 static DEFINE_RAW_SPINLOCK(mk_drain_lock);
 static DEFINE_PER_CPU(bool, mk_draining);
 
-static void mk_ipi_drain_ring(void);
+/* Children whose to_parent ring this kernel drains, under mk_drain_lock */
+static LIST_HEAD(mk_ipi_rx_list);
 
 /*
  * Ring indices live in memory another kernel instance can write, so every
@@ -34,30 +35,32 @@ static inline unsigned int mk_ring_idx(unsigned int i)
 }
 
 /**
- * mk_ipi_ring_drop_pending - Discard everything queued in this kernel's ring
- *
- * Called when an instance is re-spawned. A halting instance parks its CPUs
- * wherever they were, including between claiming a ring slot and publishing
- * it, and the drain stops at such a slot forever. Anything still queued was
- * sent by a kernel that is gone, so drop it all rather than let one
- * abandoned slot wedge the ring.
+ * mk_ipi_rx_add - Start draining a child's to_parent ring
+ * @instance: Child about to run, with its rings freshly cleared
  */
-void mk_ipi_ring_drop_pending(void)
+void mk_ipi_rx_add(struct mk_instance *instance)
 {
-	struct mk_ipi_ring *ring;
-	unsigned int head, tail;
+	unsigned long flags;
 
-	if (!mk_self || !mk_self->ipi_data)
-		return;
+	raw_spin_lock_irqsave(&mk_drain_lock, flags);
+	if (list_empty(&instance->ipi_rx_node))
+		list_add_tail(&instance->ipi_rx_node, &mk_ipi_rx_list);
+	raw_spin_unlock_irqrestore(&mk_drain_lock, flags);
+}
 
-	ring = &mk_self->ipi_data->ring;
-	head = mk_ring_idx(atomic_read(&ring->head));
+/**
+ * mk_ipi_rx_del - Stop draining a child's to_parent ring
+ * @instance: Child that is no longer running
+ *
+ * Once this returns, no drain is looking at the instance's ring.
+ */
+void mk_ipi_rx_del(struct mk_instance *instance)
+{
+	unsigned long flags;
 
-	for (tail = mk_ring_idx(atomic_read(&ring->tail)); tail != head;
-	     tail = mk_ring_idx(tail + 1))
-		ring->entries[tail].data_size = 0;
-
-	atomic_set(&ring->tail, head);
+	raw_spin_lock_irqsave(&mk_drain_lock, flags);
+	list_del_init(&instance->ipi_rx_node);
+	raw_spin_unlock_irqrestore(&mk_drain_lock, flags);
 }
 
 /**
@@ -96,6 +99,8 @@ EXPORT_SYMBOL(multikernel_register_handler);
 /**
  * multikernel_unregister_handler - Unregister a multikernel IPI callback
  * @handler: Handler pointer returned from multikernel_register_handler
+ *
+ * Must not be called from a multikernel IPI callback.
  */
 void multikernel_unregister_handler(struct mk_ipi_handler *handler)
 {
@@ -115,6 +120,10 @@ void multikernel_unregister_handler(struct mk_ipi_handler *handler)
 		pp = &p->next;
 	}
 	raw_spin_unlock_irqrestore(&mk_handlers_lock, flags);
+
+	/* A drain calls the handler unlocked but holds mk_drain_lock throughout */
+	raw_spin_lock_irqsave(&mk_drain_lock, flags);
+	raw_spin_unlock_irqrestore(&mk_drain_lock, flags);
 
 	kfree(p);
 }
@@ -179,6 +188,7 @@ int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
 				 size_t data_size, unsigned long type)
 {
 	struct mk_shared_data *ipi_data;
+	struct mk_ipi_ring *ring;
 	struct mk_ipi_data *slot;
 	int instance_id = instance->id;
 	unsigned int head, next_head, tail;
@@ -197,18 +207,31 @@ int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
 		return -ENODEV;
 	}
 
-	/* The ring lives as long as the instance, which is pinned here */
-	ipi_data = READ_ONCE(instance->ipi_data);
-	if (!ipi_data) {
+	/* Our own to_child ring has our parent as its producer */
+	if (instance == mk_self)
+		return -EINVAL;
+
+	/*
+	 * The link to the parent lives in this kernel's own shared area,
+	 * the one to a child in that child's, which is pinned here.
+	 */
+	if (instance == host_instance) {
+		ipi_data = READ_ONCE(mk_self->ipi_data);
+		ring = ipi_data ? &ipi_data->to_parent : NULL;
+	} else {
+		ipi_data = READ_ONCE(instance->ipi_data);
+		ring = ipi_data ? &ipi_data->to_child : NULL;
+	}
+	if (!ring) {
 		pr_err("Multikernel IPI buffer not available for instance %d\n", instance_id);
 		return -ENODEV;
 	}
 
 	/* Try to enqueue the message in the ring buffer */
 	do {
-		head = mk_ring_idx(atomic_read(&ipi_data->ring.head));
+		head = mk_ring_idx(atomic_read(&ring->head));
 		next_head = mk_ring_idx(head + 1);
-		tail = mk_ring_idx(atomic_read(&ipi_data->ring.tail));
+		tail = mk_ring_idx(atomic_read(&ring->tail));
 
 		/* Check if ring buffer is full */
 		if (next_head == tail) {
@@ -224,10 +247,10 @@ int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
 		}
 
 		/* Try to claim this slot atomically */
-	} while (atomic_cmpxchg(&ipi_data->ring.head, head, next_head) != head);
+	} while (atomic_cmpxchg(&ring->head, head, next_head) != head);
 
 	/* We've claimed slot 'head', now fill it */
-	slot = &ipi_data->ring.entries[head];
+	slot = &ring->entries[head];
 
 	slot->sender_cpu = arch_cpu_physical_id(smp_processor_id());
 	slot->type = type;
@@ -247,7 +270,7 @@ int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
 	return 0;
 }
 
-static void mk_ipi_drain_ring(void)
+static void mk_ipi_drain_ring(struct mk_ipi_ring *ring)
 {
 	struct mk_ipi_data *slot;
 	struct mk_ipi_handler *handler;
@@ -255,17 +278,14 @@ static void mk_ipi_drain_ring(void)
 	size_t data_size;
 	int messages_processed = 0;
 
-	if (!mk_self || !mk_self->ipi_data)
-		return;
-
 	while (1) {
-		tail = mk_ring_idx(atomic_read(&mk_self->ipi_data->ring.tail));
-		head = mk_ring_idx(atomic_read(&mk_self->ipi_data->ring.head));
+		tail = mk_ring_idx(atomic_read(&ring->tail));
+		head = mk_ring_idx(atomic_read(&ring->head));
 
 		if (tail == head)
 			break;
 
-		slot = &mk_self->ipi_data->ring.entries[tail];
+		slot = &ring->entries[tail];
 
 		/*
 		 * Pairs with the store_release in multikernel_send_ipi_data().
@@ -275,8 +295,9 @@ static void mk_ipi_drain_ring(void)
 		 * the next one, brings us back here.
 		 *
 		 * A sender stopped before publishing leaves its slot zero
-		 * forever; mk_ipi_ring_drop_pending() clears those out when
-		 * the instance is re-spawned.
+		 * forever. Only its own kernel produces on this ring, and
+		 * mk_instance_start() clears it before that kernel's
+		 * successor runs.
 		 */
 		data_size = smp_load_acquire(&slot->data_size);
 		if (data_size == 0)
@@ -287,7 +308,7 @@ static void mk_ipi_drain_ring(void)
 				     tail, data_size);
 			slot->data_size = 0;
 			next_tail = mk_ring_idx(tail + 1);
-			atomic_set(&mk_self->ipi_data->ring.tail, next_tail);
+			atomic_set(&ring->tail, next_tail);
 			continue;
 		}
 
@@ -309,7 +330,7 @@ advance_tail:
 		/* Mark consumed so the slot reads as unpublished again */
 		slot->data_size = 0;
 		next_tail = mk_ring_idx(tail + 1);
-		atomic_set(&mk_self->ipi_data->ring.tail, next_tail);
+		atomic_set(&ring->tail, next_tail);
 		messages_processed++;
 
 		if (messages_processed >= MK_IPI_RING_SIZE)
@@ -325,9 +346,11 @@ advance_tail:
  */
 static void multikernel_interrupt_handler(void)
 {
+	struct mk_shared_data *ipi_data;
+	struct mk_instance *child;
 	unsigned long flags;
 
-	if (!mk_self || !mk_self->ipi_data)
+	if (!mk_self)
 		return;
 
 	/*
@@ -338,14 +361,23 @@ static void multikernel_interrupt_handler(void)
 	 * the CPU was bringing its APIC up, say - every later queue attempt
 	 * is a no-op and the ring never drains again.
 	 *
-	 * The ring has one consumer at a time. That used to be implied by
+	 * Each ring has one consumer at a time. That used to be implied by
 	 * the doorbell going to a single CPU; mk_ipi_poll() is a second way
 	 * in, so it is a lock now. Waiting for it rather than giving up
 	 * matters: a poller that is just leaving may not look again.
+	 *
+	 * The doorbell does not say who rang, so look at the link from the
+	 * parent and at every running child's link.
 	 */
 	raw_spin_lock_irqsave(&mk_drain_lock, flags);
 	this_cpu_write(mk_draining, true);
-	mk_ipi_drain_ring();
+	if (mk_self->ipi_data)
+		mk_ipi_drain_ring(&mk_self->ipi_data->to_child);
+	list_for_each_entry(child, &mk_ipi_rx_list, ipi_rx_node) {
+		ipi_data = READ_ONCE(child->ipi_data);
+		if (ipi_data)
+			mk_ipi_drain_ring(&ipi_data->to_parent);
+	}
 	this_cpu_write(mk_draining, false);
 	raw_spin_unlock_irqrestore(&mk_drain_lock, flags);
 }

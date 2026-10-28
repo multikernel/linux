@@ -297,6 +297,11 @@ static int __init mk_restore_instance_ipi(struct mk_instance *instance)
 		return 0;
 	}
 	ipi_size = (size_t)ipi_pages << PAGE_SHIFT;
+	if (ipi_size < sizeof(struct mk_shared_data)) {
+		pr_err("IPI buffer is too small: %zu < %zu\n", ipi_size,
+		       sizeof(struct mk_shared_data));
+		return -EINVAL;
+	}
 
 	instance->ipi_data = memremap(ipi_phys, ipi_size, MEMREMAP_WB);
 	if (!instance->ipi_data) {

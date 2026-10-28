@@ -379,7 +379,7 @@ static ssize_t mktty_spawn_write(struct tty_struct *tty, const u8 *buf,
 	size_t sent = 0, chunk;
 	int ret;
 
-	if (tty->index != 0)
+	if (tty->index != 0 || !host_instance)
 		return -ENODEV;
 
 	msg = kmalloc(sizeof(*msg), GFP_KERNEL);
@@ -394,7 +394,7 @@ static ssize_t mktty_spawn_write(struct tty_struct *tty, const u8 *buf,
 		msg->reserved = 0;
 		memcpy(msg->data, buf + sent, chunk);
 
-		ret = multikernel_send_ipi_data(0, msg,
+		ret = multikernel_send_ipi_data_to(host_instance, msg,
 				sizeof(*msg) - MKTTY_MAX_DATA + chunk,
 				MKTTY_IPI_TYPE);
 		if (ret < 0) {
@@ -450,6 +450,9 @@ static void mktty_spawn_console_write(struct console *con, const char *s,
 	unsigned long flags;
 	size_t chunk;
 
+	if (!host_instance)
+		return;
+
 	spin_lock_irqsave(&mktty_console_lock, flags);
 	while (count > 0) {
 		chunk = min_t(size_t, count, MKTTY_MAX_DATA);
@@ -459,7 +462,7 @@ static void mktty_spawn_console_write(struct console *con, const char *s,
 		mktty_console_msg.reserved = 0;
 		memcpy(mktty_console_msg.data, s, chunk);
 
-		multikernel_send_ipi_data(0, &mktty_console_msg,
+		multikernel_send_ipi_data_to(host_instance, &mktty_console_msg,
 				sizeof(mktty_console_msg) - MKTTY_MAX_DATA + chunk,
 				MKTTY_IPI_TYPE);
 		s += chunk;

@@ -288,6 +288,7 @@ struct mk_instance *mk_instance_alloc(int id, const char *name)
 
 	instance->state = MK_STATE_READY;
 	instance->ipi_target = MK_PHYS_CPU_INVALID;
+	INIT_LIST_HEAD(&instance->ipi_rx_node);
 	INIT_LIST_HEAD(&instance->memory_regions);
 	INIT_LIST_HEAD(&instance->list);
 	INIT_LIST_HEAD(&instance->pci_devices);
@@ -374,6 +375,10 @@ void mk_instance_set_state(struct mk_instance *instance,
 	instance->state = state;
 	mk_instance_track_dump(instance, old_state, state);
 
+	/* Whatever stopped it, its ring is no longer ours to drain */
+	if (old_state == MK_STATE_ACTIVE)
+		mk_ipi_rx_del(instance);
+
 	pr_debug("Instance %d (%s) state: %s -> %s\n",
 		 instance->id, instance->name,
 		 mk_state_to_string(old_state),
@@ -434,23 +439,17 @@ int mk_instance_start(struct mk_instance *instance, struct kimage *image,
 	int ret;
 
 	/*
-	 * Start the instance with an empty ring. It outlives the kernel
-	 * that was using it, so a new instance would otherwise inherit that
+	 * Start the instance with empty rings. They outlive the kernel that
+	 * was using them, so a new instance would otherwise inherit that
 	 * kernel's indices and any slot it left half written - which stalls
 	 * the reader, since an unpublished slot means "the sender is still
-	 * filling this one". Anything left in there was addressed to a
-	 * kernel that is gone.
+	 * filling this one". Anything left in there, in either direction,
+	 * belongs to a kernel that is gone.
 	 */
-	if (instance->ipi_data)
+	if (instance->ipi_data) {
 		memset(instance->ipi_data, 0, sizeof(*instance->ipi_data));
-
-	/*
-	 * Same for the other direction: whatever the halted instance left
-	 * queued for us is addressed from a kernel that no longer exists,
-	 * and a slot it claimed but never published stalls our ring for
-	 * good.
-	 */
-	mk_ipi_ring_drop_pending();
+		mk_ipi_rx_add(instance);
+	}
 
 	/* A previous run that died without a word left its leases */
 	mk_instance_fence_devices(instance);
@@ -459,12 +458,14 @@ int mk_instance_start(struct mk_instance *instance, struct kimage *image,
 	if (ret) {
 		pr_err("Instance %d: its PCI functions cannot be lent: %d\n",
 		       instance->id, ret);
+		mk_ipi_rx_del(instance);
 		return ret;
 	}
 
 	ret = mk_arch_spawn_instance(image, instance, cpu);
 	if (ret) {
 		mk_instance_fence_devices(instance);
+		mk_ipi_rx_del(instance);
 		return ret;
 	}
 
@@ -1597,18 +1598,17 @@ void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size)
 struct mk_shutdown_work {
 	struct work_struct work;
 	u32 flags;
-	int sender_instance_id;
 };
 
 
 /*
- * Notify @target_id that this kernel is going down, while messaging
+ * Notify the parent that this kernel is going down, while messaging
  * still works, then park every CPU in the pool wait loop. The subtype
  * distinguishes a reply to a host-requested shutdown (SHUTDOWN_ACK)
  * from a voluntary halt the parent never asked for (HALTED); both mean
  * "my CPUs are about to park on my context".
  */
-static void __noreturn mk_notify_down_and_park(int target_id, u32 subtype)
+static void __noreturn mk_notify_down_and_park(u32 subtype)
 {
 	struct mk_resource_ack ack;
 
@@ -1616,7 +1616,9 @@ static void __noreturn mk_notify_down_and_park(int target_id, u32 subtype)
 	ack.result = 0;
 	ack.resource_id = mk_self->id;
 
-	mk_send_message(target_id, MK_MSG_SYSTEM, subtype, &ack, sizeof(ack));
+	if (host_instance)
+		mk_send_message_to(host_instance, MK_MSG_SYSTEM, subtype, &ack,
+				   sizeof(ack));
 
 	pr_info("Multikernel instance %d shutting down\n", mk_self->id);
 
@@ -1628,8 +1630,8 @@ static void __noreturn mk_notify_down_and_park(int target_id, u32 subtype)
 	mk_enter_pool_state(NULL);
 }
 
-/* The kernel that asked this one to shut down, or -1 */
-static int mk_halt_requester = -1;
+/* Set once the parent has asked this kernel to shut down */
+static int mk_halt_requested;
 
 static bool mk_host_is_fenced;
 
@@ -1637,31 +1639,28 @@ static bool mk_host_is_fenced;
  * mk_halt_to_pool - Halt this spawn kernel, returning its CPUs to the pool
  *
  * Called from the spawn kernel's machine halt path, once its devices are
- * shut down. A halt that a kernel asked for is answered to that kernel.
- * A voluntary exit cannot stay contained in this kernel: the parent owns
- * the instance's lifecycle, and without notice it would consider the
- * instance running forever. Send the parent (instance 0) a HALTED event.
- * Then park every CPU in the pool wait loop.
+ * shut down. A halt the parent asked for is answered as such. A voluntary
+ * exit cannot stay contained in this kernel: the parent owns the
+ * instance's lifecycle, and without notice it would consider the instance
+ * running forever. Send the parent a HALTED event. Then park every CPU in
+ * the pool wait loop.
  */
 void __noreturn mk_halt_to_pool(void)
 {
-	int requester = READ_ONCE(mk_halt_requester);
-
-	if (requester >= 0)
-		mk_notify_down_and_park(requester, MK_SYS_SHUTDOWN_ACK);
-	mk_notify_down_and_park(0, MK_SYS_HALTED);
+	if (READ_ONCE(mk_halt_requested))
+		mk_notify_down_and_park(MK_SYS_SHUTDOWN_ACK);
+	mk_notify_down_and_park(MK_SYS_HALTED);
 }
 
 /* As reboot(2) halts, so that this kernel's drivers shut their devices down */
 static void mk_shutdown_work_fn(struct work_struct *work)
 {
 	struct mk_shutdown_work *sw = container_of(work, struct mk_shutdown_work, work);
-	int sender_instance_id = sw->sender_instance_id;
 
 	kfree(sw);
 
 	/* Only the first request is answered, the halt it starts answers it */
-	if (cmpxchg(&mk_halt_requester, -1, sender_instance_id) != -1)
+	if (xchg(&mk_halt_requested, 1))
 		return;
 
 	mutex_lock(&system_transition_mutex);
@@ -1736,7 +1735,6 @@ static void mk_system_msg_handler(u32 msg_type, u32 subtype,
 
 		INIT_WORK(&sw->work, mk_shutdown_work_fn);
 		sw->flags = req->flags;
-		sw->sender_instance_id = req->sender_instance_id;
 		schedule_work(&sw->work);
 		break;
 	}
