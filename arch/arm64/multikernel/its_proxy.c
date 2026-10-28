@@ -76,10 +76,14 @@ struct mk_msi_work {
 	struct mk_io_msi_payload req;
 };
 
-/* What a MAP resolved about a device, for the MOVEs that follow */
+/*
+ * What a MAP resolved about a device, for the MOVEs that follow. The ITS
+ * holds the device's events under the lease, which they end with.
+ */
 struct mk_msi_route {
 	struct list_head list;
 	struct mk_instance *instance;
+	struct mk_lease *lease;
 	u32 domain;
 	u32 rid;
 	struct irq_domain *msi_domain;
@@ -107,14 +111,14 @@ static void mk_msi_drop_route(void *data)
 
 	scoped_guard(raw_spinlock_irqsave, &mk_msi_routes_lock)
 		list_del(&route->list);
-	its_foreign_unmap(route->instance, route->msi_domain, route->dev_id);
+	its_foreign_unmap(route->lease, route->msi_domain, route->dev_id);
 	mk_instance_put(route->instance);
 	kfree(route);
 }
 
 /*
- * The first MAP of a device in a lease. The doorbell window opens before
- * the ACK, which the instance waits for to program the vector.
+ * At the first MAP of a device in a lease, before the ITS has anything of
+ * it, so that whatever the ITS ends up holding goes with the lease.
  */
 static int mk_msi_add_route(struct mk_instance *instance, struct pci_dev *pdev,
 			    struct mk_lease *lease,
@@ -122,18 +126,12 @@ static int mk_msi_add_route(struct mk_instance *instance, struct pci_dev *pdev,
 			    struct irq_domain *msi_domain, u32 dev_id)
 {
 	struct mk_msi_route *route;
-	int ret;
-
-	ret = mk_lease_allow_msi(lease, req->doorbell);
-	if (ret)
-		goto unmap;
 
 	route = kzalloc_obj(*route);
-	if (!route) {
-		ret = -ENOMEM;
-		goto unmap;
-	}
+	if (!route)
+		return -ENOMEM;
 	route->instance = mk_instance_get(instance);
+	route->lease = lease;
 	route->domain = req->domain;
 	route->rid = req->rid;
 	route->msi_domain = msi_domain;
@@ -143,10 +141,6 @@ static int mk_msi_add_route(struct mk_instance *instance, struct pci_dev *pdev,
 		list_add(&route->list, &mk_msi_routes);
 
 	return devm_add_action_or_reset(&pdev->dev, mk_msi_drop_route, route);
-
-unmap:
-	its_foreign_unmap(instance, msi_domain, dev_id);
-	return ret;
 }
 
 /* Every vector the device has: the instance's driver may use any of them */
@@ -164,7 +158,7 @@ static int mk_msi_map_for(struct mk_instance *instance,
 	struct mk_lease *lease;
 	struct pci_dev *pdev;
 	bool first;
-	int cpu, ret;
+	int cpu, lpi, ret;
 	u32 dev_id;
 
 	if (!mk_cpu_set_contains(instance->cpus, req->phys_cpu))
@@ -192,20 +186,23 @@ static int mk_msi_map_for(struct mk_instance *instance,
 
 	scoped_guard(raw_spinlock_irqsave, &mk_msi_routes_lock)
 		first = !mk_msi_find_route(instance->id, req->domain, req->rid);
-
-	ret = its_foreign_map(instance, msi_domain, dev_id, req->event,
-			      mk_msi_max_vectors(pdev), cpu, &doorbell);
-	if (ret < 0)
-		goto unlock;
-	req->doorbell = doorbell;
-
 	if (first) {
-		int err = mk_msi_add_route(instance, pdev, lease, req,
-					   msi_domain, dev_id);
-
-		if (err)
-			ret = err;
+		ret = mk_msi_add_route(instance, pdev, lease, req, msi_domain,
+				       dev_id);
+		if (ret)
+			goto unlock;
 	}
+
+	lpi = its_foreign_map(lease, msi_domain, dev_id, req->event,
+			      mk_msi_max_vectors(pdev), cpu, &doorbell);
+	if (lpi < 0) {
+		ret = lpi;
+		goto unlock;
+	}
+
+	/* Before the ACK, which the instance waits for to program the vector */
+	ret = mk_lease_allow_msi(lease, doorbell) ?: lpi;
+	req->doorbell = doorbell;
 
 unlock:
 	mk_lease_unlock(lease);
@@ -259,7 +256,7 @@ static void mk_msi_move(const struct mk_io_msi_payload *req)
 	if (cpu < 0 || !mk_cpu_set_contains(route->instance->cpus, req->phys_cpu))
 		ack.result = -EPERM;
 	else
-		ack.result = its_foreign_move(route->instance, route->msi_domain,
+		ack.result = its_foreign_move(route->lease, route->msi_domain,
 					      route->dev_id, req->event, cpu);
 
 	ack.sender_instance_id = mk_self->id;
