@@ -1205,6 +1205,9 @@ __init void e820__reserve_resources_late(void)
 	 * doesn't properly list 'stolen RAM' as a system region
 	 * in the E820 map.
 	 */
+	if (!x86_platform.legacy.reserve_ram_buffers)
+		return;
+
 	for (u32 idx = 0; idx < e820_table->nr_entries; idx++) {
 		struct e820_entry *entry = &e820_table->entries[idx];
 		u64 start, end;

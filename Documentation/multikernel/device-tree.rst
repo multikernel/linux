@@ -80,6 +80,7 @@ back the pool::
         #address-cells = <2>;
         #size-cells = <2>;
         id = <0>;
+        memory-granule = <0x0 0x400000>;
         resources {
             cpus = <0x0 0x1  0x0 0x2  0x0 0x3>;     /* every pool member */
             cpus-available = <0x0 0x2  0x0 0x3>;    /* the free subset */
@@ -91,15 +92,23 @@ back the pool::
             devices { ... };                        /* platform devices only */
         };
         aliases {
-            enp9s0 = "/pci@0/pci@3,0/pci@0,0";
+            enp9s0 = "/pci@0,9/pci@0,0";
         };
-        pci@0 { ... };                              /* see Devices below */
+        pci@0,9 { ... };                            /* see Devices below */
     };
 
 ``cpus`` lists every CPU the pool owns, including CPUs lent to instances;
 ``cpus-available`` lists the free ones. There is one ``memory@<base>`` node
 per pool chunk in the standard memory node form. Free pool PCI devices
 appear under their host bridge.
+
+``memory-granule`` is the unit memory moves into or out of the kernel
+reading the tree in: the base and size of a pool chunk, or of memory added
+to or removed from the kernel at run time, are multiples of it. Every
+kernel's own ``/sys/fs/multikernel/device_tree`` carries it, a spawn
+kernel's included, and an instance tree does not, as it describes another
+kernel. It covers whole MAX_PAGE_ORDER blocks, 4M on x86, as the buddy
+allocator merges free pages across them.
 
 The Instance Tree
 =================
@@ -120,54 +129,55 @@ instance owns. The root is the instance, named by ``model``::
             devices { ... };                        /* platform devices only */
         };
         aliases {
-            enp9s0 = "/pci@0/pci@3,0/pci@0,0";
+            enp9s0 = "/pci@0,9/pci@0,0";
         };
-        pci@0 { ... };
+        pci@0,9 { ... };
     };
 
 Devices
 =======
 
 PCI devices are described where the devicetree PCI bus binding puts them:
-under the bus they sit on. One node per root bus the instance reaches,
-then one node per bridge on the way down, then the device as a leaf::
+under the bus they sit on. Each bus that holds a device of the instance is
+a root bus of its own, with the instance's devices on it as leaves and
+nothing else. The bridges above it are not described: they belong to the
+kernel that writes the tree, which keeps driving them::
 
-    pci@0 {
+    pci@0,9 {                                       /* domain 0, bus 9 */
         compatible = "multikernel,pci-host-bridge";
         device_type = "pci";
         #address-cells = <3>;
         #size-cells = <2>;
         linux,pci-domain = <0>;
-        bus-range = <0x0 0xff>;
-        reg = <0x0 0xb0000000  0x0 0x10000000>;    /* ECAM window, when known */
-        ranges = <0x01000000 0x0 0x0  0x0 0x0  0x0 0xcf8      /* I/O */
-                  0x02000000 0x0 0x80000000  0x0 0x80000000  0x0 0x30000000
-                  ...>;
-        pci@3,0 {                                   /* a bridge on the path */
-            device_type = "pci";
-            #address-cells = <3>;
-            #size-cells = <2>;
-            reg = <0x00001800 0 0 0 0>;             /* bus 0, device 3, fn 0 */
-            bus-range = <0x9 0x9>;
-            pci@0,0 {                               /* the device */
-                reg = <0x00090000 0 0 0 0>;         /* bus 9, device 0, fn 0 */
-                vendor-id = <0x1af4>;
-                device-id = <0x1041>;
-            };
+        bus-range = <0x9 0x9>;
+        reg = <0x0 0xb0900000  0x0 0x100000>;       /* the bus's ECAM, when known */
+        ranges = <0x02000000 0x0 0xfe800000  0x0 0xfe800000  0x0 0x200000
+                  0x43000000 0x0 0xfc800000  0x0 0xfc800000  0x0 0x200000>;
+        pci@0,0 {                                   /* the device */
+            reg = <0x00090000 0 0 0 0>;             /* bus 9, device 0, fn 0 */
+            vendor-id = <0x1af4>;
+            device-id = <0x1041>;
         };
     };
 
-The unit address of a device or bridge is ``device,function`` in hex and
-its ``reg`` encodes bus, device and function in the first cell as the
-binding prescribes, so ``pci_set_of_node()`` finds it by devfn under its
-bus. ``ranges`` uses the standard 7-cell PCI encoding. ``reg`` on a host
-bridge is its ECAM window; a spawn kernel installs it so that any domain
-and extended config space are reachable, and falls back to port ``0xCF8``
-for domain 0 without one.
+Bus, device and function numbers are the real ones, so a device has the
+same address in every kernel. The unit address of a device is
+``device,function`` in hex and its ``reg`` encodes bus, device and function
+in the first cell as the binding prescribes, so ``pci_set_of_node()`` finds
+it by devfn under its bus. ``ranges`` uses the standard 7-cell PCI encoding
+and holds the windows of the bridge above the bus, or of the host bridge
+for a root bus, which cover the BARs of every device on it.
 
-The path down comes from the bus structures of the kernel that writes the
-tree, so a device that has been detached from that kernel is still placed
-correctly.
+A PCI function handed to a running spawn comes with the same description
+of its bus, and the spawn adds the nodes it would have booted with: the
+device under its bus, and the bus as a root bus of its own when the
+spawn has none.
+
+``reg`` is the ECAM window of the bus, as in the generic ECAM host bridge
+binding. A spawn kernel does not use it while the kernel that lent the
+devices is alive: it reaches their config space through that kernel, over
+the message ring, and goes to the window only once it has fenced that
+kernel.
 
 Platform devices stay under ``/resources/devices`` as nodes with
 ``device-type = "platform"`` and ``device-name`` or ``acpi-hid``.
@@ -216,11 +226,11 @@ everything else read the tree through the usual ``of_*`` helpers.
 What a spawn does with its tree:
 
 * creates a PCI root bus per ``multikernel,pci-host-bridge`` node, with
-  the node's bus range, windows and ECAM;
+  the node's bus range and windows, whose config space it asks the host
+  for;
 * probes a PCI slot only when the bus's node has a child at that devfn,
-  which admits the bridges on the path and nothing else on the shared
-  fabric, and registers a platform device only when a
-  ``/resources/devices`` node names it;
+  which admits nothing else on the shared fabric, and registers a
+  platform device only when a ``/resources/devices`` node names it;
 * binds every bus and device to its node, so ``dev->of_node`` is set as on
   any devicetree platform;
 * names network devices from ``/aliases``.

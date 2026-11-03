@@ -1,0 +1,49 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+Multikernel VSOCK receive context
+================================
+
+MK_MSG_NETWORK callbacks run under the raw IPI drain lock. Allocating an skb
+with GFP_ATOMIC or taking an ordinary skb-queue spinlock there can violate
+the lock nesting rules. The callback now validates the message/header lengths
+and copies the complete packet into a preallocated record FIFO under a raw
+lock. It does not retain the shared IPI slot, allocate/free an skb, or enter
+the socket stack. The payload format and stream operations are unchanged.
+
+The FIFO occupies MK_IPI_RING_SIZE * MK_MAX_DATA_SIZE bytes (256 KiB), with a
+two-byte prefix per record. It holds 64 maximum-size packets or more smaller
+packets. Full capacity drops a whole new packet without overwriting older
+records or claiming success. A send accepted by the IPI transport still does
+not guarantee remote socket delivery; overflow or allocation failure can cause
+a connection to time out. This change does not add stream retransmission or
+repair the transport's simplified flow control.
+
+The existing work item is the sole consumer. It peeks the head length under
+the raw lock, allocates in process context, then copies/removes that same head.
+Producers only append; they cannot change it during allocation. Allocation
+failure discards that record and continues. Each invocation consumes at most
+64 records and requeues if needed. The fixed callback and workqueue preserve
+workqueue non-reentrancy, including a receive racing the worker's final empty
+check. No packet-sized kernel stack buffer is introduced.
+
+Initialization creates the queue and registers the transport before publishing
+the message callback; failure unwinds those steps. Exit unregisters/drains the
+callback first, cancels work and destroys the queue, then unregisters the
+transport. No worker can enter the socket stack after transport removal.
+Queued raw bytes own no skb or external reference and need no allocator cleanup.
+
+Run:
+
+  bash tools/testing/selftests/multikernel/vsock_rx_test.sh
+  CC=clang CFLAGS='-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all' \
+    bash tools/testing/selftests/multikernel/vsock_rx_test.sh
+
+The fixture extracts the actual receive/worker/init/exit functions and wire
+header. It checks malformed input, copied data lifetime, FIFO saturation and
+reuse, worker budget, allocation failure, an arrival during allocation and at
+the final empty check, initialization errors, and entered callbacks during
+unregister. FIFO, workqueue, IRQ and socket boundaries are modeled. Native
+qualification must enable CONFIG_VSOCKETS and CONFIG_MULTIKERNEL_VSOCKETS;
+passing lifecycle tests with those options disabled is not VSOCK evidence.
+This fixture does not qualify socket protocol races, full streams, physical
+hardware, peer identity/reuse, or real module unload concurrency.

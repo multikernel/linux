@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include <linux/cpu.h>
 #include <linux/cpumask.h>
 #include <linux/delay.h>
 #include <linux/smp.h>
 #include <linux/string_choices.h>
 
 #include <asm/io_apic.h>
+#include <asm/x86_init.h>
 
 #include "local.h"
 
@@ -24,10 +26,30 @@ __setup("no_ipi_broadcast=", apic_ipi_shorthand);
 static int __init print_ipi_mode(void)
 {
 	pr_info("IPI shorthand broadcast: %s\n",
-		str_disabled_enabled(apic_ipi_shorthand_off));
+		str_disabled_enabled(apic_ipi_shorthand_off ||
+				     x86_platform.legacy.shared_apic_bus));
 	return 0;
 }
 late_initcall(print_ipi_mode);
+
+/*
+ * A CPU departing to another kernel keeps its APIC on our bus, but is
+ * cleared from the present mask only after the takedown has already
+ * re-evaluated the shorthand mode with it still present.
+ */
+static bool apic_bus_shared(void)
+{
+	unsigned int cpu;
+
+	if (x86_platform.legacy.shared_apic_bus)
+		return true;
+
+	for_each_cpu(cpu, &cpus_booted_once_mask) {
+		if (cpu_departing(cpu))
+			return true;
+	}
+	return false;
+}
 
 void apic_smt_update(void)
 {
@@ -36,13 +58,15 @@ void apic_smt_update(void)
 	 * - Disabled on the command line
 	 * - Only a single CPU is online
 	 * - Not all present CPUs have been at least booted once
+	 * - Another kernel owns APICs on the bus
 	 *
-	 * The latter is important as the local APIC might be in some
-	 * random state and a broadcast might cause havoc. That's
-	 * especially true for NMI broadcasting.
+	 * The latter two are important as the local APIC might be in some
+	 * random state, or not ours to interrupt, and a broadcast might
+	 * cause havoc. That's especially true for NMI broadcasting.
 	 */
 	if (apic_ipi_shorthand_off || num_online_cpus() == 1 ||
-	    !cpumask_equal(cpu_present_mask, &cpus_booted_once_mask)) {
+	    !cpumask_equal(cpu_present_mask, &cpus_booted_once_mask) ||
+	    apic_bus_shared()) {
 		static_branch_disable(&apic_use_ipi_shorthand);
 	} else {
 		static_branch_enable(&apic_use_ipi_shorthand);

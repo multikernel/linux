@@ -2234,6 +2234,12 @@ static int memory_blocks_have_altmaps(u64 start, u64 size)
 	return 1;
 }
 
+static int release_system_ram_cb(struct resource *res, void *arg)
+{
+	release_mem_region_adjustable(res->start, resource_size(res));
+	return 0;
+}
+
 static int try_remove_memory(u64 start, u64 size)
 {
 	int rc, nid = NUMA_NO_NODE;
@@ -2278,7 +2284,8 @@ static int try_remove_memory(u64 start, u64 size)
 	if (IS_ENABLED(CONFIG_ARCH_KEEP_MEMBLOCK))
 		memblock_remove(start, size);
 
-	release_mem_region_adjustable(start, size);
+	/* Memory added back in subsections has resources of its own */
+	walk_system_ram_res(start, start + size - 1, NULL, release_system_ram_cb);
 
 	if (nid != NUMA_NO_NODE)
 		try_offline_node(nid);
@@ -2432,4 +2439,292 @@ int offline_and_remove_memory(u64 start, u64 size)
 	return rc;
 }
 EXPORT_SYMBOL_GPL(offline_and_remove_memory);
+
+#ifdef CONFIG_CONTIG_ALLOC
+struct subsection_walk {
+	struct zone *zone;
+	unsigned long nr_blocks;
+};
+
+static int subsection_block_cb(struct memory_block *mem, void *arg)
+{
+	struct subsection_walk *walk = arg;
+
+	if (mem->state != MEM_ONLINE || mem->altmap || mem->group ||
+	    !mem->zone)
+		return -EBUSY;
+	if (walk->nr_blocks++ && mem->zone != walk->zone)
+		return -EBUSY;
+	walk->zone = mem->zone;
+	return 0;
+}
+
+/*
+ * The memory blocks a range of subsections touches must be online in a
+ * single zone, so that the range joins or leaves the zone of its block.
+ */
+static int subsections_walk(u64 start, u64 size, struct subsection_walk *walk)
+{
+	if (!size || !IS_ALIGNED(start | size, MHP_SUBSECTIONS_ALIGN))
+		return -EINVAL;
+	return walk_memory_blocks(start, size, walk, subsection_block_cb);
+}
+
+static unsigned long subsections_nr_blocks(u64 start, u64 size)
+{
+	const u64 block_size = memory_block_size_bytes();
+
+	return (ALIGN(start + size, block_size) - ALIGN_DOWN(start, block_size)) /
+	       block_size;
+}
+
+static unsigned long system_ram_pages(unsigned long start_pfn,
+				      unsigned long nr_pages)
+{
+	unsigned long nr = 0;
+
+	walk_system_ram_range(start_pfn, nr_pages, &nr,
+			      count_system_ram_pages_cb);
+	return nr;
+}
+
+/* A block without any System RAM has nothing for its device to stand for */
+static void remove_empty_block_devices(u64 start, u64 size)
+{
+	const u64 block_size = memory_block_size_bytes();
+	u64 block;
+
+	for (block = ALIGN_DOWN(start, block_size); block < start + size;
+	     block += block_size)
+		if (!system_ram_pages(PFN_DOWN(block), PFN_DOWN(block_size)))
+			remove_memory_block_devices(block, block_size);
+}
+
+/**
+ * offline_and_remove_subsections - remove part of online memory blocks
+ * @start: physical address of the range, MHP_SUBSECTIONS_ALIGN aligned
+ * @size: size of the range, MHP_SUBSECTIONS_ALIGN aligned
+ *
+ * Unlike offline_and_remove_memory(), this does not need whole memory
+ * blocks: the range is allocated out of the buddy, then its memmap,
+ * direct mapping and resource go. A block the range empties goes with
+ * it; any other stays online, and the hole keeps it from being offlined
+ * until add_and_online_subsections() fills it again.
+ *
+ * Memory notifiers are not called, as they assume whole memory blocks:
+ * page_ext, for one, frees the data of whole sections on MEM_OFFLINE.
+ *
+ * Return: 0 on success, or a negative errno if the range is not online
+ * System RAM of a single zone or cannot be allocated.
+ */
+int offline_and_remove_subsections(u64 start, u64 size)
+{
+	const unsigned long start_pfn = PFN_DOWN(start);
+	const unsigned long nr_pages = PFN_DOWN(size);
+	struct subsection_walk walk = {};
+	unsigned long normal_pages = 0;
+	struct pglist_data *pgdat;
+	struct zone *zone;
+	enum zone_type zt;
+	int ret;
+
+	lock_device_hotplug();
+	ret = subsections_walk(start, size, &walk);
+	if (ret)
+		goto out;
+	ret = -EINVAL;
+	if (walk.nr_blocks != subsections_nr_blocks(start, size) ||
+	    system_ram_pages(start_pfn, nr_pages) != nr_pages)
+		goto out;
+	zone = walk.zone;
+	pgdat = zone->zone_pgdat;
+	/* Emptying a node would take tearing the node down as well */
+	ret = -EBUSY;
+	if (nr_pages >= pgdat->node_present_pages)
+		goto out;
+
+	ret = alloc_contig_range(start_pfn, start_pfn + nr_pages,
+				 ACR_FLAGS_NONE, GFP_KERNEL);
+	if (ret)
+		goto out;
+
+	mem_hotplug_begin();
+	adjust_managed_page_count(pfn_to_page(start_pfn), -nr_pages);
+	adjust_present_page_count(pfn_to_page(start_pfn), NULL, -nr_pages);
+	init_per_zone_wmark_min();
+	if (zone_idx(zone) <= ZONE_NORMAL) {
+		for (zt = 0; zt <= ZONE_NORMAL; zt++)
+			normal_pages += pgdat->node_zones[zt].present_pages;
+		if (!normal_pages)
+			node_clear_state(pgdat->node_id, N_NORMAL_MEMORY);
+	}
+	if (!populated_zone(zone)) {
+		zone_pcp_reset(zone);
+		build_all_zonelists(NULL);
+	}
+	writeback_set_ratelimit();
+
+	remove_pfn_range_from_zone(zone, start_pfn, nr_pages);
+	arch_remove_memory(start, size, NULL);
+	/*
+	 * Only now does pfn_to_online_page() see the hole that keeps the zone
+	 * from being contiguous.
+	 */
+	clear_zone_contiguous(zone);
+	set_zone_contiguous(zone);
+	if (IS_ENABLED(CONFIG_ARCH_KEEP_MEMBLOCK))
+		memblock_remove(start, size);
+	walk_system_ram_res(start, start + size - 1, NULL, release_system_ram_cb);
+	remove_empty_block_devices(start, size);
+	mem_hotplug_done();
+out:
+	unlock_device_hotplug();
+	return ret;
+}
+EXPORT_SYMBOL_GPL(offline_and_remove_subsections);
+
+static int add_missing_block_devices(u64 start, u64 size, int nid,
+				     struct zone *zone)
+{
+	const u64 block_size = memory_block_size_bytes();
+	struct memory_block *mem;
+	u64 block;
+	int ret;
+
+	for (block = ALIGN_DOWN(start, block_size); block < start + size;
+	     block += block_size) {
+		mem = find_memory_block(pfn_to_section_nr(PFN_DOWN(block)));
+		if (mem) {
+			put_device(&mem->dev);
+			continue;
+		}
+		ret = create_online_memory_block_device(block, nid, zone);
+		if (ret) {
+			remove_empty_block_devices(start, size);
+			return ret;
+		}
+	}
+	return 0;
+}
+
+static void online_subsections_range(unsigned long pfn, unsigned long end_pfn)
+{
+	const unsigned long start_pfn = pfn;
+	int order;
+
+	while (pfn < end_pfn) {
+		/* Unlike memory blocks, the range need not end on an order boundary */
+		order = min3(MAX_PAGE_ORDER, (int)__ffs(pfn | MAX_ORDER_NR_PAGES),
+			     ilog2(end_pfn - pfn));
+		debug_pagealloc_map_pages(pfn_to_page(pfn), 1 << order);
+		generic_online_page(pfn_to_page(pfn), order);
+		pfn += 1UL << order;
+	}
+	online_mem_sections(start_pfn, end_pfn);
+}
+
+/**
+ * add_and_online_subsections - add memory without whole memory blocks
+ * @nid: node of the memory
+ * @start: physical address of the range, MHP_SUBSECTIONS_ALIGN aligned
+ * @size: size of the range, MHP_SUBSECTIONS_ALIGN aligned
+ * @online_type: MMOP_ONLINE_KERNEL or MMOP_ONLINE_MOVABLE, for a range
+ *		 whose blocks have no memory yet
+ * @resource_name: "System RAM", or the name of driver managed memory
+ *
+ * Adds and onlines a range that may cover memory blocks only in part,
+ * such as one offline_and_remove_subsections() removed. A range in a
+ * block that has memory joins the zone of that block; a block without
+ * memory gets a device, online in the zone @online_type picks, so the
+ * memory hotplug core knows the block and its zone as for boot memory.
+ *
+ * Return: 0 on success, or a negative errno.
+ */
+int add_and_online_subsections(int nid, u64 start, u64 size, int online_type,
+			       const char *resource_name)
+{
+	struct mhp_params params = { .pgprot = pgprot_mhp(PAGE_KERNEL) };
+	enum memblock_flags memblock_flags = MEMBLOCK_NONE;
+	const unsigned long start_pfn = PFN_DOWN(start);
+	const unsigned long nr_pages = PFN_DOWN(size);
+	struct subsection_walk walk = {};
+	struct resource *res;
+	struct zone *zone;
+	unsigned long flags;
+	bool rebuild;
+	int ret;
+
+	lock_device_hotplug();
+	ret = subsections_walk(start, size, &walk);
+	if (ret)
+		goto out;
+	ret = -EINVAL;
+	if (!node_online(nid))
+		goto out;
+	zone = walk.zone ?: zone_for_pfn_range(online_type, nid, NULL,
+					       start_pfn, nr_pages);
+	if (zone_to_nid(zone) != nid)
+		goto out;
+
+	ret = add_missing_block_devices(start, size, nid, zone);
+	if (ret)
+		goto out;
+	res = register_memory_resource(start, size, resource_name);
+	if (IS_ERR(res)) {
+		ret = PTR_ERR(res);
+		goto out_block_devices;
+	}
+
+	mem_hotplug_begin();
+	if (IS_ENABLED(CONFIG_ARCH_KEEP_MEMBLOCK)) {
+		if (res->flags & IORESOURCE_SYSRAM_DRIVER_MANAGED)
+			memblock_flags = MEMBLOCK_DRIVER_MANAGED;
+		ret = memblock_add_node(start, size, nid, memblock_flags);
+		if (ret)
+			goto out_release;
+	}
+	ret = arch_add_memory(nid, start, size, &params);
+	if (ret)
+		goto out_memblock;
+
+	move_pfn_range_to_zone(zone, start_pfn, nr_pages, NULL,
+			       MIGRATE_MOVABLE, true);
+	spin_lock_irqsave(&zone->lock, flags);
+	zone->nr_isolate_pageblock += nr_pages / pageblock_nr_pages;
+	spin_unlock_irqrestore(&zone->lock, flags);
+	rebuild = !populated_zone(zone);
+	if (rebuild)
+		setup_zone_pageset(zone);
+	online_subsections_range(start_pfn, start_pfn + nr_pages);
+	adjust_present_page_count(pfn_to_page(start_pfn), NULL, nr_pages);
+	if (!node_state(nid, N_NORMAL_MEMORY) && zone_idx(zone) <= ZONE_NORMAL)
+		node_set_state(nid, N_NORMAL_MEMORY);
+	if (rebuild)
+		build_all_zonelists(NULL);
+	undo_isolate_page_range(start_pfn, start_pfn + nr_pages);
+	shuffle_zone(zone);
+	init_per_zone_wmark_min();
+	writeback_set_ratelimit();
+	register_memory_blocks_under_node_hotplug(nid, start_pfn,
+						  PFN_UP(start + size - 1));
+	mem_hotplug_done();
+
+	merge_system_ram_resource(res);
+	unlock_device_hotplug();
+	return 0;
+
+out_memblock:
+	if (IS_ENABLED(CONFIG_ARCH_KEEP_MEMBLOCK))
+		memblock_remove(start, size);
+out_release:
+	mem_hotplug_done();
+	release_memory_resource(res);
+out_block_devices:
+	remove_empty_block_devices(start, size);
+out:
+	unlock_device_hotplug();
+	return ret;
+}
+EXPORT_SYMBOL_GPL(add_and_online_subsections);
+#endif /* CONFIG_CONTIG_ALLOC */
 #endif /* CONFIG_MEMORY_HOTREMOVE */

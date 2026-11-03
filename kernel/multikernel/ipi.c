@@ -12,13 +12,17 @@
 #include <linux/kexec.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
+#include <linux/rcupdate.h>
 #include "internal.h"
 
 /* Callback management */
-static struct mk_ipi_handler *mk_handlers;
+static struct mk_ipi_handler __rcu *mk_handlers;
 static raw_spinlock_t mk_handlers_lock = __RAW_SPIN_LOCK_UNLOCKED(mk_handlers_lock);
 
-static void mk_ipi_drain_ring(void);
+static DEFINE_RAW_SPINLOCK(mk_drain_lock);
+static DEFINE_PER_CPU(bool, mk_draining);
+
+static int mk_ipi_drain_ring(void);
 
 /*
  * Ring indices live in memory another kernel instance can write, so every
@@ -28,33 +32,6 @@ static void mk_ipi_drain_ring(void);
 static inline unsigned int mk_ring_idx(unsigned int i)
 {
 	return i & (MK_IPI_RING_SIZE - 1);
-}
-
-/**
- * mk_ipi_ring_drop_pending - Discard everything queued in this kernel's ring
- *
- * Called when an instance is re-spawned. A halting instance parks its CPUs
- * wherever they were, including between claiming a ring slot and publishing
- * it, and the drain stops at such a slot forever. Anything still queued was
- * sent by a kernel that is gone, so drop it all rather than let one
- * abandoned slot wedge the ring.
- */
-void mk_ipi_ring_drop_pending(void)
-{
-	struct mk_ipi_ring *ring;
-	unsigned int head, tail;
-
-	if (!mk_self || !mk_self->ipi_data)
-		return;
-
-	ring = &mk_self->ipi_data->ring;
-	head = mk_ring_idx(atomic_read(&ring->head));
-
-	for (tail = mk_ring_idx(atomic_read(&ring->tail)); tail != head;
-	     tail = mk_ring_idx(tail + 1))
-		ring->entries[tail].data_size = 0;
-
-	atomic_set(&ring->tail, head);
 }
 
 /**
@@ -82,8 +59,10 @@ struct mk_ipi_handler *multikernel_register_handler(mk_ipi_callback_t callback, 
 	handler->ipi_type = ipi_type;
 
 	raw_spin_lock_irqsave(&mk_handlers_lock, flags);
-	handler->next = mk_handlers;
-	mk_handlers = handler;
+	RCU_INIT_POINTER(handler->next,
+			 rcu_dereference_protected(mk_handlers,
+						   lockdep_is_held(&mk_handlers_lock)));
+	rcu_assign_pointer(mk_handlers, handler);
 	raw_spin_unlock_irqrestore(&mk_handlers_lock, flags);
 
 	return handler;
@@ -93,10 +72,15 @@ EXPORT_SYMBOL(multikernel_register_handler);
 /**
  * multikernel_unregister_handler - Unregister a multikernel IPI callback
  * @handler: Handler pointer returned from multikernel_register_handler
+ *
+ * Process context only; no callback-owned locks may be held. Removal excludes
+ * new lookups; the grace period drains old readers and their callbacks before
+ * context release. Old readers may still invoke the callback during the wait.
  */
 void multikernel_unregister_handler(struct mk_ipi_handler *handler)
 {
-	struct mk_ipi_handler **pp, *p;
+	struct mk_ipi_handler __rcu **pp;
+	struct mk_ipi_handler *p;
 	unsigned long flags;
 
 	if (!handler)
@@ -104,39 +88,67 @@ void multikernel_unregister_handler(struct mk_ipi_handler *handler)
 
 	raw_spin_lock_irqsave(&mk_handlers_lock, flags);
 	pp = &mk_handlers;
-	while ((p = *pp) != NULL) {
+	while ((p = rcu_dereference_protected(*pp,
+						 lockdep_is_held(&mk_handlers_lock))) != NULL) {
 		if (p == handler) {
-			*pp = p->next;
+			rcu_assign_pointer(*pp,
+					   rcu_dereference_protected(p->next,
+							 lockdep_is_held(&mk_handlers_lock)));
 			break;
 		}
 		pp = &p->next;
 	}
 	raw_spin_unlock_irqrestore(&mk_handlers_lock, flags);
 
-	kfree(p);
+	if (p) {
+		synchronize_rcu();
+		kfree(p);
+	}
 }
 EXPORT_SYMBOL(multikernel_unregister_handler);
 
-/*
- * An instance's IPI area is allocated when its image is loaded; the
- * instance pointer is filled in lazily on first use.
- */
-static struct mk_shared_data *mk_instance_ipi_area(struct mk_instance *instance)
+void mk_instance_ipi_deactivate(struct mk_instance *instance)
 {
-	struct mk_shared_data *ipi_data;
+	unsigned long flags;
 
-	if (instance->ipi_data)
-		return instance->ipi_data;
+	lockdep_assert_held(&mk_overlay_mutex);
+	/* Acquiring the lock drains every already-entered ring producer. */
+	raw_spin_lock_irqsave(&instance->ipi_lock, flags);
+	instance->ipi_data = NULL;
+	raw_spin_unlock_irqrestore(&instance->ipi_lock, flags);
+}
 
-	if (!instance->kimage || !instance->kimage->mk_ipi)
-		return NULL;
+void mk_instance_ipi_publish(struct mk_instance *instance)
+{
+	unsigned long flags;
 
-	ipi_data = phys_to_virt(instance->kimage->mk_ipi);
-	if (cmpxchg(&instance->ipi_data, NULL, ipi_data) == NULL)
-		pr_info("Initialized IPI ring buffer for instance %d: phys=0x%llx\n",
-			instance->id, (unsigned long long)instance->kimage->mk_ipi);
+	lockdep_assert_held(&mk_overlay_mutex);
+	raw_spin_lock_irqsave(&instance->ipi_lock, flags);
+	instance->ipi_target = mk_cpu_set_first(instance->cpus);
+	instance->ipi_data = phys_to_virt(instance->ipi_phys);
+	raw_spin_unlock_irqrestore(&instance->ipi_lock, flags);
+}
 
-	return instance->ipi_data;
+void mk_instance_ipi_reset(struct mk_instance *instance)
+{
+	lockdep_assert_held(&mk_overlay_mutex);
+	mk_instance_ipi_deactivate(instance);
+	/* No producer can enter while closed; do the large clear with IRQs on. */
+	memset(phys_to_virt(instance->ipi_phys), 0, sizeof(struct mk_shared_data));
+	mk_instance_ipi_publish(instance);
+}
+
+void mk_instance_ipi_retarget(struct mk_instance *instance)
+{
+	unsigned long flags;
+
+	lockdep_assert_held(&mk_overlay_mutex);
+	/* The restored parent has a firmware-described, explicit doorbell CPU. */
+	if (instance == host_instance)
+		return;
+	raw_spin_lock_irqsave(&instance->ipi_lock, flags);
+	instance->ipi_target = mk_cpu_set_first(instance->cpus);
+	raw_spin_unlock_irqrestore(&instance->ipi_lock, flags);
 }
 
 /**
@@ -153,15 +165,21 @@ static struct mk_shared_data *mk_instance_ipi_area(struct mk_instance *instance)
  */
 int mk_arm_force_halt(struct mk_instance *instance)
 {
-	struct mk_shared_data *ipi_data = mk_instance_ipi_area(instance);
+	struct mk_shared_data *ipi_data;
+	unsigned long flags;
+	int ret = -ENODEV;
 
-	if (!ipi_data)
-		return -ENODEV;
+	raw_spin_lock_irqsave(&instance->ipi_lock, flags);
+	ipi_data = instance->ipi_data;
+	if (ipi_data) {
+		WRITE_ONCE(ipi_data->force_halt, 1);
+		/* The marker must be visible before the NMIs that test it. */
+		smp_wmb();
+		ret = 0;
+	}
 
-	WRITE_ONCE(ipi_data->force_halt, 1);
-	/* The marker must be visible before the NMIs that test it */
-	smp_wmb();
-	return 0;
+	raw_spin_unlock_irqrestore(&instance->ipi_lock, flags);
+	return ret;
 }
 
 /**
@@ -178,41 +196,60 @@ int mk_arm_force_halt(struct mk_instance *instance)
  */
 int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, unsigned long type)
 {
-	struct mk_ipi_data *slot;
 	struct mk_instance *instance = mk_instance_find(instance_id);
-	unsigned int head, next_head, tail;
-	mk_phys_cpu_t target;
+	int ret;
 
 	if (!instance)
 		return -EINVAL;
-	if (data_size > MK_MAX_DATA_SIZE) {
-		mk_instance_put(instance);
+
+	ret = multikernel_send_ipi_data_to(instance, data, data_size, type);
+	mk_instance_put(instance);
+	return ret;
+}
+
+/* All producers retain the instance and publish under the same ring lock. */
+static int mk_send_ipi_data(struct mk_instance *instance, const void *data,
+			    size_t data_size, unsigned long type,
+			    const struct mk_message *message)
+{
+	struct mk_shared_data *ipi_data;
+	struct mk_ipi_data *slot;
+	int instance_id = instance->id;
+	unsigned int head, next_head, tail;
+	mk_phys_cpu_t target;
+	unsigned long flags;
+	size_t header_size = message ? sizeof(*message) : 0;
+	size_t offset = 0;
+	int ret;
+
+	if (data_size > MK_MAX_DATA_SIZE - header_size)
 		return -EINVAL;
-	}
 
+	raw_spin_lock_irqsave(&instance->ipi_lock, flags);
 	target = instance->ipi_target;
-	if (target == MK_PHYS_CPU_INVALID)
-		target = mk_cpu_set_first(instance->cpus);
 	if (target == MK_PHYS_CPU_INVALID) {
-		pr_err("Instance %d has no CPU to receive the IPI\n", instance_id);
-		mk_instance_put(instance);
-		return -ENODEV;
+		ret = -ENODEV;
+		goto unlock;
 	}
 
-	if (!mk_instance_ipi_area(instance)) {
-		pr_err("Multikernel IPI buffer not available for instance %d\n", instance_id);
-		mk_instance_put(instance);
-		return -ENODEV;
+	/* The ring lives as long as the instance, which is pinned here */
+	ipi_data = READ_ONCE(instance->ipi_data);
+	if (!ipi_data) {
+		ret = -ENODEV;
+		goto unlock;
 	}
 
 	/* Try to enqueue the message in the ring buffer */
 	do {
-		head = mk_ring_idx(atomic_read(&instance->ipi_data->ring.head));
+		head = mk_ring_idx(atomic_read(&ipi_data->ring.head));
 		next_head = mk_ring_idx(head + 1);
-		tail = mk_ring_idx(atomic_read(&instance->ipi_data->ring.tail));
+		/* Pair with the consumer's release of cleared slot capacity. */
+		tail = mk_ring_idx(atomic_read_acquire(&ipi_data->ring.tail));
 
 		/* Check if ring buffer is full */
 		if (next_head == tail) {
+			ret = -ENOSPC;
+			raw_spin_unlock_irqrestore(&instance->ipi_lock, flags);
 			/*
 			 * Console output reaches this path, so a plain printk
 			 * here re-enters the console write that called us and
@@ -221,53 +258,89 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 			printk_deferred(KERN_WARNING
 					"multikernel: IPI ring full for instance %d (head=%u, tail=%u)\n",
 					instance_id, head, tail);
-			mk_instance_put(instance);
 			return -ENOSPC;
 		}
 
 		/* Try to claim this slot atomically */
-	} while (atomic_cmpxchg(&instance->ipi_data->ring.head, head, next_head) != head);
+	} while (atomic_cmpxchg(&ipi_data->ring.head, head, next_head) != head);
 
 	/* We've claimed slot 'head', now fill it */
-	slot = &instance->ipi_data->ring.entries[head];
+	slot = &ipi_data->ring.entries[head];
 
 	slot->sender_cpu = arch_cpu_physical_id(smp_processor_id());
 	slot->type = type;
 
+	if (message) {
+		/* The flexible payload can start before sizeof(*message). */
+		offset = offsetof(struct mk_message, payload);
+		memset(slot->buffer, 0, header_size + data_size);
+		memcpy(slot->buffer, message, offset);
+	}
 	if (data && data_size > 0)
-		memcpy(slot->buffer, data, data_size);
+		memcpy(slot->buffer + offset, data, data_size);
 
 	/*
 	 * data_size publishes the slot: the reader treats a zero as "the
 	 * producer has claimed this slot but has not filled it yet" and
 	 * waits. Claiming the slot advanced head, so a reader can already
-	 * be looking at it; everything above must be visible first.
+	 * be looking at it; the header and payload must be visible first.
 	 */
-	smp_store_release(&slot->data_size, data_size);
+	smp_store_release(&slot->data_size, header_size + data_size);
+	raw_spin_unlock_irqrestore(&instance->ipi_lock, flags);
 
 	mk_arch_send_ipi(target);
-
-	mk_instance_put(instance);
 	return 0;
+
+unlock:
+	raw_spin_unlock_irqrestore(&instance->ipi_lock, flags);
+	return ret;
 }
 
-static void mk_ipi_drain_ring(void)
+/*
+ * The same for a caller that already holds a reference to @instance.
+ * Both send routes serialize against ring reset without sleeping.
+ */
+int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
+				 size_t data_size, unsigned long type)
+{
+	return mk_send_ipi_data(instance, data, data_size, type, NULL);
+}
+
+int mk_send_message_ipi(int instance_id, struct mk_instance *instance,
+			const struct mk_message *message, const void *payload)
+{
+	bool lookup = !instance;
+	int ret;
+
+	if (lookup)
+		instance = mk_instance_find(instance_id);
+	if (!instance)
+		return -EINVAL;
+
+	ret = mk_send_ipi_data(instance, payload, message->payload_len,
+			      message->msg_type, message);
+	if (lookup)
+		mk_instance_put(instance);
+	return ret;
+}
+
+static int mk_ipi_drain_ring(void)
 {
 	struct mk_ipi_data *slot;
 	struct mk_ipi_handler *handler;
 	unsigned int head, tail, next_tail;
 	size_t data_size;
-	int messages_processed = 0;
 
 	if (!mk_self || !mk_self->ipi_data)
-		return;
+		return 0;
 
+	/* New peer traffic must not extend this bounded retirement snapshot. */
+	head = mk_ring_idx(atomic_read(&mk_self->ipi_data->ring.head));
 	while (1) {
 		tail = mk_ring_idx(atomic_read(&mk_self->ipi_data->ring.tail));
-		head = mk_ring_idx(atomic_read(&mk_self->ipi_data->ring.head));
 
 		if (tail == head)
-			break;
+			return 0;
 
 		slot = &mk_self->ipi_data->ring.entries[tail];
 
@@ -278,46 +351,45 @@ static void mk_ipi_drain_ring(void)
 		 * drop the message it is about to publish. Its own IPI, or
 		 * the next one, brings us back here.
 		 *
-		 * A sender stopped before publishing leaves its slot zero
-		 * forever; mk_ipi_ring_drop_pending() clears those out when
-		 * the instance is re-spawned.
+		 * A stopped sender may leave its slot zero permanently. Without
+		 * per-slot ownership or a quiescence protocol, respawning one peer
+		 * cannot safely clear this shared receive ring: other peers may
+		 * still publish or this receiver may advance tail concurrently.
+		 * Retain the slot rather than fabricate reusable capacity.
 		 */
 		data_size = smp_load_acquire(&slot->data_size);
 		if (data_size == 0)
-			break;
+			return -EBUSY;
 
 		if (data_size > MK_MAX_DATA_SIZE) {
 			pr_warn_once("Multikernel IPI slot %u has bad size %zu\n",
 				     tail, data_size);
 			slot->data_size = 0;
 			next_tail = mk_ring_idx(tail + 1);
-			atomic_set(&mk_self->ipi_data->ring.tail, next_tail);
+			/* Do not let a producer reuse the slot before its clear. */
+			atomic_set_release(&mk_self->ipi_data->ring.tail, next_tail);
 			continue;
 		}
 
 		/* Dispatch to registered handler */
-		raw_spin_lock(&mk_handlers_lock);
-		for (handler = mk_handlers; handler; handler = handler->next) {
+		rcu_read_lock();
+		for (handler = rcu_dereference(mk_handlers); handler;
+		     handler = rcu_dereference(handler->next)) {
 			if (handler->ipi_type == slot->type && handler->callback) {
 				mk_ipi_callback_t cb = handler->callback;
 				void *ctx = handler->context;
 
-				raw_spin_unlock(&mk_handlers_lock);
 				cb(slot, ctx);
-				goto advance_tail;
+				break;
 			}
 		}
-		raw_spin_unlock(&mk_handlers_lock);
+		rcu_read_unlock();
 
-advance_tail:
 		/* Mark consumed so the slot reads as unpublished again */
 		slot->data_size = 0;
 		next_tail = mk_ring_idx(tail + 1);
-		atomic_set(&mk_self->ipi_data->ring.tail, next_tail);
-		messages_processed++;
-
-		if (messages_processed >= MK_IPI_RING_SIZE)
-			break;
+		/* Pair with producers' acquire: clear precedes all future reuse. */
+		atomic_set_release(&mk_self->ipi_data->ring.tail, next_tail);
 	}
 }
 
@@ -327,10 +399,15 @@ advance_tail:
  * This function is called when a multikernel IPI is received.
  * Messages are drained here, in interrupt context.
  */
-static void multikernel_interrupt_handler(void)
+static int multikernel_interrupt_handler(void)
 {
+	unsigned long flags;
+	int ret;
+
 	if (!mk_self || !mk_self->ipi_data)
-		return;
+		return 0;
+	if (mk_ipi_in_drain())
+		return -EBUSY;
 
 	/*
 	 * Drain here rather than from irq_work. We are already in interrupt
@@ -339,8 +416,50 @@ static void multikernel_interrupt_handler(void)
 	 * instance, so if it is ever left pending - its self-IPI lost while
 	 * the CPU was bringing its APIC up, say - every later queue attempt
 	 * is a no-op and the ring never drains again.
+	 *
+	 * The ring has one consumer at a time. That used to be implied by
+	 * the doorbell going to a single CPU; mk_ipi_poll() is a second way
+	 * in, so it is a lock now. Waiting for it rather than giving up
+	 * matters: a poller that is just leaving may not look again.
 	 */
-	mk_ipi_drain_ring();
+	raw_spin_lock_irqsave(&mk_drain_lock, flags);
+	this_cpu_write(mk_draining, true);
+	ret = mk_ipi_drain_ring();
+	this_cpu_write(mk_draining, false);
+	raw_spin_unlock_irqrestore(&mk_drain_lock, flags);
+	return ret;
+}
+
+/**
+ * mk_ipi_in_drain - Whether this CPU is running a message handler
+ *
+ * A handler that polled the ring for an answer would wait for the drain
+ * lock it already holds.
+ */
+bool mk_ipi_in_drain(void)
+{
+	return this_cpu_read(mk_draining);
+}
+
+/**
+ * mk_ipi_poll - Drain the message ring without waiting for the doorbell
+ *
+ * For a caller that waits for an answer where the doorbell interrupt
+ * cannot be taken: with interrupts off on the doorbell CPU, or while
+ * stop_machine() holds every CPU. Message handlers run in the caller's
+ * context, which they are fit for, as they normally run in the interrupt.
+ *
+ * After stopping a peer's CPUs, a successful snapshot drain also ensures its
+ * old requests have reached their handlers before that peer's grants are reused.
+ * Deferred handlers must separately pin identity and reject revoked work.
+ *
+ * Returns 0 if the captured prefix was consumed, -EBUSY if an unpublished slot
+ * blocked it or the caller is already dispatching a message. Other peers may
+ * still be writing; success is not global ring quiescence.
+ */
+int mk_ipi_poll(void)
+{
+	return multikernel_interrupt_handler();
 }
 
 /**
@@ -381,5 +500,17 @@ bool mk_has_pending_shutdown(void)
 	if (!mk_self->ipi_data)
 		return mk_manifest_phys() != 0;
 
-	return READ_ONCE(mk_self->ipi_data->force_halt);
+	return mk_force_halt_armed();
+}
+
+/**
+ * mk_force_halt_armed - Check the force-halt marker alone
+ *
+ * Unlike mk_has_pending_shutdown(), never true for a kernel without a
+ * ring, so it can be tested on NMIs that a local source may own.
+ */
+bool mk_force_halt_armed(void)
+{
+	return mk_self && mk_self->ipi_data &&
+	       READ_ONCE(mk_self->ipi_data->force_halt);
 }

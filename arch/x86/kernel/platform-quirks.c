@@ -136,6 +136,17 @@ static void __init multikernel_parse_smp_config(void)
 	 */
 	apic_update_callback(wakeup_secondary_cpu_64, multikernel_wakeup_cpu);
 }
+
+/*
+ * The BIOS areas an MP table would be found in are the host's, and so are
+ * the ACPI tables. ACPI is disabled again here, the last platform hook
+ * before the ACPI tables are looked up, because acpi=force on the command
+ * line has undone the quirk by now.
+ */
+static void __init multikernel_find_mptable(void)
+{
+	disable_acpi();
+}
 #else
 static inline void multikernel_setup_calibration(void)
 {
@@ -151,6 +162,7 @@ void __init x86_early_init_platform_quirks(void)
 	x86_platform.legacy.rtc = 1;
 	x86_platform.legacy.warm_reset = 1;
 	x86_platform.legacy.reserve_bios_regions = 0;
+	x86_platform.legacy.reserve_ram_buffers = 1;
 	x86_platform.legacy.map_isa_ram = 0;
 	x86_platform.legacy.devices.pnpbios = 1;
 
@@ -176,6 +188,13 @@ void __init x86_early_init_platform_quirks(void)
 		x86_platform.legacy.rtc = 0;
 		x86_platform.legacy.warm_reset = 0;
 		x86_platform.legacy.no_bsp_restriction = 1;
+		x86_platform.legacy.shared_apic_bus = 1;
+		/*
+		 * The host builds the map from the memory it granted, and
+		 * what lies past each region is RAM that may be moved into
+		 * this kernel later.
+		 */
+		x86_platform.legacy.reserve_ram_buffers = 0;
 		/*
 		 * Set smp_found_config early to prevent acpi_mps_check() from
 		 * disabling the APIC when ACPI is disabled but MPPARSE is not
@@ -193,9 +212,18 @@ void __init x86_early_init_platform_quirks(void)
 		 */
 		x86_init.paging.pagetable_init = multikernel_pagetable_init;
 #endif
+		x86_init.mpparse.find_mptable = multikernel_find_mptable;
 		x86_init.mpparse.parse_smp_cfg = multikernel_parse_smp_config;
 #ifdef CONFIG_PCI
 		x86_init.pci.init = pci_multikernel_init;
+		x86_init.pci.arch_init = pci_multikernel_arch_init;
+		/*
+		 * Config space is reached through the kernel that lent the
+		 * devices. The 0xCF8 ports, ECAM and the PCI BIOS are the
+		 * host's: no early quirk or probe of ours may touch them.
+		 */
+		pci_probe &= ~(PCI_PROBE_BIOS | PCI_PROBE_CONF1 |
+			       PCI_PROBE_CONF2 | PCI_PROBE_MMCONF);
 #endif
 #endif
 		x86_init.mpparse.early_parse_smp_cfg = x86_init_noop;

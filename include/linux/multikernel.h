@@ -16,6 +16,8 @@
 #include <linux/mutex.h>
 #include <linux/numa.h>
 #include <linux/sizes.h>
+#include <linux/spinlock.h>
+#include <linux/workqueue.h>
 
 #ifdef CONFIG_MULTIKERNEL
 #include <asm/multikernel.h>
@@ -140,7 +142,7 @@ struct mk_ipi_handler {
 	mk_ipi_callback_t callback;
 	void *context;
 	unsigned int ipi_type;       /* IPI type this handler is registered for */
-	struct mk_ipi_handler *next;
+	struct mk_ipi_handler __rcu *next;
 };
 
 /**
@@ -156,6 +158,11 @@ struct mk_ipi_handler *multikernel_register_handler(mk_ipi_callback_t callback, 
 /**
  * multikernel_unregister_handler - Unregister a multikernel IPI callback
  * @handler: Handler pointer returned from multikernel_register_handler
+ *
+ * Sleeps until entered callbacks have returned. Call from process context,
+ * never from an IPI callback, and do not hold locks needed by callbacks.
+ * After return, the caller may release the callback context. The caller must
+ * serialize unregister calls for a given handler.
  */
 void multikernel_unregister_handler(struct mk_ipi_handler *handler);
 
@@ -175,8 +182,15 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 
 void generic_multikernel_interrupt(void);
 
+/* Drain one inbox snapshot; -EBUSY for an unpublished slot or callback reentry. */
+int mk_ipi_poll(void);
+bool mk_ipi_in_drain(void);
+
+struct mk_instance;
+int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
+				 size_t data_size, unsigned long type);
+
 /* Discard everything queued in this kernel's ring (instance re-spawn) */
-void mk_ipi_ring_drop_pending(void);
 
 /*
  * Multikernel Messaging System
@@ -192,6 +206,7 @@ void mk_ipi_ring_drop_pending(void);
 #define MK_MSG_SYSTEM       0x3000
 #define MK_MSG_USER         0x4000
 #define MK_MSG_NETWORK      0x5000
+#define MK_MSG_PCI          0x6000
 
 /* I/O interrupt forwarding subtypes */
 #define MK_IO_IRQ_FORWARD   (MK_MSG_IO + 1)
@@ -218,6 +233,11 @@ void mk_ipi_ring_drop_pending(void);
 /* Network/vsock subtypes */
 #define MK_NET_VSOCK_PKT    (MK_MSG_NETWORK + 1)  /* vsock packet */
 #define MK_NET_DATA_READY   (MK_MSG_NETWORK + 2)  /* Data available notification */
+
+/* PCI config space of a lent function, served by the kernel that lent it */
+#define MK_PCI_CFG_READ     (MK_MSG_PCI + 1)
+#define MK_PCI_CFG_WRITE    (MK_MSG_PCI + 2)
+#define MK_PCI_CFG_ACK      (MK_MSG_PCI + 3)  /* Answer to either */
 
 /**
  * Core message structure
@@ -276,6 +296,17 @@ struct mk_mem_resource_payload {
 #define MK_MEM_DMA32            0x04
 #define MK_MEM_HIGHMEM          0x08
 
+/*
+ * A PCI bus as a root bus of another kernel: its windows as the cells of
+ * a devicetree "ranges" property, and the base of its 1MB ECAM window.
+ */
+#define MK_PCI_BUS_MAX_WINDOWS	16
+struct mk_pci_bus_desc {
+	u64 ecam;               /* 0 if none */
+	u32 nr_ranges;          /* Cells used in ranges */
+	__be32 ranges[MK_PCI_BUS_MAX_WINDOWS * 7];
+};
+
 /* PCI device resource operations */
 struct mk_device_resource_payload {
 	u16 domain;             /* PCI domain */
@@ -284,6 +315,10 @@ struct mk_device_resource_payload {
 	u32 flags;              /* Device flags */
 	char driver_override[64]; /* Target driver name for binding */
 	int sender_instance_id; /* Sender instance ID for ACK */
+	/* Device add to a running instance, which may lack the function and its bus */
+	u16 vendor;
+	u16 device;
+	struct mk_pci_bus_desc bus_desc;
 };
 
 /* Device flags */
@@ -297,6 +332,19 @@ struct mk_resource_ack {
 	u64 resource_id;        /* Physical CPU ID, memory PFN, etc. */
 };
 
+/* PCI config space access, request and answer */
+struct mk_pci_cfg_payload {
+	u64 seq;                /* From mk_request_seq(), echoed in the answer */
+	int sender_instance_id;
+	u16 domain;
+	u8 bus;
+	u8 devfn;
+	u16 where;              /* Offset in config space */
+	u8 size;                /* 1, 2 or 4 bytes */
+	u32 val;                /* Value written, or read in the answer */
+	int result;             /* Answer: PCIBIOS_* */
+};
+
 /* Shutdown request payload */
 struct mk_shutdown_payload {
 	u32 flags;
@@ -308,7 +356,7 @@ struct mk_shutdown_payload {
 /**
  * Message handler callback type
  */
-typedef void (*mk_msg_handler_t)(u32 msg_type, u32 subtype,
+typedef void (*mk_msg_handler_t)(u32 msg_type, u32 subtype, u64 msg_id,
 				 void *payload, u32 payload_len, void *ctx);
 
 /* Opaque type for pending message tracking */
@@ -330,6 +378,29 @@ struct mk_pending_msg;
  */
 int mk_send_message(int instance_id, u32 msg_type, u32 subtype,
 		    void *payload, u32 payload_len);
+int mk_send_message_id(int instance_id, u32 msg_type, u32 subtype, u64 msg_id,
+		       void *payload, u32 payload_len);
+
+/*
+ * The same for a caller that holds a reference to @instance. Looking an
+ * instance up by ID sleeps; this does not, so it is the one to use with
+ * interrupts off.
+ */
+struct mk_instance;
+int mk_send_message_to(struct mk_instance *instance, u32 msg_type, u32 subtype,
+		       void *payload, u32 payload_len);
+
+/*
+ * A request that waits for its answer by polling the ring, so it works
+ * with interrupts off. The caller puts @seq, from mk_request_seq(), in
+ * its payload; the handler of the answer gives it back to
+ * mk_request_answer(), which copies the answer in and ends the wait.
+ */
+u64 mk_request_seq(void);
+int mk_request_sync(struct mk_instance *to, u32 msg_type, u32 subtype, u64 seq,
+		    void *payload, u32 payload_len, void *answer, u32 answer_len,
+		    unsigned int timeout_us);
+void mk_request_answer(u64 seq, const void *answer, u32 answer_len);
 
 /**
  * mk_register_msg_handler - Register handler for specific message type
@@ -350,9 +421,16 @@ int mk_register_msg_handler(u32 msg_type, mk_msg_handler_t handler, void *ctx);
  */
 int mk_unregister_msg_handler(u32 msg_type, mk_msg_handler_t handler);
 
-/* Pending message tracking for request-response pattern */
+/*
+ * Pending requests: add returns ERR_PTR on failure. The requester owns the
+ * pointer until exactly one wait or cancel; neither may run concurrently on
+ * the same pointer. IDs are unique only within this kernel's lifetime.
+ */
 struct mk_pending_msg *mk_msg_pending_add(u32 msg_type, u32 operation, u64 resource_id);
-void mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id, int result);
+u64 mk_msg_pending_id(const struct mk_pending_msg *pending);
+void mk_msg_pending_cancel(struct mk_pending_msg *pending);
+void mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id,
+			     u64 msg_id, int result);
 int mk_msg_pending_wait(struct mk_pending_msg *pending, unsigned long timeout_ms);
 
 /**
@@ -373,7 +451,8 @@ static inline int mk_send_irq_forward(int instance_id, u32 irq_number,
 			       &payload, sizeof(payload));
 }
 
-/* CPU resource management - these wait for operation to complete */
+/* Controller resource senders below require mk_overlay_mutex across the wait. */
+/* CPU resource management */
 int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags);
 int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id);
 
@@ -401,9 +480,8 @@ void mk_messaging_cleanup(void);
  */
 struct mk_pool_chunk {
 	struct list_head list;
-	struct page *pages;
-	unsigned long nr_pages;
 	int node;
+	bool movable;			/* taken from ZONE_MOVABLE */
 	struct resource res;
 };
 
@@ -416,6 +494,13 @@ struct mk_pool_chunk {
  */
 struct mk_pool {
 	struct mk_cpu_set *cpus;	/* Parked CPUs free to assign */
+	/*
+	 * Stabilizes cpus storage and membership against CPUHP wake readers.
+	 * Writers are serialized by mk_overlay_mutex, but CPUHP does not take
+	 * it. Nests inside park_lock and mk_instance_mutex; never hold across
+	 * CPU hotplug, park/repark calls or ACK waits (wake takes it again).
+	 */
+	struct mutex cpus_lock;
 	struct list_head chunks;	/* Donated memory (struct mk_pool_chunk) */
 	struct gen_pool *node_pools[MAX_NUMNODES];
 	struct mutex mem_lock;		/* Protects chunks and node_pools */
@@ -438,6 +523,11 @@ extern struct mk_pool *mk_pool;
 
 int mk_pool_mem_grow(size_t size, int node, phys_addr_t *out_base);
 int mk_pool_mem_shrink(phys_addr_t start, size_t size);
+/* Caller owns the range. Map failure adds no mappings; unmap failure retains them. */
+int mk_pool_map(phys_addr_t start, size_t size);
+int mk_pool_unmap(phys_addr_t start, size_t size);
+int mk_arch_pool_map(phys_addr_t start, size_t size);
+int mk_arch_pool_unmap(phys_addr_t start, size_t size);
 extern phys_addr_t multikernel_alloc(size_t size, int node);
 extern void multikernel_free(phys_addr_t addr, size_t size);
 struct resource *mk_pool_chunk_resource(phys_addr_t addr);
@@ -550,8 +640,7 @@ extern struct mk_instance *host_instance;
  * Used by instance management to track both resource hierarchy and pool chunks.
  */
 struct mk_memory_region {
-	struct resource res;            /* The actual resource */
-	struct gen_pool_chunk *chunk;   /* Associated gen_pool chunk */
+	struct resource res;            /* The actual resource, one instance pool chunk */
 	struct list_head list;          /* List entry for management */
 };
 
@@ -644,6 +733,9 @@ struct mk_instance {
 	int id;                         /* Kernel-assigned instance ID */
 	char *name;                     /* User-provided instance name */
 	enum mk_instance_state state;   /* Current state */
+	/* Protected by mk_overlay_mutex; a failed remote rollback pins grants. */
+	bool resource_uncertain;
+	raw_spinlock_t ipi_lock;         /* Ring writers versus reset/publication */
 
 	/* Resource management - list of reserved memory regions */
 	struct list_head memory_regions;  /* List of struct mk_memory_region */
@@ -665,10 +757,20 @@ struct mk_instance {
 	int platform_device_count;           /* Number of platform devices */
 	bool platform_devices_valid;         /* Whether platform device list is valid */
 
-	/* IPI communication buffer */
+	/*
+	 * IPI communication buffer. ipi_data is set only while the ring can
+	 * be addressed: always for this kernel's own records, and on the host
+	 * while an image is loaded for the instance.
+	 */
 	struct mk_shared_data *ipi_data; /* IPI shared memory buffer (virtual address) */
 	phys_addr_t ipi_phys;           /* IPI buffer physical address */
 	u32 ipi_pages;                  /* IPI buffer size in pages */
+	/*
+	 * Host side only: the page the instance's boot tree is written to at
+	 * each exec. It and the IPI ring are allocated on the first load and
+	 * freed with the instance; a zero here means the host owns neither.
+	 */
+	phys_addr_t manifest_phys;
 	/*
 	 * On a spawn's record of its host: the physical address of the
 	 * host's pool wake slot, where the host's CPUs park. A backup
@@ -700,9 +802,10 @@ struct mk_instance {
 	size_t ctrl_used;
 
 	/*
-	 * CPUs parked inside this instance's memory (its arch park area)
-	 * rather than in the host pool. They must be confirmed parked before
-	 * the image is rewritten and they pin the pool until they leave.
+	 * CPUs that may use this instance's memory (its kernel or arch park
+	 * area), including handoffs whose wake acknowledgment timed out.
+	 * They must be confirmed parked before the image is rewritten and
+	 * they pin the pool until they leave.
 	 * Membership is per CPU because it changes one CPU at a time:
 	 * hotplug moves CPUs in and out while the instance runs, and a
 	 * stopped instance can gain CPUs that still sit in the host pool.
@@ -731,6 +834,9 @@ struct mk_instance {
 
 	/* Reference counting */
 	struct kref refcount;           /* Reference count for cleanup */
+	struct work_struct release_work; /* Last reference may be put from an IPI */
+	struct work_struct halted_work; /* Holds a reference while settling a notice */
+	atomic_t halted_pending;       /* Excludes restart until the notice retires */
 };
 
 /**
@@ -846,14 +952,29 @@ struct mk_instance *mk_instance_find_by_name(const char *name);
  * Returns the instance pointer for convenience.
  */
 struct mk_instance *mk_instance_get(struct mk_instance *instance);
+int mk_instance_alloc_boot_pages(struct mk_instance *instance);
+#ifdef CONFIG_MULTIKERNEL
+void mk_instance_ipi_publish(struct mk_instance *instance);
+void mk_instance_ipi_deactivate(struct mk_instance *instance);
+void mk_instance_ipi_reset(struct mk_instance *instance);
+void mk_instance_ipi_retarget(struct mk_instance *instance);
+#else
+static inline void mk_instance_ipi_publish(struct mk_instance *instance) { }
+static inline void mk_instance_ipi_deactivate(struct mk_instance *instance) { }
+static inline void mk_instance_ipi_reset(struct mk_instance *instance) { }
+static inline void mk_instance_ipi_retarget(struct mk_instance *instance) { }
+#endif
 
 /**
  * mk_halt_to_pool() - Halt this spawn kernel, returning its CPUs to the pool
+ * @notify: Caller has excluded new resource operations through final parking
  *
- * Notifies the host and parks every CPU in the pool wait loop, keeping
- * the instance re-spawnable. Never returns.
+ * Parks every CPU in the pool wait loop. Only a qualified caller may notify
+ * the host that the instance can be considered for reuse after stop proof.
+ * Unqualified exits must pass false and leave the host retaining resources.
+ * Never returns.
  */
-void __noreturn mk_halt_to_pool(void);
+void __noreturn mk_halt_to_pool(bool notify);
 
 /**
  * mk_instance_reserve_resources() - Reserve CPU and memory resources for instance
@@ -874,18 +995,25 @@ int mk_instance_reserve_resources(struct mk_instance *instance,
  *
  * Returns all reserved memory regions back to the multikernel pool
  * and removes them from the resource hierarchy.
+ * Return: 0 on success, or an error with memory and metadata retained.
  */
-void mk_instance_free_memory(struct mk_instance *instance);
+int mk_instance_free_memory(struct mk_instance *instance);
 
 
 int mk_instance_transfer_cpus(struct mk_instance *instance,
 			       const struct mk_cpu_set *cpus);
 int mk_instance_return_cpus(struct mk_instance *instance,
 			     const struct mk_cpu_set *cpus);
-int mk_instance_add_memory_region(struct mk_instance *instance, size_t size,
-				  int node);
+int mk_instance_add_memory_region(struct mk_instance *instance,
+				  phys_addr_t phys_addr, size_t size);
 int mk_instance_remove_memory_region(struct mk_instance *instance,
 				     phys_addr_t phys_addr, size_t size);
+int mk_instance_begin_memory_removal(struct mk_instance *instance,
+				     phys_addr_t phys_addr, size_t size);
+void mk_instance_abort_memory_removal(struct mk_instance *instance,
+				      phys_addr_t phys_addr, size_t size);
+void mk_instance_finish_memory_removal(struct mk_instance *instance,
+				       phys_addr_t phys_addr, size_t size);
 int mk_instance_add_pci_device(struct mk_instance *instance,
 			       u16 domain, u8 bus, u8 devfn);
 int mk_instance_remove_pci_device(struct mk_instance *instance,
@@ -907,13 +1035,9 @@ enum mk_instance_state mk_string_to_state(const char *str);
  * and the kexec multikernel system.
  */
 
-/**
- * mk_instance_set_kexec_active() - Mark instance as active for kexec
- * @mk_id: Multikernel ID from kexec system
- *
- * Returns 0 on success, negative error code on failure.
- */
-int mk_instance_set_kexec_active(int mk_id);
+struct kimage;
+int mk_instance_start(struct mk_instance *instance, struct kimage *image,
+		      int cpu);
 
 /*
  * The declarations below are referenced from always-built code (kexec,
@@ -925,10 +1049,18 @@ struct pci_bus;
 struct pci_dev;
 
 #ifdef CONFIG_MULTIKERNEL
+/*
+ * Serializes controller resource changes with MK image load, exec and cleanup.
+ * Process context only. Lock order: kexec_lock -> mk_overlay_mutex ->
+ * mk_instance_mutex. Do not wait for remote work under mk_instance_mutex.
+ */
+extern struct mutex mk_overlay_mutex;
+
 bool multikernel_allow_emergency_restart(void);
 int multikernel_halt_by_id(int mk_id);
 int multikernel_force_halt_by_id(int mk_id);
 bool mk_has_pending_shutdown(void);
+bool mk_force_halt_armed(void);
 bool mk_crash_notes_wanted(void);
 
 /* Instance lookup and reference counting */
@@ -936,6 +1068,79 @@ struct mk_instance *mk_instance_find(int mk_id);
 void mk_instance_put(struct mk_instance *instance);
 void mk_instance_set_state(struct mk_instance *instance,
 			   enum mk_instance_state state);
+
+/* The PCI root buses of a spawn kernel's tree */
+#define MK_PCI_HOST_BRIDGE	"multikernel,pci-host-bridge"
+
+/* PCI buses of a spawn kernel, config space reached through its host */
+struct pci_host_bridge;
+int mk_arch_pcifront_prepare(struct pci_host_bridge *bridge, int domain);
+#if defined(CONFIG_PCI) && defined(CONFIG_OF)
+int mk_pcifront_init(void);
+int mk_pcifront_config(unsigned int domain, unsigned int bus,
+		       unsigned int devfn, int where, int size, u32 *val,
+		       bool write);
+u64 mk_pcifront_ecam(unsigned int domain, unsigned int bus);
+void mk_pcifront_host_fenced(void);
+int mk_pcifront_add_function(u16 domain, u8 bus, u8 devfn, u16 vendor,
+			     u16 device, const struct mk_pci_bus_desc *desc);
+int mk_pcifront_adopt_function(u16 domain, u8 bus, u8 devfn);
+#else
+static inline int mk_pcifront_init(void)
+{
+	return 0;
+}
+static inline int mk_pcifront_config(unsigned int domain, unsigned int bus,
+				     unsigned int devfn, int where, int size,
+				     u32 *val, bool write)
+{
+	return -ENODEV;
+}
+static inline u64 mk_pcifront_ecam(unsigned int domain, unsigned int bus)
+{
+	return 0;
+}
+static inline int mk_pcifront_add_function(u16 domain, u8 bus, u8 devfn,
+					   u16 vendor, u16 device,
+					   const struct mk_pci_bus_desc *desc)
+{
+	return -ENODEV;
+}
+static inline int mk_pcifront_adopt_function(u16 domain, u8 bus, u8 devfn)
+{
+	return -ENODEV;
+}
+static inline void mk_pcifront_host_fenced(void)
+{
+}
+#endif
+
+/* Config space of the PCI functions lent to a running instance */
+#ifdef CONFIG_PCI
+int mk_pciback_lend(struct mk_instance *instance);
+void mk_pciback_unlend(struct mk_instance *instance);
+int mk_pciback_lend_one(struct mk_instance *instance, u16 domain, u8 bus,
+			u8 devfn);
+void mk_pciback_unlend_one(struct mk_instance *instance, u16 domain, u8 bus,
+			   u8 devfn);
+#else
+static inline int mk_pciback_lend(struct mk_instance *instance)
+{
+	return 0;
+}
+static inline void mk_pciback_unlend(struct mk_instance *instance)
+{
+}
+static inline int mk_pciback_lend_one(struct mk_instance *instance, u16 domain,
+				      u8 bus, u8 devfn)
+{
+	return 0;
+}
+static inline void mk_pciback_unlend_one(struct mk_instance *instance,
+					 u16 domain, u8 bus, u8 devfn)
+{
+}
+#endif
 
 /* Kimage-based access to the instance memory pool */
 void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align);

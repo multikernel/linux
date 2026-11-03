@@ -384,28 +384,45 @@ void __noreturn mk_enter_pool_state(void *info)
 EXPORT_SYMBOL_GPL(mk_enter_pool_state);
 
 /*
- * NMI handler for multikernel forcible shutdown.
- *
- * Sits on the unknown-NMI chain, so it only sees NMIs no local source
- * has claimed. The host's force-halt NMI has no local source and lands
- * here; a PMI from the hardlockup detector is claimed by perf first and
- * never reaches it, which matters because a spawn without a ring takes
- * any NMI it is offered as the demand to park.
- *
- * We enter a pool state (HLT loop) rather than calling stop_this_cpu(),
+ * Enter a pool state (HLT loop) rather than calling stop_this_cpu(),
  * because stop_this_cpu() disables the APIC - preventing re-spawn.
  */
-static int mk_stop_nmi_callback(unsigned int val, struct pt_regs *regs)
+static void __noreturn mk_force_stop(struct pt_regs *regs)
 {
-	if (!mk_has_pending_shutdown())
-		return NMI_DONE;
-
 	pr_emerg("CPU %d: Forcible shutdown via NMI (instance %d)\n",
 		 smp_processor_id(), mk_self ? mk_self->id : -1);
 
 	mk_save_stop_regs(regs);
 	cpu_emergency_disable_virtualization();
 	mk_enter_pool_state(NULL);
+}
+
+/*
+ * Runs ahead of every local NMI source once the marker is armed. perf
+ * would otherwise claim the force-halt NMI on a CPU that panicked: panic
+ * masks the PMI but leaves the watchdog counter running, and once that
+ * counter overflows perf takes any NMI as its own.
+ */
+static int mk_stop_nmi_local(unsigned int val, struct pt_regs *regs)
+{
+	if (!mk_force_halt_armed())
+		return NMI_DONE;
+
+	mk_force_stop(regs);
+	return NMI_HANDLED; /* unreachable */
+}
+
+/*
+ * A spawn without a ring has no marker and takes any NMI no local
+ * source claims as the demand to park, so it must sit behind perf: a
+ * PMI from the hardlockup detector is not a demand.
+ */
+static int mk_stop_nmi_unknown(unsigned int val, struct pt_regs *regs)
+{
+	if (!mk_has_pending_shutdown())
+		return NMI_DONE;
+
+	mk_force_stop(regs);
 	return NMI_HANDLED; /* unreachable */
 }
 
@@ -427,16 +444,21 @@ void noinstr mk_nmi_offline_park(void)
 }
 
 /*
- * Register the NMI handler that forcibly parks this kernel's CPUs when a
- * peer arms the force-halt marker. It only acts on an armed marker, so
- * it is harmless on the whole NMI_UNKNOWN chain and can be installed
- * unconditionally at init on any multikernel-capable kernel; a force
- * halt cannot arrive until a spawn is running, long after this.
+ * Register the NMI handlers that forcibly park this kernel's CPUs when a
+ * peer demands it. They only act on a pending demand, so they are
+ * harmless on their chains and can be installed unconditionally at init
+ * on any multikernel-capable kernel; a force halt cannot arrive until a
+ * spawn is running, long after this.
  */
 static int __init mk_register_force_stop(void)
 {
-	int ret = register_nmi_handler(NMI_UNKNOWN, mk_stop_nmi_callback, 0,
-				       "mk_stop");
+	int ret;
+
+	ret = register_nmi_handler(NMI_LOCAL, mk_stop_nmi_local,
+				   NMI_FLAG_FIRST, "mk_stop");
+	if (!ret)
+		ret = register_nmi_handler(NMI_UNKNOWN, mk_stop_nmi_unknown, 0,
+					   "mk_stop");
 	if (ret)
 		pr_err("Failed to register multikernel NMI stop handler: %d\n",
 		       ret);

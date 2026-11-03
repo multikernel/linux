@@ -24,6 +24,7 @@
 #include <linux/elfcore.h>
 #include <linux/kernel.h>
 #include <linux/kernel_read_file.h>
+#include <linux/module_signature.h>
 #include <linux/syscalls.h>
 #include <linux/vmalloc.h>
 #include <linux/dma-map-ops.h>
@@ -176,6 +177,49 @@ int kexec_kernel_verify_pe_sig(const char *kernel, unsigned long kernel_len)
 		ret = verify_pefile_signature(kernel, kernel_len,
 					      VERIFY_USE_PLATFORM_KEYRING,
 					      VERIFYING_KEXEC_PE_SIGNATURE);
+	}
+	return ret;
+}
+#endif
+
+#ifdef CONFIG_KEXEC_VMLINUX_VERIFY_SIG
+/*
+ * Verify a PKCS#7 signature appended to a kernel image in the module
+ * signature format, as produced by scripts/sign-file. This is for images
+ * with no PE wrapper to carry a signature, such as an ELF vmlinux.
+ */
+int kexec_kernel_verify_appended_sig(const char *kernel, unsigned long kernel_len)
+{
+	const unsigned long marker_len = sizeof(MODULE_SIG_STRING) - 1;
+	struct module_signature ms;
+	unsigned long sig_len;
+	int ret;
+
+	if (kernel_len <= marker_len + sizeof(ms))
+		return -ENODATA;
+	if (memcmp(kernel + kernel_len - marker_len, MODULE_SIG_STRING, marker_len))
+		return -ENODATA;
+	kernel_len -= marker_len;
+
+	memcpy(&ms, kernel + kernel_len - sizeof(ms), sizeof(ms));
+	ret = mod_check_sig(&ms, kernel_len, "kexec image");
+	if (ret)
+		return ret;
+
+	sig_len = be32_to_cpu(ms.sig_len);
+	kernel_len -= sizeof(ms) + sig_len;
+
+	ret = verify_pkcs7_signature(kernel, kernel_len,
+				     kernel + kernel_len, sig_len,
+				     VERIFY_USE_SECONDARY_KEYRING,
+				     VERIFYING_MODULE_SIGNATURE,
+				     NULL, NULL);
+	if (ret == -ENOKEY && IS_ENABLED(CONFIG_INTEGRITY_PLATFORM_KEYRING)) {
+		ret = verify_pkcs7_signature(kernel, kernel_len,
+					     kernel + kernel_len, sig_len,
+					     VERIFY_USE_PLATFORM_KEYRING,
+					     VERIFYING_MODULE_SIGNATURE,
+					     NULL, NULL);
 	}
 	return ret;
 }
@@ -345,8 +389,10 @@ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 	bool kexec_on_panic = flags & KEXEC_FILE_ON_CRASH;
 
 	image = do_kimage_alloc_init();
-	if (!image)
+	if (!image) {
+		mk_instance_put(instance);
 		return -ENOMEM;
+	}
 
 	kexec_file_dbg_print = !!(flags & KEXEC_FILE_DEBUG);
 	image->file_mode = 1;
@@ -360,7 +406,6 @@ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 #endif
 	if (instance) {
 		int mk_id = KEXEC_GET_MK_ID(flags);
-		struct page *fdt_page;
 
 		image->type = KEXEC_TYPE_MULTIKERNEL;
 
@@ -369,38 +414,10 @@ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 
 		image->mk_instance = instance;
 		image->mk_id = mk_id;
-		instance->kimage = image;
 
-		pr_info("Associated kimage with multikernel instance %d\n", mk_id);
-
-		fdt_page = alloc_pages(GFP_KERNEL | __GFP_ZERO,
-				       get_order(MK_MANIFEST_SIZE));
-		if (!fdt_page) {
-			pr_err("Failed to allocate FDT pages for multikernel kimage\n");
-			ret = -ENOMEM;
+		ret = mk_instance_alloc_boot_pages(instance);
+		if (ret)
 			goto out_free_image;
-		}
-		image->mk_manifest = page_to_phys(fdt_page);
-
-		{
-			struct page *ipi_page;
-			unsigned int order;
-			size_t ipi_buffer_size;
-
-			ipi_buffer_size = sizeof(struct mk_shared_data);
-			order = get_order(ipi_buffer_size);
-			ipi_page = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
-			if (!ipi_page) {
-				pr_err("Failed to allocate %zu bytes (order %u) for IPI buffer\n",
-				       ipi_buffer_size, order);
-				ret = -ENOMEM;
-				goto out_free_fdt;
-			}
-			image->mk_ipi = page_to_phys(ipi_page);
-
-			pr_info("Allocated IPI ring buffer: phys=0x%llx, size=%zu bytes (order %u)\n",
-				(unsigned long long)image->mk_ipi, ipi_buffer_size, order);
-		}
 	}
 
 	ret = kimage_file_prepare_segments(image, kernel_fd, initrd_fd,
@@ -434,25 +451,10 @@ out_free_control_pages:
 	kimage_free_page_list(&image->control_pages);
 out_free_post_load_bufs:
 	kimage_file_post_load_cleanup(image);
-out_free_fdt:
-	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
-		if (image->mk_ipi) {
-			unsigned int order = get_order(sizeof(struct mk_shared_data));
-			__free_pages(phys_to_page(image->mk_ipi), order);
-			image->mk_ipi = 0;
-		}
-		if (image->mk_manifest) {
-			__free_pages(phys_to_page(image->mk_manifest),
-				     get_order(MK_MANIFEST_SIZE));
-			image->mk_manifest = 0;
-		}
-		if (image->mk_instance) {
-			image->mk_instance->kimage = NULL;
-			mk_instance_put(image->mk_instance);
-			image->mk_instance = NULL;
-		}
-	}
 out_free_image:
+	if (image->type == KEXEC_TYPE_MULTIKERNEL)
+		kimage_free_multikernel(image);
+	kimage_file_free_cmdline(image);
 	kfree(image);
 	return ret;
 }
@@ -465,7 +467,7 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 			 KEXEC_TYPE_CRASH : KEXEC_TYPE_DEFAULT;
 	struct kimage **dest_image, *image;
 	struct mk_instance *instance = NULL;
-	int ret = 0, i;
+	int ret = 0, i, free_ret;
 
 	/* We only trust the superuser with rebooting the system. */
 	if (!kexec_load_permitted(image_type))
@@ -475,10 +477,19 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 	if (flags != (flags & KEXEC_FILE_FLAGS))
 		return -EINVAL;
 
+	/* A multikernel image is never a crash kernel */
+	if ((flags & KEXEC_MULTIKERNEL) && (flags & KEXEC_FILE_ON_CRASH))
+		return -EINVAL;
+
 	image = NULL;
 
 	if (!kexec_trylock())
 		return -EBUSY;
+
+#ifdef CONFIG_MULTIKERNEL
+	if (flags & KEXEC_MULTIKERNEL)
+		mutex_lock(&mk_overlay_mutex);
+#endif
 
 	if (flags & KEXEC_MULTIKERNEL) {
 		int mk_id = KEXEC_GET_MK_ID(flags);
@@ -500,7 +511,6 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 			}
 
 			pr_info("Unloading kernel from multikernel instance %d\n", mk_id);
-			kimage_remove_from_list(mk_image);
 			image = mk_image;
 			ret = 0;
 			goto out;
@@ -512,7 +522,8 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 				goto out;
 			}
 
-			if (instance->kimage) {
+			if (instance == mk_self || instance->state != MK_STATE_READY ||
+			    instance->kimage) {
 				pr_err("Multikernel instance %d already has an associated kimage\n", mk_id);
 				mk_instance_put(instance);
 				ret = -EBUSY;
@@ -545,16 +556,11 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 		}
 	}
 
+	/* Consumes the instance reference, on failure too */
 	ret = kimage_file_alloc_init(&image, kernel_fd, initrd_fd, cmdline_ptr,
 				     cmdline_len, flags, instance);
-	if (ret) {
-		if (instance) {
-			mk_instance_put(instance);
-			instance = NULL;
-		}
+	if (ret)
 		goto out;
-	}
-	instance = NULL;
 
 #ifdef CONFIG_CRASH_HOTPLUG
 	if ((flags & KEXEC_FILE_ON_CRASH) && arch_crash_hotplug_support(image, flags))
@@ -612,6 +618,9 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 		kimage_file_post_load_cleanup(image);
 
 	if (image && image->type == KEXEC_TYPE_MULTIKERNEL) {
+		/* Publish only a complete image to exec, unload and IPI */
+		image->mk_instance->kimage = image;
+		mk_instance_ipi_publish(image->mk_instance);
 		mk_instance_set_state(image->mk_instance, MK_STATE_LOADED);
 		kimage_add_to_list(image);
 		image = NULL; /* Don't free the new image */
@@ -648,8 +657,15 @@ out:
 		arch_kexec_protect_crashkres();
 #endif
 
+	/* Failed-load and unload cleanup still use the instance pool. */
+	free_ret = kimage_free(image);
+	if (!ret)
+		ret = free_ret;
+#ifdef CONFIG_MULTIKERNEL
+	if (flags & KEXEC_MULTIKERNEL)
+		mutex_unlock(&mk_overlay_mutex);
+#endif
 	kexec_unlock();
-	kimage_free(image);
 	return ret;
 }
 
@@ -895,13 +911,6 @@ static int kexec_alloc_multikernel(struct kexec_buf *kbuf)
 
 	pr_info("kexec_alloc_multikernel: called for segment size=0x%lx, buf_min=0x%lx, buf_max=0x%lx, align=0x%lx\n",
 		kbuf->memsz, kbuf->buf_min, kbuf->buf_max, kbuf->buf_align);
-
-	/* Check if this is a multikernel image with an associated instance */
-	if (!kbuf->image->mk_instance || kbuf->image->type != KEXEC_TYPE_MULTIKERNEL) {
-		pr_info("kexec_alloc_multikernel: not a multikernel image (mk_instance=%p, type=%d)\n",
-			kbuf->image->mk_instance, kbuf->image->type);
-		return -EPERM;
-	}
 
 	/* Allocate from the multikernel instance pool using the proper API */
 	virt_addr = mk_kimage_alloc(kbuf->image, kbuf->memsz, kbuf->buf_align);

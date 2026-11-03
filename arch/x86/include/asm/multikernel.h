@@ -8,6 +8,13 @@
 #define MK_SPAWN_F_SECONDARY	BIT(0)	/* Secondary CPU joining existing kernel */
 #define MK_SPAWN_F_REPARK	BIT(1)	/* Move the CPU to another park slot */
 
+/* Shared C/assembly protocol. All participating kernels must use it. */
+#define MK_SLOT_IDLE		0
+#define MK_SLOT_PENDING		1
+#define MK_SLOT_BUSY		2
+#define MK_SLOT_ACK		3
+#define MK_SLOT_QUARANTINED	4
+
 #ifndef __ASSEMBLY__
 
 #include <linux/build_bug.h>
@@ -126,7 +133,7 @@ struct mk_spawn_context {
 	unsigned long ctrl_size;	/* park page, page tables. Spawn must not reuse it */
 	u32 target_apic_id;		/* Target CPU's APIC ID */
 	u32 flags;			/* MK_SPAWN_F_* flags */
-	u32 ready;			/* Signal flag */
+	u32 ready;			/* MK_SLOT_* state, not a boolean */
 	u32 reserved;			/* Padding for alignment */
 	/* Keep all existing context offsets unchanged. */
 	struct boot_params bp;		/* Standard x86 boot params */
@@ -184,12 +191,12 @@ struct mk_spawn_context *mk_alloc_spawn_context(struct mk_instance *instance,
 struct boot_params *mk_spawn_context_boot_params(struct mk_spawn_context *ctx);
 
 /* Set up spawn context for kernel boot */
-void mk_set_spawn_context(struct mk_spawn_context *ctx,
-			  unsigned long identity_cr3,
-			  unsigned long kernel_entry,
-			  unsigned long trampoline_virt,
-			  unsigned long trampoline_phys,
-			  unsigned long park_phys);
+int mk_set_spawn_context(struct mk_spawn_context *ctx,
+			 unsigned long identity_cr3,
+			 unsigned long kernel_entry,
+			 unsigned long trampoline_virt,
+			 unsigned long trampoline_phys,
+			 unsigned long park_phys);
 
 /* Trigger spawn on a pool CPU */
 int mk_spawn_cpu(struct mk_instance *instance, int cpu,

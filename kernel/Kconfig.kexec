@@ -86,6 +86,19 @@ config KEXEC_BZIMAGE_VERIFY_SIG
 	help
 	  Enable bzImage signature verification support.
 
+config KEXEC_VMLINUX_VERIFY_SIG
+	bool "Enable ELF vmlinux signature verification support"
+	depends on ARCH_SUPPORTS_KEXEC_VMLINUX_VERIFY_SIG
+	depends on KEXEC_SIG
+	select MODULE_SIG_FORMAT
+	select SYSTEM_TRUSTED_KEYRING
+	help
+	  Verify a PKCS#7 signature appended to an ELF vmlinux loaded by
+	  kexec_file_load(), in the same format as a signed module. Sign the
+	  image with scripts/sign-file. The signing certificate must be in
+	  the secondary trusted keyring or, with INTEGRITY_PLATFORM_KEYRING,
+	  the platform keyring (for example a MOK key).
+
 config KEXEC_JUMP
 	bool "kexec jump"
 	depends on ARCH_SUPPORTS_KEXEC_JUMP

@@ -9,7 +9,9 @@
 #include <linux/ioport.h>
 #include <linux/kexec.h>
 #include <linux/list.h>
+#include <linux/memory_hotplug.h>
 #include <linux/mm.h>
+#include <linux/mmzone.h>
 #include <linux/mutex.h>
 #include <linux/genalloc.h>
 #include <linux/io.h>
@@ -61,6 +63,52 @@ phys_addr_t multikernel_alloc(size_t size, int node)
 	mutex_unlock(&mk_pool->mem_lock);
 
 	return (phys_addr_t)addr;
+}
+
+/* gen_pool_fixed_alloc() applies its offset to every chunk it tries */
+static unsigned long mk_pool_algo_at(unsigned long *map, unsigned long size,
+				     unsigned long start, unsigned int nr,
+				     void *data, struct gen_pool *pool,
+				     unsigned long start_addr)
+{
+	unsigned long addr = *(unsigned long *)data;
+	unsigned long bit;
+
+	if (addr < start_addr)
+		return size;
+	bit = (addr - start_addr) >> pool->min_alloc_order;
+	if (bit >= size || bitmap_find_next_zero_area(map, size, bit, nr, 0) != bit)
+		return size;
+	return bit;
+}
+
+/**
+ * multikernel_alloc_at() - Allocate a given range from the multikernel pool
+ * @addr: physical address of the range, page aligned
+ * @size: size of the range, page aligned
+ *
+ * Returns the NUMA node the range is on, or a negative error code: -EBUSY
+ * if any of the range is not free pool memory.
+ */
+static int multikernel_alloc_at(phys_addr_t addr, size_t size)
+{
+	unsigned long start = addr;
+	int nid;
+
+	if (!mk_pool)
+		return -ENODEV;
+	if (!size || !PAGE_ALIGNED(addr) || !PAGE_ALIGNED(size))
+		return -EINVAL;
+
+	guard(mutex)(&mk_pool->mem_lock);
+	for_each_online_node(nid) {
+		struct gen_pool *pool = mk_pool->node_pools[nid];
+
+		if (pool && gen_pool_alloc_algo(pool, size, mk_pool_algo_at,
+						&start) == start)
+			return nid;
+	}
+	return -EBUSY;
 }
 
 /**
@@ -335,7 +383,10 @@ cleanup:
  * multikernel_destroy_instance_pool() - Destroy an instance memory pool
  * @pool_handle: Handle returned by multikernel_create_instance_pool()
  *
- * Frees all memory associated with the instance pool back to the main pool
+ * Frees the memory of every chunk the instance still owns back to the main
+ * pool. Nothing may be allocated from the pool any more, so a chunk with no
+ * space left is one whose region left the instance: its memory went back
+ * then, and only the reservation holding it is dropped.
  */
 void multikernel_destroy_instance_pool(void *pool_handle)
 {
@@ -345,9 +396,14 @@ void multikernel_destroy_instance_pool(void *pool_handle)
 	if (!instance_pool)
 		return;
 
-	/* Free all chunks back to main pool */
 	list_for_each_entry(chunk, &instance_pool->chunks, next_chunk) {
-		multikernel_free(chunk->start_addr, chunk->end_addr - chunk->start_addr + 1);
+		size_t size = chunk->end_addr - chunk->start_addr + 1;
+
+		if (!atomic_long_read(&chunk->avail)) {
+			gen_pool_free(instance_pool, chunk->start_addr, size);
+			continue;
+		}
+		multikernel_free(chunk->start_addr, size);
 		pr_debug("Freed instance pool chunk: 0x%lx-0x%lx\n",
 			 chunk->start_addr, chunk->end_addr);
 	}
@@ -416,32 +472,90 @@ size_t multikernel_instance_pool_avail(void *pool_handle)
 	return gen_pool_avail(instance_pool);
 }
 
+/*
+ * Every region of an instance is one chunk of its instance pool, which is
+ * where its kernel image and control block are allocated from. A region that
+ * leaves the instance keeps its chunk, reserved in full, since a gen_pool
+ * cannot give a chunk back.
+ */
+static int mk_instance_pool_add(struct mk_instance *instance, phys_addr_t phys_addr,
+				size_t size, int node)
+{
+	if (!instance->instance_pool) {
+		instance->instance_pool = gen_pool_create(PAGE_SHIFT, -1);
+		if (!instance->instance_pool)
+			return -ENOMEM;
+	}
+
+	if (gen_pool_add(instance->instance_pool, phys_addr, size, node))
+		return -ENOMEM;
+	instance->pool_size += size;
+	return 0;
+}
+
+/* gen_pool algorithm: all of the chunk that starts at *data, or nothing */
+static unsigned long mk_whole_chunk_algo(unsigned long *map, unsigned long size,
+					 unsigned long start, unsigned int nr,
+					 void *data, struct gen_pool *pool,
+					 unsigned long start_addr)
+{
+	if (start_addr != *(unsigned long *)data || nr != size)
+		return size;
+	return bitmap_find_next_zero_area(map, size, 0, nr, 0) ? size : 0;
+}
+
+/* Reserve a region's whole chunk, or fail if anything is allocated in it */
+static int mk_instance_pool_reserve(struct mk_instance *instance,
+				    phys_addr_t phys_addr, size_t size)
+{
+	unsigned long start = phys_addr;
+
+	if (gen_pool_alloc_algo(instance->instance_pool, size,
+				mk_whole_chunk_algo, &start) != start)
+		return -EBUSY;
+	instance->pool_size -= size;
+	return 0;
+}
+
+static struct mk_memory_region *mk_instance_find_region(struct mk_instance *instance,
+							phys_addr_t phys_addr, size_t size)
+{
+	struct mk_memory_region *region;
+
+	list_for_each_entry(region, &instance->memory_regions, list)
+		if (region->res.start == phys_addr &&
+		    resource_size(&region->res) == size)
+			return region;
+	return NULL;
+}
+
 /**
  * mk_instance_add_memory_region() - Add a memory region to an instance
  * @instance: Target instance
- * @size: Size of the memory region to allocate
- * @node: NUMA node to allocate from, or NUMA_NO_NODE for any node
+ * @phys_addr: Physical address of the region, page aligned
+ * @size: Size of the region, page aligned
  *
- * Allocates memory from the main multikernel pool and adds it to the
- * instance's memory_regions list. Used for non-running instances where
- * we only need to track memory allocation without performing memory
- * hotplug operations.
+ * Takes the region out of the main multikernel pool and adds it to the
+ * instance's memory_regions list. The region is the one the instance's
+ * kernel is told to add, so no other instance can be given it.
  *
- * Returns: 0 on success, negative error code on failure
+ * Returns: 0 on success, -EBUSY if the region is not free pool memory, or
+ * another negative error code
  */
-int mk_instance_add_memory_region(struct mk_instance *instance, size_t size,
-				  int node)
+int mk_instance_add_memory_region(struct mk_instance *instance,
+				  phys_addr_t phys_addr, size_t size)
 {
 	struct mk_memory_region *region;
 	struct resource *parent;
-	phys_addr_t phys_addr;
-	int ret;
+	int node, ret;
 
-	phys_addr = multikernel_alloc(size, node);
-	if (!phys_addr) {
-		pr_err("Failed to allocate %zu bytes from multikernel pool for instance %d\n",
-		       size, instance->id);
-		return -ENOMEM;
+	node = multikernel_alloc_at(phys_addr, size);
+	if (node < 0) {
+		pr_err("Failed to take 0x%llx-0x%llx from multikernel pool for instance %d: %d\n",
+		       (unsigned long long)phys_addr,
+		       (unsigned long long)(phys_addr + size - 1),
+		       instance->id, node);
+		return node;
 	}
 
 	region = kzalloc(sizeof(*region), GFP_KERNEL);
@@ -460,14 +574,22 @@ int mk_instance_add_memory_region(struct mk_instance *instance, size_t size,
 
 	region->res.start = phys_addr;
 	region->res.end = phys_addr + size - 1;
-	region->res.flags = IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
-	region->chunk = NULL;  /* For overlay-added regions */
+	region->res.flags = IORESOURCE_MEM | IORESOURCE_BUSY;
 
 	parent = mk_pool_chunk_resource(phys_addr);
 	ret = parent ? insert_resource(parent, &region->res) : -ENODEV;
 	if (ret) {
 		pr_err("Failed to insert resource for instance %d region %d: %d\n",
 		       instance->id, instance->region_count, ret);
+		kfree(region->res.name);
+		kfree(region);
+		multikernel_free(phys_addr, size);
+		return ret;
+	}
+
+	ret = mk_instance_pool_add(instance, phys_addr, size, node);
+	if (ret) {
+		remove_resource(&region->res);
 		kfree(region->res.name);
 		kfree(region);
 		multikernel_free(phys_addr, size);
@@ -485,25 +607,81 @@ int mk_instance_add_memory_region(struct mk_instance *instance, size_t size,
 	return 0;
 }
 
-/* Does [phys_addr, phys_addr+size) back a segment of the loaded image? */
-static bool mk_range_backs_kimage(struct mk_instance *instance,
-				  phys_addr_t phys_addr, size_t size)
+/**
+ * mk_instance_begin_memory_removal() - Take a region away from the instance pool
+ * @instance: Target instance
+ * @phys_addr: Physical address of the memory region
+ * @size: Size of the memory region
+ *
+ * Reserves the region's chunk so nothing more is allocated from it. Follow
+ * with mk_instance_finish_memory_removal(), or with
+ * mk_instance_abort_memory_removal() if the region has to stay.
+ *
+ * Returns: 0 on success, -ENOENT if no region matches exactly, -EBUSY if the
+ * instance's kernel image or control block lives in it
+ */
+int mk_instance_begin_memory_removal(struct mk_instance *instance,
+				     phys_addr_t phys_addr, size_t size)
 {
-	struct kimage *image = instance->kimage;
-	unsigned long i;
-
-	if (!image)
-		return false;
-
-	for (i = 0; i < image->nr_segments; i++) {
-		unsigned long start = image->segment[i].mem;
-		unsigned long end = start + image->segment[i].memsz;
-
-		if (phys_addr < end && start < phys_addr + size)
-			return true;
+	if (!mk_instance_find_region(instance, phys_addr, size)) {
+		pr_warn("Memory region 0x%llx-0x%llx not found in instance %d (%s)\n",
+			(unsigned long long)phys_addr,
+			(unsigned long long)(phys_addr + size - 1),
+			instance->id, instance->name);
+		return -ENOENT;
 	}
 
-	return false;
+	if (mk_instance_pool_reserve(instance, phys_addr, size)) {
+		pr_err("Refusing to remove 0x%llx-0x%llx from instance %d (%s): its kernel image or control block lives there\n",
+		       (unsigned long long)phys_addr,
+		       (unsigned long long)(phys_addr + size - 1),
+		       instance->id, instance->name);
+		return -EBUSY;
+	}
+	return 0;
+}
+
+/**
+ * mk_instance_abort_memory_removal() - Give a region back to the instance pool
+ * @instance: Target instance
+ * @phys_addr: Physical address of the memory region
+ * @size: Size of the memory region
+ */
+void mk_instance_abort_memory_removal(struct mk_instance *instance,
+				      phys_addr_t phys_addr, size_t size)
+{
+	gen_pool_free(instance->instance_pool, phys_addr, size);
+	instance->pool_size += size;
+}
+
+/**
+ * mk_instance_finish_memory_removal() - Hand a region back to the multikernel pool
+ * @instance: Target instance
+ * @phys_addr: Physical address of the memory region
+ * @size: Size of the memory region
+ *
+ * The region must have been through mk_instance_begin_memory_removal().
+ */
+void mk_instance_finish_memory_removal(struct mk_instance *instance,
+				       phys_addr_t phys_addr, size_t size)
+{
+	struct mk_memory_region *region;
+
+	region = mk_instance_find_region(instance, phys_addr, size);
+	list_del(&region->list);
+	if (region->res.parent)
+		remove_resource(&region->res);
+
+	multikernel_free(phys_addr, size);
+
+	kfree(region->res.name);
+	kfree(region);
+	instance->region_count--;
+
+	pr_info("Removed memory region 0x%llx-0x%llx (%zu MB) from instance %d (%s)\n",
+		(unsigned long long)phys_addr,
+		(unsigned long long)(phys_addr + size - 1),
+		size >> 20, instance->id, instance->name);
 }
 
 /**
@@ -512,72 +690,143 @@ static bool mk_range_backs_kimage(struct mk_instance *instance,
  * @phys_addr: Physical address of the memory region
  * @size: Size of the memory region
  *
- * Removes a memory region from the instance's memory_regions list and
- * frees it back to the main multikernel pool. Used for non-running instances
- * where we only need to track memory deallocation without performing memory
- * hotplug operations.
+ * For instances not running a kernel, where no hotplug is involved.
  *
- * Returns: 0 on success, -ENOENT if region not found
+ * Returns: 0 on success, or an error from mk_instance_begin_memory_removal()
  */
 int mk_instance_remove_memory_region(struct mk_instance *instance,
 				     phys_addr_t phys_addr, size_t size)
 {
-	struct mk_memory_region *region, *tmp;
-	bool found = false;
+	int ret;
 
 	if (!instance)
 		return -EINVAL;
 
-	if (mk_range_backs_kimage(instance, phys_addr, size)) {
-		pr_err("Refusing to remove 0x%llx-0x%llx from instance %d (%s): the loaded kernel image lives there\n",
-		       (unsigned long long)phys_addr,
-		       (unsigned long long)(phys_addr + size - 1),
-		       instance->id, instance->name);
-		return -EBUSY;
-	}
+	ret = mk_instance_begin_memory_removal(instance, phys_addr, size);
+	if (!ret)
+		mk_instance_finish_memory_removal(instance, phys_addr, size);
+	return ret;
+}
 
-	list_for_each_entry_safe(region, tmp, &instance->memory_regions, list) {
-		if (region->res.start == phys_addr &&
-		    resource_size(&region->res) == size) {
-			list_del(&region->list);
-			if (region->res.parent)
-				remove_resource(&region->res);
+/*
+ * Pool chunks are hot-removed from this kernel: their pages, struct
+ * pages and direct mapping all go, so no stray pointer here can reach
+ * memory another kernel runs on. Zones are scanned from the top down
+ * (higher addresses are less likely to hold pinned kernel allocations),
+ * ZONE_MOVABLE before ZONE_NORMAL.
+ */
+static int mk_take_from_zone(struct zone *zone, u64 size, phys_addr_t *start)
+{
+	const unsigned long step = PHYS_PFN(MHP_SUBSECTIONS_ALIGN);
+	unsigned long nr_pages = PHYS_PFN(size);
+	unsigned long first = ALIGN(zone->zone_start_pfn, step);
+	unsigned long candidate;
 
-			multikernel_free(phys_addr, size);
+	if (!populated_zone(zone) || zone_end_pfn(zone) < first + nr_pages)
+		return -ENOMEM;
 
-			kfree(region->res.name);
-			kfree(region);
-			instance->region_count--;
-			found = true;
-
-			pr_info("Removed memory region 0x%llx-0x%llx (%zu MB) from instance %d (%s)\n",
-				(unsigned long long)phys_addr,
-				(unsigned long long)(phys_addr + size - 1),
-				size >> 20, instance->id, instance->name);
-			break;
+	candidate = ALIGN_DOWN(zone_end_pfn(zone) - nr_pages, step);
+	for (;;) {
+		if (!offline_and_remove_subsections(PFN_PHYS(candidate), size)) {
+			*start = PFN_PHYS(candidate);
+			return 0;
 		}
+		if (candidate < first + step)
+			return -ENOMEM;
+		candidate -= step;
+		cond_resched();
 	}
-
-	if (!found) {
-		pr_warn("Memory region 0x%llx-0x%llx not found in instance %d (%s)\n",
-			(unsigned long long)phys_addr,
-			(unsigned long long)(phys_addr + size - 1),
-			instance->id, instance->name);
-		return -ENOENT;
-	}
-
-	return 0;
 }
 
 /**
- * mk_pool_mem_grow() - Allocate a contiguous chunk and add it to the pool
- * @size: chunk size in bytes, page aligned
+ * mk_take_memory() - Hot-remove a contiguous range for the pool
+ * @size: bytes, a multiple of MHP_SUBSECTIONS_ALIGN
+ * @node: NUMA node to take from, or NUMA_NO_NODE for any node
+ * @start: physical base of the range taken
+ * @nid: node the range was taken from
+ * @movable: whether it was ZONE_MOVABLE, to give it back there
+ *
+ * Returns 0 on success, -ENOMEM when no range of @size could be removed.
+ */
+static int mk_take_memory(u64 size, int node, phys_addr_t *start, int *nid,
+			  bool *movable)
+{
+	static const enum zone_type zone_order[] = { ZONE_MOVABLE, ZONE_NORMAL };
+	int n, i;
+
+	for_each_online_node(n) {
+		if (node != NUMA_NO_NODE && n != node)
+			continue;
+
+		for (i = 0; i < ARRAY_SIZE(zone_order); i++) {
+			if (mk_take_from_zone(&NODE_DATA(n)->node_zones[zone_order[i]],
+					      size, start))
+				continue;
+			*nid = n;
+			*movable = zone_order[i] == ZONE_MOVABLE;
+			return 0;
+		}
+	}
+	return -ENOMEM;
+}
+
+static DEFINE_MUTEX(mk_pool_map_lock);
+
+/**
+ * mk_pool_map() - Map part of the pool back at its direct-map address
+ * @start: physical base, page aligned
+ * @size: bytes, page aligned
+ *
+ * The pool is hot-removed from this kernel. What this kernel keeps in it
+ * for itself, the park area and each instance's control block, it reads,
+ * writes and executes through __va(), so exactly those pages come back.
+ * The lock keeps two mappers from populating the same page table page,
+ * and holding the online memory stable keeps memory hotplug out of it.
+ */
+int mk_pool_map(phys_addr_t start, size_t size)
+{
+	int ret;
+
+	guard(mutex)(&mk_pool_map_lock);
+	get_online_mems();
+	ret = mk_arch_pool_map(start, size);
+	put_online_mems();
+	return ret;
+}
+
+int mk_pool_unmap(phys_addr_t start, size_t size)
+{
+	int ret;
+
+	guard(mutex)(&mk_pool_map_lock);
+	get_online_mems();
+	ret = mk_arch_pool_unmap(start, size);
+	put_online_mems();
+	return ret;
+}
+
+static void mk_pool_chunk_return(struct mk_pool_chunk *chunk)
+{
+	int online_type = chunk->movable ? MMOP_ONLINE_MOVABLE : MMOP_ONLINE_KERNEL;
+	int ret = add_and_online_subsections(chunk->node, chunk->res.start,
+					     resource_size(&chunk->res),
+					     online_type, "System RAM");
+
+	if (ret)
+		pr_err("Multikernel pool: %pa-%pa could not be given back to the kernel: %d\n",
+		       &chunk->res.start, &chunk->res.end, ret);
+	kfree(chunk);
+}
+
+/**
+ * mk_pool_mem_grow() - Take a contiguous chunk out of this kernel for the pool
+ * @size: chunk size in bytes, page aligned; rounded up to MHP_SUBSECTIONS_ALIGN
  * @node: NUMA node to allocate from, or NUMA_NO_NODE for any node
  * @out_base: optional output for the physical base of the new chunk
  *
- * The chunk is owned by the kernel until mk_pool_mem_shrink() returns it,
- * and is never handed back to the buddy allocator behind the pool's back:
- * spawn kernels execute out of it.
+ * The chunk is hot-removed until mk_pool_mem_shrink() returns it: spawn
+ * kernels execute out of it, and this kernel keeps no mapping of it
+ * beyond what mk_pool_map() brings back.
  *
  * Returns 0 on success, negative error code on failure.
  */
@@ -601,16 +850,15 @@ int mk_pool_mem_grow(size_t size, int node, phys_addr_t *out_base)
 	if (!chunk)
 		return -ENOMEM;
 
-	chunk->nr_pages = size >> PAGE_SHIFT;
-	chunk->pages = mk_alloc_contig_pages(chunk->nr_pages, node);
-	if (!chunk->pages) {
+	size = ALIGN(size, MHP_SUBSECTIONS_ALIGN);
+	ret = mk_take_memory(size, node, &start, &chunk->node, &chunk->movable);
+	if (ret) {
 		kfree(chunk);
-		return -ENOMEM;
+		return ret;
 	}
-	chunk->node = page_to_nid(chunk->pages);
 	chunk->res.name = "Multikernel Memory Pool";
-	chunk->res.start = page_to_phys(chunk->pages);
-	chunk->res.end = chunk->res.start + size - 1;
+	chunk->res.start = start;
+	chunk->res.end = start + size - 1;
 	chunk->res.flags = IORESOURCE_BUSY | IORESOURCE_MEM;
 	chunk->res.desc = IORES_DESC_RESERVED;
 
@@ -646,8 +894,7 @@ int mk_pool_mem_grow(size_t size, int node, phys_addr_t *out_base)
 
 err_unlock:
 	mutex_unlock(&mk_pool->mem_lock);
-	mk_free_contig_pages(chunk->pages, chunk->nr_pages);
-	kfree(chunk);
+	mk_pool_chunk_return(chunk);
 	return ret;
 }
 
@@ -684,10 +931,9 @@ int mk_pool_mem_shrink(phys_addr_t start, size_t size)
 
 	if (chunk->res.parent)
 		remove_resource(&chunk->res);
-	/* The pool park table keeps the stale range mapped, but never dereferences it */
-	mk_free_contig_pages(chunk->pages, chunk->nr_pages);
 	pr_info("Multikernel pool: removed %pa-%pa (%zu MB)\n",
 		&chunk->res.start, &chunk->res.end, size >> 20);
-	kfree(chunk);
+	/* The pool park table keeps the stale range mapped, but never dereferences it */
+	mk_pool_chunk_return(chunk);
 	return 0;
 }

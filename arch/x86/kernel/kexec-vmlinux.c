@@ -572,4 +572,7 @@ const struct kexec_file_ops kexec_vmlinux_ops = {
 	.probe = vmlinux_probe,
 	.load = vmlinux_load,
 	.cleanup = vmlinux_cleanup,
+#ifdef CONFIG_KEXEC_VMLINUX_VERIFY_SIG
+	.verify_sig = kexec_kernel_verify_appended_sig,
+#endif
 };

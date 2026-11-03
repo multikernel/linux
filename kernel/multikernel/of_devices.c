@@ -18,8 +18,6 @@
 
 #include "internal.h"
 
-#define MK_PCI_HOST_BRIDGE	"multikernel,pci-host-bridge"
-
 static struct device_node *mk_of_pci_child(struct device_node *bus, u8 busnr,
 					   u8 devfn)
 {

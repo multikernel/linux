@@ -890,6 +890,29 @@ int create_memory_block_devices(unsigned long start, unsigned long size,
 }
 
 /*
+ * Create the device of a memory block that only part of is present, and
+ * online in @zone like a boot memory block with holes: the present part
+ * was onlined without the device, and the rest is not there to online.
+ *
+ * Called under device_hotplug_lock.
+ */
+int create_online_memory_block_device(unsigned long start, int nid,
+				      struct zone *zone)
+{
+	const unsigned long block_id = pfn_to_block_id(PFN_DOWN(start));
+	struct memory_block *mem;
+	int ret;
+
+	ret = add_memory_block(block_id, nid, MEM_ONLINE, NULL, NULL);
+	if (ret)
+		return ret;
+	mem = find_memory_block_by_id(block_id);
+	mem->zone = zone;
+	put_device(&mem->dev);
+	return 0;
+}
+
+/*
  * Remove memory block devices for the given memory area. Start and size
  * have to be aligned to memory block granularity. Memory block devices
  * have to be offline.

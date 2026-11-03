@@ -1180,6 +1180,36 @@ remove_pmd_table(pmd_t *pmd_start, unsigned long addr, unsigned long end,
 		update_page_count(PG_LEVEL_2M, -pages);
 }
 
+/*
+ * Hot-remove of a range that covers only part of a 1G direct mapping
+ * would otherwise walk the leaf as if it were a page table. Map the same
+ * memory with the same attributes through 2M leaves instead, so that only
+ * the removed part goes.
+ */
+static bool __meminit split_direct_pud(pud_t *pud)
+{
+	unsigned long pfn = pud_pfn(*pud);
+	pgprot_t prot = pud_pgprot(*pud);
+	pmd_t *pmd;
+	int i;
+
+	pmd = (pmd_t *)get_zeroed_page(GFP_KERNEL);
+	if (!pmd)
+		return false;
+	for (i = 0; i < PTRS_PER_PMD; i++)
+		set_pmd(pmd + i, pfn_pmd(pfn + i * PTRS_PER_PTE, prot));
+
+	spin_lock(&init_mm.page_table_lock);
+	pud_populate(&init_mm, pud, pmd);
+	spin_unlock(&init_mm.page_table_lock);
+	/* Both translations of one address must never sit in the TLB at once */
+	flush_tlb_all();
+
+	update_page_count(PG_LEVEL_1G, -1);
+	update_page_count(PG_LEVEL_2M, PTRS_PER_PMD);
+	return true;
+}
+
 static void __meminit
 remove_pud_table(pud_t *pud_start, unsigned long addr, unsigned long end,
 		 struct vmem_altmap *altmap, bool direct)
@@ -1204,6 +1234,10 @@ remove_pud_table(pud_t *pud_start, unsigned long addr, unsigned long end,
 			pages++;
 			continue;
 		}
+
+		if (pud_leaf(*pud) &&
+		    (!direct || WARN_ON_ONCE(!split_direct_pud(pud))))
+			continue;
 
 		pmd_base = pmd_offset(pud, 0);
 		remove_pmd_table(pmd_base, addr, next, direct, altmap);
@@ -1279,7 +1313,7 @@ void __ref vmemmap_free(unsigned long start, unsigned long end,
 	remove_pagetable(start, end, false, altmap);
 }
 
-static void __meminit
+void __meminit
 kernel_physical_mapping_remove(unsigned long start, unsigned long end)
 {
 	start = (unsigned long)__va(start);

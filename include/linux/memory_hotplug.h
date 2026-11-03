@@ -258,6 +258,14 @@ static inline void pgdat_resize_unlock(struct pglist_data *p, unsigned long *f) 
 static inline void pgdat_resize_init(struct pglist_data *pgdat) {}
 #endif /* !(CONFIG_MEMORY_HOTPLUG || CONFIG_DEFERRED_STRUCT_PAGE_INIT) */
 
+/*
+ * What offline_and_remove_subsections() and add_and_online_subsections()
+ * work in: whole subsections, and whole MAX_PAGE_ORDER blocks, as the buddy
+ * allocator reads the struct page of a buddy anywhere in the block when it
+ * merges.
+ */
+#define MHP_SUBSECTIONS_ALIGN	max(SUBSECTION_SIZE, PAGE_SIZE << MAX_PAGE_ORDER)
+
 #ifdef CONFIG_MEMORY_HOTREMOVE
 
 extern void try_offline_node(int nid);
@@ -266,6 +274,9 @@ extern int offline_pages(unsigned long start_pfn, unsigned long nr_pages,
 extern int remove_memory(u64 start, u64 size);
 extern void __remove_memory(u64 start, u64 size);
 extern int offline_and_remove_memory(u64 start, u64 size);
+extern int offline_and_remove_subsections(u64 start, u64 size);
+extern int add_and_online_subsections(int nid, u64 start, u64 size,
+				      int online_type, const char *resource_name);
 
 #else
 static inline void try_offline_node(int nid) {}

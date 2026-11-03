@@ -161,6 +161,7 @@ extern int __init pcibios_init(void);
 extern int pci_legacy_init(void);
 #if defined(CONFIG_PCI) && defined(CONFIG_MULTIKERNEL)
 extern int __init pci_multikernel_init(void);
+extern int __init pci_multikernel_arch_init(void);
 #endif
 extern void pcibios_fixup_irqs(void);
 

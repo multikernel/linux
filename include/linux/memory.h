@@ -155,6 +155,8 @@ int create_memory_block_devices(unsigned long start, unsigned long size,
 				int nid, struct vmem_altmap *altmap,
 				struct memory_group *group);
 void remove_memory_block_devices(unsigned long start, unsigned long size);
+int create_online_memory_block_device(unsigned long start, int nid,
+				      struct zone *zone);
 extern void memory_dev_init(void);
 extern int memory_notify(enum memory_block_state state, void *v);
 extern struct memory_block *find_memory_block(unsigned long section_nr);

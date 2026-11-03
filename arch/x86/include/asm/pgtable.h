@@ -1185,6 +1185,7 @@ unsigned long init_memory_mapping(unsigned long start,
 
 #ifdef CONFIG_X86_64
 extern pgd_t trampoline_pgd_entry;
+void kernel_physical_mapping_remove(unsigned long start, unsigned long end);
 #endif
 
 /* local pte updates need not use xchg for locking */

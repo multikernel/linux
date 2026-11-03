@@ -234,6 +234,7 @@ kernel that manages a pool, its ``/resources`` node describes the pool::
         #address-cells = <2>;
         #size-cells = <2>;
         id = <0>;
+        memory-granule = <0x0 0x400000>;
         resources {
             cpus = <...>;                       /* every pool member */
             cpus-available = <...>;             /* the free subset */
@@ -248,6 +249,8 @@ kernel that manages a pool, its ``/resources`` node describes the pool::
         pci@0 { ... };                          /* free pool PCI devices */
     };
 
+``memory-granule`` is what the base and size of a ``memory-add`` or
+``memory-remove`` item for this kernel must be multiples of.
 ``cpus`` lists every CPU the pool owns, including CPUs currently lent to
 instances; ``cpus-available`` lists only the free ones. There is one
 ``memory@<base>`` node per pool chunk, in the standard memory node form, and

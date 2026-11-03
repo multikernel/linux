@@ -311,13 +311,13 @@ static void setup_multikernel(const struct kimage *image,
 	struct setup_data *sd = (void *)params + setup_data_offset;
 	struct mk_setup_data *mk = (void *)sd + sizeof(*sd);
 
-	if (image->type != KEXEC_TYPE_MULTIKERNEL || !image->mk_manifest)
+	if (image->type != KEXEC_TYPE_MULTIKERNEL)
 		return;
 
 	sd->type = SETUP_MULTIKERNEL;
 	sd->len = sizeof(struct mk_setup_data);
 
-	mk->fdt_addr = image->mk_manifest;
+	mk->fdt_addr = image->mk_instance->manifest_phys;
 	mk->fdt_size = MK_MANIFEST_SIZE;
 
 	sd->next = params->hdr.setup_data;
@@ -352,8 +352,14 @@ setup_boot_parameters(struct kimage *image, struct boot_params *params,
 	params->screen_info.ext_mem_k = 0;
 	params->alt_mem_k = 0;
 
-	/* Always fill in RSDP: it is either 0 or a valid value */
-	params->acpi_rsdp_addr = boot_params.acpi_rsdp_addr;
+	/*
+	 * A spawn kernel runs without ACPI: the host's tables describe the
+	 * whole machine, not the instance.
+	 */
+	if (image->type == KEXEC_TYPE_MULTIKERNEL)
+		params->acpi_rsdp_addr = 0;
+	else
+		params->acpi_rsdp_addr = boot_params.acpi_rsdp_addr;
 
 	/* Default APM info */
 	memset(&params->apm_bios_info, 0, sizeof(params->apm_bios_info));
@@ -746,12 +752,14 @@ static void *bzImage64_load(struct kimage *image, char *kernel,
 		goto out_free_params;
 
 	/* For multikernel, setup custom e820 map */
+#ifdef CONFIG_MULTIKERNEL
 	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
 		image->arch.mk_boot_params = bootparam_load_addr;
 		ret = mk_e820_fill(image->mk_instance, params);
 		if (ret)
 			goto out_free_params;
 	}
+#endif
 
 	/* Allocate loader specific data */
 	ldata = kzalloc_obj(struct bzimage64_data);

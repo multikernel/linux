@@ -219,15 +219,13 @@ static int mk_manifest_add_reserved(void *fdt, struct kimage *image)
 	if (mk_self->ipi_data)
 		ret = mk_reserved_add(&r, mk_self->ipi_phys,
 				      (u64)mk_self->ipi_pages << PAGE_SHIFT);
-	/*
-	 * This image's ring and boot tree; the instance record points
-	 * at them only after finalization, so take them from the image.
-	 */
-	if (!ret && image->mk_ipi)
-		ret = mk_reserved_add(&r, image->mk_ipi,
-				      PAGE_ALIGN(sizeof(struct mk_shared_data)));
-	if (!ret && image->mk_manifest)
-		ret = mk_reserved_add(&r, image->mk_manifest, MK_MANIFEST_SIZE);
+	/* This instance's own ring and boot tree */
+	if (!ret)
+		ret = mk_reserved_add(&r, image->mk_instance->ipi_phys,
+				      (u64)image->mk_instance->ipi_pages << PAGE_SHIFT);
+	if (!ret)
+		ret = mk_reserved_add(&r, image->mk_instance->manifest_phys,
+				      MK_MANIFEST_SIZE);
 
 	mutex_lock(&mk_instance_mutex);
 	list_for_each_entry(other, &mk_instance_list, list) {
@@ -237,8 +235,8 @@ static int mk_manifest_add_reserved(void *fdt, struct kimage *image)
 			continue;
 		ret = mk_reserved_add(&r, other->ipi_phys,
 				      (u64)other->ipi_pages << PAGE_SHIFT);
-		if (!ret && other->kimage && other->kimage->mk_manifest)
-			ret = mk_reserved_add(&r, other->kimage->mk_manifest,
+		if (!ret && other->manifest_phys)
+			ret = mk_reserved_add(&r, other->manifest_phys,
 					      MK_MANIFEST_SIZE);
 	}
 	mutex_unlock(&mk_instance_mutex);
@@ -305,27 +303,28 @@ static int mk_manifest_chosen(void *fdt, void *data)
 			return ret;
 	}
 
-	if (image->mk_ipi) {
-		u32 pages = PAGE_ALIGN(sizeof(struct mk_shared_data)) >> PAGE_SHIFT;
+	ret = fdt_property_u64(fdt, "multikernel,ipi-buffer",
+			       (u64)image->mk_instance->ipi_phys);
+	if (!ret)
+		ret = fdt_property_u32(fdt, "multikernel,ipi-pages",
+				       image->mk_instance->ipi_pages);
+	if (ret)
+		return ret;
 
-		ret = fdt_property_u64(fdt, "multikernel,ipi-buffer",
-				       (u64)image->mk_ipi);
-		if (!ret)
-			ret = fdt_property_u32(fdt, "multikernel,ipi-pages", pages);
-		if (ret)
-			return ret;
-	}
-
-	/* A node's properties precede its subnodes: the host tree closes /chosen */
-	return mk_manifest_add_host_tree(fdt, ctx->instance);
+	/* A node's properties precede its subnodes: those close /chosen */
+	ret = mk_manifest_add_host_tree(fdt, ctx->instance);
+	/* A backup, which user space arms with a host tree, takes over buses */
+	if (!ret && ctx->instance->host_tree)
+		ret = mk_dt_emit_pci_buses(fdt);
+	return ret;
 }
 
 /**
  * mk_manifest_finalize - Write the boot tree for a spawn
  * @image: The multikernel kimage being executed
  *
- * Generates the instance's device tree into the manifest page allocated
- * at load time, with /chosen carrying the boot handoff.
+ * Generates the instance's device tree into its manifest page, with
+ * /chosen carrying the boot handoff.
  *
  * Returns: 0 on success, negative error code on failure
  */
@@ -341,10 +340,6 @@ int mk_manifest_finalize(struct kimage *image)
 		return -EINVAL;
 	}
 
-	if (!image->mk_manifest) {
-		pr_err("No manifest page allocated for multikernel kimage\n");
-		return -EINVAL;
-	}
 
 	instance = mk_instance_find(image->mk_id);
 	if (!instance) {
@@ -353,7 +348,7 @@ int mk_manifest_finalize(struct kimage *image)
 	}
 
 	ctx.instance = instance;
-	fdt = phys_to_virt(image->mk_manifest);
+	fdt = phys_to_virt(instance->manifest_phys);
 	ret = mk_dt_emit_boot_tree(instance, fdt, MK_MANIFEST_SIZE, mk_manifest_chosen,
 				   &ctx);
 	if (ret) {

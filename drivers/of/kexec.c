@@ -14,6 +14,7 @@
 #include <linux/kexec.h>
 #include <linux/memblock.h>
 #include <linux/libfdt.h>
+#include <linux/multikernel.h>
 #include <linux/of.h>
 #include <linux/of_fdt.h>
 #include <linux/random.h>
@@ -307,12 +308,12 @@ static int mk_add_chosen(const struct kimage *image, void *fdt, int chosen_node)
 		return ret;
 
 	if (!IS_ENABLED(CONFIG_MULTIKERNEL) ||
-	    image->type != KEXEC_TYPE_MULTIKERNEL || !image->mk_manifest)
+	    image->type != KEXEC_TYPE_MULTIKERNEL)
 		return 0;
 
 	return fdt_appendprop_addrrange(fdt, 0, chosen_node,
 					"linux,multikernel-fdt",
-					image->mk_manifest, PAGE_SIZE);
+					image->mk_instance->manifest_phys, PAGE_SIZE);
 }
 
 /*

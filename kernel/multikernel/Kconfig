@@ -10,13 +10,19 @@ config ARCH_SUPPORTS_MULTIKERNEL
 config ARCH_HAS_MK_HOST_PARK
 	bool
 
+# The architecture can forcibly stop a remote instance's CPUs (x86 NMI).
+config ARCH_HAS_MK_FORCE_STOP
+	bool
+
 config MULTIKERNEL
 	bool "Multikernel support"
 	depends on ARCH_SUPPORTS_MULTIKERNEL
-	depends on CONTIG_ALLOC
+	depends on HOTPLUG_CPU
 	depends on KEXEC_CORE
 	depends on MEMORY_HOTPLUG
 	depends on MEMORY_HOTREMOVE
+	depends on CONTIG_ALLOC
+	depends on OF && OF_EARLY_FLATTREE
 	select LIBFDT
 	select OF_DYNAMIC if OF
 	help

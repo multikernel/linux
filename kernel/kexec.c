@@ -120,18 +120,6 @@ static int do_kexec_load(unsigned long entry, unsigned long nr_segments,
 				kimage_remove_from_list(old_image);
 				kimage_free(old_image);
 			}
-		} else if (flags & KEXEC_MULTIKERNEL) {
-			/* For multikernel unload, we need to specify which image to remove */
-			/* For now, remove all multikernel images - this could be enhanced */
-			struct kimage *images[10];
-			int count, i;
-
-			count = kimage_get_all_by_type(KEXEC_TYPE_MULTIKERNEL, images, 10);
-			for (i = 0; i < count; i++) {
-				kimage_remove_from_list(images[i]);
-				kimage_free(images[i]);
-			}
-			pr_info("Unloaded %d multikernel images\n", count);
 		} else {
 			struct kimage *old_image = xchg(&kexec_image, NULL);
 			if (old_image) {
@@ -202,10 +190,6 @@ static int do_kexec_load(unsigned long entry, unsigned long nr_segments,
 			kimage_add_to_list(image);
 			kimage_update_compat_pointers(image, KEXEC_TYPE_CRASH);
 		}
-		image = NULL; /* Don't free the new image */
-	} else if (flags & KEXEC_MULTIKERNEL) {
-		if (image)
-			kimage_add_to_list(image);
 		image = NULL; /* Don't free the new image */
 	} else {
 		struct kimage *old_image = xchg(&kexec_image, image);

@@ -254,12 +254,17 @@ enum x86_legacy_i8042_state {
  * @reserve_bios_regions: boot code will search for the EBDA address and the
  * 	start of the 640k - 1M BIOS region.  If false, the platform must
  * 	ensure that its memory map correctly reserves sub-1MB regions as needed.
+ * @reserve_ram_buffers: reserve the gap from the end of each E820 RAM region
+ *	to a rounded boundary, in case firmware left stolen RAM out of the map.
+ *	Platforms whose memory map is not written by firmware can clear it.
  * @map_isa_ram: if true, init_mem_mapping() maps the ISA range (0-1MB).
  *	Systems without legacy BIOS RAM (multikernel spawn, some VMs) should
  *	set this to false.
  * @no_bsp_restriction: if true, skip BSP/crash kernel detection during CPU
  *	topology setup. Used by multikernel spawns that intentionally boot
  *	on non-BSP CPUs and manage CPU resources separately.
+ * @shared_apic_bus: if true, APICs on the bus belong to other kernels too,
+ *	so IPI shorthands, which reach every APIC, must not be used.
  * @devices: legacy x86 devices, refer to struct x86_legacy_devices
  * 	documentation for further details.
  */
@@ -269,8 +274,10 @@ struct x86_legacy_features {
 	int warm_reset;
 	int no_vga;
 	int reserve_bios_regions;
+	int reserve_ram_buffers;
 	int map_isa_ram;
 	int no_bsp_restriction;
+	int shared_apic_bus;
 	struct x86_legacy_devices devices;
 };
 
