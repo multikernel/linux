@@ -28,10 +28,35 @@
 
 /* Physical address of the manifest this kernel booted with, 0 if none */
 static phys_addr_t mk_manifest_fdt_phys;
+static phys_addr_t mk_manifest_entry_stub;
+static bool mk_spawn_observed;
 
 phys_addr_t mk_manifest_phys(void)
 {
 	return mk_manifest_fdt_phys;
+}
+
+bool mk_spawned(void)
+{
+	/* Even an invalid spawn handoff must never enable machine-wide reset. */
+	return mk_spawn_observed;
+}
+
+phys_addr_t mk_manifest_entry_stub_phys(void)
+{
+	return mk_manifest_entry_stub;
+}
+
+int __weak mk_arch_prepare_instance(struct kimage *image,
+				    struct mk_instance *instance)
+{
+	return 0;
+}
+
+int __weak mk_arch_manifest_chosen(void *fdt, struct kimage *image,
+				   struct mk_instance *instance)
+{
+	return 0;
 }
 
 /**
@@ -45,8 +70,12 @@ phys_addr_t mk_manifest_phys(void)
  */
 void __init mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 {
+	const fdt64_t *entry;
 	void *fdt = NULL;
+	int chosen, len;
 	int err = 0;
+
+	mk_spawn_observed = true;
 
 	pr_info("multikernel: processing manifest at 0x%llx (size: %llu)\n",
 		fdt_phys, fdt_len);
@@ -72,6 +101,17 @@ void __init mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 		goto out;
 	}
 
+	chosen = fdt_path_offset(fdt, "/chosen");
+	if (chosen >= 0) {
+		entry = fdt_getprop(fdt, chosen, MK_FDT_ENTRY_STUB, &len);
+		if (entry) {
+			if (len != sizeof(*entry)) {
+				err = -EINVAL;
+				goto out;
+			}
+			mk_manifest_entry_stub = fdt64_ld(entry);
+		}
+	}
 	mk_manifest_fdt_phys = fdt_phys;
 
 	pr_info("multikernel: manifest accepted\n");
@@ -311,6 +351,10 @@ static int mk_manifest_chosen(void *fdt, void *data)
 	if (ret)
 		return ret;
 
+	ret = mk_arch_manifest_chosen(fdt, image, ctx->instance);
+	if (ret)
+		return ret;
+
 	/* A node's properties precede its subnodes: those close /chosen */
 	ret = mk_manifest_add_host_tree(fdt, ctx->instance);
 	/* A backup, which user space arms with a host tree, takes over buses */
@@ -348,18 +392,23 @@ int mk_manifest_finalize(struct kimage *image)
 	}
 
 	ctx.instance = instance;
+	ret = mk_arch_prepare_instance(image, instance);
+	if (ret)
+		goto out;
+
 	fdt = phys_to_virt(instance->manifest_phys);
 	ret = mk_dt_emit_boot_tree(instance, fdt, MK_MANIFEST_SIZE, mk_manifest_chosen,
 				   &ctx);
 	if (ret) {
 		pr_err("Failed to write the boot tree for instance %d: %d\n",
 		       image->mk_id, ret);
-		mk_instance_put(instance);
-		return ret == -FDT_ERR_NOSPACE ? -ENOSPC : ret;
+		ret = ret == -FDT_ERR_NOSPACE ? -ENOSPC : ret;
+		goto out;
 	}
 
 	pr_info("multikernel: boot tree for instance %d written (%u bytes)\n",
 		image->mk_id, fdt_totalsize(fdt));
+out:
 	mk_instance_put(instance);
-	return 0;
+	return ret;
 }
