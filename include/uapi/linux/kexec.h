@@ -14,11 +14,6 @@
 #define KEXEC_PRESERVE_CONTEXT	0x00000002
 #define KEXEC_UPDATE_ELFCOREHDR	0x00000004
 #define KEXEC_CRASH_HOTPLUG_SUPPORT 0x00000008
-#define KEXEC_MULTIKERNEL	0x00000010
-#define KEXEC_MK_ID_MASK	0x0000ffe0
-#define KEXEC_MK_ID_SHIFT	5
-#define KEXEC_MK_ID(id)		(((id) << KEXEC_MK_ID_SHIFT) & KEXEC_MK_ID_MASK)
-#define KEXEC_GET_MK_ID(flags)	(((flags) & KEXEC_MK_ID_MASK) >> KEXEC_MK_ID_SHIFT)
 #define KEXEC_ARCH_MASK		0xffff0000
 
 /*
@@ -30,6 +25,12 @@
  * KEXEC_FILE_FORCE_DTB : Force carrying over the current boot's DTB to the new
  *                        kernel on x86. This is already the default behavior on
  *                        some other architectures, like ARM64 and PowerPC.
+ * KEXEC_FILE_MULTIKERNEL : Load a multikernel spawn image for the instance
+ *                          whose id is in KEXEC_FILE_MK_ID_MASK, instead of
+ *                          an image to reboot into.
+ *
+ * The upper half is a destination field apart from the flags: the
+ * multikernel flag and the instance id.
  */
 #define KEXEC_FILE_UNLOAD	0x00000001
 #define KEXEC_FILE_ON_CRASH	0x00000002
@@ -37,6 +38,13 @@
 #define KEXEC_FILE_DEBUG	0x00000008
 #define KEXEC_FILE_NO_CMA	0x00000010
 #define KEXEC_FILE_FORCE_DTB	0x00000020
+
+#define KEXEC_FILE_MK_ID_SHIFT	16
+#define KEXEC_FILE_MK_ID_MASK	0x7fff0000
+#define KEXEC_FILE_MK_ID(id)	(((id) << KEXEC_FILE_MK_ID_SHIFT) & KEXEC_FILE_MK_ID_MASK)
+#define KEXEC_FILE_GET_MK_ID(flags)	\
+	(((flags) & KEXEC_FILE_MK_ID_MASK) >> KEXEC_FILE_MK_ID_SHIFT)
+#define KEXEC_FILE_MULTIKERNEL	0x80000000
 
 /* These values match the ELF architecture values.
  * Unless there is a good reason that should continue to be the case.

@@ -272,7 +272,7 @@ static int kexec_post_load(struct kimage *image, unsigned long flags)
 	/*
 	 * Skip IMA measurements for multikernel for now.
 	 */
-	if (!(flags & (KEXEC_FILE_ON_CRASH | KEXEC_MULTIKERNEL)))
+	if (!(flags & (KEXEC_FILE_ON_CRASH | KEXEC_FILE_MULTIKERNEL)))
 		ima_kexec_post_load(image);
 #endif
 	return machine_kexec_post_load(image);
@@ -405,7 +405,7 @@ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 	} else
 #endif
 	if (instance) {
-		int mk_id = KEXEC_GET_MK_ID(flags);
+		int mk_id = KEXEC_FILE_GET_MK_ID(flags);
 
 		image->type = KEXEC_TYPE_MULTIKERNEL;
 
@@ -477,7 +477,7 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 		return -EINVAL;
 
 	/* A multikernel image is never a crash kernel */
-	if ((flags & KEXEC_MULTIKERNEL) && (flags & KEXEC_FILE_ON_CRASH))
+	if ((flags & KEXEC_FILE_MULTIKERNEL) && (flags & KEXEC_FILE_ON_CRASH))
 		return -EINVAL;
 
 	image = NULL;
@@ -485,8 +485,8 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 	if (!kexec_trylock())
 		return -EBUSY;
 
-	if (flags & KEXEC_MULTIKERNEL) {
-		int mk_id = KEXEC_GET_MK_ID(flags);
+	if (flags & KEXEC_FILE_MULTIKERNEL) {
+		int mk_id = KEXEC_FILE_GET_MK_ID(flags);
 
 		if (mk_id <= 0) {
 			pr_err("Invalid multikernel ID %d\n", mk_id);
