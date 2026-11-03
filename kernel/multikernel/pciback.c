@@ -39,6 +39,7 @@
 #define pr_fmt(fmt) "mk_pciback: " fmt
 
 #include <linux/multikernel.h>
+#include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
@@ -60,6 +61,8 @@ struct mk_pciback_dev {
 	refcount_t ref;
 	struct mk_instance *instance;
 	struct pci_dev *pdev;
+	struct mutex io_lock;	/* Slow config accesses versus device retirement */
+	bool revoked;
 	unsigned long sizing;	/* BARs written with something else than their value */
 	u16 sriov;		/* SR-IOV capability, or 0 */
 };
@@ -71,7 +74,11 @@ struct mk_pciback_work {
 	struct work_struct work;
 	struct mk_pci_cfg_payload req;
 	u32 subtype;
+	struct mk_pciback_dev *dev;
 };
+
+/* dev is the busy marker, protected by mk_pciback_lock. */
+static struct mk_pciback_work mk_pciback_requests[MK_IPI_RING_SIZE];
 
 static struct mk_pciback_dev *mk_pciback_find(int instance_id, u16 domain,
 					      u8 bus, u8 devfn)
@@ -300,71 +307,70 @@ static void mk_pciback_answer(struct mk_instance *instance,
 			   sizeof(*ack));
 }
 
-/*
- * The slow way: the requester is not known here (it was lent nothing),
- * or this kernel's own config access goes over the ring.
- */
+/* This kernel's own config access goes over the ring and may wait. */
 static void mk_pciback_work_fn(struct work_struct *work)
 {
 	struct mk_pciback_work *w = container_of(work, struct mk_pciback_work, work);
 	struct mk_pci_cfg_payload *ack = &w->req;
-	struct mk_instance *instance;
-	struct mk_pciback_dev *d;
+	struct mk_pciback_dev *d = w->dev;
 
-	instance = mk_instance_find(ack->sender_instance_id);
-	if (!instance)
-		goto out;
-
-	scoped_guard(raw_spinlock_irqsave, &mk_pciback_lock) {
-		d = mk_pciback_find(instance->id, ack->domain, ack->bus,
-				    ack->devfn);
-		if (d)
-			refcount_inc(&d->ref);
-	}
-
-	if (d) {
+	/* A pin preserves identity; revocation forbids both access and stale ACKs. */
+	mutex_lock(&d->io_lock);
+	if (!READ_ONCE(d->revoked)) {
 		mk_pciback_do(d, w->subtype, ack);
-		mk_pciback_put(d);
-	} else {
-		ack->result = PCIBIOS_DEVICE_NOT_FOUND;
-		ack->val = ~0U;
+		mk_pciback_answer(d->instance, ack);
 	}
-
-	mk_pciback_answer(instance, ack);
-	mk_instance_put(instance);
-out:
-	kfree(w);
+	mutex_unlock(&d->io_lock);
+	mk_pciback_put(d);
+	/* No request access after release; callback and queue remain unchanged. */
+	scoped_guard(raw_spinlock_irqsave, &mk_pciback_lock)
+		w->dev = NULL;
 }
 
-static void mk_pciback_defer(const struct mk_pci_cfg_payload *req, u32 subtype)
+static void mk_pciback_defer(const struct mk_pci_cfg_payload *req, u32 subtype,
+			     struct mk_pciback_dev *d)
 {
-	struct mk_pciback_work *w = kzalloc(sizeof(*w), GFP_ATOMIC);
+	struct mk_pciback_work *w;
+	int i;
 
-	if (!w)
+	lockdep_assert_held(&mk_pciback_lock);
+	for (i = 0; i < MK_IPI_RING_SIZE; i++) {
+		w = &mk_pciback_requests[i];
+		if (w->dev)
+			continue;
+		refcount_inc(&d->ref);
+		w->dev = d;
+		w->req = *req;
+		w->subtype = subtype;
+		schedule_work(&w->work);
 		return;
-	w->req = *req;
-	w->subtype = subtype;
-	INIT_WORK(&w->work, mk_pciback_work_fn);
-	schedule_work(&w->work);
+	}
 }
 
 static void mk_pciback_request(const struct mk_pci_cfg_payload *req,
 			       u32 subtype)
 {
 	struct mk_pci_cfg_payload ack = *req;
+	struct mk_instance *instance;
 	struct mk_pciback_dev *d;
-
-	if (mk_manifest_phys()) {
-		mk_pciback_defer(req, subtype);
-		return;
-	}
 
 	guard(raw_spinlock_irqsave)(&mk_pciback_lock);
 
 	d = mk_pciback_find(req->sender_instance_id, req->domain, req->bus,
 			    req->devfn);
 	if (!d) {
-		mk_pciback_defer(req, subtype);
+		/* RCU-pinned lookup and a negative reply need no config access. */
+		instance = mk_instance_find(req->sender_instance_id);
+		if (instance) {
+			ack.result = PCIBIOS_DEVICE_NOT_FOUND;
+			ack.val = ~0U;
+			mk_pciback_answer(instance, &ack);
+			mk_instance_put(instance);
+		}
+		return;
+	}
+	if (mk_manifest_phys()) {
+		mk_pciback_defer(req, subtype, d);
 		return;
 	}
 
@@ -372,20 +378,23 @@ static void mk_pciback_request(const struct mk_pci_cfg_payload *req,
 	mk_pciback_answer(d->instance, &ack);
 }
 
-static void mk_pciback_msg_handler(u32 msg_type, u32 subtype, void *payload,
-				   u32 payload_len, void *ctx)
+static void mk_pciback_msg_handler(u32 msg_type, u32 subtype, u64 msg_id,
+				   void *payload, u32 payload_len, void *ctx)
 {
-	if (payload_len < sizeof(struct mk_pci_cfg_payload))
+	struct mk_pci_cfg_payload req;
+
+	if (payload_len < sizeof(req))
 		return;
+	/* The wire payload need not align its 64-bit sequence number. */
+	memcpy(&req, payload, sizeof(req));
 
 	switch (subtype) {
 	case MK_PCI_CFG_READ:
 	case MK_PCI_CFG_WRITE:
-		mk_pciback_request(payload, subtype);
+		mk_pciback_request(&req, subtype);
 		break;
 	case MK_PCI_CFG_ACK:
-		mk_request_answer(((struct mk_pci_cfg_payload *)payload)->seq,
-				  payload, sizeof(struct mk_pci_cfg_payload));
+		mk_request_answer(req.seq, &req, sizeof(req));
 		break;
 	}
 }
@@ -423,6 +432,7 @@ int mk_pciback_lend_one(struct mk_instance *instance, u16 domain, u8 bus,
 	pm_runtime_get_sync(&pdev->dev);
 
 	refcount_set(&d->ref, 1);
+	mutex_init(&d->io_lock);
 	d->pdev = pdev;
 	d->sriov = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_SRIOV);
 	d->instance = instance;
@@ -438,8 +448,11 @@ static void mk_pciback_free(struct list_head *gone)
 	struct mk_pciback_dev *d, *tmp;
 
 	list_for_each_entry_safe(d, tmp, gone, list) {
+		/* Admission is closed; wait outside the registry spinlock. */
+		mutex_lock(&d->io_lock);
 		if (pci_reset_function(d->pdev))
 			pci_clear_master(d->pdev);
+		mutex_unlock(&d->io_lock);
 		mk_pciback_put(d);
 	}
 }
@@ -455,8 +468,10 @@ void mk_pciback_unlend_one(struct mk_instance *instance, u16 domain, u8 bus,
 
 	scoped_guard(raw_spinlock_irqsave, &mk_pciback_lock) {
 		d = mk_pciback_find(instance->id, domain, bus, devfn);
-		if (d)
+		if (d) {
+			WRITE_ONCE(d->revoked, true);
 			list_move(&d->list, &gone);
+		}
 	}
 	mk_pciback_free(&gone);
 }
@@ -472,8 +487,10 @@ void mk_pciback_unlend(struct mk_instance *instance)
 
 	scoped_guard(raw_spinlock_irqsave, &mk_pciback_lock) {
 		list_for_each_entry_safe(d, tmp, &mk_pciback_devs, list) {
-			if (d->instance == instance)
+			if (d->instance == instance) {
+				WRITE_ONCE(d->revoked, true);
 				list_move(&d->list, &gone);
+			}
 		}
 	}
 	mk_pciback_free(&gone);
@@ -510,6 +527,11 @@ int mk_pciback_lend(struct mk_instance *instance)
 /* Answers reach a spawn's front end from its first bus scan, at subsys_initcall */
 static int __init mk_pciback_init(void)
 {
+	int i;
+
+	for (i = 0; i < MK_IPI_RING_SIZE; i++)
+		INIT_WORK(&mk_pciback_requests[i].work, mk_pciback_work_fn);
+
 	return mk_register_msg_handler(MK_MSG_PCI, mk_pciback_msg_handler, NULL);
 }
 arch_initcall(mk_pciback_init);

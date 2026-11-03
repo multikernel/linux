@@ -14,6 +14,10 @@ extern struct list_head mk_instance_list;
 /* core.c */
 struct mk_instance *mk_instance_alloc(int id, const char *name);
 int mk_instance_publish(struct mk_instance *instance);
+int mk_instance_idr_add(struct mk_instance *instance, int start, int end);
+void mk_instance_idr_remove(int id);
+int mk_instance_prepare_destroy(struct mk_instance *instance);
+int mk_instance_retire_resources(struct mk_instance *instance);
 void mk_instance_free(struct mk_instance *instance);
 
 /* kernfs.c */
@@ -37,18 +41,20 @@ int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 
 /* overlay.c */
 extern struct kernfs_node *mk_overlay_root_kn;
-extern struct mutex mk_overlay_mutex;
 int mk_overlay_init(void);
-void mk_overlay_exit(void);
 int mk_overlay_rmdir(struct kernfs_node *kn);
 
 /* ipi.c */
 int mk_arm_force_halt(struct mk_instance *instance);
+int mk_send_message_ipi(int instance_id, struct mk_instance *instance,
+			const struct mk_message *message, const void *payload);
 
 /* hotplug.c */
 int mk_hotplug_init(void);
+void mk_hotplug_quiesce(void);
 void mk_hotplug_cleanup(void);
-int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_len);
+int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_len,
+			 u64 msg_id);
 
 /*
  * Move primitives between this kernel and the pool it manages. Valid
@@ -62,6 +68,7 @@ int mk_pool_device_remove(u16 domain, u8 bus, u8 devfn,
 
 /* Root pool bookkeeping for PCI devices, see core.c */
 bool mk_root_has_pci_device(u16 domain, u8 bus, u8 devfn);
+bool mk_pci_device_assigned(u16 domain, u8 bus, u8 devfn);
 int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn, const char *alias);
 int mk_root_del_pci_device(u16 domain, u8 bus, u8 devfn);
 

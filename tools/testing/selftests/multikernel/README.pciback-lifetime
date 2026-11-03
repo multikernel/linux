@@ -1,0 +1,102 @@
+.. SPDX-License-Identifier: GPL-2.0-only
+
+PCI backend request retirement
+==============================
+
+Run: bash tools/testing/selftests/multikernel/pciback_lifetime_test.sh
+
+The fixture extracts the production request, deferred worker, reference release,
+unlend and inbox-draining functions. It uses pthread locks and controlled
+condition variables where the kernel uses locks and a workqueue. PCI config
+access, reset, IRQ delivery and message decoding are modeled.
+
+Four scenarios check:
+
+* A queued request pins its original device grant. Unlend followed by a new grant
+  with the same instance ID and BDF cannot redirect that request, or send its ACK
+  into a later boot.
+* A negative reply requires no config access and does not queue an ID lookup.
+* Unlend revokes admission under the registry spinlock, then waits outside that
+  lock for a slow config access and its reply before resetting the function.
+* Direct and deferred config writes preserve the request value; single-function
+  retirement releases the same pins as whole-instance retirement.
+
+The existing startup and image-lock tests also check PCI retirement before
+publishing a reusable instance state and before freeing Image segments.
+
+Requests still in the shared ring
+---------------------------------
+
+Pinning a deferred worker cannot protect a request that has not reached its
+handler. Generic parked confirmation therefore drains a captured prefix of the
+local inbox after confirming every owned/tracked CPU stopped. With the controller
+resource mutex held, the retiring peer can no longer publish requests or acquire
+a replacement grant. The consumer lock also waits for any entered callback.
+PCI requests reach the old grant before unlend revokes it; queued workers retain
+that grant and cannot access or reply through a later one.
+
+A claimed but unpublished slot returns -EBUSY, leaving the slot and the following
+traffic intact. Callers retain the Image, grants and instance ID. If a live peer
+publishes later, retry can succeed; an abandoned slot can block retirement until
+controller reboot. The shared ring is never reset to recover one peer.
+
+The captured prefix contains at most ring-size-minus-one entries, including
+malformed ones. New traffic from other peers cannot extend this drain; it remains
+queued for a later poll or doorbell. This bounds entries, not callback duration
+or lock wait. Successful polling is not global ring quiescence. Deferred handlers
+still need their own admission/identity and retirement guarantees.
+
+Additional scenarios exercise old PCI requests before unlend/re-lend, unrelated
+messages, unpublished slots, late publication, partial prefixes, wraparound,
+continuous valid/malformed arrivals and callback reentry. cpu_ownership_test
+checks that failed CPU confirmation prevents draining and a blocked drain cannot
+report reusable confirmation.
+
+Limits
+------
+
+These checks do not prove native lockdep behavior, PCI reset/DMA quiescence, or
+RISC-V PCI assignment. Real cross-kernel producers, memory ordering, interrupt
+delivery and CPU-stop proof need runtime qualification. A stopped peer must not
+be able to publish via an untracked CPU or another kernel. Native device-remove
+ACKs must mean the remote driver stopped issuing config requests. Delayed
+resource-hotplug ACKs, partial overlay rollback and stale deferred non-PCI work
+are separate lifetime gates; a passing fixture is not end-to-end safety.
+
+Bounded deferred requests
+-------------------------
+
+Nested kernels use MK_IPI_RING_SIZE preinitialized system-workqueue slots.
+A free slot has no device pin. Under mk_pciback_lock, admission takes the grant
+reference and copies the request/subtype into a slot before queueing it. The
+worker still serializes access and its ACK with revocation via the grant's
+io_lock. It releases the grant before marking its slot free under the raw lock.
+No request field is used afterward. Each work item keeps its callback and queue
+and is never reinitialized in receive context, preserving workqueue
+non-reentrancy if another request arrives before the old callback returns.
+The slots have static lifetime and are initialized before the early PCI handler
+registration. Registration errors are still propagated.
+
+Full capacity drops the new request without taking a reference or sending a
+success reply, matching the former allocation-failure behavior. The requester
+can time out; no reset, grant reuse or recovery is implied. Direct config access
+and negative replies remain synchronous because frontends may poll with
+interrupts off. Process-context grant allocations and final reference release
+remain; only IRQ-side work allocation/free/init is removed.
+
+The handler copies the wire payload into aligned local storage before reading
+its 64-bit sequence number or dispatching requests. The packed message layout
+is unchanged. A deliberately misaligned ACK reproduces undefined behavior
+before this copy; short messages are rejected as before.
+
+The fixture now extracts the real payload/work definitions and early init,
+checks allocation exhaustion without IRQ allocator entry, saturation without
+overwrite or extra pins, copied request values, slot reuse, saturated revocation
+and replacement-grant isolation, and unaligned request/ACK decoding. Existing
+pthread retirement races and bounded ring-prefix tests remain. Run ASan/UBSan:
+
+  CC=clang CFLAGS='-O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all' \
+    bash tools/testing/selftests/multikernel/pciback_lifetime_test.sh
+
+The scheduler remains controlled; PCI reset/DMA and actual nested-kernel config
+forwarding are not qualified by the host fixture.

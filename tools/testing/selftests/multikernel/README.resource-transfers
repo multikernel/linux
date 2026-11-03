@@ -1,0 +1,62 @@
+.. SPDX-License-Identifier: GPL-2.0-only
+
+Uncertain resource transfer retention
+====================================
+
+Run resource_transfer_test.sh and overlay_retention_test.sh with sh. They
+extract the actual controller senders and overlay lifetime functions. Transport,
+native resource operations and kernfs are controlled boundaries. No test here
+boots a kernel, runs a delayed remote worker or proves PCI/DMA quiescence.
+
+All six CPU/memory/device controller senders require mk_overlay_mutex, as do
+their overlay callers and Image operations. A successful ring enqueue is
+publication; transport errors currently occur before a slot is published.
+Cancelling a pending waiter does not cancel a published request.
+
+Memory and device ownership must be reserved before publication. Device add
+also reserves ownership before admitting config access. Before publication,
+allocation or send errors undo the reservation; failed cleanup retains it and
+reports the cleanup error. After publication, any unsuccessful wait retains
+ownership and marks the instance resource_uncertain. A negative ACK cannot
+certify rollback: the receiver can have changed one memory piece, failed the
+next, and failed to restore the first. A timeout permits later worker execution.
+Memory removal therefore keeps its range reserved against Image allocations;
+device failures retain lending and do not reset a potentially busy function.
+The free-pool device-add path checks all other instance grants before touching
+the local function. Otherwise a second overlay could make a retained function
+assignable again without addressing the quarantined instance at all.
+
+The flag blocks further CPU/memory/device controller changes, start, Image
+reuse/unload and destruction through the common confirmation gate. Freeing all
+instance memory also checks it. Even confirmed stopped CPUs cannot prove a
+resource rollback or DMA settlement. There is no automatic flag clearing:
+recovery requires rebooting the controller. Graceful/force halt can still request
+that CPUs stop, but settlement returns -EBUSY and does not publish LOADED.
+This deliberately sacrifices availability, including for a negative ACK that
+happened before any remote change. A future recovery protocol must distinguish
+that case and prove all admitted resource work has retired before granting reuse.
+
+Overlay records are allocated and populated while inactive, before resource
+operations begin. Record allocation failure cannot strand applied changes.
+An apply failure can leave a partially applied transaction; it remains visible
+as failed. rmdir only inverses an applied transaction, and the first inverse
+failure permanently marks it failed. Repeating a failed inverse could undo
+operations that never ran, or undo an already-reversed item twice. The unused
+overlay exit/discard path was removed; it could free records after failed
+rollback and before draining attribute readers. No per-operation transaction
+journal or automatic retry is provided. Successful removal still drains kernfs
+readers outside mk_overlay_mutex before freeing the transaction.
+
+Coverage: negative ACKs and timeouts for all four memory/device operations,
+ownership before lending/publication, competing reservations, attempts to
+reinsert a retained PCI grant through the free-pool path, unpublished error
+cleanup, cleanup failures, resource quarantine across state changes, metadata
+allocation failure before overlay effects, partial apply/inverse and repeated
+removal. cpu_ownership_test, memory_teardown_test and start_lifetime_test exercise
+the actual reuse gates. image_lock_test checks controller serialization with
+real host mutexes; its transaction begins in APPLIED state.
+
+Remaining qualification: actual delayed/partial receiver work, live lockdep,
+hardware PCI reset/DMA and native/QEMU resource cycles. README.pciback-lifetime
+describes the separate stopped-peer inbox drain before PCI grant reuse. It does
+not establish retirement of deferred resource workers or cancel published work.

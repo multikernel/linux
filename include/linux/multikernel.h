@@ -16,6 +16,8 @@
 #include <linux/mutex.h>
 #include <linux/numa.h>
 #include <linux/sizes.h>
+#include <linux/spinlock.h>
+#include <linux/workqueue.h>
 
 #ifdef CONFIG_MULTIKERNEL
 #include <asm/multikernel.h>
@@ -140,7 +142,7 @@ struct mk_ipi_handler {
 	mk_ipi_callback_t callback;
 	void *context;
 	unsigned int ipi_type;       /* IPI type this handler is registered for */
-	struct mk_ipi_handler *next;
+	struct mk_ipi_handler __rcu *next;
 };
 
 /**
@@ -156,6 +158,11 @@ struct mk_ipi_handler *multikernel_register_handler(mk_ipi_callback_t callback, 
 /**
  * multikernel_unregister_handler - Unregister a multikernel IPI callback
  * @handler: Handler pointer returned from multikernel_register_handler
+ *
+ * Sleeps until entered callbacks have returned. Call from process context,
+ * never from an IPI callback, and do not hold locks needed by callbacks.
+ * After return, the caller may release the callback context. The caller must
+ * serialize unregister calls for a given handler.
  */
 void multikernel_unregister_handler(struct mk_ipi_handler *handler);
 
@@ -175,8 +182,8 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 
 void generic_multikernel_interrupt(void);
 
-/* Drain the message ring where the doorbell interrupt cannot be taken */
-void mk_ipi_poll(void);
+/* Drain one inbox snapshot; -EBUSY for an unpublished slot or callback reentry. */
+int mk_ipi_poll(void);
 bool mk_ipi_in_drain(void);
 
 struct mk_instance;
@@ -184,7 +191,6 @@ int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
 				 size_t data_size, unsigned long type);
 
 /* Discard everything queued in this kernel's ring (instance re-spawn) */
-void mk_ipi_ring_drop_pending(void);
 
 /*
  * Multikernel Messaging System
@@ -350,7 +356,7 @@ struct mk_shutdown_payload {
 /**
  * Message handler callback type
  */
-typedef void (*mk_msg_handler_t)(u32 msg_type, u32 subtype,
+typedef void (*mk_msg_handler_t)(u32 msg_type, u32 subtype, u64 msg_id,
 				 void *payload, u32 payload_len, void *ctx);
 
 /* Opaque type for pending message tracking */
@@ -372,6 +378,8 @@ struct mk_pending_msg;
  */
 int mk_send_message(int instance_id, u32 msg_type, u32 subtype,
 		    void *payload, u32 payload_len);
+int mk_send_message_id(int instance_id, u32 msg_type, u32 subtype, u64 msg_id,
+		       void *payload, u32 payload_len);
 
 /*
  * The same for a caller that holds a reference to @instance. Looking an
@@ -413,9 +421,16 @@ int mk_register_msg_handler(u32 msg_type, mk_msg_handler_t handler, void *ctx);
  */
 int mk_unregister_msg_handler(u32 msg_type, mk_msg_handler_t handler);
 
-/* Pending message tracking for request-response pattern */
+/*
+ * Pending requests: add returns ERR_PTR on failure. The requester owns the
+ * pointer until exactly one wait or cancel; neither may run concurrently on
+ * the same pointer. IDs are unique only within this kernel's lifetime.
+ */
 struct mk_pending_msg *mk_msg_pending_add(u32 msg_type, u32 operation, u64 resource_id);
-void mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id, int result);
+u64 mk_msg_pending_id(const struct mk_pending_msg *pending);
+void mk_msg_pending_cancel(struct mk_pending_msg *pending);
+void mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id,
+			     u64 msg_id, int result);
 int mk_msg_pending_wait(struct mk_pending_msg *pending, unsigned long timeout_ms);
 
 /**
@@ -436,7 +451,8 @@ static inline int mk_send_irq_forward(int instance_id, u32 irq_number,
 			       &payload, sizeof(payload));
 }
 
-/* CPU resource management - these wait for operation to complete */
+/* Controller resource senders below require mk_overlay_mutex across the wait. */
+/* CPU resource management */
 int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags);
 int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id);
 
@@ -478,6 +494,13 @@ struct mk_pool_chunk {
  */
 struct mk_pool {
 	struct mk_cpu_set *cpus;	/* Parked CPUs free to assign */
+	/*
+	 * Stabilizes cpus storage and membership against CPUHP wake readers.
+	 * Writers are serialized by mk_overlay_mutex, but CPUHP does not take
+	 * it. Nests inside park_lock and mk_instance_mutex; never hold across
+	 * CPU hotplug, park/repark calls or ACK waits (wake takes it again).
+	 */
+	struct mutex cpus_lock;
 	struct list_head chunks;	/* Donated memory (struct mk_pool_chunk) */
 	struct gen_pool *node_pools[MAX_NUMNODES];
 	struct mutex mem_lock;		/* Protects chunks and node_pools */
@@ -500,10 +523,11 @@ extern struct mk_pool *mk_pool;
 
 int mk_pool_mem_grow(size_t size, int node, phys_addr_t *out_base);
 int mk_pool_mem_shrink(phys_addr_t start, size_t size);
+/* Caller owns the range. Map failure adds no mappings; unmap failure retains them. */
 int mk_pool_map(phys_addr_t start, size_t size);
-void mk_pool_unmap(phys_addr_t start, size_t size);
+int mk_pool_unmap(phys_addr_t start, size_t size);
 int mk_arch_pool_map(phys_addr_t start, size_t size);
-void mk_arch_pool_unmap(phys_addr_t start, size_t size);
+int mk_arch_pool_unmap(phys_addr_t start, size_t size);
 extern phys_addr_t multikernel_alloc(size_t size, int node);
 extern void multikernel_free(phys_addr_t addr, size_t size);
 struct resource *mk_pool_chunk_resource(phys_addr_t addr);
@@ -709,6 +733,9 @@ struct mk_instance {
 	int id;                         /* Kernel-assigned instance ID */
 	char *name;                     /* User-provided instance name */
 	enum mk_instance_state state;   /* Current state */
+	/* Protected by mk_overlay_mutex; a failed remote rollback pins grants. */
+	bool resource_uncertain;
+	raw_spinlock_t ipi_lock;         /* Ring writers versus reset/publication */
 
 	/* Resource management - list of reserved memory regions */
 	struct list_head memory_regions;  /* List of struct mk_memory_region */
@@ -775,9 +802,10 @@ struct mk_instance {
 	size_t ctrl_used;
 
 	/*
-	 * CPUs parked inside this instance's memory (its arch park area)
-	 * rather than in the host pool. They must be confirmed parked before
-	 * the image is rewritten and they pin the pool until they leave.
+	 * CPUs that may use this instance's memory (its kernel or arch park
+	 * area), including handoffs whose wake acknowledgment timed out.
+	 * They must be confirmed parked before the image is rewritten and
+	 * they pin the pool until they leave.
 	 * Membership is per CPU because it changes one CPU at a time:
 	 * hotplug moves CPUs in and out while the instance runs, and a
 	 * stopped instance can gain CPUs that still sit in the host pool.
@@ -806,6 +834,9 @@ struct mk_instance {
 
 	/* Reference counting */
 	struct kref refcount;           /* Reference count for cleanup */
+	struct work_struct release_work; /* Last reference may be put from an IPI */
+	struct work_struct halted_work; /* Holds a reference while settling a notice */
+	atomic_t halted_pending;       /* Excludes restart until the notice retires */
 };
 
 /**
@@ -922,14 +953,28 @@ struct mk_instance *mk_instance_find_by_name(const char *name);
  */
 struct mk_instance *mk_instance_get(struct mk_instance *instance);
 int mk_instance_alloc_boot_pages(struct mk_instance *instance);
+#ifdef CONFIG_MULTIKERNEL
+void mk_instance_ipi_publish(struct mk_instance *instance);
+void mk_instance_ipi_deactivate(struct mk_instance *instance);
+void mk_instance_ipi_reset(struct mk_instance *instance);
+void mk_instance_ipi_retarget(struct mk_instance *instance);
+#else
+static inline void mk_instance_ipi_publish(struct mk_instance *instance) { }
+static inline void mk_instance_ipi_deactivate(struct mk_instance *instance) { }
+static inline void mk_instance_ipi_reset(struct mk_instance *instance) { }
+static inline void mk_instance_ipi_retarget(struct mk_instance *instance) { }
+#endif
 
 /**
  * mk_halt_to_pool() - Halt this spawn kernel, returning its CPUs to the pool
+ * @notify: Caller has excluded new resource operations through final parking
  *
- * Notifies the host and parks every CPU in the pool wait loop, keeping
- * the instance re-spawnable. Never returns.
+ * Parks every CPU in the pool wait loop. Only a qualified caller may notify
+ * the host that the instance can be considered for reuse after stop proof.
+ * Unqualified exits must pass false and leave the host retaining resources.
+ * Never returns.
  */
-void __noreturn mk_halt_to_pool(void);
+void __noreturn mk_halt_to_pool(bool notify);
 
 /**
  * mk_instance_reserve_resources() - Reserve CPU and memory resources for instance
@@ -950,8 +995,9 @@ int mk_instance_reserve_resources(struct mk_instance *instance,
  *
  * Returns all reserved memory regions back to the multikernel pool
  * and removes them from the resource hierarchy.
+ * Return: 0 on success, or an error with memory and metadata retained.
  */
-void mk_instance_free_memory(struct mk_instance *instance);
+int mk_instance_free_memory(struct mk_instance *instance);
 
 
 int mk_instance_transfer_cpus(struct mk_instance *instance,
@@ -1003,6 +1049,13 @@ struct pci_bus;
 struct pci_dev;
 
 #ifdef CONFIG_MULTIKERNEL
+/*
+ * Serializes controller resource changes with MK image load, exec and cleanup.
+ * Process context only. Lock order: kexec_lock -> mk_overlay_mutex ->
+ * mk_instance_mutex. Do not wait for remote work under mk_instance_mutex.
+ */
+extern struct mutex mk_overlay_mutex;
+
 bool multikernel_allow_emergency_restart(void);
 int multikernel_halt_by_id(int mk_id);
 int multikernel_force_halt_by_id(int mk_id);
