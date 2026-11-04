@@ -35,7 +35,6 @@ config MULTIKERNEL
 	  If unsure, say N.
 
 
-# Confine the DMA of an instance's PCI devices to its memory. x86 runs
-# them without an IOMMU so far.
+# Confine the DMA of an instance's PCI devices to its memory.
 config MULTIKERNEL_IOMMU
-	def_bool MULTIKERNEL && IOMMU_API && PCI && ARM64
+	def_bool MULTIKERNEL && IOMMU_API && PCI
