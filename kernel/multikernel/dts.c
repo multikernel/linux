@@ -1246,6 +1246,10 @@ static int mk_dt_emit_bus_tree(struct pci_bus *bus, void *fdt,
 	mk_pci_bus_describe(bus, desc);
 	ret = fdt_begin_node(fdt, name);
 	if (!ret)
+		ret = fdt_property_u32(fdt, "#address-cells", 3);
+	if (!ret)
+		ret = fdt_property_u32(fdt, "#size-cells", 2);
+	if (!ret)
 		ret = mk_dt_emit_bus_desc(fdt, desc);
 	if (!ret)
 		ret = fdt_end_node(fdt);
@@ -1269,7 +1273,9 @@ static int mk_dt_emit_bus_tree(struct pci_bus *bus, void *fdt,
  * buses of the backup until it takes a function on one.
  *
  *   multikernel,pci-buses {
- *       pci@0,4 { reg = <...>; ranges = <...>; };
+ *       #address-cells = <2>; #size-cells = <2>;
+ *       pci@0,4 { #address-cells = <3>; #size-cells = <2>;
+ *                 reg = <...>; ranges = <...>; };
  *   };
  *
  * Returns: 0 or a libfdt error
@@ -1285,6 +1291,10 @@ int mk_dt_emit_pci_buses(void *fdt)
 		return -FDT_ERR_NOSPACE;
 
 	ret = fdt_begin_node(fdt, "multikernel,pci-buses");
+	if (!ret)
+		ret = fdt_property_u32(fdt, "#address-cells", 2);
+	if (!ret)
+		ret = fdt_property_u32(fdt, "#size-cells", 2);
 	pci_lock_rescan_remove();
 	while (!ret && (bus = pci_find_next_bus(bus)))
 		ret = mk_dt_emit_bus_tree(bus, fdt, desc);
