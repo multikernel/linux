@@ -171,6 +171,15 @@ static int modify_irte(struct irq_2_iommu *irq_iommu,
 	index = irq_iommu->irte_index + irq_iommu->sub_handle;
 	irte = &iommu->ir_table->base[index];
 
+	/* The owner's table first, so an entry it refuses leaves both alike */
+	if (dmar_unit_foreign(iommu)) {
+		rc = dmar_foreign->irte_write(iommu->reg_phys, index, 0,
+					      irte_modified->low,
+					      irte_modified->high);
+		if (rc)
+			goto unlock;
+	}
+
 	if ((irte->pst == 1) || (irte_modified->pst == 1)) {
 		/*
 		 * We use cmpxchg16 to atomically update the 128-bit IRTE,
@@ -186,8 +195,10 @@ static int modify_irte(struct irq_2_iommu *irq_iommu,
 	}
 	__iommu_flush_cache(iommu, irte, sizeof(*irte));
 
-	rc = qi_flush_iec(iommu, index, 0);
+	if (!dmar_unit_foreign(iommu))
+		rc = qi_flush_iec(iommu, index, 0);
 
+unlock:
 	raw_spin_unlock_irqrestore(&irq_2_ir_lock, flags);
 
 	return rc;
@@ -244,6 +255,9 @@ static int clear_entries(struct irq_2_iommu *irq_iommu)
 	bitmap_release_region(iommu->ir_table->bitmap, index,
 			      irq_iommu->irte_mask);
 
+	if (dmar_unit_foreign(iommu))
+		return dmar_foreign->irte_write(iommu->reg_phys, index,
+						irq_iommu->irte_mask, 0, 0);
 	return qi_flush_iec(iommu, index, irq_iommu->irte_mask);
 }
 
@@ -565,6 +579,17 @@ static int intel_setup_irq_remapping(struct intel_iommu *iommu)
 	ir_table->bitmap = bitmap;
 	iommu->ir_table = ir_table;
 
+	if (dmar_unit_foreign(iommu)) {
+		if (dmar_foreign->irte_block(iommu->reg_phys, &ir_table->foreign_first,
+					     &ir_table->foreign_count)) {
+			pr_info("%s: no remapping entries lent\n", iommu->name);
+			goto out_free_ir_domain;
+		}
+		bitmap_fill(bitmap, INTR_REMAP_TABLE_ENTRIES);
+		bitmap_clear(bitmap, ir_table->foreign_first, ir_table->foreign_count);
+		return 0;
+	}
+
 	/*
 	 * If the queued invalidation is already initialized,
 	 * shouldn't disable it.
@@ -697,6 +722,51 @@ static void __init intel_cleanup_irq_remapping(void)
 		pr_warn("Failed to enable irq remapping. You are vulnerable to irq-injection attacks.\n");
 }
 
+/*
+ * The owner writes this kernel's entries into its live table until the unit
+ * is claimed. Both tables hold the same entries, so the modes must match.
+ */
+static int __init intel_prepare_irq_remapping_foreign(void)
+{
+	struct dmar_drhd_unit *drhd;
+	struct intel_iommu *iommu;
+	int eim = -1;
+
+	/* IOAPICs, and the scopes naming them, stay with the owner */
+	if (nr_ioapics) {
+		pr_info("Not remapping interrupts beside foreign IOAPICs\n");
+		return -ENODEV;
+	}
+
+	for_each_iommu(iommu, drhd) {
+		int mode;
+
+		if (!ecap_ir_support(iommu->ecap) ||
+		    !(readl(iommu->reg + DMAR_GSTS_REG) & DMA_GSTS_IRES)) {
+			pr_info("%s: owner does not remap interrupts\n",
+				iommu->name);
+			return -ENODEV;
+		}
+		mode = !!(dmar_readq(iommu->reg + DMAR_IRTA_REG) &
+			  IR_X2APIC_MODE(1));
+		if (eim >= 0 && mode != eim)
+			return -ENODEV;
+		eim = mode;
+	}
+	if (eim < 0)
+		return -ENODEV;
+	eim_mode = eim;
+
+	for_each_iommu(iommu, drhd) {
+		if (intel_setup_irq_remapping(iommu)) {
+			for_each_iommu(iommu, drhd)
+				intel_teardown_irq_remapping(iommu);
+			return -ENODEV;
+		}
+	}
+	return 0;
+}
+
 static int __init intel_prepare_irq_remapping(void)
 {
 	struct dmar_drhd_unit *drhd;
@@ -715,6 +785,9 @@ static int __init intel_prepare_irq_remapping(void)
 
 	if (dmar_table_init() < 0)
 		return -ENODEV;
+
+	if (dmar_foreign)
+		return intel_prepare_irq_remapping_foreign();
 
 	if (!dmar_ir_support())
 		return -ENODEV;
@@ -804,7 +877,7 @@ static int __init intel_enable_irq_remapping(void)
 	 * Setup Interrupt-remapping for all the DRHD's now.
 	 */
 	for_each_iommu(iommu, drhd) {
-		if (!ir_pre_enabled(iommu))
+		if (!ir_pre_enabled(iommu) && !dmar_unit_foreign(iommu))
 			iommu_enable_irq_remapping(iommu);
 		setup = true;
 	}
@@ -814,7 +887,9 @@ static int __init intel_enable_irq_remapping(void)
 
 	irq_remapping_enabled = 1;
 
-	set_irq_posting_cap();
+	/* The owner cannot write posted entries naming this kernel's memory */
+	if (!dmar_foreign)
+		set_irq_posting_cap();
 
 	pr_info("Enabled IRQ remapping in %s mode\n", eim_mode ? "x2apic" : "xapic");
 
@@ -1016,7 +1091,7 @@ static void disable_irq_remapping(void)
 	 * Disable Interrupt-remapping for all the DRHD's now.
 	 */
 	for_each_iommu(iommu, drhd) {
-		if (!ecap_ir_support(iommu->ecap))
+		if (!ecap_ir_support(iommu->ecap) || dmar_unit_foreign(iommu))
 			continue;
 
 		iommu_disable_irq_remapping(iommu);
@@ -1043,7 +1118,7 @@ static int reenable_irq_remapping(int eim)
 	 * Setup Interrupt-remapping for all the DRHD's now.
 	 */
 	for_each_iommu(iommu, drhd) {
-		if (!ecap_ir_support(iommu->ecap))
+		if (!ecap_ir_support(iommu->ecap) || dmar_unit_foreign(iommu))
 			continue;
 
 		/* Set up interrupt remapping for iommu.*/

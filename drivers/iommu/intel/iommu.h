@@ -506,6 +506,9 @@ struct irq_domain;
 struct ir_table {
 	struct irte *base;
 	unsigned long *bitmap;
+	/* The entries the owner of a foreign unit lent this kernel */
+	u32 foreign_first;
+	u32 foreign_count;
 };
 
 void intel_irq_remap_add_device(struct dmar_pci_notify_info *info);

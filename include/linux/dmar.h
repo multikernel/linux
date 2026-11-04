@@ -50,6 +50,9 @@ struct dmar_foreign_ops {
 	/* The @i-th unit, or -ENOENT past the last */
 	int (*unit)(int i, struct dmar_unit_desc *desc);
 	int (*device_unit)(struct pci_dev *pdev, u64 *base);
+	int (*irte_block)(u64 base, u32 *first, u32 *count);
+	/* Have the owner write an entry; a zero one with @mask clears 1 << @mask */
+	int (*irte_write)(u64 base, u32 index, u32 mask, u64 low, u64 high);
 };
 
 #ifdef CONFIG_DMAR_TABLE
