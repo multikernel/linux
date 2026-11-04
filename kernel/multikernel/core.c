@@ -731,11 +731,6 @@ static int mk_instance_transfer_pci_devices(struct mk_instance *instance,
 	int not_found = 0;
 	bool found;
 
-	if (!mk_self || !mk_self->pci_devices_valid) {
-		pr_err("No self instance or PCI devices not initialized\n");
-		return -EINVAL;
-	}
-
 	if (requested_count == 0 || list_empty(requested_devices)) {
 		pr_info("No PCI devices requested for instance %d (%s)\n",
 			instance->id, instance->name);
@@ -769,6 +764,11 @@ static int mk_instance_transfer_pci_devices(struct mk_instance *instance,
 		pr_info("Lent %d PCI devices to instance %d (%s)\n",
 			transferred, instance->id, instance->name);
 		return 0;
+	}
+
+	if (!mk_self || !mk_self->pci_devices_valid) {
+		pr_err("No self instance or PCI devices not initialized\n");
+		return -EINVAL;
 	}
 
 	list_for_each_entry(req_dev, requested_devices, list) {
@@ -945,11 +945,6 @@ int mk_instance_add_pci_device(struct mk_instance *instance,
 	u8 slot = PCI_SLOT(devfn);
 	u8 func = PCI_FUNC(devfn);
 
-	if (!mk_self || !mk_self->pci_devices_valid) {
-		pr_err("No self instance or PCI devices not initialized\n");
-		return -EINVAL;
-	}
-
 	if (mk_manifest_phys()) {
 		int ret = mk_of_pci_lend(instance, domain, bus, devfn);
 
@@ -960,6 +955,11 @@ int mk_instance_add_pci_device(struct mk_instance *instance,
 			pr_info("Lent PCI device %04x:%02x:%02x.%x to instance %d\n",
 				domain, bus, slot, func, instance->id);
 		return ret;
+	}
+
+	if (!mk_self || !mk_self->pci_devices_valid) {
+		pr_err("No self instance or PCI devices not initialized\n");
+		return -EINVAL;
 	}
 
 	list_for_each_entry_safe(self_dev, tmp, &mk_self->pci_devices, list) {
