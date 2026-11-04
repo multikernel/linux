@@ -33,7 +33,29 @@ struct dmar_dev_scope {
 	u8 devfn;
 };
 
+struct pci_dev;
+
+/*
+ * VT-d units another kernel drives, left alone here until intel_iommu_claim().
+ * Set before detect_intel_iommu().
+ */
+struct dmar_unit_desc {
+	u64	base;			/* register base	*/
+	u64	size;			/* size of register set */
+	u16	segment;		/* PCI domain		*/
+	int	node;			/* NUMA node, or NUMA_NO_NODE */
+};
+
+struct dmar_foreign_ops {
+	/* The @i-th unit, or -ENOENT past the last */
+	int (*unit)(int i, struct dmar_unit_desc *desc);
+	int (*device_unit)(struct pci_dev *pdev, u64 *base);
+};
+
 #ifdef CONFIG_DMAR_TABLE
+void dmar_set_foreign_ops(const struct dmar_foreign_ops *ops);
+int dmar_unit_get(int i, struct dmar_unit_desc *desc);
+int dmar_device_unit(struct pci_dev *pdev, u64 *base);
 extern struct acpi_table_header *dmar_tbl;
 struct dmar_drhd_unit {
 	struct list_head list;		/* list of drhd units	*/
@@ -46,6 +68,7 @@ struct dmar_drhd_unit {
 	u8	ignored:1; 		/* ignore drhd		*/
 	u8	include_all:1;
 	u8	gfx_dedicated:1;	/* graphic dedicated	*/
+	u8	foreign:1;		/* another kernel drives it */
 	struct intel_iommu *iommu;
 };
 
@@ -74,12 +97,12 @@ extern struct list_head dmar_drhd_units;
 #define for_each_active_drhd_unit(drhd)					\
 	list_for_each_entry_rcu(drhd, &dmar_drhd_units, list,		\
 				dmar_rcu_check())			\
-		if (drhd->ignored) {} else
+		if (drhd->ignored || drhd->foreign) {} else
 
 #define for_each_active_iommu(i, drhd)					\
 	list_for_each_entry_rcu(drhd, &dmar_drhd_units, list,		\
 				dmar_rcu_check())			\
-		if (i=drhd->iommu, drhd->ignored) {} else
+		if (i = drhd->iommu, drhd->ignored || drhd->foreign) {} else
 
 #define for_each_iommu(i, drhd)						\
 	list_for_each_entry_rcu(drhd, &dmar_drhd_units, list,		\
@@ -176,6 +199,20 @@ static inline int dmar_ir_hotplug(struct dmar_drhd_unit *dmaru, bool insert)
 extern bool dmar_platform_optin(void);
 
 #else /* CONFIG_DMAR_TABLE */
+
+static inline void dmar_set_foreign_ops(const struct dmar_foreign_ops *ops)
+{
+}
+
+static inline int dmar_unit_get(int i, struct dmar_unit_desc *desc)
+{
+	return -ENOENT;
+}
+
+static inline int dmar_device_unit(struct pci_dev *pdev, u64 *base)
+{
+	return -ENODEV;
+}
 
 static inline int dmar_device_add(void *handle)
 {

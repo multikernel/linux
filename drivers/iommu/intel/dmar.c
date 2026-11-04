@@ -61,6 +61,7 @@ DECLARE_RWSEM(dmar_global_lock);
 LIST_HEAD(dmar_drhd_units);
 
 struct acpi_table_header * __initdata dmar_tbl;
+const struct dmar_foreign_ops *dmar_foreign;
 static int dmar_dev_scope_status = 1;
 static DEFINE_IDA(dmar_seq_ids);
 
@@ -431,6 +432,7 @@ static int dmar_parse_one_drhd(struct acpi_dmar_header *header, void *arg)
 	/* The size of the register set is 2 ^ N 4 KB pages. */
 	dmaru->reg_size = 1UL << (drhd->size + 12);
 	dmaru->include_all = drhd->flags & 0x1; /* BIT0: INCLUDE_ALL */
+	dmaru->foreign = !!dmar_foreign;
 	dmaru->devices = dmar_alloc_dev_scope((void *)(drhd + 1),
 					      ((void *)drhd) + drhd->header.length,
 					      &dmaru->devices_cnt);
@@ -577,7 +579,105 @@ static int __init dmar_table_detect(void)
 		status = AE_NOT_FOUND;
 	}
 
+	if (ACPI_SUCCESS(status))
+		dmar_foreign = NULL;
+	else if (dmar_foreign) {
+		struct dmar_unit_desc unit;
+
+		if (dmar_foreign->unit(0, &unit))
+			dmar_foreign = NULL;
+		else
+			status = AE_OK;
+	}
+
 	return ACPI_SUCCESS(status) ? 0 : -ENOENT;
+}
+
+void __init dmar_set_foreign_ops(const struct dmar_foreign_ops *ops)
+{
+	dmar_foreign = ops;
+}
+
+/* Each foreign unit as a DRHD without scopes: the owner names each device's unit */
+static int __init dmar_walk_foreign_units(int (*fn)(struct acpi_dmar_header *header,
+						    const struct dmar_unit_desc *unit))
+{
+	struct acpi_dmar_hardware_unit drhd = {
+		.header.type = ACPI_DMAR_TYPE_HARDWARE_UNIT,
+		.header.length = sizeof(drhd),
+	};
+	struct dmar_unit_desc unit;
+	int i, ret;
+
+	for (i = 0; !dmar_foreign->unit(i, &unit); i++) {
+		if (unit.size < VTD_PAGE_SIZE || !is_power_of_2(unit.size))
+			return -EINVAL;
+		drhd.address = unit.base;
+		drhd.segment = unit.segment;
+		drhd.size = ilog2(unit.size) - VTD_PAGE_SHIFT;
+		ret = fn(&drhd.header, &unit);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static int __init dmar_parse_foreign_unit(struct acpi_dmar_header *header,
+					  const struct dmar_unit_desc *unit)
+{
+	struct dmar_drhd_unit *dmaru;
+	int ret;
+
+	ret = dmar_parse_one_drhd(header, NULL);
+	if (ret)
+		return ret;
+	dmaru = dmar_find_drhd_by_base(unit->base);
+	if (dmaru && unit->node != NUMA_NO_NODE && node_possible(unit->node))
+		dmaru->iommu->node = unit->node;
+	return 0;
+}
+
+/**
+ * dmar_unit_get - Describe the @i-th unit this kernel drives
+ * @i: index of the unit
+ * @desc: filled with its description
+ *
+ * Return: 0, or -ENOENT past the last unit.
+ */
+int dmar_unit_get(int i, struct dmar_unit_desc *desc)
+{
+	struct dmar_drhd_unit *dmaru;
+
+	guard(rcu)();
+	for_each_drhd_unit(dmaru) {
+		if (dmaru->foreign)
+			continue;
+		if (i--)
+			continue;
+		desc->base = dmaru->reg_base_addr;
+		desc->size = dmaru->reg_size;
+		desc->segment = dmaru->segment;
+		desc->node = dmaru->iommu ? dmaru->iommu->node : NUMA_NO_NODE;
+		return 0;
+	}
+	return -ENOENT;
+}
+
+/**
+ * dmar_device_unit - The register base of the unit @pdev sits behind
+ * @pdev: the device
+ * @base: filled with the base
+ *
+ * Return: 0, or -ENODEV when no unit covers @pdev.
+ */
+int dmar_device_unit(struct pci_dev *pdev, u64 *base)
+{
+	struct dmar_drhd_unit *dmaru = dmar_find_matched_drhd_unit(pdev);
+
+	if (!dmaru)
+		return -ENODEV;
+	*base = dmaru->reg_base_addr;
+	return 0;
 }
 
 static int dmar_walk_remapping_entries(struct acpi_dmar_header *start,
@@ -654,6 +754,8 @@ parse_dmar_table(void)
 	 * fixed map.
 	 */
 	dmar_table_detect();
+	if (dmar_foreign)
+		return dmar_walk_foreign_units(dmar_parse_foreign_unit);
 
 	/*
 	 * ACPI tables may not be DMA protected by tboot, so use DMAR copy
@@ -696,6 +798,26 @@ static int dmar_pci_device_match(struct dmar_dev_scope devices[],
 	return 0;
 }
 
+struct dmar_drhd_unit *dmar_find_drhd_by_base(u64 base)
+{
+	struct dmar_drhd_unit *dmaru;
+
+	for_each_drhd_unit(dmaru)
+		if (dmaru->reg_base_addr == base)
+			return dmaru;
+	return NULL;
+}
+
+/* The owner may show a device without the bridges its device scope names */
+struct dmar_drhd_unit *dmar_foreign_drhd_unit(struct pci_dev *dev)
+{
+	u64 base;
+
+	if (dmar_foreign->device_unit(pci_physfn(dev), &base))
+		return NULL;
+	return dmar_find_drhd_by_base(base);
+}
+
 struct dmar_drhd_unit *
 dmar_find_matched_drhd_unit(struct pci_dev *dev)
 {
@@ -705,6 +827,10 @@ dmar_find_matched_drhd_unit(struct pci_dev *dev)
 	dev = pci_physfn(dev);
 
 	rcu_read_lock();
+	if (dmar_foreign) {
+		dmaru = dmar_foreign_drhd_unit(dev);
+		goto out;
+	}
 	for_each_drhd_unit(dmaru) {
 		drhd = container_of(dmaru->hdr,
 				    struct acpi_dmar_hardware_unit,
@@ -915,6 +1041,12 @@ dmar_validate_one_drhd(struct acpi_dmar_header *entry, void *arg)
 	return 0;
 }
 
+static int __init dmar_validate_foreign_unit(struct acpi_dmar_header *header,
+					     const struct dmar_unit_desc *unit)
+{
+	return dmar_validate_one_drhd(header, NULL);
+}
+
 void __init detect_intel_iommu(void)
 {
 	int ret;
@@ -925,11 +1057,19 @@ void __init detect_intel_iommu(void)
 
 	down_write(&dmar_global_lock);
 	ret = dmar_table_detect();
-	if (!ret)
+	if (!ret && dmar_foreign)
+		ret = dmar_walk_foreign_units(dmar_validate_foreign_unit);
+	else if (!ret)
 		ret = dmar_walk_dmar_table((struct acpi_table_dmar *)dmar_tbl,
 					   &validate_drhd_cb);
-	if (!ret && !no_iommu && !iommu_detected &&
-	    (!dmar_disabled || dmar_platform_optin())) {
+	/*
+	 * Drivers bind with physical addresses before the units are claimed,
+	 * and only identity domains keep their DMA working afterwards.
+	 */
+	if (!ret && dmar_foreign)
+		iommu_set_default_passthrough(true);
+	else if (!ret && !no_iommu && !iommu_detected &&
+		 (!dmar_disabled || dmar_platform_optin())) {
 		iommu_detected = 1;
 		/* Make sure ACS will be enabled */
 		pci_request_acs();
@@ -940,10 +1080,9 @@ void __init detect_intel_iommu(void)
 		x86_platform.iommu_shutdown = intel_iommu_shutdown;
 	}
 
-	if (dmar_tbl) {
+	if (dmar_tbl)
 		acpi_put_table(dmar_tbl);
-		dmar_tbl = NULL;
-	}
+	dmar_tbl = NULL;
 	up_write(&dmar_global_lock);
 }
 
@@ -2048,7 +2187,8 @@ int enable_drhd_fault_handling(unsigned int cpu)
 		u32 fault_status;
 		int ret;
 
-		if (iommu->irq || iommu->node != cpu_to_node(cpu))
+		if (iommu->irq || iommu->node != cpu_to_node(cpu) ||
+		    dmar_unit_foreign(iommu))
 			continue;
 
 		ret = dmar_set_interrupt(iommu);
@@ -2117,7 +2257,7 @@ static int __init dmar_free_unused_resources(void)
 {
 	struct dmar_drhd_unit *dmaru, *dmaru_n;
 
-	if (dmar_in_use())
+	if (dmar_in_use() || dmar_foreign)
 		return 0;
 
 	if (dmar_dev_scope_status != 1 && !list_empty(&dmar_drhd_units))

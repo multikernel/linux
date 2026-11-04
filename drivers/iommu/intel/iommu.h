@@ -1208,6 +1208,15 @@ int __domain_setup_first_level(struct intel_iommu *iommu, struct device *dev,
 
 int dmar_ir_support(void);
 
+extern const struct dmar_foreign_ops *dmar_foreign;
+struct dmar_drhd_unit *dmar_find_drhd_by_base(u64 base);
+struct dmar_drhd_unit *dmar_foreign_drhd_unit(struct pci_dev *dev);
+
+static inline bool dmar_unit_foreign(struct intel_iommu *iommu)
+{
+	return iommu->drhd->foreign;
+}
+
 void iommu_flush_write_buffer(struct intel_iommu *iommu);
 struct iommu_domain *
 intel_iommu_domain_alloc_nested(struct device *dev, struct iommu_domain *parent,

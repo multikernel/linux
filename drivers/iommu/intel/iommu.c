@@ -480,6 +480,15 @@ static struct intel_iommu *device_lookup_iommu(struct device *dev, u8 *bus, u8 *
 		dev = &ACPI_COMPANION(dev)->dev;
 
 	rcu_read_lock();
+	if (dmar_foreign) {
+		drhd = pdev ? dmar_foreign_drhd_unit(pdev) : NULL;
+		iommu = drhd ? drhd->iommu : NULL;
+		if (!iommu || dmar_unit_foreign(iommu)) {
+			iommu = NULL;
+			goto out;
+		}
+		goto got_pdev;
+	}
 	for_each_iommu(iommu, drhd) {
 		if (pdev && segment != drhd->segment)
 			continue;
@@ -1790,6 +1799,8 @@ static int init_iommu_hw(void)
 	}
 
 	for_each_iommu(iommu, drhd) {
+		if (drhd->foreign)
+			continue;
 		if (drhd->ignored) {
 			/*
 			 * we always have to disable PMRs or DMA may fail on
@@ -2371,6 +2382,8 @@ void intel_iommu_shutdown(void)
 	 */
 	list_for_each_entry(drhd, &dmar_drhd_units, list) {
 		iommu = drhd->iommu;
+		if (drhd->foreign)
+			continue;
 
 		/* Disable PMRs explicitly here. */
 		iommu_disable_protect_mem_regions(iommu);
@@ -2584,6 +2597,16 @@ int __init intel_iommu_init(void)
 	dmar_register_bus_notifier();
 
 	down_write(&dmar_global_lock);
+
+	if (dmar_foreign) {
+		for_each_iommu(iommu, drhd)
+			pr_info("%s at %llx: driven by another kernel\n",
+				iommu->name, drhd->reg_base_addr);
+		intel_iommu_debugfs_init();
+		up_write(&dmar_global_lock);
+		init_iommu_pm_ops();
+		return 0;
+	}
 
 	if (!no_iommu)
 		intel_iommu_debugfs_init();
