@@ -184,6 +184,8 @@ int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
 	unsigned int head, next_head, tail;
 	mk_phys_cpu_t target;
 
+	if (READ_ONCE(instance->silent))
+		return -EHOSTDOWN;
 	if (data_size > MK_MAX_DATA_SIZE)
 		return -EINVAL;
 

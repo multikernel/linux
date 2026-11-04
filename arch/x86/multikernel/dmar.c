@@ -37,7 +37,6 @@
 
 /* 256 entries per spawn and unit, in an aligned block */
 #define MK_IRTE_ORDER		8
-#define MK_IRTE_TIMEOUT_US	USEC_PER_SEC
 #define MK_IOMMUS_PATH		"/chosen/multikernel,iommus"
 
 struct mk_irte_payload {
@@ -61,7 +60,6 @@ struct mk_irte_block {
 
 static LIST_HEAD(mk_irte_blocks);
 static DEFINE_RAW_SPINLOCK(mk_irte_blocks_lock);
-static bool mk_irte_host_silent;
 
 static struct mk_irte_block *mk_irte_find_block(int instance_id, u64 unit)
 {
@@ -359,18 +357,8 @@ static int mk_irte_write(u64 unit, u32 index, u32 mask, u64 low, u64 high)
 		return 0;
 	if (!host_instance)
 		return -ENODEV;
-	/* Each wait spins with interrupts off; one unanswered write is enough */
-	if (READ_ONCE(mk_irte_host_silent))
-		return -EHOSTDOWN;
 	ret = mk_request_sync(host_instance, MK_MSG_IO, MK_IO_IRTE_WRITE, req.seq,
-			      &req, sizeof(req), &ack, sizeof(ack),
-			      MK_IRTE_TIMEOUT_US);
-	if (ret == -ETIMEDOUT) {
-		WRITE_ONCE(mk_irte_host_silent, true);
-		pr_err("host did not write remapping entry %u; no more are sent\n",
-		       index);
-		return -EHOSTDOWN;
-	}
+			      &req, sizeof(req), &ack, sizeof(ack));
 	return ret ? ret : ack.result;
 }
 

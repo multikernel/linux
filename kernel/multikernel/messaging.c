@@ -237,7 +237,8 @@ static int mk_build_and_send(int instance_id, struct mk_instance *instance,
 	kfree(msg);
 
 	if (ret < 0) {
-		pr_err("Failed to send multikernel message: %d\n", ret);
+		if (ret != -EHOSTDOWN)
+			pr_err("Failed to send multikernel message: %d\n", ret);
 		return ret;
 	}
 
@@ -272,6 +273,12 @@ struct mk_sync_request {
 	bool done;
 };
 
+/*
+ * Generous, as the wait spins: an instance that misses it is marked
+ * silent, so a dead one costs a single wait.
+ */
+#define MK_REQUEST_TIMEOUT_US	USEC_PER_SEC
+
 static LIST_HEAD(mk_sync_requests);
 static DEFINE_RAW_SPINLOCK(mk_sync_requests_lock);
 static atomic64_t mk_sync_seq;
@@ -292,18 +299,17 @@ EXPORT_SYMBOL_GPL(mk_request_seq);
  * @payload_len: Length of @payload
  * @answer: Where the answer is copied
  * @answer_len: Size of @answer
- * @timeout_us: How long to wait
  *
  * Callable with interrupts off: the doorbell may never be taken here, so
  * the wait drains the ring itself. Not from a message handler, which
  * already holds the drain.
  *
- * Returns 0 once the answer is in @answer, -ETIMEDOUT, or another
+ * Returns 0 once the answer is in @answer, -EHOSTDOWN if @to is silent
+ * or the answer did not come in time, which makes @to silent, or another
  * negative error code if the request could not be sent.
  */
 int mk_request_sync(struct mk_instance *to, u32 msg_type, u32 subtype, u64 seq,
-		    void *payload, u32 payload_len, void *answer, u32 answer_len,
-		    unsigned int timeout_us)
+		    void *payload, u32 payload_len, void *answer, u32 answer_len)
 {
 	struct mk_sync_request r = {
 		.seq = seq,
@@ -320,7 +326,7 @@ int mk_request_sync(struct mk_instance *to, u32 msg_type, u32 subtype, u64 seq,
 		list_add(&r.list, &mk_sync_requests);
 
 	ret = mk_send_message_to(to, msg_type, subtype, payload, payload_len);
-	deadline = ktime_add_us(ktime_get(), timeout_us);
+	deadline = ktime_add_us(ktime_get(), MK_REQUEST_TIMEOUT_US);
 	/* Pairs with mk_request_answer(): the answer is copied in before done */
 	while (!ret && !smp_load_acquire(&r.done)) {
 		mk_ipi_poll();
@@ -334,7 +340,15 @@ int mk_request_sync(struct mk_instance *to, u32 msg_type, u32 subtype, u64 seq,
 	scoped_guard(raw_spinlock_irqsave, &mk_sync_requests_lock)
 		list_del(&r.list);
 
-	return r.done ? 0 : ret;
+	if (r.done)
+		return 0;
+	if (ret == -ETIMEDOUT) {
+		if (!xchg(&to->silent, true))
+			pr_err("instance %d did not answer; nothing more is sent to it\n",
+			       to->id);
+		ret = -EHOSTDOWN;
+	}
+	return ret;
 }
 EXPORT_SYMBOL_GPL(mk_request_sync);
 

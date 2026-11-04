@@ -432,15 +432,10 @@ static int mk_transport_connect(struct vsock_sock *vsk)
 	hdr->buf_alloc = cpu_to_le32(64 * 1024);
 	hdr->fwd_cnt = 0;
 
+	/* -EHOSTDOWN for a silent peer reaches connect() as is */
 	ret = mk_send_pkt(skb);
 	kfree_skb(skb);
-
-	if (ret < 0) {
-		pr_err("mk_vsock: failed to send connection request: %d\n", ret);
-		return ret;
-	}
-
-	return 0;
+	return ret < 0 ? ret : 0;
 }
 
 static int mk_transport_shutdown(struct vsock_sock *vsk, int mode)

@@ -409,8 +409,7 @@ int mk_send_message_to(struct mk_instance *instance, u32 msg_type, u32 subtype,
  */
 u64 mk_request_seq(void);
 int mk_request_sync(struct mk_instance *to, u32 msg_type, u32 subtype, u64 seq,
-		    void *payload, u32 payload_len, void *answer, u32 answer_len,
-		    unsigned int timeout_us);
+		    void *payload, u32 payload_len, void *answer, u32 answer_len);
 void mk_request_answer(u64 seq, const void *answer, u32 answer_len);
 
 /**
@@ -777,6 +776,8 @@ struct mk_instance {
 	 * explicitly so routing never masquerades as ownership in @cpus.
 	 */
 	mk_phys_cpu_t ipi_target;
+	/* A request to it went unanswered, so nothing more is sent to it */
+	bool silent;
 
 	/* Kexec integration */
 	struct kimage *kimage;          /* Associated kimage object */

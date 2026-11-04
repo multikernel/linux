@@ -51,8 +51,6 @@
 
 #include "internal.h"
 
-#define MK_PCIFRONT_TIMEOUT_US	(10 * USEC_PER_MSEC)
-
 /* The private part of each host bridge, one per bus */
 struct mk_pcifront_bus {
 	struct list_head list;
@@ -98,8 +96,7 @@ static int mk_pcifront_ask(struct mk_pcifront_bus *fb, unsigned int devfn,
 	int ret;
 
 	ret = mk_request_sync(host_instance, MK_MSG_PCI, subtype, req.seq,
-			      &req, sizeof(req), &ack, sizeof(ack),
-			      MK_PCIFRONT_TIMEOUT_US);
+			      &req, sizeof(req), &ack, sizeof(ack));
 	if (ret)
 		return ret;
 
