@@ -1110,6 +1110,230 @@ static void prepare_irte_posted(struct irte *irte)
 	irte->p_pst = 1;
 }
 
+static struct intel_iommu *remapping_unit(u64 base)
+{
+	struct dmar_drhd_unit *drhd;
+
+	guard(rcu)();
+	drhd = dmar_find_drhd_by_base(base);
+	if (!drhd || !drhd->iommu->ir_table || dmar_unit_foreign(drhd->iommu))
+		return NULL;
+	return drhd->iommu;
+}
+
+/**
+ * intel_irq_remap_units - Register bases of the units this kernel remaps through
+ * @bases: filled with up to @max bases
+ * @max: room in @bases
+ *
+ * Return: the number of units, which may exceed @max.
+ */
+int intel_irq_remap_units(u64 *bases, int max)
+{
+	struct dmar_drhd_unit *drhd;
+	struct intel_iommu *iommu;
+	int n = 0;
+
+	if (!irq_remapping_enabled)
+		return 0;
+	guard(rcu)();
+	for_each_iommu(iommu, drhd) {
+		if (!iommu->ir_table || dmar_unit_foreign(iommu))
+			continue;
+		if (n < max)
+			bases[n] = drhd->reg_base_addr;
+		n++;
+	}
+	return n;
+}
+
+static void clear_block(struct intel_iommu *iommu, u32 first, unsigned int order)
+{
+	memset(iommu->ir_table->base + first, 0, sizeof(struct irte) << order);
+	__iommu_flush_cache(iommu, iommu->ir_table->base + first,
+			    sizeof(struct irte) << order);
+	qi_global_iec(iommu);
+}
+
+/**
+ * intel_irq_remap_reserve - Set entries aside for another kernel
+ * @base: register base of a unit this kernel remaps interrupts through
+ * @order: log2 of the number of entries
+ * @first: set to the first entry
+ *
+ * Return: 0, -ENODEV or -ENOSPC.
+ */
+int intel_irq_remap_reserve(u64 base, unsigned int order, u32 *first)
+{
+	struct intel_iommu *iommu;
+	unsigned long flags;
+	int index, ret = 0;
+
+	raw_spin_lock_irqsave(&irq_2_ir_lock, flags);
+	iommu = remapping_unit(base);
+	index = iommu ? bitmap_find_free_region(iommu->ir_table->bitmap,
+					       INTR_REMAP_TABLE_ENTRIES, order) : -ENODEV;
+	if (index < 0) {
+		ret = iommu ? -ENOSPC : -ENODEV;
+	} else {
+		clear_block(iommu, index, order);
+		*first = index;
+	}
+	raw_spin_unlock_irqrestore(&irq_2_ir_lock, flags);
+	return ret;
+}
+
+/**
+ * intel_irq_remap_release - Free a block from intel_irq_remap_reserve()
+ * @base: register base of the unit
+ * @first: the first entry
+ * @order: log2 of the number of entries
+ */
+void intel_irq_remap_release(u64 base, u32 first, unsigned int order)
+{
+	struct intel_iommu *iommu;
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&irq_2_ir_lock, flags);
+	iommu = remapping_unit(base);
+	if (iommu) {
+		clear_block(iommu, first, order);
+		bitmap_release_region(iommu->ir_table->bitmap, first, order);
+	}
+	raw_spin_unlock_irqrestore(&irq_2_ir_lock, flags);
+}
+
+/**
+ * intel_irq_remap_msi_dest - Destination of an MSI entry another kernel composed
+ * @low: the entry's low 64 bits
+ * @apicid: set to the destination APIC ID
+ *
+ * Return: 0, or -EINVAL unless the entry is present, remapped rather than
+ * posted, and delivered fixed to one physical destination.
+ */
+int intel_irq_remap_msi_dest(u64 low, u32 *apicid)
+{
+	struct irte irte = { .low = low };
+
+	if (!irte.present || irte.pst || irte.dst_mode ||
+	    irte.dlvry_mode != APIC_DELIVERY_MODE_FIXED || irte.r_res0 ||
+	    irte.r_res1)
+		return -EINVAL;
+	if (!eim_mode && (irte.dest_id & ~IRTE_DEST(0xff)))
+		return -EINVAL;
+	*apicid = eim_mode ? irte.dest_id : irte.dest_id >> 8;
+	return 0;
+}
+
+/**
+ * intel_irq_remap_msi_source - Source verification of a function's MSI entries
+ * @pdev: the function
+ *
+ * Return: the high 64 bits this kernel writes into the MSI entries of @pdev.
+ */
+u64 intel_irq_remap_msi_source(struct pci_dev *pdev)
+{
+	struct irte irte = {};
+
+	set_msi_sid(&irte, pdev);
+	return irte.high;
+}
+
+/**
+ * intel_irq_remap_msi_device - The function an entry's source verification names
+ * @base: register base of the unit
+ * @high: the entry's high 64 bits
+ *
+ * Only an entry that verifies a full requester ID names one function; one
+ * that verifies a bus range, or nothing, names none.
+ *
+ * Return: the function, with a reference, or NULL.
+ */
+struct pci_dev *intel_irq_remap_msi_device(u64 base, u64 high)
+{
+	struct irte irte = { .high = high };
+	struct dmar_drhd_unit *drhd;
+	int segment;
+
+	if (irte.svt != SVT_VERIFY_SID_SQ || irte.sq != SQ_ALL_16)
+		return NULL;
+	scoped_guard(rcu) {
+		drhd = dmar_find_drhd_by_base(base);
+		if (!drhd)
+			return NULL;
+		segment = drhd->segment;
+	}
+	return pci_get_domain_bus_and_slot(segment, PCI_BUS_NUM(irte.sid),
+					   irte.sid & 0xff);
+}
+
+/**
+ * intel_irq_remap_clear_source - Clear the entries of a block that name a function
+ * @base: register base of the unit
+ * @first: the block's first entry
+ * @count: entries in the block
+ * @high: the function's high 64 bits, from intel_irq_remap_msi_source()
+ */
+void intel_irq_remap_clear_source(u64 base, u32 first, u32 count, u64 high)
+{
+	struct intel_iommu *iommu;
+	struct irte *entry;
+	unsigned long flags;
+	u32 i;
+
+	raw_spin_lock_irqsave(&irq_2_ir_lock, flags);
+	iommu = remapping_unit(base);
+	for (i = 0; iommu && i < count && first + i < INTR_REMAP_TABLE_ENTRIES; i++) {
+		entry = iommu->ir_table->base + first + i;
+		if (!entry->present || entry->high != high)
+			continue;
+		WRITE_ONCE(entry->low, 0);
+		WRITE_ONCE(entry->high, 0);
+		__iommu_flush_cache(iommu, entry, sizeof(*entry));
+		qi_flush_iec(iommu, first + i, 0);
+	}
+	raw_spin_unlock_irqrestore(&irq_2_ir_lock, flags);
+}
+
+/**
+ * intel_irq_remap_write - Write an entry another kernel composed
+ * @base: register base of the unit
+ * @index: the entry, which the caller has checked against its block
+ * @mask: with a zero entry, clear 1 << @mask entries from @index
+ * @low: the entry's low 64 bits
+ * @high: the entry's high 64 bits
+ *
+ * Return: 0 or a negative errno.
+ */
+int intel_irq_remap_write(u64 base, u32 index, u32 mask, u64 low, u64 high)
+{
+	struct intel_iommu *iommu;
+	struct irte *entry, *end;
+	unsigned long flags;
+	int ret = -ENODEV;
+
+	if (mask && (low || high))
+		return -EINVAL;
+
+	raw_spin_lock_irqsave(&irq_2_ir_lock, flags);
+	iommu = remapping_unit(base);
+	if (iommu && mask > ecap_max_handle_mask(iommu->ecap))
+		ret = -EINVAL;
+	else if (iommu && index + (1U << mask) <= INTR_REMAP_TABLE_ENTRIES) {
+		entry = iommu->ir_table->base + index;
+		end = entry + (1U << mask);
+		for (; entry < end; entry++) {
+			WRITE_ONCE(entry->low, low);
+			WRITE_ONCE(entry->high, high);
+		}
+		__iommu_flush_cache(iommu, iommu->ir_table->base + index,
+				    sizeof(struct irte) << mask);
+		ret = qi_flush_iec(iommu, index, mask);
+	}
+	raw_spin_unlock_irqrestore(&irq_2_ir_lock, flags);
+	return ret;
+}
+
 struct irq_remap_ops intel_irq_remap_ops = {
 	.prepare		= intel_prepare_irq_remapping,
 	.enable			= intel_enable_irq_remapping,

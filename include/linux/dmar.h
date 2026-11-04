@@ -157,6 +157,49 @@ static inline void dmar_fault_dump_ptes(struct intel_iommu *iommu, u16 source_id
 					unsigned long long addr, u32 pasid) {}
 #endif
 
+#if defined(CONFIG_INTEL_IOMMU) && defined(CONFIG_IRQ_REMAP)
+/* Remapping entries another kernel composes and this one writes */
+int intel_irq_remap_units(u64 *bases, int max);
+int intel_irq_remap_reserve(u64 base, unsigned int order, u32 *first);
+void intel_irq_remap_release(u64 base, u32 first, unsigned int order);
+int intel_irq_remap_write(u64 base, u32 index, u32 mask, u64 low, u64 high);
+int intel_irq_remap_msi_dest(u64 low, u32 *apicid);
+u64 intel_irq_remap_msi_source(struct pci_dev *pdev);
+struct pci_dev *intel_irq_remap_msi_device(u64 base, u64 high);
+void intel_irq_remap_clear_source(u64 base, u32 first, u32 count, u64 high);
+#else
+static inline int intel_irq_remap_units(u64 *bases, int max)
+{
+	return 0;
+}
+static inline int intel_irq_remap_reserve(u64 base, unsigned int order, u32 *first)
+{
+	return -ENODEV;
+}
+static inline void intel_irq_remap_release(u64 base, u32 first, unsigned int order)
+{
+}
+static inline int intel_irq_remap_write(u64 base, u32 index, u32 mask, u64 low, u64 high)
+{
+	return -ENODEV;
+}
+static inline int intel_irq_remap_msi_dest(u64 low, u32 *apicid)
+{
+	return -ENODEV;
+}
+static inline u64 intel_irq_remap_msi_source(struct pci_dev *pdev)
+{
+	return 0;
+}
+static inline struct pci_dev *intel_irq_remap_msi_device(u64 base, u64 high)
+{
+	return NULL;
+}
+static inline void intel_irq_remap_clear_source(u64 base, u32 first, u32 count, u64 high)
+{
+}
+#endif
+
 #ifdef CONFIG_INTEL_IOMMU
 extern int iommu_detected, no_iommu;
 extern int intel_iommu_init(void);
