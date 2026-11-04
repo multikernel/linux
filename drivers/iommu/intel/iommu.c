@@ -483,10 +483,8 @@ static struct intel_iommu *device_lookup_iommu(struct device *dev, u8 *bus, u8 *
 	if (dmar_foreign) {
 		drhd = pdev ? dmar_foreign_drhd_unit(pdev) : NULL;
 		iommu = drhd ? drhd->iommu : NULL;
-		if (!iommu || dmar_unit_foreign(iommu)) {
-			iommu = NULL;
+		if (!iommu)
 			goto out;
-		}
 		goto got_pdev;
 	}
 	for_each_iommu(iommu, drhd) {
@@ -734,7 +732,8 @@ void iommu_flush_write_buffer(struct intel_iommu *iommu)
 	u32 val;
 	unsigned long flag;
 
-	if (!rwbf_quirk && !cap_rwbf(iommu->cap))
+	/* A foreign unit's registers are its owner's until it is claimed */
+	if (dmar_unit_foreign(iommu) || (!rwbf_quirk && !cap_rwbf(iommu->cap)))
 		return;
 
 	raw_spin_lock_irqsave(&iommu->register_lock, flag);
@@ -1394,6 +1393,10 @@ static int device_def_domain_type(struct device *dev)
 {
 	struct device_domain_info *info = dev_iommu_priv_get(dev);
 	struct intel_iommu *iommu = info->iommu;
+
+	/* The owner maps a lent device's grant 1:1, so it must DMA to physical addresses */
+	if (dmar_unit_foreign(iommu))
+		return IOMMU_DOMAIN_IDENTITY;
 
 	/*
 	 * Hardware does not support the passthrough translation mode.
@@ -2562,6 +2565,42 @@ static __init int tboot_force_iommu(void)
 	return 1;
 }
 
+/*
+ * Devices behind a foreign unit are probed now, in device order as the
+ * IOMMU core expects, so their drivers bind with identity domains. Their
+ * entries go into this kernel's own root table, which the unit loads only
+ * once intel_iommu_claim() takes it over. Until then nothing here touches
+ * the unit's registers, and with no invalidation queue of this kernel's,
+ * qi_submit_sync() flushes nothing.
+ */
+static int __init intel_iommu_init_foreign(void)
+{
+	struct dmar_drhd_unit *drhd;
+	struct intel_iommu *iommu;
+
+	intel_iommu_debugfs_init();
+
+	down_read(&dmar_global_lock);
+	for_each_iommu(iommu, drhd) {
+		if (iommu_alloc_root_entry(iommu)) {
+			pr_err("%s: no root table; cannot be claimed\n", iommu->name);
+			continue;
+		}
+		iommu->flush.flush_context = qi_flush_context;
+		iommu->flush.flush_iotlb = qi_flush_iotlb;
+		pr_info("%s at %llx: driven by another kernel\n",
+			iommu->name, drhd->reg_base_addr);
+
+		iommu_device_sysfs_add(&iommu->iommu, NULL, intel_iommu_groups,
+				       "%s", iommu->name);
+		up_read(&dmar_global_lock);
+		iommu_device_register(&iommu->iommu, &intel_iommu_ops, NULL);
+		down_read(&dmar_global_lock);
+	}
+	up_read(&dmar_global_lock);
+	return 0;
+}
+
 int __init intel_iommu_init(void)
 {
 	int ret = -ENODEV;
@@ -2599,13 +2638,8 @@ int __init intel_iommu_init(void)
 	down_write(&dmar_global_lock);
 
 	if (dmar_foreign) {
-		for_each_iommu(iommu, drhd)
-			pr_info("%s at %llx: driven by another kernel\n",
-				iommu->name, drhd->reg_base_addr);
-		intel_iommu_debugfs_init();
 		up_write(&dmar_global_lock);
-		init_iommu_pm_ops();
-		return 0;
+		return intel_iommu_init_foreign();
 	}
 
 	if (!no_iommu)
@@ -2713,8 +2747,10 @@ out_free_dmar:
  * intel_iommu_claim - Take over a foreign unit whose owner is gone
  * @base: register base of the unit
  *
- * Translation stays on across the root table switch, so devices bound here
- * keep their DMA. The caller must have stopped all DMA the owner set up.
+ * The unit's devices were attached at boot to this kernel's root table;
+ * this loads that table and the interrupt table into the unit. Translation
+ * stays on across the switch, so devices bound here keep their DMA. The
+ * caller must have stopped all DMA the owner set up.
  *
  * Return: 0 or a negative errno.
  */
@@ -2726,7 +2762,7 @@ int intel_iommu_claim(u64 base)
 
 	down_write(&dmar_global_lock);
 	drhd = dmar_find_drhd_by_base(base);
-	if (!drhd || !drhd->foreign || drhd->ignored) {
+	if (!drhd || !drhd->foreign || drhd->ignored || !drhd->iommu->root_entry) {
 		ret = -ENODEV;
 		goto out_unlock;
 	}
@@ -2742,32 +2778,21 @@ int intel_iommu_claim(u64 base)
 		goto out_unlock;
 	}
 
-	ret = iommu_alloc_root_entry(iommu);
-	if (ret)
-		goto out_unlock;
 	intel_svm_check(iommu);
 	intel_iommu_init_qi(iommu);
-	iommu_flush_write_buffer(iommu);
 	if (ecap_prs(iommu->ecap)) {
 		ret = intel_iommu_enable_prq(iommu);
 		if (ret)
-			goto out_free;
+			goto out_unlock;
 	}
 	ret = dmar_set_interrupt(iommu);
-	if (ret)
-		goto out_free;
+	if (ret) {
+		if (ecap_prs(iommu->ecap))
+			intel_iommu_finish_prq(iommu);
+		goto out_unlock;
+	}
 	drhd->foreign = 0;
-	up_write(&dmar_global_lock);
-
-	ret = iommu_device_sysfs_add(&iommu->iommu, NULL, intel_iommu_groups,
-				     "%s", iommu->name);
-	if (ret)
-		goto out_foreign;
-	ret = iommu_device_register(&iommu->iommu, &intel_iommu_ops, NULL);
-	if (ret)
-		goto out_sysfs;
-
-	down_write(&dmar_global_lock);
+	iommu_flush_write_buffer(iommu);
 	intel_irq_remap_claim(iommu);
 	iommu_set_root_entry(iommu);
 	if (!(iommu->gcmd & DMA_GCMD_TE))
@@ -2781,13 +2806,6 @@ int intel_iommu_claim(u64 base)
 		iommu->name, iommu->ir_table ? " and interrupts remapped" : "");
 	return 0;
 
-out_sysfs:
-	iommu_device_sysfs_remove(&iommu->iommu);
-out_foreign:
-	down_write(&dmar_global_lock);
-	drhd->foreign = 1;
-out_free:
-	free_dmar_iommu(iommu);
 out_unlock:
 	up_write(&dmar_global_lock);
 	return ret;
@@ -3361,7 +3379,9 @@ static struct iommu_device *intel_iommu_probe_device(struct device *dev)
 	info->dev = dev;
 	info->iommu = iommu;
 	if (dev_is_pci(dev)) {
-		if (ecap_dev_iotlb_support(iommu->ecap) &&
+		/* The owner's context entry decides whether a device may use ATS */
+		if (!dmar_unit_foreign(iommu) &&
+		    ecap_dev_iotlb_support(iommu->ecap) &&
 		    pci_ats_supported(pdev) &&
 		    dmar_ats_supported(pdev, iommu)) {
 			info->ats_supported = 1;
