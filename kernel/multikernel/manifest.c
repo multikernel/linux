@@ -272,6 +272,11 @@ struct mk_manifest_ctx {
 	struct mk_instance *instance;
 };
 
+int __weak mk_arch_manifest_chosen(void *fdt, struct mk_instance *instance)
+{
+	return 0;
+}
+
 static int mk_manifest_chosen(void *fdt, void *data)
 {
 	struct mk_manifest_ctx *ctx = data;
@@ -313,6 +318,10 @@ static int mk_manifest_chosen(void *fdt, void *data)
 	if (!ret)
 		ret = fdt_property_u32(fdt, "multikernel,ipi-pages",
 				       image->mk_instance->ipi_pages);
+	if (ret)
+		return ret;
+
+	ret = mk_arch_manifest_chosen(fdt, ctx->instance);
 	if (ret)
 		return ret;
 

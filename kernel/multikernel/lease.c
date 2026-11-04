@@ -163,6 +163,11 @@ int mk_lease_unbind(struct pci_dev *pdev)
 	return 0;
 }
 
+int __weak mk_arch_lease_grant(struct mk_instance *instance, struct pci_dev *pdev)
+{
+	return 0;
+}
+
 /**
  * mk_lease_grant - Give an instance a function until mk_lease_fence()
  * @instance: The instance, about to start or running
@@ -192,6 +197,8 @@ int mk_lease_grant(struct mk_instance *instance, struct pci_dev *pdev)
 	ret = mk_pciback_lend(instance, pdev);
 	if (!ret)
 		ret = mk_iommu_confine(instance, pdev);
+	if (!ret)
+		ret = mk_arch_lease_grant(instance, pdev);
 	if (ret) {
 		devres_release_group(&pdev->dev, lease);
 		return ret;

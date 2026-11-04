@@ -228,6 +228,14 @@ static inline void mk_nmi_offline_park(void)
 }
 #endif
 
+#if defined(CONFIG_MULTIKERNEL) && defined(CONFIG_DMAR_TABLE)
+void mk_dmar_init(void);
+#else
+static inline void mk_dmar_init(void)
+{
+}
+#endif
+
 #endif /* __ASSEMBLY__ */
 
 #endif /* _ASM_X86_MULTIKERNEL_H */

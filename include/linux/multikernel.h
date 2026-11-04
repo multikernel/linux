@@ -220,6 +220,8 @@ void mk_ipi_ring_drop_pending(void);
 #define MK_IO_MSI_MAP       (MK_MSG_IO + 5)  /* Route a device's MSI to one of my CPUs */
 #define MK_IO_MSI_ACK       (MK_MSG_IO + 6)  /* Answer: the interrupt number, or an error */
 #define MK_IO_MSI_MOVE      (MK_MSG_IO + 7)  /* Move a routed MSI to another of my CPUs */
+#define MK_IO_IRTE_WRITE    (MK_MSG_IO + 8)  /* Write a remapping entry I composed */
+#define MK_IO_IRTE_ACK      (MK_MSG_IO + 9)  /* Answer: 0 or an error */
 
 /* Resource management subtypes */
 #define MK_RES_CPU_ADD      (MK_MSG_RESOURCE + 1)
@@ -328,6 +330,7 @@ struct mk_device_resource_payload {
 	/* Device add to a running instance, which may lack the function and its bus */
 	u16 vendor;
 	u16 device;
+	u64 iommu;		/* Its IOMMU unit, from mk_arch_pci_iommu() */
 	struct mk_pci_bus_desc bus_desc;
 };
 
@@ -1041,6 +1044,7 @@ struct resource;
 u64 mk_pci_ecam_window(const struct resource *res, u64 first,
 		       unsigned int busnr);
 u64 mk_arch_pci_bus_ecam(struct pci_bus *bus);
+u64 mk_arch_pci_iommu(struct pci_dev *pdev);
 
 /* PCI buses of a spawn kernel, config space reached through its host */
 struct pci_host_bridge;
@@ -1052,7 +1056,8 @@ int mk_pcifront_config(unsigned int domain, unsigned int bus,
 		       bool write);
 void mk_pcifront_host_fenced(void);
 int mk_pcifront_add_function(u16 domain, u8 bus, u8 devfn, u16 vendor,
-			     u16 device, const struct mk_pci_bus_desc *desc);
+			     u16 device, u64 iommu,
+			     const struct mk_pci_bus_desc *desc);
 int mk_pcifront_adopt_function(u16 domain, u8 bus, u8 devfn);
 #else
 static inline int mk_pcifront_init(void)
@@ -1066,7 +1071,7 @@ static inline int mk_pcifront_config(unsigned int domain, unsigned int bus,
 	return -ENODEV;
 }
 static inline int mk_pcifront_add_function(u16 domain, u8 bus, u8 devfn,
-					   u16 vendor, u16 device,
+					   u16 vendor, u16 device, u64 iommu,
 					   const struct mk_pci_bus_desc *desc)
 {
 	return -ENODEV;
@@ -1081,6 +1086,7 @@ static inline void mk_pcifront_host_fenced(void)
 #endif
 
 bool mk_host_fenced(void);
+void mk_arch_instance_destroy(struct mk_instance *instance);
 
 /*
  * PCI functions this kernel let go of, held for instances. A lease gives
@@ -1093,6 +1099,8 @@ struct mk_lease *mk_lease_lock(struct mk_instance *instance,
 			       struct pci_dev *pdev);
 void mk_lease_unlock(struct mk_lease *lease);
 int mk_lease_allow_msi(struct mk_lease *lease, phys_addr_t doorbell);
+/* Called as a lease is granted; devres actions on @pdev end with the lease */
+int mk_arch_lease_grant(struct mk_instance *instance, struct pci_dev *pdev);
 
 /* Kimage-based access to the instance memory pool */
 void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align);
@@ -1110,6 +1118,9 @@ void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len);
 
 /* True in a kernel another kernel spawned, i.e. one that booted with a manifest */
 bool mk_spawned(void);
+
+/* Arch properties of a spawn's /chosen */
+int mk_arch_manifest_chosen(void *fdt, struct mk_instance *instance);
 
 /* Build the manifest for a spawn (host, kexec path) */
 int mk_manifest_finalize(struct kimage *image);

@@ -390,6 +390,10 @@ static int mk_kernfs_rmdir(struct kernfs_node *kn)
 	return mk_overlay_rmdir(kn);
 }
 
+void __weak mk_arch_instance_destroy(struct mk_instance *instance)
+{
+}
+
 /**
  * mk_instance_destroy - Destroy a multikernel instance
  * @instance: Instance to destroy
@@ -428,6 +432,7 @@ int mk_instance_destroy(struct mk_instance *instance)
 
 	list_del(&instance->list);
 	idr_remove(&mk_instance_idr, instance->id);
+	mk_arch_instance_destroy(instance);
 	if (instance->kn) {
 		kernfs_remove(instance->kn);
 		instance->kn = NULL;

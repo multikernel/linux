@@ -878,6 +878,7 @@ struct mk_device_hotplug_work {
 	u32 operation;
 	u16 vendor;
 	u16 device;
+	u64 iommu;
 	struct mk_pci_bus_desc bus_desc;
 };
 
@@ -891,7 +892,8 @@ static void mk_device_add_work_fn(struct work_struct *work)
 	if (mk_manifest_phys())
 		ret = mk_pcifront_add_function(hp_work->domain, hp_work->bus,
 					       hp_work->devfn, hp_work->vendor,
-					       hp_work->device, &hp_work->bus_desc);
+					       hp_work->device, hp_work->iommu,
+					       &hp_work->bus_desc);
 	if (!ret)
 		ret = mk_do_device_add(hp_work->domain, hp_work->bus,
 				       hp_work->devfn, hp_work->driver_override,
@@ -962,6 +964,7 @@ static int mk_handle_device_add(struct mk_device_resource_payload *payload, u32 
 	hp_work->operation = MK_RES_DEVICE_ADD;
 	hp_work->vendor = payload->vendor;
 	hp_work->device = payload->device;
+	hp_work->iommu = payload->iommu;
 	hp_work->bus_desc = payload->bus_desc;
 	schedule_work(&hp_work->work);
 
@@ -1725,6 +1728,7 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 	/* It may not have the function in its tree, nor even its bus */
 	payload.vendor = pdev->vendor;
 	payload.device = pdev->device;
+	payload.iommu = mk_arch_pci_iommu(pdev);
 	mk_pci_bus_describe(pdev->bus, &payload.bus_desc);
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_DEVICE_ADD, resource_id);

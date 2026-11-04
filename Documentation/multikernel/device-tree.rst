@@ -157,6 +157,7 @@ kernel that writes the tree, which keeps driving them::
             reg = <0x00090000 0 0 0 0>;             /* bus 9, device 0, fn 0 */
             vendor-id = <0x1af4>;
             device-id = <0x1041>;
+            multikernel,iommu-base = <0x0 0xfed90000>; /* its IOMMU unit, if any */
         };
     };
 
@@ -215,6 +216,18 @@ only the boot handoff knows::
         multikernel,host-ipi-buffer = <...>;        /* the host's ring */
         multikernel,host-ipi-pages = <...>;
         multikernel,host-ipi-cpu = <...>;           /* the host CPU its doorbell rings, u64 */
+
+        multikernel,iommus {                        /* the host's VT-d units, on x86 */
+            #address-cells = <2>;
+            #size-cells = <2>;
+            iommu@fed90000 {
+                compatible = "multikernel,vtd";
+                reg = <0x0 0xfed90000  0x0 0x1000>;
+                linux,pci-domain = <0>;
+                numa-node-id = <0>;                 /* when the host knows it */
+                multikernel,irte-block = <0x100 0x100>; /* first, count; if it remaps */
+            };
+        };
     };
 
 On x86 the ``SETUP_MULTIKERNEL`` setup_data entry points at the page and
@@ -233,7 +246,11 @@ What a spawn does with its tree:
   platform device only when a ``/resources/devices`` node names it;
 * binds every bus and device to its node, so ``dev->of_node`` is set as on
   any devicetree platform;
-* names network devices from ``/aliases``.
+* names network devices from ``/aliases``;
+* on x86, registers each ``multikernel,vtd`` unit as driven by the host,
+  and composes the interrupt remapping entries of its devices in the
+  unit's ``multikernel,irte-block``, which the host checks against the
+  lease and writes. A device names its unit in ``multikernel,iommu-base``.
 
 The pool-CPUs list registers every CPU the instance might be handed later,
 because a kernel can only online a CPU whose physical id it enumerated at

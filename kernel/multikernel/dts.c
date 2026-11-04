@@ -1074,8 +1074,16 @@ static int mk_dt_emit_pci_devices(struct mk_instance *instance,
 	int ret;
 
 	list_for_each_entry(dev, &instance->pci_devices, list) {
+		struct pci_dev *pdev;
+		u64 iommu = 0;
+
 		if (dev->domain != domain || dev->bus != bus->number)
 			continue;
+
+		pdev = pci_get_slot(bus, PCI_DEVFN(dev->slot, dev->func));
+		if (pdev)
+			iommu = mk_arch_pci_iommu(pdev);
+		pci_dev_put(pdev);
 
 		snprintf(name, sizeof(name), "pci@%x,%x", dev->slot, dev->func);
 		ret = fdt_begin_node(fdt, name);
@@ -1086,6 +1094,8 @@ static int mk_dt_emit_pci_devices(struct mk_instance *instance,
 			ret = fdt_property_u32(fdt, "vendor-id", dev->vendor);
 		if (!ret)
 			ret = fdt_property_u32(fdt, "device-id", dev->device);
+		if (!ret && iommu)
+			ret = fdt_property_u64(fdt, "multikernel,iommu-base", iommu);
 		if (!ret)
 			ret = fdt_end_node(fdt);
 		if (ret)

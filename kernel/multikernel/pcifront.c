@@ -452,10 +452,12 @@ mk_pcifront_new_bus_node(struct of_changeset *cs, u16 domain, u8 busnr,
 }
 
 static int mk_pcifront_add_node(u16 domain, u8 busnr, u8 devfn, u16 vendor,
-				u16 device, const struct mk_pci_bus_desc *desc,
+				u16 device, u64 iommu,
+				const struct mk_pci_bus_desc *desc,
 				struct device_node **bus_np, bool *new_bus)
 {
 	u32 reg[5] = { (u32)busnr << 16 | (u32)devfn << 8 };
+	u32 base[2] = { upper_32_bits(iommu), lower_32_bits(iommu) };
 	struct device_node *np;
 	struct of_changeset *cs;
 	char name[16];
@@ -493,6 +495,9 @@ static int mk_pcifront_add_node(u16 domain, u8 busnr, u8 devfn, u16 vendor,
 		ret = of_changeset_add_prop_u32(cs, np, "vendor-id", vendor);
 	if (!ret)
 		ret = of_changeset_add_prop_u32(cs, np, "device-id", device);
+	if (!ret && iommu)
+		ret = of_changeset_add_prop_u32_array(cs, np, "multikernel,iommu-base",
+						      base, 2);
 	if (!ret)
 		ret = of_changeset_apply(cs);
 	if (ret)
@@ -557,6 +562,7 @@ static bool mk_pcifront_has_function(u16 domain, u8 busnr, u8 devfn)
  * @devfn: Device and function
  * @vendor: Its vendor ID
  * @device: Its device ID
+ * @iommu: Register base of its IOMMU unit, 0 if none
  * @desc: The bus it sits on, as the host describes it
  *
  * Gives the function a node in this kernel's tree, and its bus one too
@@ -566,7 +572,8 @@ static bool mk_pcifront_has_function(u16 domain, u8 busnr, u8 devfn)
  * Returns: 0 once the function is on a bus of this kernel, or -errno
  */
 int mk_pcifront_add_function(u16 domain, u8 bus, u8 devfn, u16 vendor,
-			     u16 device, const struct mk_pci_bus_desc *desc)
+			     u16 device, u64 iommu,
+			     const struct mk_pci_bus_desc *desc)
 {
 	struct device_node *bus_np;
 	bool new_bus;
@@ -580,8 +587,8 @@ int mk_pcifront_add_function(u16 domain, u8 bus, u8 devfn, u16 vendor,
 		goto unlock;
 
 	/* A new bus node probes as it is added, and takes the rescan lock */
-	ret = mk_pcifront_add_node(domain, bus, devfn, vendor, device, desc,
-				   &bus_np, &new_bus);
+	ret = mk_pcifront_add_node(domain, bus, devfn, vendor, device, iommu,
+				   desc, &bus_np, &new_bus);
 	if (ret)
 		goto unlock;
 	of_node_put(bus_np);
@@ -598,9 +605,9 @@ unlock:
 	return ret;
 }
 
-/* The IDs of a function, from the host tree user space armed this kernel with */
+/* The IDs and IOMMU unit of a function, from the host tree user space armed this kernel with */
 static int mk_pcifront_host_ids(u16 domain, u8 bus, u8 devfn, u16 *vendor,
-				u16 *device)
+				u16 *device, u64 *iommu)
 {
 	struct device_node *devices, *np;
 	const char *id;
@@ -621,6 +628,8 @@ static int mk_pcifront_host_ids(u16 domain, u8 bus, u8 devfn, u16 *vendor,
 		    !of_property_read_u32(np, "device-id", &d)) {
 			*vendor = v;
 			*device = d;
+			if (of_property_read_u64(np, "multikernel,iommu-base", iommu))
+				*iommu = 0;
 			ret = 0;
 		}
 		of_node_put(np);
@@ -678,6 +687,7 @@ int mk_pcifront_adopt_function(u16 domain, u8 bus, u8 devfn)
 	struct mk_pci_bus_desc *desc;
 	struct pci_dev *pdev;
 	u16 vendor, device;
+	u64 iommu;
 	int ret;
 
 	pdev = pci_get_domain_bus_and_slot(domain, bus, devfn);
@@ -688,7 +698,7 @@ int mk_pcifront_adopt_function(u16 domain, u8 bus, u8 devfn)
 	if (!READ_ONCE(mk_pcifront_direct_access))
 		return -EPERM;
 
-	ret = mk_pcifront_host_ids(domain, bus, devfn, &vendor, &device);
+	ret = mk_pcifront_host_ids(domain, bus, devfn, &vendor, &device, &iommu);
 	if (ret) {
 		pr_err("%04x:%02x:%02x.%x is not in the host tree\n", domain,
 		       bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
@@ -704,7 +714,7 @@ int mk_pcifront_adopt_function(u16 domain, u8 bus, u8 devfn)
 		       bus);
 	else
 		ret = mk_pcifront_add_function(domain, bus, devfn, vendor,
-					       device, desc);
+					       device, iommu, desc);
 	kfree(desc);
 	return ret;
 }
