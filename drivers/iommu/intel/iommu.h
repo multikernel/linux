@@ -1220,6 +1220,14 @@ static inline bool dmar_unit_foreign(struct intel_iommu *iommu)
 	return iommu->drhd->foreign;
 }
 
+#ifdef CONFIG_IRQ_REMAP
+void intel_irq_remap_claim(struct intel_iommu *iommu);
+#else
+static inline void intel_irq_remap_claim(struct intel_iommu *iommu)
+{
+}
+#endif
+
 void iommu_flush_write_buffer(struct intel_iommu *iommu);
 struct iommu_domain *
 intel_iommu_domain_alloc_nested(struct device *dev, struct iommu_domain *parent,

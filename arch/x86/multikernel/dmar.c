@@ -404,6 +404,11 @@ void __init mk_dmar_init(void)
 	dmar_set_foreign_ops(&mk_dmar_foreign_ops);
 }
 
+int mk_arch_iommu_claim(u64 base)
+{
+	return intel_iommu_claim(base);
+}
+
 static int __init mk_irte_init(void)
 {
 	return mk_register_msg_handler(MK_MSG_IO, mk_irte_msg_handler, NULL);

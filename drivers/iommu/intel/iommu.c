@@ -2709,6 +2709,90 @@ out_free_dmar:
 	return ret;
 }
 
+/**
+ * intel_iommu_claim - Take over a foreign unit whose owner is gone
+ * @base: register base of the unit
+ *
+ * Translation stays on across the root table switch, so devices bound here
+ * keep their DMA. The caller must have stopped all DMA the owner set up.
+ *
+ * Return: 0 or a negative errno.
+ */
+int intel_iommu_claim(u64 base)
+{
+	struct dmar_drhd_unit *drhd;
+	struct intel_iommu *iommu;
+	int ret;
+
+	down_write(&dmar_global_lock);
+	drhd = dmar_find_drhd_by_base(base);
+	if (!drhd || !drhd->foreign || drhd->ignored) {
+		ret = -ENODEV;
+		goto out_unlock;
+	}
+	iommu = drhd->iommu;
+
+	/* The root table type cannot change while translation is on */
+	if ((readl(iommu->reg + DMAR_GSTS_REG) & DMA_GSTS_TES) &&
+	    !!(dmar_readq(iommu->reg + DMAR_RTADDR_REG) & DMA_RTADDR_SMT) !=
+	    !!sm_supported(iommu)) {
+		pr_err("%s: owner runs it in %s mode, this kernel does not\n",
+		       iommu->name, sm_supported(iommu) ? "legacy" : "scalable");
+		ret = -EOPNOTSUPP;
+		goto out_unlock;
+	}
+
+	ret = iommu_alloc_root_entry(iommu);
+	if (ret)
+		goto out_unlock;
+	intel_svm_check(iommu);
+	intel_iommu_init_qi(iommu);
+	iommu_flush_write_buffer(iommu);
+	if (ecap_prs(iommu->ecap)) {
+		ret = intel_iommu_enable_prq(iommu);
+		if (ret)
+			goto out_free;
+	}
+	ret = dmar_set_interrupt(iommu);
+	if (ret)
+		goto out_free;
+	drhd->foreign = 0;
+	up_write(&dmar_global_lock);
+
+	ret = iommu_device_sysfs_add(&iommu->iommu, NULL, intel_iommu_groups,
+				     "%s", iommu->name);
+	if (ret)
+		goto out_foreign;
+	ret = iommu_device_register(&iommu->iommu, &intel_iommu_ops, NULL);
+	if (ret)
+		goto out_sysfs;
+
+	down_write(&dmar_global_lock);
+	intel_irq_remap_claim(iommu);
+	iommu_set_root_entry(iommu);
+	if (!(iommu->gcmd & DMA_GCMD_TE))
+		iommu_enable_translation(iommu);
+	iommu_disable_protect_mem_regions(iommu);
+	intel_iommu_enabled = 1;
+	up_write(&dmar_global_lock);
+
+	iommu_pmu_register(iommu);
+	pr_info("%s: claimed; DMA translated%s by this kernel\n",
+		iommu->name, iommu->ir_table ? " and interrupts remapped" : "");
+	return 0;
+
+out_sysfs:
+	iommu_device_sysfs_remove(&iommu->iommu);
+out_foreign:
+	down_write(&dmar_global_lock);
+	drhd->foreign = 1;
+out_free:
+	free_dmar_iommu(iommu);
+out_unlock:
+	up_write(&dmar_global_lock);
+	return ret;
+}
+
 static int domain_context_clear_one_cb(struct pci_dev *pdev, u16 alias, void *opaque)
 {
 	struct device_domain_info *info = opaque;

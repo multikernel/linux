@@ -1185,6 +1185,26 @@ static void prepare_irte_posted(struct irte *irte)
 	irte->p_pst = 1;
 }
 
+/*
+ * This kernel's table already holds its own entries; the owner's quiesced
+ * devices get new ones as their drivers rebind.
+ */
+void intel_irq_remap_claim(struct intel_iommu *iommu)
+{
+	struct ir_table *table = iommu->ir_table;
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&irq_2_ir_lock, flags);
+	if (table) {
+		u32 end = table->foreign_first + table->foreign_count;
+
+		iommu_set_irq_remapping(iommu, eim_mode);
+		bitmap_clear(table->bitmap, 0, table->foreign_first);
+		bitmap_clear(table->bitmap, end, INTR_REMAP_TABLE_ENTRIES - end);
+	}
+	raw_spin_unlock_irqrestore(&irq_2_ir_lock, flags);
+}
+
 static struct intel_iommu *remapping_unit(u64 base)
 {
 	struct dmar_drhd_unit *drhd;

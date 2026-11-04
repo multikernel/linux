@@ -234,6 +234,7 @@ static struct kernfs_ops mk_overlay_new_ops = {
  *       cpu-remove    { cpu@0 { reg = <u64 cpuid>; }; };
  *       device-add    { pci@0 { pci-id = "DDDD:BB:SS.F"; driver = "vfio-pci"; }; };
  *       device-remove { pci@0 { pci-id = "DDDD:BB:SS.F"; }; };
+ *       iommu-add     { dmar@0 { reg = <u64 base>; }; };	this kernel only
  *     };
  *   };
  *
@@ -250,9 +251,14 @@ static struct kernfs_ops mk_overlay_new_ops = {
  * cpu-add hands a CPU of this kernel to the pool and cpu-remove takes a
  * free pool CPU back.
  *
+ * iommu-add takes over an IOMMU unit of this kernel's fenced host, by its
+ * register base, once user space has stopped every device the host may
+ * have left running behind it.
+ *
  * Fragments are processed in ascending unit-address order. Within a
  * fragment the order is instance-create, memory-remove, memory-add,
- * cpu-remove, cpu-add, device-remove, device-add, instance-remove, so
+ * cpu-remove, cpu-add, device-remove, device-add, iommu-add,
+ * instance-remove, so
  * that a resource is released by its source before its destination
  * acquires it. A /resources fragment moves memory-remove after
  * cpu-remove and device-remove instead, so resources leave the pool as
@@ -947,6 +953,55 @@ static int mk_overlay_op_device(struct mk_overlay_tx *tx, const void *fdt,
 	return 0;
 }
 
+int __weak mk_arch_iommu_claim(u64 base)
+{
+	return -EOPNOTSUPP;
+}
+
+/* Nothing to undo: no host is left to hand a unit back to */
+static int mk_overlay_op_iommu_add(struct mk_overlay_tx *tx, const void *fdt,
+				   int op_node,
+				   const struct mk_overlay_target *target,
+				   bool undo)
+{
+	int item_node, ret;
+
+	if (undo)
+		return 0;
+	if (target->kind != MK_OVERLAY_TARGET_INSTANCE ||
+	    target->instance->id != mk_self->id) {
+		pr_err("Overlay tx%d: iommu-add is for this kernel only, not %s\n",
+		       tx->id, target->path);
+		return -EINVAL;
+	}
+	if (!mk_host_fenced()) {
+		pr_err("Overlay tx%d: iommu-add while the host runs\n", tx->id);
+		return -EPERM;
+	}
+
+	fdt_for_each_subnode(item_node, fdt, op_node) {
+		const fdt64_t *reg;
+		u64 base;
+		int len;
+
+		reg = fdt_getprop(fdt, item_node, "reg", &len);
+		if (!reg || len != sizeof(*reg)) {
+			pr_err("Overlay tx%d: iommu-add %s needs reg = <u64 base>\n",
+			       tx->id, fdt_get_name(fdt, item_node, NULL));
+			return -EINVAL;
+		}
+		base = fdt64_to_cpu(*reg);
+		pr_info("Overlay tx%d: +iommu %llx -> %s\n", tx->id, base,
+			mk_overlay_target_name(target));
+		ret = mk_arch_iommu_claim(base);
+		if (ret) {
+			pr_err("Failed to take over IOMMU %llx: %d\n", base, ret);
+			return ret;
+		}
+	}
+	return 0;
+}
+
 /**
  * mk_overlay_instance_name - Read and validate an instance-name property
  *
@@ -1156,6 +1211,7 @@ enum mk_overlay_op {
 	MK_OVERLAY_OP_CPU_ADD,
 	MK_OVERLAY_OP_DEVICE_REMOVE,
 	MK_OVERLAY_OP_DEVICE_ADD,
+	MK_OVERLAY_OP_IOMMU_ADD,
 	MK_OVERLAY_OP_INSTANCE_REMOVE,
 	MK_OVERLAY_OP_COUNT,
 };
@@ -1168,6 +1224,7 @@ static const char * const mk_overlay_op_names[MK_OVERLAY_OP_COUNT] = {
 	[MK_OVERLAY_OP_CPU_ADD]		= "cpu-add",
 	[MK_OVERLAY_OP_DEVICE_REMOVE]	= "device-remove",
 	[MK_OVERLAY_OP_DEVICE_ADD]	= "device-add",
+	[MK_OVERLAY_OP_IOMMU_ADD]	= "iommu-add",
 	[MK_OVERLAY_OP_INSTANCE_REMOVE]	= "instance-remove",
 };
 
@@ -1180,6 +1237,7 @@ static const u8 mk_overlay_order[MK_OVERLAY_OP_COUNT] = {
 	MK_OVERLAY_OP_CPU_ADD,
 	MK_OVERLAY_OP_DEVICE_REMOVE,
 	MK_OVERLAY_OP_DEVICE_ADD,
+	MK_OVERLAY_OP_IOMMU_ADD,
 	MK_OVERLAY_OP_INSTANCE_REMOVE,
 };
 
@@ -1196,6 +1254,7 @@ static const u8 mk_overlay_pool_order[MK_OVERLAY_OP_COUNT] = {
 	MK_OVERLAY_OP_MEMORY_ADD,
 	MK_OVERLAY_OP_CPU_ADD,
 	MK_OVERLAY_OP_DEVICE_ADD,
+	MK_OVERLAY_OP_IOMMU_ADD,
 	MK_OVERLAY_OP_INSTANCE_REMOVE,
 };
 
@@ -1231,6 +1290,8 @@ static int mk_overlay_run_op(struct mk_overlay_tx *tx, const void *fdt,
 	case MK_OVERLAY_OP_DEVICE_ADD:
 		return mk_overlay_op_device(tx, fdt, op_node, target, !undo,
 					    undo);
+	case MK_OVERLAY_OP_IOMMU_ADD:
+		return mk_overlay_op_iommu_add(tx, fdt, op_node, target, undo);
 	case MK_OVERLAY_OP_INSTANCE_REMOVE:
 		return mk_overlay_op_instance_remove(tx, fdt, op_node, target,
 						     undo);
