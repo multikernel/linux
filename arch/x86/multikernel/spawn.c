@@ -1740,6 +1740,14 @@ void mk_pool_park_cpu(void)
 	mk_park_cpu();
 }
 
+/* Once its host is fenced, this kernel's spawns wake its CPUs from its pool slot */
+static struct mk_spawn_context *mk_park_context(void)
+{
+	if (mk_host_fenced() && mk_pool && mk_pool->arch.slot)
+		return mk_pool->arch.slot;
+	return mk_own_context();
+}
+
 /*
  * Park this CPU in the instance's pool park page. Called on the way into
  * pool state by a dying spawn kernel; the park page and its page table
@@ -1749,14 +1757,14 @@ void mk_pool_park_cpu(void)
 /* True only in a spawn kernel whose boot context carries a park area */
 bool mk_cpu_parkable(void)
 {
-	struct mk_spawn_context *ctx = mk_own_context();
+	struct mk_spawn_context *ctx = mk_park_context();
 
 	return ctx && ctx->park_phys && ctx->park_cr3;
 }
 
 void mk_park_cpu(void)
 {
-	struct mk_spawn_context *ctx = mk_own_context();
+	struct mk_spawn_context *ctx = mk_park_context();
 	mk_pool_park_fn park;
 
 	if (!ctx) {

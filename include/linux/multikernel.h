@@ -1080,6 +1080,8 @@ static inline void mk_pcifront_host_fenced(void)
 }
 #endif
 
+bool mk_host_fenced(void);
+
 /*
  * PCI functions this kernel let go of, held for instances. A lease gives
  * one instance a function from its start, or its hot add, to its halt,

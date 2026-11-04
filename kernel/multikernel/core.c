@@ -1631,6 +1631,8 @@ static void __noreturn mk_notify_down_and_park(int target_id, u32 subtype)
 /* The kernel that asked this one to shut down, or -1 */
 static int mk_halt_requester = -1;
 
+static bool mk_host_is_fenced;
+
 /**
  * mk_halt_to_pool - Halt this spawn kernel, returning its CPUs to the pool
  *
@@ -2041,8 +2043,10 @@ int multikernel_force_halt_by_id(int mk_id)
 	 */
 	if (instance == host_instance) {
 		ret = mk_confirm_fenced(instance, targets);
-		if (!ret)
+		if (!ret) {
 			mk_pcifront_host_fenced();
+			WRITE_ONCE(mk_host_is_fenced, true);
+		}
 	} else {
 		mk_instance_settle_halted(instance);
 	}
@@ -2050,6 +2054,12 @@ int multikernel_force_halt_by_id(int mk_id)
 	mk_cpu_set_free(targets);
 	mk_instance_put(instance);
 	return ret;
+}
+
+/* Once a fence confirmed the host's CPUs parked; never reverts */
+bool mk_host_fenced(void)
+{
+	return READ_ONCE(mk_host_is_fenced);
 }
 
 static int __init multikernel_init(void)
