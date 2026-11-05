@@ -32,13 +32,13 @@ static inline int arch_cpu_from_physical_id(u64 phys_id)
 }
 
 /*
- * The ways down of a spawn kernel. Stock arm64 leaves stopped CPUs in a
- * WFI loop inside the kernel image, which the host is about to overwrite;
- * a spawn returns them to firmware instead. Both return on a host.
+ * The ways down. Stock arm64 leaves stopped CPUs in a WFI loop inside the
+ * kernel image; a multikernel kernel returns them to firmware instead,
+ * where another kernel can turn them on. The halt returns on a host.
  */
 #ifdef CONFIG_MULTIKERNEL
 void mk_spawn_machine_halt(void);
-void mk_spawn_stop_this_cpu(void);
+void mk_stop_this_cpu(void);
 
 /* A stop IPI from another kernel: its force halt, or not ours to obey */
 void mk_foreign_cpu_stop(void);
@@ -54,7 +54,7 @@ static inline void mk_spawn_machine_halt(void)
 {
 }
 
-static inline void mk_spawn_stop_this_cpu(void)
+static inline void mk_stop_this_cpu(void)
 {
 }
 

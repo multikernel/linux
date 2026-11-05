@@ -89,9 +89,15 @@ void mk_spawn_machine_halt(void)
 		mk_halt_to_pool();
 }
 
-void mk_spawn_stop_this_cpu(void)
+/*
+ * A spawn's image is about to be overwritten, and a host's CPUs are what
+ * a backup kernel takes over once it has fenced the host: firmware hands
+ * out only CPUs that are off. A kernel outside any multikernel keeps the
+ * stock WFI loop.
+ */
+void mk_stop_this_cpu(void)
 {
-	if (mk_spawned())
+	if (mk_self)
 		mk_enter_pool_state(NULL);
 }
 
@@ -164,6 +170,13 @@ static int mk_wait_cpu_off(mk_phys_cpu_t mpidr)
 	return read_poll_timeout(psci_ops.affinity_info, state,
 				 state == PSCI_0_2_AFFINITY_LEVEL_OFF,
 				 1000, MK_CPU_OFF_TIMEOUT_US, false, mpidr, 0);
+}
+
+/* A fenced CPU executes nothing: firmware holds it off */
+bool mk_arch_cpu_fenced(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
+{
+	return psci_ops.affinity_info &&
+	       psci_ops.affinity_info(phys_cpu, 0) == PSCI_0_2_AFFINITY_LEVEL_OFF;
 }
 
 /*

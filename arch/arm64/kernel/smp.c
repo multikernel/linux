@@ -874,7 +874,7 @@ static void __noreturn local_cpu_stop(unsigned int cpu)
 	set_cpu_online(cpu, false);
 
 	local_daif_mask();
-	mk_spawn_stop_this_cpu();
+	mk_stop_this_cpu();
 	sdei_mask_local_cpu();
 	cpu_park_loop();
 }

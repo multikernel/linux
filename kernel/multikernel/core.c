@@ -1905,21 +1905,27 @@ int mk_cpu_rank(mk_phys_cpu_t phys)
 }
 EXPORT_SYMBOL_GPL(mk_cpu_rank);
 
-/* How many fence targets have not yet recorded presence */
+/* A CPU that parked records its presence in the shared area */
+bool __weak mk_arch_cpu_fenced(struct mk_instance *instance,
+			       mk_phys_cpu_t phys_cpu)
+{
+	int rank = mk_cpu_rank(phys_cpu);
+
+	return rank < MK_PARKED_MAX &&
+	       READ_ONCE(instance->ipi_data->parked[rank]);
+}
+
+/* How many fence targets have not yet left the host's kernel */
 static int mk_fence_missing(struct mk_instance *instance,
 			    struct mk_cpu_set *targets)
 {
-	struct mk_shared_data *sd = instance->ipi_data;
 	mk_phys_cpu_t phys;
 	unsigned int i;
 	int missing = 0;
 
-	mk_cpu_set_for_each(i, phys, targets) {
-		int rank = mk_cpu_rank(phys);
-
-		if (rank >= MK_PARKED_MAX || !READ_ONCE(sd->parked[rank]))
+	mk_cpu_set_for_each(i, phys, targets)
+		if (!mk_arch_cpu_fenced(instance, phys))
 			missing++;
-	}
 	return missing;
 }
 
@@ -1952,12 +1958,9 @@ static int mk_confirm_fenced(struct mk_instance *instance,
 				20 * USEC_PER_MSEC, 5 * USEC_PER_SEC, false,
 				instance, targets);
 
-	mk_cpu_set_for_each(i, phys, targets) {
-		int rank = mk_cpu_rank(phys);
-
-		if (rank < MK_PARKED_MAX && READ_ONCE(sd->parked[rank]))
+	mk_cpu_set_for_each(i, phys, targets)
+		if (mk_arch_cpu_fenced(instance, phys))
 			mk_cpu_set_add(instance->cpus_on_slot, phys);
-	}
 
 	if (ret)
 		pr_err("Fence incomplete: %d of the host's CPUs never parked\n",

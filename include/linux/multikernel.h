@@ -1320,6 +1320,9 @@ int mk_arch_release_instance(struct mk_instance *instance);
 /* Verify one of an instance's CPUs has reached its park loop */
 int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
 
+/* Whether a CPU the fence of the host stopped is out of the host's kernel; never sleeps */
+bool mk_arch_cpu_fenced(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
+
 /*
  * Wait until every CPU an instance owns is parked. Its kernel image may
  * only be overwritten once this succeeds: a CPU still executing that
