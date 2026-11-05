@@ -324,7 +324,8 @@ static int mk_msi_request(struct mk_io_msi_payload *req,
 	struct mk_msi_request r;
 	int ret;
 
-	if (!host_instance)
+	/* A fenced host never answers */
+	if (!host_instance || mk_host_fenced())
 		return -ENODEV;
 	req->sender_instance_id = mk_self->id;
 	r.msg = *req;
