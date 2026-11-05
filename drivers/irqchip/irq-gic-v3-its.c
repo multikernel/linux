@@ -4015,6 +4015,23 @@ phys_addr_t its_foreign_doorbell(struct irq_domain *domain)
 
 	return its ? its->phys_base + GITS_TRANSLATER : 0;
 }
+
+/* The @i-th ITS, or -ENOENT past the last */
+int its_unit_get(int i, struct its_unit_desc *desc)
+{
+	struct its_node *its;
+
+	guard(raw_spinlock)(&its_lock);
+	list_for_each_entry(its, &its_nodes, entry) {
+		if (i--)
+			continue;
+		desc->base = its->phys_base;
+		desc->size = SZ_128K;
+		desc->node = its->numa_node;
+		return 0;
+	}
+	return -ENOENT;
+}
 #endif
 
 /*

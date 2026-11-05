@@ -647,6 +647,14 @@ int its_foreign_move(void *owner, struct irq_domain *domain, u32 dev_id,
 		     u32 event, unsigned int cpu);
 void its_foreign_unmap(void *owner, struct irq_domain *domain, u32 dev_id);
 phys_addr_t its_foreign_doorbell(struct irq_domain *domain);
+
+struct its_unit_desc {
+	u64	base;			/* ITS_base frame */
+	u64	size;			/* ITS_base and translation frames */
+	int	node;			/* NUMA node, or NUMA_NO_NODE */
+};
+
+int its_unit_get(int i, struct its_unit_desc *desc);
 int its_init(struct fwnode_handle *handle, struct rdists *rdists,
 	     struct irq_domain *domain, u8 irq_prio);
 int mbi_init(struct fwnode_handle *fwnode, struct irq_domain *parent);

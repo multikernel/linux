@@ -6,4 +6,4 @@
 obj-y += spawn.o dtb.o dtb_of.o dtb_pci.o
 obj-$(CONFIG_ACPI) += dtb_acpi.o
 obj-$(CONFIG_ARM_SDE_INTERFACE) += sdei.o
-obj-$(CONFIG_MULTIKERNEL_ITS_PROXY) += its_proxy.o
+obj-$(CONFIG_MULTIKERNEL_ITS_PROXY) += its.o its_proxy.o
