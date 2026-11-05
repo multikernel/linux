@@ -1133,6 +1133,9 @@ int mk_arch_manifest_chosen(void *fdt, struct mk_instance *instance);
 
 /* Build the manifest for a spawn (host, kexec path) */
 int mk_manifest_finalize(struct kimage *image);
+
+/* Memory a device keeps using after this kernel is gone; no spawn may reuse it */
+int mk_preserve_range(phys_addr_t base, u64 size);
 #else
 static inline bool multikernel_allow_emergency_restart(void)
 {
@@ -1178,6 +1181,10 @@ static inline bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
 static inline bool mk_platform_device_allowed(const char *name, const char *hid)
 {
 	return true;
+}
+static inline int mk_preserve_range(phys_addr_t base, u64 size)
+{
+	return 0;
 }
 static inline void mk_register_cpus_from_manifest(void)
 {

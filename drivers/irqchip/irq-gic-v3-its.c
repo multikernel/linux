@@ -23,6 +23,7 @@
 #include <linux/memblock.h>
 #include <linux/mm.h>
 #include <linux/msi.h>
+#include <linux/multikernel.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
@@ -2310,6 +2311,10 @@ static bool gic_check_reserved_range(phys_addr_t addr, unsigned long size)
 
 static int gic_reserve_range(phys_addr_t addr, unsigned long size)
 {
+	int ret = mk_preserve_range(addr, size);
+
+	if (ret)
+		return ret;
 	if (efi_enabled(EFI_CONFIG_TABLES))
 		return efi_mem_reserve_persistent(addr, size);
 

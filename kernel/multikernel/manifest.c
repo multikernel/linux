@@ -223,14 +223,46 @@ out:
  */
 #define MK_RESERVED_PAIRS 80
 
+struct mk_preserved {
+	struct list_head list;
+	u64 base;
+	u64 size;
+};
+
+static LIST_HEAD(mk_preserved_list);
+static DEFINE_SPINLOCK(mk_preserved_lock);
+static int mk_preserved_count;
+
+/*
+ * Some memory outlives the kernel that allocated it: the GIC's LPI
+ * tables, for one, stay in use once enabled and cannot be moved. Every
+ * spawn is told about it, so that one taking over from this kernel does
+ * not hand it out again.
+ */
+int mk_preserve_range(phys_addr_t base, u64 size)
+{
+	struct mk_preserved *p = kmalloc(sizeof(*p), GFP_ATOMIC);
+
+	if (!p)
+		return -ENOMEM;
+	p->base = base;
+	p->size = size;
+	spin_lock(&mk_preserved_lock);
+	list_add_tail(&p->list, &mk_preserved_list);
+	mk_preserved_count++;
+	spin_unlock(&mk_preserved_lock);
+	return 0;
+}
+
 struct mk_reserved_ranges {
 	u64 *pair;
 	int n;
+	int cap;
 };
 
 static int mk_reserved_add(struct mk_reserved_ranges *r, u64 base, u64 size)
 {
-	if (r->n == MK_RESERVED_PAIRS)
+	if (r->n == r->cap)
 		return -E2BIG;
 	r->pair[2 * r->n] = base;
 	r->pair[2 * r->n + 1] = size;
@@ -242,11 +274,12 @@ static int mk_manifest_add_reserved(void *fdt, struct kimage *image)
 {
 	struct mk_reserved_ranges r;
 	struct mk_instance *other;
+	struct mk_preserved *p;
 	fdt64_t *cells;
 	int ret = 0, i;
 
-	r.pair = kmalloc_array(2 * MK_RESERVED_PAIRS, sizeof(*r.pair),
-			       GFP_KERNEL);
+	r.cap = MK_RESERVED_PAIRS + READ_ONCE(mk_preserved_count);
+	r.pair = kmalloc_array(2 * r.cap, sizeof(*r.pair), GFP_KERNEL);
 	if (!r.pair)
 		return -ENOMEM;
 	r.n = 0;
@@ -275,9 +308,17 @@ static int mk_manifest_add_reserved(void *fdt, struct kimage *image)
 					      MK_MANIFEST_SIZE);
 	}
 	mutex_unlock(&mk_instance_mutex);
+
+	spin_lock(&mk_preserved_lock);
+	list_for_each_entry(p, &mk_preserved_list, list) {
+		if (ret)
+			break;
+		ret = mk_reserved_add(&r, p->base, p->size);
+	}
+	spin_unlock(&mk_preserved_lock);
+
 	if (!ret) {
-		int pairs = mk_pool_park_regions(r.pair + 2 * r.n,
-						 MK_RESERVED_PAIRS - r.n);
+		int pairs = mk_pool_park_regions(r.pair + 2 * r.n, r.cap - r.n);
 
 		if (pairs < 0)
 			ret = pairs;
