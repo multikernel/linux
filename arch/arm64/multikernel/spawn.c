@@ -54,6 +54,20 @@ void __init mk_arch_register_cpu(mk_phys_cpu_t phys_id)
 {
 }
 
+static phys_addr_t mk_ram_start __initdata = PHYS_ADDR_MAX;
+
+/* Hot-added RAM must fall inside the linear map, which starts at boot */
+void __init mk_arch_register_ram(phys_addr_t start, u64 size)
+{
+	if (size)
+		mk_ram_start = min(mk_ram_start, start);
+}
+
+phys_addr_t __init mk_linear_map_start(phys_addr_t dram_start)
+{
+	return min(dram_start, mk_ram_start);
+}
+
 void __init mk_spawn_accept_boot_tree(phys_addr_t dt_phys)
 {
 	if (!initial_boot_params ||

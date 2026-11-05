@@ -40,6 +40,7 @@
 #include <asm/kernel-pgtable.h>
 #include <asm/kvm_host.h>
 #include <asm/memory.h>
+#include <asm/multikernel.h>
 #include <asm/numa.h>
 #include <asm/rsi.h>
 #include <asm/sections.h>
@@ -214,7 +215,7 @@ void __init arm64_memblock_init(void)
 	/*
 	 * Select a suitable value for the base of physical memory.
 	 */
-	memstart_addr = round_down(memblock_start_of_DRAM(),
+	memstart_addr = round_down(mk_linear_map_start(memblock_start_of_DRAM()),
 				   ARM64_MEMSTART_ALIGN);
 
 	if ((memblock_end_of_DRAM() - memstart_addr) > linear_region_size)

@@ -677,6 +677,11 @@ void __init mk_arch_register_cpu(u64 phys_id)
 	topology_register_apic((u32)phys_id, CPU_ACPIID_INVALID, true);
 }
 
+/* The direct map starts at physical 0, so it already reaches any RAM */
+void __init mk_arch_register_ram(phys_addr_t start, u64 size)
+{
+}
+
 /*
  * Initialize boot context tracking in spawn kernel.
  * Called early during spawn kernel boot.

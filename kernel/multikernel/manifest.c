@@ -22,6 +22,7 @@
 #include <linux/ioport.h>
 #include <linux/libfdt.h>
 #include <linux/sort.h>
+#include <linux/unaligned.h>
 #include <linux/multikernel.h>
 
 #include "internal.h"
@@ -37,6 +38,34 @@ phys_addr_t mk_manifest_phys(void)
 bool mk_spawned(void)
 {
 	return mk_manifest_fdt_phys != 0;
+}
+
+/*
+ * A kernel that takes over from its host is handed all of the machine's
+ * RAM the host tree names, most of it outside the RAM it boots with. Like
+ * its CPUs, the arch may have to make room for it before it lays out
+ * memory, which comes before the tree is unflattened.
+ */
+static void __init mk_register_ram_from_host_tree(const void *fdt)
+{
+	int node, host_tree;
+
+	node = fdt_path_offset(fdt, "/chosen");
+	host_tree = node < 0 ? node : fdt_subnode_offset(fdt, node, "multikernel,host-tree");
+	if (host_tree < 0)
+		return;
+
+	fdt_for_each_subnode(node, fdt, host_tree) {
+		const void *reg;
+		int len;
+
+		if (strncmp(fdt_get_name(fdt, node, NULL), "memory@", 7))
+			continue;
+		reg = fdt_getprop(fdt, node, "reg", &len);
+		if (reg && len == 2 * sizeof(u64))
+			mk_arch_register_ram(get_unaligned_be64(reg),
+					     get_unaligned_be64(reg + sizeof(u64)));
+	}
 }
 
 /**
@@ -78,6 +107,7 @@ void __init mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 	}
 
 	mk_manifest_fdt_phys = fdt_phys;
+	mk_register_ram_from_host_tree(fdt);
 
 	pr_info("multikernel: manifest accepted\n");
 
