@@ -21,6 +21,7 @@
 #include <linux/kexec.h>
 #include <linux/ioport.h>
 #include <linux/libfdt.h>
+#include <linux/of.h>
 #include <linux/sort.h>
 #include <linux/unaligned.h>
 #include <linux/multikernel.h>
@@ -229,6 +230,8 @@ struct mk_preserved {
 	u64 size;
 };
 
+#define MK_PRESERVED_PROP "multikernel,preserved-memory"
+
 static LIST_HEAD(mk_preserved_list);
 static DEFINE_SPINLOCK(mk_preserved_lock);
 static int mk_preserved_count;
@@ -254,6 +257,28 @@ int mk_preserve_range(phys_addr_t base, u64 size)
 	return 0;
 }
 
+/*
+ * The kernel that allocated it may be long gone: a successor reuses the
+ * GIC's tables in place and never reports them itself. So what this
+ * kernel was told to preserve, it passes on too.
+ */
+static int __init mk_inherit_preserved(void)
+{
+	u64 base, size;
+	int i, n;
+
+	n = of_property_count_u64_elems(of_chosen, MK_PRESERVED_PROP);
+	for (i = 0; i + 1 < n; i += 2) {
+		if (of_property_read_u64_index(of_chosen, MK_PRESERVED_PROP, i, &base) ||
+		    of_property_read_u64_index(of_chosen, MK_PRESERVED_PROP, i + 1, &size))
+			return -EINVAL;
+		if (mk_preserve_range(base, size))
+			return -ENOMEM;
+	}
+	return 0;
+}
+core_initcall(mk_inherit_preserved);
+
 struct mk_reserved_ranges {
 	u64 *pair;
 	int n;
@@ -275,8 +300,8 @@ static int mk_manifest_add_reserved(void *fdt, struct kimage *image)
 	struct mk_reserved_ranges r;
 	struct mk_instance *other;
 	struct mk_preserved *p;
+	int ret = 0, i, first_preserved, n_preserved;
 	fdt64_t *cells;
-	int ret = 0, i;
 
 	r.cap = MK_RESERVED_PAIRS + READ_ONCE(mk_preserved_count);
 	r.pair = kmalloc_array(2 * r.cap, sizeof(*r.pair), GFP_KERNEL);
@@ -309,6 +334,7 @@ static int mk_manifest_add_reserved(void *fdt, struct kimage *image)
 	}
 	mutex_unlock(&mk_instance_mutex);
 
+	first_preserved = r.n;
 	spin_lock(&mk_preserved_lock);
 	list_for_each_entry(p, &mk_preserved_list, list) {
 		if (ret)
@@ -316,6 +342,7 @@ static int mk_manifest_add_reserved(void *fdt, struct kimage *image)
 		ret = mk_reserved_add(&r, p->base, p->size);
 	}
 	spin_unlock(&mk_preserved_lock);
+	n_preserved = r.n - first_preserved;
 
 	if (!ret) {
 		int pairs = mk_pool_park_regions(r.pair + 2 * r.n, r.cap - r.n);
@@ -333,6 +360,10 @@ static int mk_manifest_add_reserved(void *fdt, struct kimage *image)
 		cells[i] = cpu_to_fdt64(r.pair[i]);
 	ret = fdt_property(fdt, "multikernel,reserved-memory", cells,
 			   2 * r.n * sizeof(*cells));
+	if (!ret && n_preserved)
+		ret = fdt_property(fdt, MK_PRESERVED_PROP,
+				   cells + 2 * first_preserved,
+				   2 * n_preserved * sizeof(*cells));
 out:
 	kfree(r.pair);
 	return ret;
