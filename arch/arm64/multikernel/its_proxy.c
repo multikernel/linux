@@ -25,6 +25,12 @@
  *
  * Both ends live here. The ITS side of the host is its_foreign_*() in the
  * ITS driver, the interrupt domain of the instance is irq-gic-v3-its-mk.
+ *
+ * An instance that takes over from its host claims the host's ITSes and
+ * becomes the one that maps: its own requests are then served right here,
+ * as are those of the instances it spawns. Whatever the host had mapped for
+ * it is mapped again at the same LPIs, so neither its devices nor its
+ * interrupt descriptors notice.
  */
 
 #define pr_fmt(fmt) "mk_its: " fmt
@@ -39,6 +45,8 @@
 #include <linux/pci.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
+
+#include "internal.h"
 
 #define MK_MSI_MAP_TIMEOUT_MS	5000
 /* As long as the ITS driver gives one of its own commands */
@@ -150,6 +158,20 @@ static u32 mk_msi_max_vectors(struct pci_dev *pdev)
 	return max3(pci_msix_vec_count(pdev), pci_msi_vec_count(pdev), 1);
 }
 
+/*
+ * The ITS behind a device, of possibly several, and its DeviceID there: as
+ * the firmware says, through the device's MSI domain, unless this kernel
+ * took the ITS over from its host and has only the host's word for it.
+ */
+void mk_msi_resolve(struct pci_dev *pdev, struct irq_domain **its, u32 *dev_id)
+{
+	if (!mk_its_lookup(pci_domain_nr(pdev->bus), pci_dev_id(pdev), its,
+			   dev_id))
+		return;
+	*its = dev_get_msi_domain(&pdev->dev);
+	*dev_id = pci_msi_domain_get_msi_rid(*its, pdev);
+}
+
 /* Only a device the instance holds a lease on, only a CPU it owns */
 static int mk_msi_map_for(struct mk_instance *instance,
 			  struct mk_io_msi_payload *req)
@@ -181,9 +203,7 @@ static int mk_msi_map_for(struct mk_instance *instance,
 		goto put;
 	}
 
-	/* The device's MSI domain names the ITS behind it, of possibly several */
-	msi_domain = dev_get_msi_domain(&pdev->dev);
-	dev_id = pci_msi_domain_get_msi_rid(msi_domain, pdev);
+	mk_msi_resolve(pdev, &msi_domain, &dev_id);
 
 	scoped_guard(raw_spinlock_irqsave, &mk_msi_routes_lock)
 		first = !mk_msi_find_route(instance->id, req->domain, req->rid);
@@ -371,18 +391,57 @@ int mk_arch_pcifront_prepare(struct pci_host_bridge *bridge, int domain)
 	return 0;
 }
 
-/**
- * mk_msi_proxy_map - Ask the host to route a device's MSI to a CPU
- * @domain: PCI domain of the device
- * @rid: bus << 8 | devfn
- * @event: MSI data the device will write
- * @phys_cpu: target, one of this kernel's CPUs
- * @doorbell: set to the address to write @event to
- *
- * Sleeps. Returns the interrupt number or a negative error code.
+/*
+ * Every event mapped for this kernel: by the host, or by this kernel once
+ * it owns the ITS. The mutex orders mappings against a claim, the lock
+ * guards the fields for moves, which may not sleep.
  */
-int mk_msi_proxy_map(u32 domain, u32 rid, u32 event, u64 phys_cpu,
-		     phys_addr_t *doorbell)
+struct mk_msi_mapping {
+	struct list_head list;
+	u32 domain;
+	u32 rid;
+	u32 event;
+	u32 lpi;
+	unsigned int cpu;
+	struct irq_domain *its;		/* once this kernel owns the ITS */
+	u32 dev_id;
+};
+
+static LIST_HEAD(mk_msi_mappings);
+static DEFINE_MUTEX(mk_msi_mappings_mutex);
+static DEFINE_RAW_SPINLOCK(mk_msi_mappings_lock);
+
+/* What this kernel holds its own devices under in its ITS */
+static char mk_msi_self;
+
+static struct mk_msi_mapping *mk_msi_find_mapping(u32 domain, u32 rid, u32 event)
+{
+	struct mk_msi_mapping *m;
+
+	list_for_each_entry(m, &mk_msi_mappings, list)
+		if (m->domain == domain && m->rid == rid && m->event == event)
+			return m;
+	return NULL;
+}
+
+static int mk_msi_map_local(struct irq_domain *its, u32 dev_id, u32 domain,
+			    u32 rid, u32 event, unsigned int cpu,
+			    phys_addr_t *doorbell)
+{
+	struct pci_dev *pdev;
+	int lpi;
+
+	pdev = pci_get_domain_bus_and_slot(domain, rid >> 8, rid & 0xff);
+	if (!pdev)
+		return -ENODEV;
+	lpi = its_foreign_map(&mk_msi_self, its, dev_id, event,
+			      mk_msi_max_vectors(pdev), cpu, doorbell);
+	pci_dev_put(pdev);
+	return lpi;
+}
+
+static int mk_msi_map_remote(u32 domain, u32 rid, u32 event, u64 phys_cpu,
+			     phys_addr_t *doorbell)
 {
 	struct mk_io_msi_payload req = {
 		.request = MK_IO_MSI_MAP,
@@ -399,14 +458,70 @@ int mk_msi_proxy_map(u32 domain, u32 rid, u32 event, u64 phys_cpu,
 }
 
 /**
- * mk_msi_proxy_move - Ask the host to move a routed MSI to another CPU
+ * mk_msi_proxy_map - Have a device's MSI routed to a CPU
+ * @domain: PCI domain of the device
+ * @rid: bus << 8 | devfn
+ * @event: MSI data the device will write
+ * @phys_cpu: target, one of this kernel's CPUs
+ * @doorbell: set to the address to write @event to
+ *
+ * Sleeps. Returns the interrupt number or a negative error code.
+ */
+int mk_msi_proxy_map(u32 domain, u32 rid, u32 event, u64 phys_cpu,
+		     phys_addr_t *doorbell)
+{
+	int cpu = arch_cpu_from_physical_id(phys_cpu);
+	struct irq_domain *its = NULL;
+	struct mk_msi_mapping *m, *new;
+	u32 dev_id = 0;
+	int lpi;
+
+	if (cpu < 0)
+		return -EINVAL;
+	new = kzalloc_obj(*new);
+	if (!new)
+		return -ENOMEM;
+
+	guard(mutex)(&mk_msi_mappings_mutex);
+
+	if (!mk_its_lookup(domain, rid, &its, &dev_id))
+		lpi = mk_msi_map_local(its, dev_id, domain, rid, event, cpu,
+				       doorbell);
+	else
+		lpi = mk_msi_map_remote(domain, rid, event, phys_cpu, doorbell);
+	if (lpi < 0) {
+		kfree(new);
+		return lpi;
+	}
+
+	scoped_guard(raw_spinlock_irqsave, &mk_msi_mappings_lock) {
+		m = mk_msi_find_mapping(domain, rid, event);
+		if (!m) {
+			m = new;
+			new = NULL;
+			m->domain = domain;
+			m->rid = rid;
+			m->event = event;
+			list_add(&m->list, &mk_msi_mappings);
+		}
+		m->lpi = lpi;
+		m->cpu = cpu;
+		m->its = its;
+		m->dev_id = dev_id;
+	}
+	kfree(new);
+	return lpi;
+}
+
+/**
+ * mk_msi_proxy_move - Have a routed MSI moved to another CPU
  * @domain: PCI domain of the device
  * @rid: bus << 8 | devfn
  * @event: event that mk_msi_proxy_map() has routed
  * @phys_cpu: new target, one of this kernel's CPUs
  *
- * Returns once the host has moved it, so the CPU it came from may go
- * away. Any context. Returns 0 or a negative error code.
+ * Returns once it has moved, so the CPU it came from may go away. Any
+ * context. Returns 0 or a negative error code.
  */
 int mk_msi_proxy_move(u32 domain, u32 rid, u32 event, u64 phys_cpu)
 {
@@ -417,8 +532,98 @@ int mk_msi_proxy_move(u32 domain, u32 rid, u32 event, u64 phys_cpu)
 		.event = event,
 		.phys_cpu = phys_cpu,
 	};
+	int cpu = arch_cpu_from_physical_id(phys_cpu);
+	struct mk_msi_mapping *m;
+	int ret;
 
-	return mk_msi_request(&req, mk_msi_wait_polling);
+	if (cpu < 0)
+		return -EINVAL;
+
+	scoped_guard(raw_spinlock_irqsave, &mk_msi_mappings_lock) {
+		m = mk_msi_find_mapping(domain, rid, event);
+		if (m && m->its) {
+			ret = its_foreign_move(&mk_msi_self, m->its, m->dev_id,
+					       event, cpu);
+			if (!ret)
+				m->cpu = cpu;
+			return ret;
+		}
+	}
+
+	ret = mk_msi_request(&req, mk_msi_wait_polling);
+	if (ret)
+		return ret;
+
+	guard(raw_spinlock_irqsave)(&mk_msi_mappings_lock);
+	m = mk_msi_find_mapping(domain, rid, event);
+	if (m)
+		m->cpu = cpu;
+	return 0;
+}
+
+/**
+ * mk_msi_proxy_unmap - A device no longer has MSIs
+ * @domain: PCI domain of the device
+ * @rid: bus << 8 | devfn
+ *
+ * What this kernel mapped in its own ITS goes, so that the device can be
+ * lent to an instance. What the host mapped stays the host's to drop.
+ */
+void mk_msi_proxy_unmap(u32 domain, u32 rid)
+{
+	struct mk_msi_mapping *m, *tmp;
+	struct irq_domain *its = NULL;
+	u32 dev_id = 0;
+
+	guard(mutex)(&mk_msi_mappings_mutex);
+
+	list_for_each_entry_safe(m, tmp, &mk_msi_mappings, list) {
+		if (m->domain != domain || m->rid != rid || !m->its)
+			continue;
+		its = m->its;
+		dev_id = m->dev_id;
+		scoped_guard(raw_spinlock_irqsave, &mk_msi_mappings_lock)
+			list_del(&m->list);
+		kfree(m);
+	}
+	if (its)
+		its_foreign_unmap(&mk_msi_self, its, dev_id);
+}
+
+/*
+ * After a claim: map everything the host had mapped for this kernel, now
+ * in the ITS this kernel owns, at the same LPIs and to the same CPUs.
+ */
+void mk_msi_proxy_rebind(void)
+{
+	struct irq_domain *its = NULL;
+	struct mk_msi_mapping *m;
+	struct pci_dev *pdev;
+	u32 dev_id;
+	int ret;
+
+	guard(mutex)(&mk_msi_mappings_mutex);
+
+	list_for_each_entry(m, &mk_msi_mappings, list) {
+		if (m->its || mk_its_lookup(m->domain, m->rid, &its, &dev_id))
+			continue;
+		pdev = pci_get_domain_bus_and_slot(m->domain, m->rid >> 8,
+						   m->rid & 0xff);
+		ret = pdev ? its_foreign_keep(&mk_msi_self, its, dev_id, m->event,
+					      mk_msi_max_vectors(pdev), m->cpu,
+					      m->lpi) : -ENODEV;
+		pci_dev_put(pdev);
+		if (ret) {
+			pr_warn("%04x:%02x:%02x.%d: event %u lost LPI %u: %d\n",
+				m->domain, m->rid >> 8, PCI_SLOT(m->rid),
+				PCI_FUNC(m->rid), m->event, m->lpi, ret);
+			continue;
+		}
+		scoped_guard(raw_spinlock_irqsave, &mk_msi_mappings_lock) {
+			m->its = its;
+			m->dev_id = dev_id;
+		}
+	}
 }
 
 static void mk_msi_msg_handler(u32 msg_type, u32 subtype, void *payload,

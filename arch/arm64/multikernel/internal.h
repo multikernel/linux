@@ -22,6 +22,20 @@ int mk_dtb_set_reg(void *fdt, int node, const u64 *pairs, int nr);
 /* The MSI proxy of the instance's PCI root buses */
 int mk_dtb_add_pci(void *fdt);
 
+struct irq_domain;
+struct pci_dev;
+#ifdef CONFIG_MULTIKERNEL_ITS_PROXY
+int mk_its_lookup(u32 domain, u32 rid, struct irq_domain **its, u32 *dev_id);
+void mk_msi_proxy_rebind(void);
+void mk_msi_resolve(struct pci_dev *pdev, struct irq_domain **its, u32 *dev_id);
+#else
+static inline void mk_msi_resolve(struct pci_dev *pdev, struct irq_domain **its,
+				  u32 *dev_id)
+{
+	*its = NULL;
+}
+#endif
+
 /*
  * The part of the machine every kernel drives for itself: PSCI, the arch
  * timer and the interrupt controller. Taken from whichever description

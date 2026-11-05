@@ -133,6 +133,7 @@ static void mk_its_msi_teardown(struct irq_domain *domain, msi_alloc_info_t *inf
 {
 	struct mk_its_device *mdev = info->scratchpad[0].ptr;
 
+	mk_msi_proxy_unmap(mdev->domain, mdev->rid);
 	bitmap_free(mdev->events);
 	kfree(mdev);
 }

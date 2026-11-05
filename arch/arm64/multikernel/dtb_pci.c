@@ -49,7 +49,11 @@ static bool mk_dtb_its_serves_pci(void)
 		return false;
 
 	for_each_pci_dev(pdev) {
-		if (its_foreign_doorbell(dev_get_msi_domain(&pdev->dev))) {
+		struct irq_domain *its;
+		u32 dev_id;
+
+		mk_msi_resolve(pdev, &its, &dev_id);
+		if (its_foreign_doorbell(its)) {
 			pci_dev_put(pdev);
 			return true;
 		}

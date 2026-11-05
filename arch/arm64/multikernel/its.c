@@ -22,12 +22,15 @@
  */
 
 #include <linux/irqchip/arm-gic-v3.h>
+#include <linux/irqdomain.h>
 #include <linux/libfdt.h>
 #include <linux/msi.h>
 #include <linux/multikernel.h>
 #include <linux/of.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
+
+#include "internal.h"
 
 #define MK_IOMMUS_PATH		"/chosen/multikernel,iommus"
 #define MK_ITS_COMPATIBLE	"multikernel,its"
@@ -162,4 +165,112 @@ int mk_arch_manifest_chosen(void *fdt, struct mk_instance *instance)
 			ret = mk_its_emit(fdt, &its);
 	}
 	return ret ? ret : fdt_end_node(fdt);
+}
+
+static struct device_node *mk_its_unit(u64 base)
+{
+	struct device_node *units, *np;
+	u64 reg;
+
+	units = of_find_node_by_path(MK_IOMMUS_PATH);
+	if (!units)
+		return NULL;
+	for_each_child_of_node(units, np)
+		if (of_device_is_compatible(np, MK_ITS_COMPATIBLE) &&
+		    !of_property_read_u64(np, "reg", &reg) && reg == base)
+			break;
+	of_node_put(units);
+	return np;
+}
+
+struct mk_its_claimed {
+	struct list_head list;
+	struct device_node *np;
+	struct irq_domain *domain;
+};
+
+static LIST_HEAD(mk_its_claimed_list);
+static DEFINE_MUTEX(mk_its_claimed_lock);
+
+/**
+ * mk_its_lookup - The claimed ITS behind a PCI function
+ * @domain: PCI domain of the function
+ * @rid: bus << 8 | devfn
+ * @its: set to the MSI domain of the ITS
+ * @dev_id: set to the DeviceID of the function there
+ *
+ * Sleeps. Returns 0, or -ENOENT unless this kernel claimed the ITS.
+ */
+int mk_its_lookup(u32 domain, u32 rid, struct irq_domain **its, u32 *dev_id)
+{
+	struct mk_its_claimed *c;
+	const __be32 *map;
+	int i, len;
+
+	guard(mutex)(&mk_its_claimed_lock);
+	list_for_each_entry(c, &mk_its_claimed_list, list) {
+		map = of_get_property(c->np, "multikernel,msi-map", &len);
+		for (i = 0; map && i + 4 <= len / sizeof(*map); i += 4) {
+			u32 first = be32_to_cpup(map + i + 1);
+
+			if (be32_to_cpup(map + i) == domain && rid >= first &&
+			    rid - first < be32_to_cpup(map + i + 3)) {
+				*its = c->domain;
+				*dev_id = be32_to_cpup(map + i + 2) + rid - first;
+				return 0;
+			}
+		}
+	}
+	return -ENOENT;
+}
+
+int mk_arch_iommu_claim(u64 base)
+{
+	struct device_node *np = mk_its_unit(base);
+	struct mk_its_claimed *c;
+	u32 node;
+	u64 size;
+	int ret;
+
+	if (!np)
+		return -ENODEV;
+	c = kzalloc_obj(*c);
+	if (!c) {
+		ret = -ENOMEM;
+		goto put;
+	}
+	if (of_property_read_u64_index(np, "reg", 1, &size)) {
+		ret = -EINVAL;
+		goto free;
+	}
+	if (of_property_read_u32(np, "numa-node-id", &node))
+		node = NUMA_NO_NODE;
+
+	scoped_guard(mutex, &mk_its_claimed_lock) {
+		struct mk_its_claimed *done;
+
+		list_for_each_entry(done, &mk_its_claimed_list, list)
+			if (done->np == np) {
+				ret = 0;
+				goto free;
+			}
+	}
+
+	/* The unit node is the fwnode of the ITS domain from now on */
+	ret = its_claim(of_fwnode_handle(np), base, size, node);
+	if (ret)
+		goto free;
+	c->np = np;
+	c->domain = irq_find_matching_fwnode(of_fwnode_handle(np),
+					     DOMAIN_BUS_NEXUS);
+	scoped_guard(mutex, &mk_its_claimed_lock)
+		list_add_tail(&c->list, &mk_its_claimed_list);
+
+	mk_msi_proxy_rebind();
+	return 0;
+free:
+	kfree(c);
+put:
+	of_node_put(np);
+	return ret;
 }

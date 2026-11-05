@@ -81,6 +81,7 @@ static inline void mk_foreign_cpu_stop(void)
 int mk_msi_proxy_map(u32 domain, u32 rid, u32 event, u64 phys_cpu,
 		     phys_addr_t *doorbell);
 int mk_msi_proxy_move(u32 domain, u32 rid, u32 event, u64 phys_cpu);
+void mk_msi_proxy_unmap(u32 domain, u32 rid);
 #endif
 
 /*
