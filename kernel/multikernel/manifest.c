@@ -257,6 +257,17 @@ int mk_preserve_range(phys_addr_t base, u64 size)
 	return 0;
 }
 
+bool mk_range_preserved(phys_addr_t base, u64 size)
+{
+	struct mk_preserved *p;
+
+	guard(spinlock)(&mk_preserved_lock);
+	list_for_each_entry(p, &mk_preserved_list, list)
+		if (base >= p->base && base + size <= p->base + p->size)
+			return true;
+	return false;
+}
+
 /*
  * The kernel that allocated it may be long gone: a successor reuses the
  * GIC's tables in place and never reports them itself. So what this

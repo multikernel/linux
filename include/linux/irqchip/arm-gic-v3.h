@@ -636,7 +636,7 @@ struct rdists {
 
 struct irq_domain;
 struct fwnode_handle;
-int __init its_lpi_memreserve_init(void);
+int its_lpi_memreserve_init(void);
 int its_cpu_init(void);
 int gic_v3_send_sgi_to_mpidr(u64 mpidr, unsigned int sgi);
 
@@ -645,6 +645,8 @@ int its_foreign_map(void *owner, struct irq_domain *domain, u32 dev_id,
 		    phys_addr_t *doorbell);
 int its_foreign_move(void *owner, struct irq_domain *domain, u32 dev_id,
 		     u32 event, unsigned int cpu);
+int its_foreign_keep(void *owner, struct irq_domain *domain, u32 dev_id,
+		     u32 event, u32 nvecs, unsigned int cpu, u32 lpi);
 void its_foreign_unmap(void *owner, struct irq_domain *domain, u32 dev_id);
 phys_addr_t its_foreign_doorbell(struct irq_domain *domain);
 
@@ -655,6 +657,18 @@ struct its_unit_desc {
 };
 
 int its_unit_get(int i, struct its_unit_desc *desc);
+#ifdef CONFIG_MULTIKERNEL_ITS_PROXY
+int its_init_tenant(struct rdists *rdists, struct irq_domain *parent_domain,
+		    u8 irq_prio);
+int its_claim(struct fwnode_handle *handle, phys_addr_t base, u64 size,
+	      int numa_node);
+#else
+static inline int its_init_tenant(struct rdists *rdists,
+				  struct irq_domain *parent_domain, u8 irq_prio)
+{
+	return 0;
+}
+#endif
 int its_init(struct fwnode_handle *handle, struct rdists *rdists,
 	     struct irq_domain *domain, u8 irq_prio);
 int mbi_init(struct fwnode_handle *fwnode, struct irq_domain *parent);

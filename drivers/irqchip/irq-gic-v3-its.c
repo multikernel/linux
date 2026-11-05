@@ -254,6 +254,13 @@ static void its_free_pages(void *addr, unsigned int order)
 
 static struct gen_pool *itt_pool;
 
+/* A multikernel successor probes the ITSes of the kernel it took over from */
+#ifdef CONFIG_MULTIKERNEL_ITS_PROXY
+#define __its_init
+#else
+#define __its_init __init
+#endif
+
 static void *itt_alloc_pool(int node, int size)
 {
 	unsigned long addr;
@@ -2160,6 +2167,35 @@ static void merge_lpi_ranges(struct lpi_range *a, struct lpi_range *b)
 	kfree(a);
 }
 
+/* Take [@base, @base + @nr_lpis) out of the free LPIs, all of it or nothing */
+static int __maybe_unused take_lpi_range(u32 base, u32 nr_lpis)
+{
+	struct lpi_range *range, *tail;
+	u32 end = base + nr_lpis;
+
+	guard(mutex)(&lpi_range_lock);
+
+	list_for_each_entry(range, &lpi_range_list, entry) {
+		u32 range_end = range->base_id + range->span;
+
+		if (base < range->base_id || end > range_end)
+			continue;
+		if (end < range_end) {
+			tail = mk_lpi_range(end, range_end - end);
+			if (!tail)
+				return -ENOMEM;
+			list_add(&tail->entry, &range->entry);
+		}
+		range->span = base - range->base_id;
+		if (!range->span) {
+			list_del(&range->entry);
+			kfree(range);
+		}
+		return 0;
+	}
+	return -EBUSY;
+}
+
 static int free_lpi_range(u32 base, u32 nr_lpis)
 {
 	struct lpi_range *new, *old;
@@ -2193,7 +2229,7 @@ static int free_lpi_range(u32 base, u32 nr_lpis)
 	return 0;
 }
 
-static int __init its_lpi_init(u32 id_bits)
+static int __its_init its_lpi_init(u32 id_bits)
 {
 	u32 lpis = (1UL << id_bits) - 8192;
 	u32 numlpis;
@@ -2295,6 +2331,10 @@ static bool gic_check_reserved_range(phys_addr_t addr, unsigned long size)
 	if (is_kdump_kernel())
 		return true;
 
+	/* Nor for a successor, which was told to leave them alone */
+	if (mk_range_preserved(addr, size))
+		return true;
+
 	addr_end = addr + size - 1;
 
 	for_each_reserved_mem_range(i, &start, &end) {
@@ -2321,7 +2361,7 @@ static int gic_reserve_range(phys_addr_t addr, unsigned long size)
 	return 0;
 }
 
-static int __init its_setup_lpi_prop_table(void)
+static int __its_init its_setup_lpi_prop_table(void)
 {
 	if (gic_rdists->flags & RDIST_FLAGS_RD_TABLES_PREALLOCATED) {
 		u64 val;
@@ -3076,7 +3116,7 @@ static bool enabled_lpis_allowed(void)
 	return gic_check_reserved_range(addr, LPI_PROPBASE_SZ);
 }
 
-static int __init allocate_lpi_tables(void)
+static int __its_init allocate_lpi_tables(void)
 {
 	u64 val;
 	int err, cpu;
@@ -3905,26 +3945,41 @@ int its_foreign_move(void *owner, struct irq_domain *domain, u32 dev_id,
 	return 0;
 }
 
-/**
- * its_foreign_map - Route a device's event to a CPU of another kernel
- * @owner: what the caller holds the device under for the other kernel
- * @domain: MSI domain of the device, which names the ITS behind it
- * @dev_id: DeviceID as that ITS sees it
- * @event: event (MSI data) to map
- * @nvecs: events the device will use at most, fixed by the first call
- * @cpu: this kernel's number of the CPU to deliver to
- * @doorbell: set to the address the device has to write the event to
- *
- * Mapping an event that is mapped already moves it to @cpu.
- *
- * Returns the LPI, which is the INTID the other kernel takes on @cpu,
- * or a negative error code.
- */
-int its_foreign_map(void *owner, struct irq_domain *domain, u32 dev_id,
-		    u32 event, u32 nvecs, unsigned int cpu,
-		    phys_addr_t *doorbell)
+/* With @lpi_base, the device's events get the LPIs another owner gave them */
+static struct its_device *its_foreign_create(struct its_node *its, u32 dev_id,
+					     u32 nvecs, int lpi_base)
+{
+	struct its_device *dev;
+	unsigned long *lpi_map;
+	u32 nr_lpis;
+
+	nvecs = roundup_pow_of_two(max(nvecs, 1U));
+	if (lpi_base < 0)
+		return its_create_device(its, dev_id, nvecs, true);
+
+	dev = its_create_device(its, dev_id, nvecs, false);
+	if (!dev)
+		return NULL;
+	nr_lpis = min_t(u32, nvecs, dev->nr_ites);
+	lpi_map = bitmap_zalloc(nr_lpis, GFP_KERNEL);
+	if (!lpi_map || take_lpi_range(lpi_base, nr_lpis)) {
+		bitmap_free(lpi_map);
+		its_send_mapd(dev, 0);
+		its_free_device(dev);
+		return NULL;
+	}
+	dev->event_map.lpi_map = lpi_map;
+	dev->event_map.lpi_base = lpi_base;
+	dev->event_map.nr_lpis = nr_lpis;
+	return dev;
+}
+
+static int __its_foreign_map(void *owner, struct irq_domain *domain,
+			     u32 dev_id, u32 event, u32 nvecs, unsigned int cpu,
+			     int lpi, phys_addr_t *doorbell)
 {
 	struct its_node *its = its_foreign_its(domain);
+	int lpi_base = lpi < 0 ? -1 : lpi - event;
 	struct its_collection *col;
 	struct its_device *dev;
 
@@ -3939,9 +3994,10 @@ int its_foreign_map(void *owner, struct irq_domain *domain, u32 dev_id,
 	dev = its_find_device(its, dev_id);
 	if (dev && dev->foreign != owner)
 		return -EBUSY;
+	if (dev && lpi_base >= 0 && dev->event_map.lpi_base != lpi_base)
+		return -EINVAL;
 	if (!dev) {
-		dev = its_create_device(its, dev_id,
-					roundup_pow_of_two(max(nvecs, 1U)), true);
+		dev = its_foreign_create(its, dev_id, nvecs, lpi_base);
 		if (!dev)
 			return -ENOMEM;
 		/* The ITS may give fewer than asked for */
@@ -3964,8 +4020,67 @@ int its_foreign_map(void *owner, struct irq_domain *domain, u32 dev_id,
 			its_foreign_config(dev, event, true);
 		}
 	}
-	*doorbell = its->get_msi_base(dev);
+	if (doorbell)
+		*doorbell = its->get_msi_base(dev);
 	return dev->event_map.lpi_base + event;
+}
+
+/**
+ * its_foreign_map - Route a device's event to a CPU of another kernel
+ * @owner: what the caller holds the device under for the other kernel
+ * @domain: MSI domain of the device, which names the ITS behind it
+ * @dev_id: DeviceID as that ITS sees it
+ * @event: event (MSI data) to map
+ * @nvecs: events the device will use at most, fixed by the first call
+ * @cpu: this kernel's number of the CPU to deliver to
+ * @doorbell: set to the address the device has to write the event to
+ *
+ * Mapping an event that is mapped already moves it to @cpu.
+ *
+ * Returns the LPI, which is the INTID the other kernel takes on @cpu,
+ * or a negative error code.
+ */
+int its_foreign_map(void *owner, struct irq_domain *domain, u32 dev_id,
+		    u32 event, u32 nvecs, unsigned int cpu,
+		    phys_addr_t *doorbell)
+{
+	return __its_foreign_map(owner, domain, dev_id, event, nvecs, cpu, -1,
+				 doorbell);
+}
+
+/**
+ * its_foreign_keep - Map an event again, at the LPI it had
+ * @owner: as for its_foreign_map()
+ * @domain: MSI domain that names the ITS
+ * @dev_id: DeviceID as that ITS sees it
+ * @event: event to map
+ * @nvecs: as for its_foreign_map()
+ * @cpu: this kernel's number of the CPU to deliver to
+ * @lpi: the LPI the event had
+ *
+ * For a kernel that took the ITS over from the one that mapped the event:
+ * the device and the CPU know the event by that LPI, so it stays. The event
+ * is raised once, as the device may have written it while it was unmapped.
+ *
+ * Returns 0 or a negative error code.
+ */
+int its_foreign_keep(void *owner, struct irq_domain *domain, u32 dev_id,
+		     u32 event, u32 nvecs, unsigned int cpu, u32 lpi)
+{
+	struct its_node *its = its_foreign_its(domain);
+	struct its_device *dev;
+	int ret;
+
+	ret = __its_foreign_map(owner, domain, dev_id, event, nvecs, cpu, lpi,
+				NULL);
+	if (ret < 0)
+		return ret;
+
+	guard(raw_spinlock_irqsave)(&its_foreign_lock);
+	dev = its_find_device(its, dev_id);
+	if (dev)
+		its_send_int(dev, event);
+	return 0;
 }
 
 /**
@@ -5355,7 +5470,7 @@ static struct syscore its_syscore = {
 	.ops = &its_syscore_ops,
 };
 
-static void __init __iomem *its_map_one(struct resource *res, int *err)
+static void __its_init __iomem *its_map_one(struct resource *res, int *err)
 {
 	void __iomem *its_base;
 	u32 val;
@@ -5450,7 +5565,7 @@ static int its_init_vpe_domain(void)
 	return 0;
 }
 
-static int __init its_compute_its_list_map(struct its_node *its)
+static int __its_init its_compute_its_list_map(struct its_node *its)
 {
 	int its_number;
 	u32 ctlr;
@@ -5487,7 +5602,7 @@ static int __init its_compute_its_list_map(struct its_node *its)
 	return its_number;
 }
 
-static int __init its_probe_one(struct its_node *its)
+static int __its_init its_probe_one(struct its_node *its)
 {
 	u64 baser, tmp;
 	struct page *page;
@@ -5737,7 +5852,7 @@ out:
 }
 
 /* Mark all the BASER registers as invalid before they get reprogrammed */
-static int __init its_reset_one(struct resource *res)
+static int __its_init its_reset_one(struct resource *res)
 {
 	void __iomem *its_base;
 	int err, i;
@@ -5758,7 +5873,7 @@ static const struct of_device_id its_device_id[] = {
 	{},
 };
 
-static struct its_node __init *its_node_init(struct resource *res,
+static struct its_node __its_init *its_node_init(struct resource *res,
 					     struct fwnode_handle *handle, int numa_node)
 {
 	void __iomem *its_base;
@@ -6045,7 +6160,7 @@ static void __init its_acpi_probe(void)
 static void __init its_acpi_probe(void) { }
 #endif
 
-int __init its_lpi_memreserve_init(void)
+int __its_init its_lpi_memreserve_init(void)
 {
 	int state;
 
@@ -6069,6 +6184,19 @@ int __init its_lpi_memreserve_init(void)
 	return 0;
 }
 
+static int __init its_init_gic(struct rdists *rdists,
+			       struct irq_domain *parent_domain, u8 irq_prio)
+{
+	itt_pool = gen_pool_create(get_order(ITS_ITT_ALIGN), -1);
+	if (!itt_pool)
+		return -ENOMEM;
+
+	gic_rdists = rdists;
+	lpi_prop_prio = irq_prio;
+	its_parent = parent_domain;
+	return 0;
+}
+
 int __init its_init(struct fwnode_handle *handle, struct rdists *rdists,
 		    struct irq_domain *parent_domain, u8 irq_prio)
 {
@@ -6078,14 +6206,10 @@ int __init its_init(struct fwnode_handle *handle, struct rdists *rdists,
 	bool has_v4_1 = false;
 	int err;
 
-	itt_pool = gen_pool_create(get_order(ITS_ITT_ALIGN), -1);
-	if (!itt_pool)
-		return -ENOMEM;
+	err = its_init_gic(rdists, parent_domain, irq_prio);
+	if (err)
+		return err;
 
-	gic_rdists = rdists;
-
-	lpi_prop_prio = irq_prio;
-	its_parent = parent_domain;
 	of_node = to_of_node(handle);
 	if (of_node)
 		its_of_probe(of_node);
@@ -6129,3 +6253,80 @@ int __init its_init(struct fwnode_handle *handle, struct rdists *rdists,
 
 	return 0;
 }
+
+#ifdef CONFIG_MULTIKERNEL_ITS_PROXY
+/*
+ * A multikernel tenant leaves the ITSes to the kernel that spawned it,
+ * but knows the GIC they belong to, in case it takes them over.
+ */
+int __init its_init_tenant(struct rdists *rdists,
+			   struct irq_domain *parent_domain, u8 irq_prio)
+{
+	return its_init_gic(rdists, parent_domain, irq_prio);
+}
+
+static void its_claim_cpu(void *unused)
+{
+	its_cpu_init();
+}
+
+/**
+ * its_claim - Take over an ITS from a kernel that is gone
+ * @handle: fwnode of the ITS's MSI domain
+ * @base: physical base of the ITS
+ * @size: size of its register frames
+ * @numa_node: NUMA node of the ITS, or NUMA_NO_NODE
+ *
+ * Probed the way a kernel kexec booted probes it: the ITS is quiesced and
+ * reset, and gets tables of this kernel's own. Whatever the other kernel
+ * mapped is gone. The LPI tables of the redistributors stay where they are,
+ * as they cannot be moved.
+ */
+int its_claim(struct fwnode_handle *handle, phys_addr_t base, u64 size,
+	      int numa_node)
+{
+	struct resource res = DEFINE_RES_MEM(base, size);
+	struct its_node *its;
+	bool first;
+	int err;
+
+	if (!gic_rdists)
+		return -ENODEV;
+
+	scoped_guard(raw_spinlock, &its_lock) {
+		list_for_each_entry(its, &its_nodes, entry)
+			if (its->phys_base == base)
+				return 0;
+		first = list_empty(&its_nodes);
+	}
+
+	if (first) {
+		/* Direct injection needs vPE tables the other kernel took along */
+		gic_rdists->has_vlpis = false;
+		gic_rdists->has_rvpeid = false;
+
+		migrate_disable();
+		err = allocate_lpi_tables();
+		migrate_enable();
+		if (err)
+			return err;
+	}
+
+	err = its_reset_one(&res);
+	if (err)
+		return err;
+	its = its_node_init(&res, handle, numa_node);
+	if (!its)
+		return -ENOMEM;
+	err = its_probe_one(its);
+	if (err) {
+		its_node_destroy(its);
+		return err;
+	}
+
+	if (first)
+		its_lpi_memreserve_init();
+	on_each_cpu(its_claim_cpu, NULL, true);
+	return 0;
+}
+#endif
