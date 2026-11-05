@@ -6032,7 +6032,8 @@ int __init its_lpi_memreserve_init(void)
 {
 	int state;
 
-	if (!efi_enabled(EFI_CONFIG_TABLES))
+	/* Multikernel hands the tables on whether or not there is EFI */
+	if (!efi_enabled(EFI_CONFIG_TABLES) && !IS_ENABLED(CONFIG_MULTIKERNEL))
 		return 0;
 
 	if (list_empty(&its_nodes))
