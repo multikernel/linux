@@ -815,6 +815,47 @@ static void mk_pool_chunk_return(struct mk_pool_chunk *chunk)
 	kfree(chunk);
 }
 
+static void mk_pool_chunk_init(struct mk_pool_chunk *chunk, phys_addr_t start,
+			       size_t size, int node)
+{
+	chunk->node = node;
+	chunk->res.name = "Multikernel Memory Pool";
+	chunk->res.start = start;
+	chunk->res.end = start + size - 1;
+	chunk->res.flags = IORESOURCE_BUSY | IORESOURCE_MEM;
+	chunk->res.desc = IORES_DESC_RESERVED;
+}
+
+/* On failure @chunk is still the caller's; on success it is the pool's. */
+static int mk_pool_chunk_add(struct mk_pool_chunk *chunk)
+{
+	struct gen_pool *pool;
+	int ret;
+
+	guard(mutex)(&mk_pool->mem_lock);
+	pool = mk_node_pool_get(chunk->node);
+	if (!pool)
+		return -ENOMEM;
+	ret = gen_pool_add(pool, chunk->res.start, resource_size(&chunk->res),
+			   chunk->node);
+	if (!ret)
+		list_add_tail(&chunk->list, &mk_pool->chunks);
+	return ret;
+}
+
+static int mk_pool_chunk_added(phys_addr_t start, size_t size, int node)
+{
+	int ret = mk_arch_pool_chunk_added(start, size);
+
+	if (ret) {
+		mk_pool_mem_shrink(start, size);
+		return ret;
+	}
+	pr_info("Multikernel pool: added %pa (%zu MB) on node %d\n",
+		&start, size >> 20, node);
+	return 0;
+}
+
 /**
  * mk_pool_mem_grow() - Take a contiguous chunk out of this kernel for the pool
  * @size: chunk size in bytes, page aligned; rounded up to MHP_SUBSECTIONS_ALIGN
@@ -830,10 +871,8 @@ static void mk_pool_chunk_return(struct mk_pool_chunk *chunk)
 int mk_pool_mem_grow(size_t size, int node, phys_addr_t *out_base)
 {
 	struct mk_pool_chunk *chunk;
-	struct gen_pool *pool;
 	phys_addr_t start;
-	int node_id;
-	int ret;
+	int nid, ret;
 
 	if (!size || !PAGE_ALIGNED(size))
 		return -EINVAL;
@@ -848,51 +887,72 @@ int mk_pool_mem_grow(size_t size, int node, phys_addr_t *out_base)
 		return -ENOMEM;
 
 	size = ALIGN(size, MHP_SUBSECTIONS_ALIGN);
-	ret = mk_take_memory(size, node, &start, &chunk->node, &chunk->movable);
+	ret = mk_take_memory(size, node, &start, &nid, &chunk->movable);
 	if (ret) {
 		kfree(chunk);
 		return ret;
 	}
-	chunk->res.name = "Multikernel Memory Pool";
-	chunk->res.start = start;
-	chunk->res.end = start + size - 1;
-	chunk->res.flags = IORESOURCE_BUSY | IORESOURCE_MEM;
-	chunk->res.desc = IORES_DESC_RESERVED;
-
-	mutex_lock(&mk_pool->mem_lock);
-	pool = mk_node_pool_get(chunk->node);
-	if (!pool) {
-		ret = -ENOMEM;
-		goto err_unlock;
-	}
-	ret = gen_pool_add(pool, chunk->res.start, size, chunk->node);
-	if (ret)
-		goto err_unlock;
+	mk_pool_chunk_init(chunk, start, size, nid);
 	if (insert_resource(&iomem_resource, &chunk->res))
 		pr_warn("Multikernel pool: chunk %pa not registered in /proc/iomem\n",
 			&chunk->res.start);
-	list_add_tail(&chunk->list, &mk_pool->chunks);
-	/* A concurrent shrink may free @chunk once the mutex is dropped */
-	start = chunk->res.start;
-	node_id = chunk->node;
-	mutex_unlock(&mk_pool->mem_lock);
 
-	ret = mk_arch_pool_chunk_added(start, size);
+	ret = mk_pool_chunk_add(chunk);
 	if (ret) {
-		mk_pool_mem_shrink(start, size);
+		if (chunk->res.parent)
+			remove_resource(&chunk->res);
+		mk_pool_chunk_return(chunk);
 		return ret;
 	}
-
-	pr_info("Multikernel pool: added %pa (%zu MB) on node %d\n",
-		&start, size >> 20, node_id);
-	if (out_base)
+	ret = mk_pool_chunk_added(start, size, nid);
+	if (!ret && out_base)
 		*out_base = start;
-	return 0;
-
-err_unlock:
-	mutex_unlock(&mk_pool->mem_lock);
-	mk_pool_chunk_return(chunk);
 	return ret;
+}
+
+/**
+ * mk_pool_mem_claim() - Put memory no kernel runs on into the pool
+ * @start: physical base, MHP_SUBSECTIONS_ALIGN aligned
+ * @size: bytes, MHP_SUBSECTIONS_ALIGN aligned
+ * @node: NUMA node of the range, or NUMA_NO_NODE to look it up
+ *
+ * For RAM of a fenced predecessor that this kernel took over but never
+ * added: it is out of every zone already, as a grown chunk is, and a
+ * shrink adds it to this kernel like any other chunk. The caller vouches
+ * that the range is RAM; anything this kernel knows at that address,
+ * RAM, a device window or another chunk, makes the claim fail.
+ *
+ * Returns 0 on success, negative error code on failure.
+ */
+int mk_pool_mem_claim(phys_addr_t start, size_t size, int node)
+{
+	struct mk_pool_chunk *chunk;
+	int ret;
+
+	if (!size || !IS_ALIGNED(start | size, MHP_SUBSECTIONS_ALIGN))
+		return -EINVAL;
+	if (!mk_pool)
+		return -ENODEV;
+	if (node == NUMA_NO_NODE)
+		node = memory_add_physaddr_to_nid(start);
+	if (node < 0 || node >= MAX_NUMNODES || !node_online(node))
+		return -EINVAL;
+
+	chunk = kzalloc_obj(*chunk, GFP_KERNEL);
+	if (!chunk)
+		return -ENOMEM;
+	mk_pool_chunk_init(chunk, start, size, node);
+	ret = request_resource(&iomem_resource, &chunk->res) ? -EBUSY : 0;
+	if (!ret) {
+		ret = mk_pool_chunk_add(chunk);
+		if (ret)
+			release_resource(&chunk->res);
+	}
+	if (ret) {
+		kfree(chunk);
+		return ret;
+	}
+	return mk_pool_chunk_added(start, size, node);
 }
 
 /**

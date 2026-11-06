@@ -523,6 +523,7 @@ struct mk_pool {
 extern struct mk_pool *mk_pool;
 
 int mk_pool_mem_grow(size_t size, int node, phys_addr_t *out_base);
+int mk_pool_mem_claim(phys_addr_t start, size_t size, int node);
 int mk_pool_mem_shrink(phys_addr_t start, size_t size);
 int mk_pool_map(phys_addr_t start, size_t size);
 void mk_pool_unmap(phys_addr_t start, size_t size);

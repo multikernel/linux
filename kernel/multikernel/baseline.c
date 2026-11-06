@@ -26,8 +26,10 @@
 #define MK_BASELINE_MAX_MEM_REQS MAX_NUMNODES
 
 struct mk_baseline_mem_req {
+	u64 base;		/* a range to claim when @claim, else unused */
 	u64 size;
 	int node;
+	bool claim;
 };
 
 /*
@@ -85,7 +87,7 @@ static int mk_baseline_parse_memory(const void *fdt, int resources_node,
 
 	fdt_for_each_subnode(node, fdt, resources_node) {
 		const char *name = fdt_get_name(fdt, node, NULL);
-		const fdt64_t *size;
+		const fdt64_t *size, *reg;
 		const fdt32_t *nid;
 
 		if (!name || strncmp(name, "memory@", 7))
@@ -96,13 +98,24 @@ static int mk_baseline_parse_memory(const void *fdt, int resources_node,
 			return -E2BIG;
 		}
 
-		size = fdt_getprop(fdt, node, "size", &len);
-		if (!size || len != 8) {
-			pr_err("Baseline %s: missing or invalid 'size'\n", name);
-			return -EINVAL;
+		reg = fdt_getprop(fdt, node, "reg", &len);
+		reqs[n].claim = reg;
+		if (reg) {
+			if (len != 16) {
+				pr_err("Baseline %s: 'reg' must be one <base size> pair of u64\n",
+				       name);
+				return -EINVAL;
+			}
+			reqs[n].base = fdt64_to_cpu(reg[0]);
+			reqs[n].size = fdt64_to_cpu(reg[1]);
+		} else {
+			size = fdt_getprop(fdt, node, "size", &len);
+			if (!size || len != 8) {
+				pr_err("Baseline %s: needs 'size' or 'reg'\n", name);
+				return -EINVAL;
+			}
+			reqs[n].size = fdt64_to_cpu(*size);
 		}
-
-		reqs[n].size = fdt64_to_cpu(*size);
 		if (!reqs[n].size || !PAGE_ALIGNED(reqs[n].size)) {
 			pr_err("Baseline %s: size 0x%llx not a positive page multiple\n",
 			       name, reqs[n].size);
@@ -338,9 +351,14 @@ static int mk_baseline_grow_pool(const struct mk_baseline_mem_req *reqs, int n)
 	int i, ret;
 
 	for (i = 0; i < n; i++) {
-		ret = mk_pool_mem_grow(reqs[i].size, reqs[i].node, NULL);
+		if (reqs[i].claim)
+			ret = mk_pool_mem_claim(reqs[i].base, reqs[i].size,
+						reqs[i].node);
+		else
+			ret = mk_pool_mem_grow(reqs[i].size, reqs[i].node, NULL);
 		if (ret) {
-			pr_err("Baseline: failed to allocate %llu MB on node %d: %d\n",
+			pr_err("Baseline: failed to %s %llu MB on node %d: %d\n",
+			       reqs[i].claim ? "claim" : "allocate",
 			       reqs[i].size >> 20, reqs[i].node, ret);
 			return ret;
 		}

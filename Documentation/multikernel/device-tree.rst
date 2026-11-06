@@ -64,7 +64,13 @@ exactly once; afterwards the pool is changed through overlays (see
     };
 
 A memory request names a size and optionally a node; the pool picks the
-chunk. A PCI device is identified by its address in ``pci-id``; the node
+chunk, taking it out of this kernel. A request may name a range in ``reg``
+instead, ``<base-hi base-lo size-hi size-lo>`` in multiples of
+``memory-granule``, for RAM that no running kernel has: what a kernel took
+over from a fenced predecessor and kept out of its own memory, so the pool
+gets it without a hot-remove that pinned pages could defeat. The range
+fails with ``-EBUSY`` if it overlaps anything in this kernel's
+``/proc/iomem``. Shrinking the pool adds it to this kernel like any chunk. A PCI device is identified by its address in ``pci-id``; the node
 name is free. An ``/aliases`` entry pointing at a device node gives the
 device its stable name (see Naming below). A platform device is named by
 ``device-name`` or ``acpi-hid``.
