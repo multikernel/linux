@@ -1705,7 +1705,7 @@ static void mk_halted_work_fn(struct work_struct *work)
 	kfree(aw);
 }
 
-static void mk_system_msg_handler(u32 msg_type, u32 subtype,
+static void mk_system_msg_handler(struct mk_instance *from, u32 msg_type, u32 subtype,
 				  void *payload, u32 payload_len, void *ctx)
 {
 	if (msg_type != MK_MSG_SYSTEM)
@@ -1720,14 +1720,13 @@ static void mk_system_msg_handler(u32 msg_type, u32 subtype,
 			return;
 
 		/* Only the kernel that spawned this one may stop it */
-		if (!host_instance ||
-		    req->sender_instance_id != host_instance->id) {
+		if (from != host_instance) {
 			pr_warn("Shutdown requested by instance %d, which did not spawn this kernel\n",
-				req->sender_instance_id);
+				from->id);
 			return;
 		}
 
-		pr_info("Shutdown requested by instance %d\n", req->sender_instance_id);
+		pr_info("Shutdown requested by the host\n");
 
 		sw = kmalloc(sizeof(*sw), GFP_ATOMIC);
 		if (!sw)

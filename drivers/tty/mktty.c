@@ -264,7 +264,8 @@ static struct miscdevice mktty_host_miscdev = {
 	.fops	= &mktty_host_fops,
 };
 
-static void mktty_host_ipi_handler(struct mk_ipi_data *data, void *ctx)
+static void mktty_host_ipi_handler(struct mk_ipi_data *data, struct mk_instance *from,
+				   void *ctx)
 {
 	struct mktty_message *msg = (struct mktty_message *)data->buffer;
 	struct mktty_host_conn *conn;
@@ -421,7 +422,8 @@ static const struct tty_operations mktty_spawn_ops = {
 	.write_room	= mktty_spawn_write_room,
 };
 
-static void mktty_spawn_ipi_handler(struct mk_ipi_data *data, void *ctx)
+static void mktty_spawn_ipi_handler(struct mk_ipi_data *data, struct mk_instance *from,
+				    void *ctx)
 {
 	struct mktty_message *msg = (struct mktty_message *)data->buffer;
 	struct tty_struct *tty;

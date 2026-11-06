@@ -300,7 +300,8 @@ static void mk_cpu_remove_work_fn(struct work_struct *work)
  *
  * Returns 0 on success, negative error code on failure
  */
-static int mk_handle_cpu_add(struct mk_cpu_resource_payload *payload, u32 payload_len)
+static int mk_handle_cpu_add(struct mk_instance *from,
+			     struct mk_cpu_resource_payload *payload, u32 payload_len)
 {
 	struct mk_cpu_hotplug_work *hp_work;
 
@@ -320,7 +321,7 @@ static int mk_handle_cpu_add(struct mk_cpu_resource_payload *payload, u32 payloa
 	hp_work->cpu_id = payload->cpu_id;
 	hp_work->numa_node = payload->numa_node;
 	hp_work->flags = payload->flags;
-	hp_work->sender_instance_id = payload->sender_instance_id;
+	hp_work->sender_instance_id = from->id;
 	hp_work->operation = MK_RES_CPU_ADD;
 	schedule_work(&hp_work->work);
 
@@ -337,7 +338,8 @@ static int mk_handle_cpu_add(struct mk_cpu_resource_payload *payload, u32 payloa
  *
  * Returns 0 on success, negative error code on failure
  */
-int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_len)
+int mk_handle_cpu_remove(struct mk_instance *from,
+			 struct mk_cpu_resource_payload *payload, u32 payload_len)
 {
 	struct mk_cpu_hotplug_work *hp_work;
 
@@ -357,7 +359,7 @@ int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_le
 	hp_work->cpu_id = payload->cpu_id;
 	hp_work->numa_node = payload->numa_node;
 	hp_work->flags = payload->flags;
-	hp_work->sender_instance_id = payload->sender_instance_id;
+	hp_work->sender_instance_id = from->id;
 	hp_work->operation = MK_RES_CPU_REMOVE;
 	schedule_work(&hp_work->work);
 
@@ -639,7 +641,8 @@ static void mk_mem_remove_work_fn(struct work_struct *work)
 	kfree(hp_work);
 }
 
-static int mk_handle_mem_add(struct mk_mem_resource_payload *payload, u32 payload_len)
+static int mk_handle_mem_add(struct mk_instance *from,
+			     struct mk_mem_resource_payload *payload, u32 payload_len)
 {
 	struct mk_mem_hotplug_work *hp_work;
 
@@ -660,14 +663,15 @@ static int mk_handle_mem_add(struct mk_mem_resource_payload *payload, u32 payloa
 	hp_work->nr_pages = payload->nr_pages;
 	hp_work->numa_node = payload->numa_node;
 	hp_work->mem_type = payload->mem_type;
-	hp_work->sender_instance_id = payload->sender_instance_id;
+	hp_work->sender_instance_id = from->id;
 	hp_work->operation = MK_RES_MEM_ADD;
 	schedule_work(&hp_work->work);
 
 	return 0;
 }
 
-static int mk_handle_mem_remove(struct mk_mem_resource_payload *payload, u32 payload_len)
+static int mk_handle_mem_remove(struct mk_instance *from,
+				struct mk_mem_resource_payload *payload, u32 payload_len)
 {
 	struct mk_mem_hotplug_work *hp_work;
 
@@ -686,7 +690,7 @@ static int mk_handle_mem_remove(struct mk_mem_resource_payload *payload, u32 pay
 	INIT_WORK(&hp_work->work, mk_mem_remove_work_fn);
 	hp_work->start_pfn = payload->start_pfn;
 	hp_work->nr_pages = payload->nr_pages;
-	hp_work->sender_instance_id = payload->sender_instance_id;
+	hp_work->sender_instance_id = from->id;
 	hp_work->operation = MK_RES_MEM_REMOVE;
 	schedule_work(&hp_work->work);
 
@@ -948,7 +952,8 @@ static void mk_device_remove_work_fn(struct work_struct *work)
 	kfree(hp_work);
 }
 
-static int mk_handle_device_add(struct mk_device_resource_payload *payload, u32 payload_len)
+static int mk_handle_device_add(struct mk_instance *from,
+				struct mk_device_resource_payload *payload, u32 payload_len)
 {
 	struct mk_device_hotplug_work *hp_work;
 
@@ -971,7 +976,7 @@ static int mk_handle_device_add(struct mk_device_resource_payload *payload, u32 
 	hp_work->devfn = payload->devfn;
 	hp_work->flags = payload->flags;
 	strscpy(hp_work->driver_override, payload->driver_override, sizeof(hp_work->driver_override));
-	hp_work->sender_instance_id = payload->sender_instance_id;
+	hp_work->sender_instance_id = from->id;
 	hp_work->operation = MK_RES_DEVICE_ADD;
 	hp_work->vendor = payload->vendor;
 	hp_work->device = payload->device;
@@ -982,7 +987,8 @@ static int mk_handle_device_add(struct mk_device_resource_payload *payload, u32 
 	return 0;
 }
 
-static int mk_handle_device_remove(struct mk_device_resource_payload *payload, u32 payload_len)
+static int mk_handle_device_remove(struct mk_instance *from,
+				   struct mk_device_resource_payload *payload, u32 payload_len)
 {
 	struct mk_device_hotplug_work *hp_work;
 
@@ -1004,7 +1010,7 @@ static int mk_handle_device_remove(struct mk_device_resource_payload *payload, u
 	hp_work->bus = payload->bus;
 	hp_work->devfn = payload->devfn;
 	hp_work->flags = payload->flags;
-	hp_work->sender_instance_id = payload->sender_instance_id;
+	hp_work->sender_instance_id = from->id;
 	hp_work->operation = MK_RES_DEVICE_REMOVE;
 	schedule_work(&hp_work->work);
 
@@ -1027,7 +1033,7 @@ static int mk_handle_device_remove(struct mk_device_resource_payload *payload, u
  * messaging system. It dispatches to specific handlers based on the
  * message subtype.
  */
-static void mk_resource_msg_handler(u32 msg_type, u32 subtype,
+static void mk_resource_msg_handler(struct mk_instance *from, u32 msg_type, u32 subtype,
 				    void *payload, u32 payload_len, void *ctx)
 {
 	int ret = 0;
@@ -1039,27 +1045,33 @@ static void mk_resource_msg_handler(u32 msg_type, u32 subtype,
 
 	switch (subtype) {
 	case MK_RES_CPU_ADD:
-		ret = mk_handle_cpu_add((struct mk_cpu_resource_payload *)payload, payload_len);
+		ret = mk_handle_cpu_add(from, (struct mk_cpu_resource_payload *)payload,
+					 payload_len);
 		break;
 
 	case MK_RES_CPU_REMOVE:
-		ret = mk_handle_cpu_remove((struct mk_cpu_resource_payload *)payload, payload_len);
+		ret = mk_handle_cpu_remove(from, (struct mk_cpu_resource_payload *)payload,
+					 payload_len);
 		break;
 
 	case MK_RES_MEM_ADD:
-		ret = mk_handle_mem_add((struct mk_mem_resource_payload *)payload, payload_len);
+		ret = mk_handle_mem_add(from, (struct mk_mem_resource_payload *)payload,
+					 payload_len);
 		break;
 
 	case MK_RES_MEM_REMOVE:
-		ret = mk_handle_mem_remove((struct mk_mem_resource_payload *)payload, payload_len);
+		ret = mk_handle_mem_remove(from, (struct mk_mem_resource_payload *)payload,
+					 payload_len);
 		break;
 
 	case MK_RES_DEVICE_ADD:
-		ret = mk_handle_device_add((struct mk_device_resource_payload *)payload, payload_len);
+		ret = mk_handle_device_add(from, (struct mk_device_resource_payload *)payload,
+					 payload_len);
 		break;
 
 	case MK_RES_DEVICE_REMOVE:
-		ret = mk_handle_device_remove((struct mk_device_resource_payload *)payload, payload_len);
+		ret = mk_handle_device_remove(from, (struct mk_device_resource_payload *)payload,
+					 payload_len);
 		break;
 
 	case MK_RES_ACK:

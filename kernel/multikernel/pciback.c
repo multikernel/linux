@@ -413,8 +413,8 @@ static void mk_pciback_request(const struct mk_pci_cfg_payload *req,
 	mk_pciback_answer(d->instance, &ack);
 }
 
-static void mk_pciback_msg_handler(u32 msg_type, u32 subtype, void *payload,
-				   u32 payload_len, void *ctx)
+static void mk_pciback_msg_handler(struct mk_instance *from, u32 msg_type, u32 subtype,
+				   void *payload, u32 payload_len, void *ctx)
 {
 	if (payload_len < sizeof(struct mk_pci_cfg_payload))
 		return;

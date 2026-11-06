@@ -270,7 +270,7 @@ int mk_ipi_send(struct mk_instance *instance, void *data, size_t data_size,
 	return 0;
 }
 
-static void mk_ipi_drain_ring(struct mk_ipi_ring *ring)
+static void mk_ipi_drain_ring(struct mk_ipi_ring *ring, struct mk_instance *from)
 {
 	struct mk_ipi_data *slot;
 	struct mk_ipi_handler *handler;
@@ -320,7 +320,7 @@ static void mk_ipi_drain_ring(struct mk_ipi_ring *ring)
 				void *ctx = handler->context;
 
 				raw_spin_unlock(&mk_handlers_lock);
-				cb(slot, ctx);
+				cb(slot, from, ctx);
 				goto advance_tail;
 			}
 		}
@@ -371,12 +371,12 @@ static void multikernel_interrupt_handler(void)
 	 */
 	raw_spin_lock_irqsave(&mk_drain_lock, flags);
 	this_cpu_write(mk_draining, true);
-	if (mk_self->ipi_data)
-		mk_ipi_drain_ring(&mk_self->ipi_data->to_child);
+	if (mk_self->ipi_data && host_instance)
+		mk_ipi_drain_ring(&mk_self->ipi_data->to_child, host_instance);
 	list_for_each_entry(child, &mk_ipi_rx_list, ipi_rx_node) {
 		ipi_data = READ_ONCE(child->ipi_data);
 		if (ipi_data)
-			mk_ipi_drain_ring(&ipi_data->to_parent);
+			mk_ipi_drain_ring(&ipi_data->to_parent, child);
 	}
 	this_cpu_write(mk_draining, false);
 	raw_spin_unlock_irqrestore(&mk_drain_lock, flags);

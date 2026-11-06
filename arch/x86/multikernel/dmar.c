@@ -362,8 +362,8 @@ static int mk_irte_write(u64 unit, u32 index, u32 mask, u64 low, u64 high)
 	return ret ? ret : ack.result;
 }
 
-static void mk_irte_msg_handler(u32 msg_type, u32 subtype, void *payload,
-				u32 payload_len, void *ctx)
+static void mk_irte_msg_handler(struct mk_instance *from, u32 msg_type, u32 subtype,
+				void *payload, u32 payload_len, void *ctx)
 {
 	struct mk_irte_payload *p = payload;
 

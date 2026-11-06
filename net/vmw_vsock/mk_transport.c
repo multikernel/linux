@@ -8,7 +8,9 @@
  * shared memory infrastructure, enabling standard AF_VSOCK sockets to
  * work between different kernel instances on the same host.
  *
- * Address mapping: CID = instance_id (direct 1:1 mapping)
+ * Address mapping: a CID is an instance ID as this kernel knows it, so its
+ * host is 0 and a child is the ID it got here, whatever IDs the sender
+ * writes; see mk_ipi_callback_t.
  * User must explicitly set SO_VM_SOCKETS_TRANSPORT to VSOCK_TRANSPORT_MULTIKERNEL
  */
 
@@ -296,7 +298,15 @@ static void mk_vsock_rx_work(struct work_struct *work)
 		mk_vsock_rx_pkt(skb);
 }
 
-static void mk_vsock_ipi_handler(u32 msg_type, u32 subtype,
+static u32 mk_transport_get_local_cid(void)
+{
+	if (!mk_self)
+		return VMADDR_CID_ANY;
+
+	return (u32)mk_self->id;
+}
+
+static void mk_vsock_ipi_handler(struct mk_instance *from, u32 msg_type, u32 subtype,
 				 void *payload, u32 payload_len, void *ctx)
 {
 	struct sk_buff *skb;
@@ -318,21 +328,20 @@ static void mk_vsock_ipi_handler(u32 msg_type, u32 subtype,
 
 	skb_put_data(skb, payload, payload_len);
 
+	/*
+	 * The sender wrote its own CIDs, which are the IDs its own host
+	 * gave it and this one. Answers must go back by the IDs this
+	 * kernel knows them by.
+	 */
 	hdr = (struct virtio_vsock_hdr *)skb->data;
+	hdr->src_cid = cpu_to_le64(from->id);
+	hdr->dst_cid = cpu_to_le64(mk_transport_get_local_cid());
 	mk_queue_rx_pkt(skb);
 }
 
 /*
  * Transport operations
  */
-
-static u32 mk_transport_get_local_cid(void)
-{
-	if (!mk_self)
-		return VMADDR_CID_ANY;
-
-	return (u32)mk_self->id;
-}
 
 static int mk_transport_init(struct vsock_sock *vsk, struct vsock_sock *psk)
 {

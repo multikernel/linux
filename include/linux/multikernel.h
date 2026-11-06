@@ -147,8 +147,15 @@ struct mk_shared_data {
 	u8 fw_stop[MK_PARKED_MAX];
 };
 
-/* Function pointer type for IPI callbacks */
-typedef void (*mk_ipi_callback_t)(struct mk_ipi_data *data, void *ctx);
+struct mk_instance;
+
+/*
+ * Each kernel numbers the kernels it talks to its own way, so @from, the
+ * kernel whose ring the message came in on, is what an answer goes to,
+ * never an ID the sender wrote into the message.
+ */
+typedef void (*mk_ipi_callback_t)(struct mk_ipi_data *data, struct mk_instance *from,
+				  void *ctx);
 
 struct mk_ipi_handler {
 	mk_ipi_callback_t callback;
@@ -375,7 +382,7 @@ struct mk_shutdown_payload {
 /**
  * Message handler callback type
  */
-typedef void (*mk_msg_handler_t)(u32 msg_type, u32 subtype,
+typedef void (*mk_msg_handler_t)(struct mk_instance *from, u32 msg_type, u32 subtype,
 				 void *payload, u32 payload_len, void *ctx);
 
 /* Opaque type for pending message tracking */

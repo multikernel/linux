@@ -44,7 +44,8 @@ static raw_spinlock_t mk_msg_type_handlers_lock = __RAW_SPIN_LOCK_UNLOCKED(mk_ms
  * @data: IPI data containing the message
  * @ctx: Context containing the message handler info
  */
-static void mk_message_type_ipi_callback(struct mk_ipi_data *data, void *ctx)
+static void mk_message_type_ipi_callback(struct mk_ipi_data *data, struct mk_instance *from,
+					 void *ctx)
 {
 	struct mk_msg_type_handler *type_handler = (struct mk_msg_type_handler *)ctx;
 	struct mk_message *msg;
@@ -88,7 +89,8 @@ static void mk_message_type_ipi_callback(struct mk_ipi_data *data, void *ctx)
 		 msg_type, msg_subtype, payload_len, data->sender_cpu);
 
 	/* Call the registered handler for this message type */
-	type_handler->msg_handler(msg_type, msg_subtype, payload, payload_len, type_handler->context);
+	type_handler->msg_handler(from, msg_type, msg_subtype, payload, payload_len,
+				  type_handler->context);
 }
 
 /*

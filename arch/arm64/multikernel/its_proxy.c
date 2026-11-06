@@ -626,8 +626,8 @@ void mk_msi_proxy_rebind(void)
 	}
 }
 
-static void mk_msi_msg_handler(u32 msg_type, u32 subtype, void *payload,
-			       u32 payload_len, void *ctx)
+static void mk_msi_msg_handler(struct mk_instance *from, u32 msg_type, u32 subtype,
+			       void *payload, u32 payload_len, void *ctx)
 {
 	struct mk_io_msi_payload *p = payload;
 	struct mk_msi_work *w;
