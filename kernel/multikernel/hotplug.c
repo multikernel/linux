@@ -368,18 +368,28 @@ int mk_handle_cpu_remove(struct mk_cpu_resource_payload *payload, u32 payload_le
  * Memory Hotplug Operations
  */
 
-static int mk_online_memory_block_movable(struct memory_block *mem, void *arg)
+/*
+ * Memory a host may take back stays movable, so that nothing pins it.
+ * What the sender marks normal is this kernel's for good, such as what a
+ * successor adopts from its fenced predecessor, and serves every kernel
+ * allocation as boot memory does.
+ */
+static int mk_online_memory_block(struct memory_block *mem, void *arg)
 {
+	int online_type = *(int *)arg;
+	bool movable = online_type == MMOP_ONLINE_MOVABLE;
 	int ret;
 
-	/* Handle blocks that were auto-onlined to wrong zone */
 	if (mem->state == MEM_ONLINE) {
+		if (mem->zone && (zone_idx(mem->zone) == ZONE_MOVABLE) == movable)
+			return 0;
+		/* An auto-online policy chose the other zone */
 		ret = device_offline(&mem->dev);
 		if (ret < 0)
 			return ret;
 	}
 
-	mem->online_type = MMOP_ONLINE_MOVABLE;
+	mem->online_type = online_type;
 	return device_online(&mem->dev);
 }
 
@@ -412,14 +422,13 @@ static int mk_mem_pieces(u64 start, u64 size, struct mk_mem_piece *piece)
 	return n;
 }
 
-static int mk_mem_piece_add(int nid, const struct mk_mem_piece *piece)
+static int mk_mem_piece_add(int nid, const struct mk_mem_piece *piece, int online_type)
 {
 	int ret;
 
 	if (!piece->blocks)
 		return add_and_online_subsections(nid, piece->start, piece->size,
-						  MMOP_ONLINE_MOVABLE,
-						  mk_mem_resource_name);
+						  online_type, mk_mem_resource_name);
 
 	ret = add_memory_driver_managed(nid, piece->start, piece->size,
 					mk_mem_resource_name,
@@ -427,8 +436,8 @@ static int mk_mem_piece_add(int nid, const struct mk_mem_piece *piece)
 	if (ret < 0)
 		return ret;
 
-	ret = walk_memory_blocks(piece->start, piece->size, NULL,
-				 mk_online_memory_block_movable);
+	ret = walk_memory_blocks(piece->start, piece->size, &online_type,
+				 mk_online_memory_block);
 	if (ret < 0)
 		offline_and_remove_memory(piece->start, piece->size);
 	return ret;
@@ -445,7 +454,7 @@ static int mk_do_mem_add(u64 start_pfn, u64 nr_pages, u32 numa_node, u32 mem_typ
 {
 	struct mk_mem_piece piece[3];
 	int ret, i, n;
-	int nid;
+	int nid, online_type;
 	u64 phys_addr;
 	u64 size;
 	struct mk_hotplug_op *op;
@@ -466,6 +475,7 @@ static int mk_do_mem_add(u64 start_pfn, u64 nr_pages, u32 numa_node, u32 mem_typ
 		nid = 0;
 	}
 
+	online_type = mem_type & MK_MEM_NORMAL ? MMOP_ONLINE_KERNEL : MMOP_ONLINE_MOVABLE;
 	pr_info("Multikernel hotplug: Adding memory 0x%llx-0x%llx (%llu MB) numa=%d type=0x%x\n",
 		phys_addr, phys_addr + size - 1, size >> 20,
 		(int)numa_node, mem_type);
@@ -488,7 +498,7 @@ static int mk_do_mem_add(u64 start_pfn, u64 nr_pages, u32 numa_node, u32 mem_typ
 
 	n = mk_mem_pieces(phys_addr, size, piece);
 	for (i = 0; i < n; i++) {
-		ret = mk_mem_piece_add(nid, &piece[i]);
+		ret = mk_mem_piece_add(nid, &piece[i], online_type);
 		if (ret < 0) {
 			pr_err("Multikernel hotplug: Failed to add memory at 0x%llx: %d\n",
 			       piece[i].start, ret);
@@ -521,7 +531,7 @@ static int mk_do_mem_remove(u64 start_pfn, u64 nr_pages)
 {
 	struct mk_mem_piece piece[3];
 	struct page *page;
-	int ret, i, n, nid;
+	int ret, i, n, nid, online_type;
 	u64 phys_addr;
 	u64 size;
 	struct mk_hotplug_op *op;
@@ -542,6 +552,7 @@ static int mk_do_mem_remove(u64 start_pfn, u64 nr_pages)
 	if (!page)
 		return -EINVAL;
 	nid = page_to_nid(page);
+	online_type = page_zonenum(page) == ZONE_MOVABLE ? MMOP_ONLINE_MOVABLE : MMOP_ONLINE_KERNEL;
 
 	n = mk_mem_pieces(phys_addr, size, piece);
 	for (i = 0; i < n; i++) {
@@ -550,7 +561,7 @@ static int mk_do_mem_remove(u64 start_pfn, u64 nr_pages)
 			pr_err("Multikernel hotplug: Failed to remove memory at 0x%llx: %d\n",
 			       piece[i].start, ret);
 			while (i--)
-				mk_mem_piece_add(nid, &piece[i]);
+				mk_mem_piece_add(nid, &piece[i], online_type);
 			return ret;
 		}
 	}

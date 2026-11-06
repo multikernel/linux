@@ -143,7 +143,10 @@ Operation Sections
 
       - ``reg``: <addr-hi addr-lo size-hi size-lo> (u64 address, u64 size)
       - ``numa-node-id``: NUMA node (u32, optional)
-      - ``mem-type``: memory type (u32, optional)
+      - ``mem-type``: memory type (u32, optional). The range is onlined in
+        ZONE_MOVABLE, so that it can be taken back, unless ``MK_MEM_NORMAL``
+        (0x01) makes it kernel memory like boot memory, for memory the
+        instance keeps for good.
 
 **memory-remove**
     Subnodes are ``memory@N`` items naming an existing range in both cases:
