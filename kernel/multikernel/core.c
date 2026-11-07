@@ -290,6 +290,7 @@ struct mk_instance *mk_instance_alloc(int id, const char *name)
 	instance->ipi_target = MK_PHYS_CPU_INVALID;
 	INIT_LIST_HEAD(&instance->ipi_rx_node);
 	INIT_LIST_HEAD(&instance->memory_regions);
+	mutex_init(&instance->pool_lock);
 	INIT_LIST_HEAD(&instance->list);
 	INIT_LIST_HEAD(&instance->pci_devices);
 	INIT_LIST_HEAD(&instance->platform_devices);
@@ -1307,6 +1308,10 @@ static int mk_instance_transfer_memory(struct mk_instance *instance, u64 size,
 	return 0;
 
 cleanup:
+	/* The chunks no region took yet; the rest go back with their regions */
+	list_for_each_entry_from(chunk, &pool->chunks, next_chunk)
+		multikernel_free(chunk->start_addr,
+				 chunk->end_addr - chunk->start_addr + 1);
 	mk_instance_free_memory(instance);
 	return ret;
 }
@@ -1322,85 +1327,68 @@ static int mk_instance_reserve_memory(struct mk_instance *instance,
  * mk_instance_free_memory() - Free all reserved memory regions
  * @instance: Instance to free memory for
  *
- * Returns all reserved memory regions back to the multikernel pool
- * and removes them from the resource hierarchy.
- *
- * Note: The memory is returned to the global multikernel pool by
- * multikernel_destroy_instance_pool(), which makes it available for
- * future instance allocations (including mk_self).
+ * Returns all reserved memory regions back to the multikernel pool, making
+ * them available for future instance allocations (including mk_self), and
+ * removes them from the resource hierarchy.
  */
 void mk_instance_free_memory(struct mk_instance *instance)
 {
 	struct mk_memory_region *region, *tmp;
+	bool give_back = true;
 	u64 total_freed = 0;
 
 	if (!instance)
 		return;
 
+	/*
+	 * The arch's boot structures are all carved from the control block,
+	 * so they are returned to the pool as one allocation rather than
+	 * individually. Freeing them piecemeal would punch holes in the
+	 * block's bitmap and leave the rest of it allocated. The arch moves
+	 * CPUs still parked in this instance's memory back to the host pool
+	 * before the block goes away.
+	 */
+	if (instance->instance_pool && mk_arch_release_instance(instance)) {
+		/*
+		 * A CPU never claimed its repark: it is still parked on this
+		 * instance's context, executing from the park page inside
+		 * this instance's memory. Handing the memory back would let
+		 * the next instance overwrite code a CPU is running, so leak
+		 * all of it instead.
+		 */
+		pr_err("Instance %d (%s): leaking its %zu byte pool, a lost CPU still parks in it\n",
+		       instance->id, instance->name, instance->pool_size);
+		give_back = false;
+	} else if (instance->ctrl_va) {
+		mk_pool_unmap(instance->ctrl_phys, MK_CTRL_BLOCK_SIZE);
+		mk_instance_mem_free(instance, instance->ctrl_va, MK_CTRL_BLOCK_SIZE);
+		instance->ctrl_va = NULL;
+		instance->ctrl_phys = 0;
+		instance->ctrl_used = 0;
+	}
+
 	list_for_each_entry_safe(region, tmp, &instance->memory_regions, list) {
 		u64 region_size = resource_size(&region->res);
-
-		pr_debug("Freeing memory region for instance %d (%s): 0x%llx-0x%llx (%llu bytes)\n",
-			 instance->id, instance->name,
-			 (unsigned long long)region->res.start,
-			 (unsigned long long)region->res.end,
-			 region_size);
 
 		list_del(&region->list);
 		if (region->res.parent)
 			remove_resource(&region->res);
+		if (give_back)
+			multikernel_free(region->res.start, region_size);
 		kfree(region->res.name);
 		kfree(region);
 
 		total_freed += region_size;
 	}
-
 	instance->region_count = 0;
-	if (instance->instance_pool) {
-		pr_info("Returning 0x%llx bytes from instance %d (%s) back to multikernel pool\n",
+
+	if (give_back && instance->instance_pool) {
+		pr_info("Returned 0x%llx bytes from instance %d (%s) back to multikernel pool\n",
 			total_freed, instance->id, instance->name);
-
-		/*
-		 * The arch's boot structures are all carved from the control
-		 * block, so they are returned to the pool as one allocation
-		 * rather than individually. Freeing them piecemeal would punch
-		 * holes in the block's bitmap and leave the rest of it
-		 * allocated. The arch moves CPUs still parked in this
-		 * instance's memory back to the host pool before the block
-		 * goes away.
-		 */
-		if (mk_arch_release_instance(instance)) {
-			/*
-			 * A CPU never claimed its repark: it is still parked
-			 * on this instance's context, executing from the park
-			 * page inside this pool. Handing the memory back
-			 * would let the next instance overwrite code a CPU is
-			 * running, so leak the whole pool instead.
-			 */
-			pr_err("Instance %d (%s): leaking its %zu byte pool, a lost CPU still parks in it\n",
-			       instance->id, instance->name,
-			       instance->pool_size);
-			instance->instance_pool = NULL;
-			instance->pool_size = 0;
-			return;
-		}
-
-		if (instance->ctrl_va) {
-			mk_pool_unmap(instance->ctrl_phys, MK_CTRL_BLOCK_SIZE);
-			mk_instance_mem_free(instance, instance->ctrl_va,
-					 MK_CTRL_BLOCK_SIZE);
-			instance->ctrl_va = NULL;
-			instance->ctrl_phys = 0;
-			instance->ctrl_used = 0;
-		}
-
 		multikernel_destroy_instance_pool(instance->instance_pool);
-		instance->instance_pool = NULL;
-		instance->pool_size = 0;
 	}
-
-	pr_debug("Freed all memory regions and pool for instance %d (%s)\n",
-		 instance->id, instance->name);
+	instance->instance_pool = NULL;
+	instance->pool_size = 0;
 }
 
 /**
@@ -1543,8 +1531,8 @@ void *mk_instance_mem_alloc(struct mk_instance *instance, size_t size, size_t al
 		return NULL;
 	}
 
-	/* Allocate from instance pool with alignment */
-	phys_addr = multikernel_instance_alloc(instance->instance_pool, size, align);
+	scoped_guard(mutex, &instance->pool_lock)
+		phys_addr = multikernel_instance_alloc(instance->instance_pool, size, align);
 	if (!phys_addr) {
 		pr_debug("Failed to allocate %zu bytes from instance pool (align=0x%zx)\n", size, align);
 		return NULL;

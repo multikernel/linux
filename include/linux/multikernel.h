@@ -749,6 +749,8 @@ struct mk_instance {
 	/* Memory pool for this instance */
 	void *instance_pool;            /* Handle for instance-specific memory pool */
 	size_t pool_size;               /* Size of the instance pool */
+	/* Allocations from instance_pool against chunks leaving it */
+	struct mutex pool_lock;
 
 	/* CPU resources */
 	struct mk_cpu_set *cpus;         /* Set of assigned physical CPU IDs */

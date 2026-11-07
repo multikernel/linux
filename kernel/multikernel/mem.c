@@ -304,6 +304,7 @@ void *multikernel_create_instance_pool(int instance_id, size_t pool_size,
 				       int min_alloc_order, int node)
 {
 	struct gen_pool *instance_pool;
+	struct gen_pool_chunk *chunk;
 	size_t remaining_size = pool_size;
 	size_t chunk_size;
 	phys_addr_t chunk_base;
@@ -374,8 +375,10 @@ void *multikernel_create_instance_pool(int instance_id, size_t pool_size,
 	return instance_pool;
 
 cleanup:
-	/* Free all chunks that were successfully added */
-	multikernel_destroy_instance_pool(instance_pool);
+	list_for_each_entry(chunk, &instance_pool->chunks, next_chunk)
+		multikernel_free(chunk->start_addr,
+				 chunk->end_addr - chunk->start_addr + 1);
+	gen_pool_destroy(instance_pool);
 	return NULL;
 }
 
@@ -383,32 +386,13 @@ cleanup:
  * multikernel_destroy_instance_pool() - Destroy an instance memory pool
  * @pool_handle: Handle returned by multikernel_create_instance_pool()
  *
- * Frees the memory of every chunk the instance still owns back to the main
- * pool. Nothing may be allocated from the pool any more, so a chunk with no
- * space left is one whose region left the instance: its memory went back
- * then, and only the reservation holding it is dropped.
+ * Nothing may be allocated from the pool any more. Its memory belongs to
+ * the instance's regions, which hand it back themselves.
  */
 void multikernel_destroy_instance_pool(void *pool_handle)
 {
-	struct gen_pool *instance_pool = (struct gen_pool *)pool_handle;
-	struct gen_pool_chunk *chunk;
-
-	if (!instance_pool)
-		return;
-
-	list_for_each_entry(chunk, &instance_pool->chunks, next_chunk) {
-		size_t size = chunk->end_addr - chunk->start_addr + 1;
-
-		if (!atomic_long_read(&chunk->avail)) {
-			gen_pool_free(instance_pool, chunk->start_addr, size);
-			continue;
-		}
-		multikernel_free(chunk->start_addr, size);
-		pr_debug("Freed instance pool chunk: 0x%lx-0x%lx\n",
-			 chunk->start_addr, chunk->end_addr);
-	}
-
-	gen_pool_destroy(instance_pool);
+	if (pool_handle)
+		gen_pool_destroy(pool_handle);
 }
 
 /**
@@ -490,30 +474,6 @@ static int mk_instance_pool_add(struct mk_instance *instance, phys_addr_t phys_a
 	if (gen_pool_add(instance->instance_pool, phys_addr, size, node))
 		return -ENOMEM;
 	instance->pool_size += size;
-	return 0;
-}
-
-/* gen_pool algorithm: all of the chunk that starts at *data, or nothing */
-static unsigned long mk_whole_chunk_algo(unsigned long *map, unsigned long size,
-					 unsigned long start, unsigned int nr,
-					 void *data, struct gen_pool *pool,
-					 unsigned long start_addr)
-{
-	if (start_addr != *(unsigned long *)data || nr != size)
-		return size;
-	return bitmap_find_next_zero_area(map, size, 0, nr, 0) ? size : 0;
-}
-
-/* Reserve a region's whole chunk, or fail if anything is allocated in it */
-static int mk_instance_pool_reserve(struct mk_instance *instance,
-				    phys_addr_t phys_addr, size_t size)
-{
-	unsigned long start = phys_addr;
-
-	if (gen_pool_alloc_algo(instance->instance_pool, size,
-				mk_whole_chunk_algo, &start) != start)
-		return -EBUSY;
-	instance->pool_size -= size;
 	return 0;
 }
 
@@ -613,9 +573,9 @@ int mk_instance_add_memory_region(struct mk_instance *instance,
  * @phys_addr: Physical address of the memory region
  * @size: Size of the memory region
  *
- * Reserves the region's chunk so nothing more is allocated from it. Follow
- * with mk_instance_finish_memory_removal(), or with
- * mk_instance_abort_memory_removal() if the region has to stay.
+ * Takes the region's chunk out of the instance pool so nothing more is
+ * allocated from it. Follow with mk_instance_finish_memory_removal(), or
+ * with mk_instance_abort_memory_removal() if the region has to stay.
  *
  * Returns: 0 on success, -ENOENT if no region matches exactly, -EBUSY if the
  * instance's kernel image or control block lives in it
@@ -623,6 +583,8 @@ int mk_instance_add_memory_region(struct mk_instance *instance,
 int mk_instance_begin_memory_removal(struct mk_instance *instance,
 				     phys_addr_t phys_addr, size_t size)
 {
+	int ret;
+
 	if (!mk_instance_find_region(instance, phys_addr, size)) {
 		pr_warn("Memory region 0x%llx-0x%llx not found in instance %d (%s)\n",
 			(unsigned long long)phys_addr,
@@ -631,13 +593,16 @@ int mk_instance_begin_memory_removal(struct mk_instance *instance,
 		return -ENOENT;
 	}
 
-	if (mk_instance_pool_reserve(instance, phys_addr, size)) {
+	scoped_guard(mutex, &instance->pool_lock)
+		ret = gen_pool_remove_chunk(instance->instance_pool, phys_addr, size);
+	if (ret) {
 		pr_err("Refusing to remove 0x%llx-0x%llx from instance %d (%s): its kernel image or control block lives there\n",
 		       (unsigned long long)phys_addr,
 		       (unsigned long long)(phys_addr + size - 1),
 		       instance->id, instance->name);
-		return -EBUSY;
+		return ret;
 	}
+	instance->pool_size -= size;
 	return 0;
 }
 
@@ -650,7 +615,14 @@ int mk_instance_begin_memory_removal(struct mk_instance *instance,
 void mk_instance_abort_memory_removal(struct mk_instance *instance,
 				      phys_addr_t phys_addr, size_t size)
 {
-	gen_pool_free(instance->instance_pool, phys_addr, size);
+	/* Still the instance's own and handed back with it, just not allocatable */
+	if (gen_pool_add(instance->instance_pool, phys_addr, size, NUMA_NO_NODE)) {
+		pr_warn("Instance %d (%s) keeps 0x%llx-0x%llx outside its pool\n",
+			instance->id, instance->name,
+			(unsigned long long)phys_addr,
+			(unsigned long long)(phys_addr + size - 1));
+		return;
+	}
 	instance->pool_size += size;
 }
 
