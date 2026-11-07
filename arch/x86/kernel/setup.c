@@ -48,6 +48,7 @@
 #include <asm/mce.h>
 #include <asm/memtype.h>
 #include <asm/mtrr.h>
+#include <asm/multikernel.h>
 #include <asm/nmi.h>
 #include <asm/numa.h>
 #include <asm/olpc_ofw.h>
