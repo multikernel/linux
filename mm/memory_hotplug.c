@@ -2640,7 +2640,7 @@ static void online_subsections_range(unsigned long pfn, unsigned long end_pfn)
 		generic_online_page(pfn_to_page(pfn), order);
 		pfn += 1UL << order;
 	}
-	online_mem_sections(start_pfn, end_pfn);
+	online_mem_sections(SECTION_ALIGN_DOWN(start_pfn), end_pfn);
 }
 
 /**
