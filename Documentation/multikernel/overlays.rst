@@ -169,6 +169,9 @@ Operation Sections
       - ``pci-id``: "DDDD:BB:SS.F" (string)
       - ``alias``: stable name for the device tree ``/aliases`` node, such
         as "nvme0" (string, optional, ``device-add`` to the pool only)
+      - ``label``: the device's name in this kernel, such as "enP1s1f1",
+        which every kernel it moves to names it by (string of at most 31
+        characters, optional, ``device-add`` to the pool only)
       - ``driver``: driver to bind (string, optional, ``device-add`` to an
         instance only)
       - ``flags``: device flags (u32, optional)
@@ -248,7 +251,6 @@ kernel that manages a pool, its ``/resources`` node describes the pool::
                 numa-node-id = <0>;
             };
         };
-        aliases { ... };
         pci@0 { ... };                          /* free pool PCI devices */
     };
 
@@ -259,7 +261,7 @@ instances; ``cpus-available`` lists only the free ones. There is one
 ``memory@<base>`` node per pool chunk, in the standard memory node form, and
 its ``reg`` is what a ``/resources memory-remove`` item must name. Free pool
 PCI devices are described under their host bridge in the devicetree PCI bus
-binding, and ``/aliases`` names them; the ``pci-id`` a ``device-add`` or
+binding, named by their ``label``; the ``pci-id`` a ``device-add`` or
 ``device-remove`` item must name is the address encoded in a device node's
 ``reg``. See ``device-tree.rst`` for the full layout.
 

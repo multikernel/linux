@@ -226,7 +226,7 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 				     struct list_head *pci_list)
 {
 	int devices_node, dev_node;
-	const char *dev_name, *device_type, *alias;
+	const char *dev_name, *device_type, *alias, *label;
 	int pci_count = 0;
 	int len;
 
@@ -283,6 +283,13 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 				return -EINVAL;
 			}
 
+			label = fdt_getprop(fdt, dev_node, "label", &len);
+			if (label && strnlen(label, len) >= sizeof(pci_dev->label)) {
+				pr_err("PCI device '%s' label is longer than %zu characters\n",
+				       dev_name, sizeof(pci_dev->label) - 1);
+				return -EINVAL;
+			}
+
 			pci_dev = kzalloc_obj(*pci_dev, GFP_KERNEL);
 			if (!pci_dev) {
 				pr_err("Failed to allocate memory for PCI device\n");
@@ -292,6 +299,8 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 			alias = mk_dt_node_alias(fdt, dev_node);
 			if (alias)
 				strscpy(pci_dev->alias, alias, sizeof(pci_dev->alias));
+			if (label)
+				strscpy(pci_dev->label, label, sizeof(pci_dev->label));
 			pci_dev->vendor = (u16)fdt32_to_cpu(*vendor_prop);
 			pci_dev->device = (u16)fdt32_to_cpu(*device_prop);
 			pci_dev->domain = (u16)domain;
@@ -412,7 +421,7 @@ static int mk_baseline_initialize_devices(struct list_head *pci_list)
 	list_for_each_entry(pci_dev, pci_list, list) {
 		ret = mk_pool_device_add(pci_dev->domain, pci_dev->bus,
 					 PCI_DEVFN(pci_dev->slot, pci_dev->func),
-					 pci_dev->alias);
+					 pci_dev->alias, pci_dev->label);
 		if (ret) {
 			pr_warn("PCI device %04x:%04x@%04x:%02x:%02x.%x not moved into the pool: %d\n",
 				pci_dev->vendor, pci_dev->device, pci_dev->domain,

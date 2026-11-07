@@ -81,6 +81,24 @@ bool mk_of_pci_available(u16 domain, u8 bus, u8 devfn)
 }
 
 /**
+ * mk_of_pci_label - Copy the label of a PCI function in this kernel's tree
+ * @domain: PCI domain
+ * @bus: PCI bus
+ * @devfn: PCI device and function
+ * @label: Buffer left untouched when the function has no label
+ * @size: Size of @label
+ */
+void mk_of_pci_label(u16 domain, u8 bus, u8 devfn, char *label, size_t size)
+{
+	struct device_node *np = mk_of_pci_node(domain, bus, devfn);
+	const char *name;
+
+	if (np && !of_property_read_string(np, "label", &name))
+		strscpy(label, name, size);
+	of_node_put(np);
+}
+
+/**
  * mk_of_pci_set_lent - Record in the tree whether a device is lent out
  * @np: The device's node
  * @lent: true when handed to an instance, false when taken back
@@ -114,7 +132,7 @@ static int mk_of_pci_set_lent(struct device_node *np, bool lent)
 static void mk_of_pci_describe(struct device_node *np, u16 domain, u8 bus,
 			       u8 devfn, struct mk_pci_device *dev)
 {
-	const char *alias;
+	const char *alias, *label;
 	u32 id;
 
 	memset(dev, 0, sizeof(*dev));
@@ -130,6 +148,8 @@ static void mk_of_pci_describe(struct device_node *np, u16 domain, u8 bus,
 	alias = of_alias_from_node(np);
 	if (alias)
 		strscpy(dev->alias, alias, sizeof(dev->alias));
+	if (!of_property_read_string(np, "label", &label))
+		strscpy(dev->label, label, sizeof(dev->label));
 }
 
 /**

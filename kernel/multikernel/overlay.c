@@ -220,7 +220,7 @@ static struct kernfs_ops mk_overlay_new_ops = {
  *       memory-remove { memory@0 { reg = <u64 base, u64 size>; }; };
  *       cpu-add       { cpu@0 { reg = <u64 cpuid>; }; };
  *       cpu-remove    { cpu@0 { reg = <u64 cpuid>; }; };
- *       device-add    { pci@0 { pci-id = "DDDD:BB:SS.F"; alias = "nvme0"; }; };
+ *       device-add    { pci@0 { pci-id = "DDDD:BB:SS.F"; alias = "nvme0"; label = "nvme0"; }; };
  *       device-remove { pci@0 { pci-id = "DDDD:BB:SS.F"; }; };
  *     };
  *   };
@@ -899,7 +899,7 @@ static int mk_overlay_op_device(struct mk_overlay_tx *tx, const void *fdt,
 
 	fdt_for_each_subnode(item_node, fdt, op_node) {
 		const char *name = fdt_get_name(fdt, item_node, NULL);
-		const char *driver, *alias;
+		const char *driver, *alias, *label;
 		u16 domain;
 		u8 bus, devfn;
 		u32 flags;
@@ -915,6 +915,13 @@ static int mk_overlay_op_device(struct mk_overlay_tx *tx, const void *fdt,
 
 		driver = fdt_getprop(fdt, item_node, "driver", &len);
 		alias = fdt_getprop(fdt, item_node, "alias", &len);
+		label = fdt_getprop(fdt, item_node, "label", &len);
+		if (label && strnlen(label, len) >= MK_PCI_LABEL_LEN) {
+			pr_err("%s tx%d: device %04x:%02x:%02x.%x label is longer than %d characters\n",
+			       verb, tx->id, domain, bus, PCI_SLOT(devfn),
+			       PCI_FUNC(devfn), MK_PCI_LABEL_LEN - 1);
+			return -EINVAL;
+		}
 		flags = mk_overlay_parse_u32(fdt, item_node, "flags");
 
 		if (target->kind == MK_OVERLAY_TARGET_POOL)
@@ -932,7 +939,7 @@ static int mk_overlay_op_device(struct mk_overlay_tx *tx, const void *fdt,
 
 		if (target->kind == MK_OVERLAY_TARGET_POOL)
 			ret = give ? mk_pool_device_add(domain, bus, devfn,
-							alias) :
+							alias, label) :
 				     mk_pool_device_remove(domain, bus, devfn,
 							   NULL, 0);
 		else if (give)

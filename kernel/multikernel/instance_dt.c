@@ -556,19 +556,18 @@ bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
 EXPORT_SYMBOL_GPL(mk_pci_should_probe);
 
 /*
- * A netdev's alias is its interface name, the one the device had in the
- * kernel that gave it away, found from the node its device is bound to,
- * so rename it once it is registered through the same path as a rename
- * from userspace. netif_change_name() rejects
- * a name that is too long or already in use, and the driver's name then
- * stands.
+ * A netdev's label is its interface name, the one the device had in the
+ * kernel that pooled it, found from the node its device is bound to, as
+ * DSA names its ports. Rename it once it is registered through the same
+ * path as a rename from userspace. netif_change_name() rejects a name
+ * that is invalid or already in use, and the driver's name then stands.
  */
-static int mk_netdev_alias_event(struct notifier_block *nb,
+static int mk_netdev_label_event(struct notifier_block *nb,
 				 unsigned long event, void *ptr)
 {
 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	struct device *parent;
-	const char *alias;
+	const char *label;
 	int ret;
 
 	if (event != NETDEV_REGISTER)
@@ -581,27 +580,26 @@ static int mk_netdev_alias_event(struct notifier_block *nb,
 	if (!parent)
 		return NOTIFY_DONE;
 
-	alias = of_alias_from_node(parent->of_node);
-	if (!alias)
+	if (of_property_read_string(parent->of_node, "label", &label))
 		return NOTIFY_DONE;
 
-	ret = netif_change_name(dev, alias);
+	ret = netif_change_name(dev, label);
 	if (ret)
-		netdev_warn(dev, "alias %s not applied: %d\n", alias, ret);
+		netdev_warn(dev, "label %s not applied: %d\n", label, ret);
 
 	return NOTIFY_DONE;
 }
 
-static struct notifier_block mk_netdev_alias_nb = {
-	.notifier_call = mk_netdev_alias_event,
+static struct notifier_block mk_netdev_label_nb = {
+	.notifier_call = mk_netdev_label_event,
 };
 
-static int __init mk_netdev_alias_init(void)
+static int __init mk_netdev_label_init(void)
 {
-	return register_netdevice_notifier(&mk_netdev_alias_nb);
+	return register_netdevice_notifier(&mk_netdev_label_nb);
 }
 /* Before device_initcall, where the drivers that register netdevs run */
-subsys_initcall(mk_netdev_alias_init);
+subsys_initcall(mk_netdev_label_init);
 
 /**
  * mk_platform_device_allowed - Whether a platform device is this kernel's

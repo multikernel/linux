@@ -51,15 +51,13 @@ exactly once; afterwards the pool is changed through overlays (see
                     pci-id = "0000:09:00.0";
                     vendor-id = <0x1af4>;
                     device-id = <0x1041>;
+                    label = "enp9s0";
                 };
                 serial_console {
                     device-type = "platform";
                     device-name = "serial8250";
                 };
             };
-        };
-        aliases {
-            enp9s0 = "/resources/devices/pci_0000_09_00_0";
         };
     };
 
@@ -71,8 +69,8 @@ over from a fenced predecessor and kept out of its own memory, so the pool
 gets it without a hot-remove that pinned pages could defeat. The range
 fails with ``-EBUSY`` if it overlaps anything in this kernel's
 ``/proc/iomem``. Shrinking the pool adds it to this kernel like any chunk. A PCI device is identified by its address in ``pci-id``; the node
-name is free. An ``/aliases`` entry pointing at a device node gives the
-device its stable name (see Naming below). A platform device is named by
+name is free. ``label`` and an ``/aliases`` entry pointing at a device
+node name it (see Naming below). A platform device is named by
 ``device-name`` or ``acpi-hid``.
 
 The Pool Tree
@@ -96,9 +94,6 @@ back the pool::
                 numa-node-id = <0>;
             };
             devices { ... };                        /* platform devices only */
-        };
-        aliases {
-            enp9s0 = "/pci@0,9/pci@0,0";
         };
         pci@0,9 { ... };                            /* see Devices below */
     };
@@ -134,9 +129,6 @@ instance owns. The root is the instance, named by ``model``::
             cpus = <0x0 0x2  0x0 0x3>;
             devices { ... };                        /* platform devices only */
         };
-        aliases {
-            enp9s0 = "/pci@0,9/pci@0,0";
-        };
         pci@0,9 { ... };
     };
 
@@ -163,6 +155,7 @@ kernel that writes the tree, which keeps driving them::
             reg = <0x00090000 0 0 0 0>;             /* bus 9, device 0, fn 0 */
             vendor-id = <0x1af4>;
             device-id = <0x1041>;
+            label = "enp9s0";                       /* its name where it was pooled */
             multikernel,iommu-base = <0x0 0xfed90000>; /* its IOMMU unit, if any */
         };
     };
@@ -192,16 +185,18 @@ Platform devices stay under ``/resources/devices`` as nodes with
 Naming
 ======
 
-A PCI device's identity is its address; names are ``/aliases`` entries, as
-the devicetree specification defines them. An alias is the name the device
-has in the kernel that owns it: ``enp9s0`` for a network interface. Aliases
-are authored in the baseline (or a ``device-add`` to the pool carrying an
-``alias`` property) and follow the device into every instance tree and boot
-tree.
+A PCI device's identity is its address. Its name is the ``label`` of its
+node: the name it had in the kernel that pooled it, verbatim, such as
+``enP1s1f1`` for a network interface. ``/aliases`` entries, as the
+devicetree specification defines them, only number devices of a class,
+such as ``nvme0``. Both are authored in the baseline (or a ``device-add``
+to the pool carrying ``label`` and ``alias`` properties) and follow the
+device into every instance tree and boot tree, and into a running spawn
+with a hot-added function. A label is at most 31 characters.
 
-In a spawn kernel a network device is renamed to its alias when it
-registers, found from the node its device is bound to through the OF alias
-table, so it keeps the name it had on the host without any user space
+In a spawn kernel a network device is renamed to its label when it
+registers, found from the node its device is bound to, as DSA names its
+ports, so it keeps the name it had on the host without any user space
 involved. Block devices are not renamed: their controller numbering within
 an instance is already stable, and their identity across kernels is what
 ``/dev/disk/by-path`` (the PCI address, unchanged in the spawn) and
@@ -252,7 +247,7 @@ What a spawn does with its tree:
   platform device only when a ``/resources/devices`` node names it;
 * binds every bus and device to its node, so ``dev->of_node`` is set as on
   any devicetree platform;
-* names network devices from ``/aliases``;
+* names network devices from their node's ``label``;
 * on x86, registers each ``multikernel,vtd`` unit as driven by the host,
   and composes the interrupt remapping entries of its devices in the
   unit's ``multikernel,irte-block``, which the host checks against the

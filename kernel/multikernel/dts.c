@@ -1094,6 +1094,8 @@ static int mk_dt_emit_pci_devices(struct mk_instance *instance,
 			ret = fdt_property_u32(fdt, "vendor-id", dev->vendor);
 		if (!ret)
 			ret = fdt_property_u32(fdt, "device-id", dev->device);
+		if (!ret && dev->label[0])
+			ret = fdt_property_string(fdt, "label", dev->label);
 		if (!ret && iommu)
 			ret = fdt_property_u64(fdt, "multikernel,iommu-base", iommu);
 		if (!ret)

@@ -1092,17 +1092,50 @@ bool mk_root_has_pci_device(u16 domain, u8 bus, u8 devfn)
 }
 
 /**
+ * mk_root_pci_label - Copy the label of a PCI device free in the root pool
+ * @domain: PCI domain
+ * @bus: PCI bus
+ * @devfn: PCI device and function (combined)
+ * @label: Buffer left untouched when the device has no label
+ * @size: Size of @label
+ */
+void mk_root_pci_label(u16 domain, u8 bus, u8 devfn, char *label, size_t size)
+{
+	struct mk_pci_device *self_dev;
+
+	if (mk_manifest_phys()) {
+		mk_of_pci_label(domain, bus, devfn, label, size);
+		return;
+	}
+
+	if (!mk_self || !mk_self->pci_devices_valid)
+		return;
+
+	list_for_each_entry(self_dev, &mk_self->pci_devices, list) {
+		if (self_dev->domain == domain && self_dev->bus == bus &&
+		    self_dev->slot == PCI_SLOT(devfn) &&
+		    self_dev->func == PCI_FUNC(devfn)) {
+			if (self_dev->label[0])
+				strscpy(label, self_dev->label, size);
+			return;
+		}
+	}
+}
+
+/**
  * mk_root_add_pci_device - List a PCI device as free in the root pool
  * @domain: PCI domain
  * @bus: PCI bus
  * @devfn: PCI device and function (combined)
  * @alias: Stable name for the device tree /aliases node, NULL or "" for none
+ * @label: Name the device had in this kernel, NULL or "" for none
  *
  * Returns: 0 on success, -EINVAL if there is no self instance, -EEXIST if
  * already listed, -ENODEV if the device does not exist, -ENOMEM on allocation
  * failure
  */
-int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn, const char *alias)
+int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn, const char *alias,
+			   const char *label)
 {
 	struct mk_pci_device *self_dev;
 	struct pci_dev *pdev;
@@ -1131,6 +1164,8 @@ int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn, const char *alias)
 	self_dev->device = pdev->device;
 	if (alias)
 		strscpy(self_dev->alias, alias, sizeof(self_dev->alias));
+	if (label)
+		strscpy(self_dev->label, label, sizeof(self_dev->label));
 	INIT_LIST_HEAD(&self_dev->list);
 	pci_dev_put(pdev);
 

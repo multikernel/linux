@@ -332,6 +332,8 @@ struct mk_pci_bus_desc {
 	__be32 ranges[MK_PCI_BUS_MAX_WINDOWS * 7];
 };
 
+#define MK_PCI_LABEL_LEN 32
+
 /* PCI device resource operations */
 struct mk_device_resource_payload {
 	u16 domain;             /* PCI domain */
@@ -345,6 +347,7 @@ struct mk_device_resource_payload {
 	u16 device;
 	u64 iommu;		/* Its IOMMU unit, from mk_arch_pci_iommu() */
 	struct mk_pci_bus_desc bus_desc;
+	char label[MK_PCI_LABEL_LEN];	/* Its name where it was pooled, "" if none */
 };
 
 /* Device flags */
@@ -670,6 +673,7 @@ struct mk_memory_region {
  */
 struct mk_pci_device {
 	char alias[MK_PCI_ALIAS_LEN];	/* Stable name from /aliases, "" if none */
+	char label[MK_PCI_LABEL_LEN];	/* Name it had where it was pooled, "" if none */
 	u16 vendor;        /* PCI vendor ID */
 	u16 device;        /* PCI device ID */
 	u16 domain;        /* PCI domain number */
@@ -1072,7 +1076,7 @@ int mk_pcifront_config(unsigned int domain, unsigned int bus,
 		       bool write);
 void mk_pcifront_host_fenced(void);
 int mk_pcifront_add_function(u16 domain, u8 bus, u8 devfn, u16 vendor,
-			     u16 device, u64 iommu,
+			     u16 device, u64 iommu, const char *label,
 			     const struct mk_pci_bus_desc *desc);
 int mk_pcifront_adopt_function(u16 domain, u8 bus, u8 devfn);
 #else
@@ -1088,6 +1092,7 @@ static inline int mk_pcifront_config(unsigned int domain, unsigned int bus,
 }
 static inline int mk_pcifront_add_function(u16 domain, u8 bus, u8 devfn,
 					   u16 vendor, u16 device, u64 iommu,
+					   const char *label,
 					   const struct mk_pci_bus_desc *desc)
 {
 	return -ENODEV;

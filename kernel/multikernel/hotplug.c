@@ -894,6 +894,7 @@ struct mk_device_hotplug_work {
 	u16 vendor;
 	u16 device;
 	u64 iommu;
+	char label[MK_PCI_LABEL_LEN];
 	struct mk_pci_bus_desc bus_desc;
 };
 
@@ -908,7 +909,7 @@ static void mk_device_add_work_fn(struct work_struct *work)
 		ret = mk_pcifront_add_function(hp_work->domain, hp_work->bus,
 					       hp_work->devfn, hp_work->vendor,
 					       hp_work->device, hp_work->iommu,
-					       &hp_work->bus_desc);
+					       hp_work->label, &hp_work->bus_desc);
 	if (!ret)
 		ret = mk_do_device_add(hp_work->domain, hp_work->bus,
 				       hp_work->devfn, hp_work->driver_override,
@@ -981,6 +982,7 @@ static int mk_handle_device_add(struct mk_instance *from,
 	hp_work->vendor = payload->vendor;
 	hp_work->device = payload->device;
 	hp_work->iommu = payload->iommu;
+	strscpy(hp_work->label, payload->label, sizeof(hp_work->label));
 	hp_work->bus_desc = payload->bus_desc;
 	schedule_work(&hp_work->work);
 
@@ -1230,10 +1232,12 @@ int mk_pool_cpu_remove(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
  * @bus: PCI bus
  * @devfn: PCI device and function (combined)
  * @alias: Stable name for the device tree /aliases node, NULL for none
+ * @label: Name the device had in this kernel, NULL for none
  *
  * Returns: 0 on success, negative error code on failure
  */
-int mk_pool_device_add(u16 domain, u8 bus, u8 devfn, const char *alias)
+int mk_pool_device_add(u16 domain, u8 bus, u8 devfn, const char *alias,
+		       const char *label)
 {
 	int ret;
 
@@ -1241,7 +1245,7 @@ int mk_pool_device_add(u16 domain, u8 bus, u8 devfn, const char *alias)
 	if (ret)
 		return ret;
 
-	ret = mk_root_add_pci_device(domain, bus, devfn, alias);
+	ret = mk_root_add_pci_device(domain, bus, devfn, alias, label);
 	if (ret && ret != -EEXIST) {
 		/* Untracked, the device would belong to neither side */
 		pr_err("Multikernel hotplug: device %04x:%02x:%02x.%x not tracked in pool: %d\n",
@@ -1753,6 +1757,7 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 	payload.device = pdev->device;
 	payload.iommu = mk_arch_pci_iommu(pdev);
 	mk_pci_bus_describe(pdev->bus, &payload.bus_desc);
+	mk_root_pci_label(domain, bus, devfn, payload.label, sizeof(payload.label));
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_DEVICE_ADD, resource_id);
 	if (!pending) {
@@ -1826,7 +1831,7 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 
 	if (instance_id == mk_self->id) {
 		if (mk_pool)
-			return mk_pool_device_add(domain, bus, devfn, NULL);
+			return mk_pool_device_add(domain, bus, devfn, NULL, NULL);
 		return mk_do_device_remove(domain, bus, devfn);
 	}
 
