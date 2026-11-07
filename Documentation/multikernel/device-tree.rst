@@ -23,8 +23,8 @@ A spawn kernel is a device tree platform. Its tree is unflattened into the
 OF core like a tree from a bootloader, so its PCI root buses are created
 from the host bridge nodes, every bus and device below binds to its node
 with ``pci_set_of_node()``, the devices it may probe are the ones with a
-node, its ``/aliases`` are real aliases, and ``/chosen`` carries the boot
-handoff the way ``linux,initrd-start`` or ``kaslr-seed`` would. The
+node, and ``/chosen`` carries the boot handoff the way
+``linux,initrd-start`` or ``kaslr-seed`` would. The
 flattened copy is kept at ``/sys/firmware/fdt`` and the unflattened tree
 at ``/sys/firmware/devicetree/base``, as on any such platform.
 
@@ -69,8 +69,7 @@ over from a fenced predecessor and kept out of its own memory, so the pool
 gets it without a hot-remove that pinned pages could defeat. The range
 fails with ``-EBUSY`` if it overlaps anything in this kernel's
 ``/proc/iomem``. Shrinking the pool adds it to this kernel like any chunk. A PCI device is identified by its address in ``pci-id``; the node
-name is free. ``label`` and an ``/aliases`` entry pointing at a device
-node name it (see Naming below). A platform device is named by
+name is free, and ``label`` names the device (see Naming below). A platform device is named by
 ``device-name`` or ``acpi-hid``.
 
 The Pool Tree
@@ -187,12 +186,11 @@ Naming
 
 A PCI device's identity is its address. Its name is the ``label`` of its
 node: the name it had in the kernel that pooled it, verbatim, such as
-``enP1s1f1`` for a network interface. ``/aliases`` entries, as the
-devicetree specification defines them, only number devices of a class,
-such as ``nvme0``. Both are authored in the baseline (or a ``device-add``
-to the pool carrying ``label`` and ``alias`` properties) and follow the
-device into every instance tree and boot tree, and into a running spawn
-with a hot-added function. A label is at most 31 characters.
+``enP1s1f1`` for a network interface or ``nvme0`` for an NVMe
+controller. It is authored in the baseline (or a ``device-add`` to the
+pool carrying a ``label`` property) and follows the device into every
+instance tree and boot tree, and into a running spawn with a hot-added
+function. A label is at most 31 characters.
 
 In a spawn kernel a network device is renamed to its label when it
 registers, found from the node its device is bound to, as DSA names its

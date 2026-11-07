@@ -132,7 +132,7 @@ static int mk_of_pci_set_lent(struct device_node *np, bool lent)
 static void mk_of_pci_describe(struct device_node *np, u16 domain, u8 bus,
 			       u8 devfn, struct mk_pci_device *dev)
 {
-	const char *alias, *label;
+	const char *label;
 	u32 id;
 
 	memset(dev, 0, sizeof(*dev));
@@ -145,9 +145,6 @@ static void mk_of_pci_describe(struct device_node *np, u16 domain, u8 bus,
 		dev->vendor = id;
 	if (!of_property_read_u32(np, "device-id", &id))
 		dev->device = id;
-	alias = of_alias_from_node(np);
-	if (alias)
-		strscpy(dev->alias, alias, sizeof(dev->alias));
 	if (!of_property_read_string(np, "label", &label))
 		strscpy(dev->label, label, sizeof(dev->label));
 }

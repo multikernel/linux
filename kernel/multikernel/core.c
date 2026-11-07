@@ -1127,15 +1127,13 @@ void mk_root_pci_label(u16 domain, u8 bus, u8 devfn, char *label, size_t size)
  * @domain: PCI domain
  * @bus: PCI bus
  * @devfn: PCI device and function (combined)
- * @alias: Stable name for the device tree /aliases node, NULL or "" for none
  * @label: Name the device had in this kernel, NULL or "" for none
  *
  * Returns: 0 on success, -EINVAL if there is no self instance, -EEXIST if
  * already listed, -ENODEV if the device does not exist, -ENOMEM on allocation
  * failure
  */
-int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn, const char *alias,
-			   const char *label)
+int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn, const char *label)
 {
 	struct mk_pci_device *self_dev;
 	struct pci_dev *pdev;
@@ -1162,8 +1160,6 @@ int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn, const char *alias,
 	self_dev->func = PCI_FUNC(devfn);
 	self_dev->vendor = pdev->vendor;
 	self_dev->device = pdev->device;
-	if (alias)
-		strscpy(self_dev->alias, alias, sizeof(self_dev->alias));
 	if (label)
 		strscpy(self_dev->label, label, sizeof(self_dev->label));
 	INIT_LIST_HEAD(&self_dev->list);

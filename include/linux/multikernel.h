@@ -661,8 +661,6 @@ struct mk_memory_region {
  * Represents a single PCI device that should be accessible to an instance.
  * Format: vendor:device@domain:bus:slot.func
  */
-#define MK_PCI_ALIAS_LEN 32	/* Devicetree spec: alias names are at most 31 chars */
-
 /*
  * A PCI host bridge as the instance device tree describes it: the
  * kernel that spawned this one knows the platform topology exactly and
@@ -672,7 +670,6 @@ struct mk_memory_region {
  * (1 IO, 2 MEM32, 3 MEM64) and bit 30 marks prefetchable.
  */
 struct mk_pci_device {
-	char alias[MK_PCI_ALIAS_LEN];	/* Stable name from /aliases, "" if none */
 	char label[MK_PCI_LABEL_LEN];	/* Name it had where it was pooled, "" if none */
 	u16 vendor;        /* PCI vendor ID */
 	u16 device;        /* PCI device ID */

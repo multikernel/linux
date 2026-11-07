@@ -27,32 +27,6 @@
 #include "internal.h"
 
 /**
- * mk_dt_node_alias() - Find the /aliases entry naming a node
- * @fdt: Device tree blob
- * @node: Offset of the node
- *
- * Returns: the alias name, valid as long as @fdt is, or NULL if none
- */
-const char *mk_dt_node_alias(const void *fdt, int node)
-{
-	int aliases, prop;
-
-	aliases = fdt_path_offset(fdt, "/aliases");
-	if (aliases < 0)
-		return NULL;
-
-	fdt_for_each_property_offset(prop, fdt, aliases) {
-		const char *name, *path;
-
-		path = fdt_getprop_by_offset(fdt, prop, &name, NULL);
-		if (path && path[0] == '/' && fdt_path_offset(fdt, path) == node)
-			return name;
-	}
-
-	return NULL;
-}
-
-/**
  * Configuration initialization and cleanup
  */
 void mk_dt_config_init(struct mk_dt_config *config)
@@ -120,8 +94,6 @@ static int mk_dt_parse_numa(const void *fdt, int chosen_node,
 			    struct mk_dt_config *config);
 static int mk_dt_parse_devices(const void *fdt, int chosen_node,
 			       struct mk_dt_config *config);
-static int mk_dt_pci_node_path(const struct mk_pci_device *dev, char *buf,
-			       size_t size);
 static int mk_dt_validate_memory(const struct mk_dt_config *config);
 static int mk_dt_validate_cpus(const struct mk_dt_config *config);
 
@@ -262,7 +234,7 @@ static int mk_dt_add_pci_device(const void *source_fdt, int dev_node,
 {
 	const fdt32_t *vendor_prop, *device_prop;
 	struct mk_pci_device *pci_dev;
-	const char *node_name, *alias;
+	const char *node_name;
 	int len;
 
 	node_name = fdt_get_name(source_fdt, dev_node, NULL);
@@ -293,9 +265,6 @@ static int mk_dt_add_pci_device(const void *source_fdt, int dev_node,
 	pci_dev->bus = (u8)bus;
 	pci_dev->slot = (u8)slot;
 	pci_dev->func = (u8)func;
-	alias = mk_dt_node_alias(source_fdt, dev_node);
-	if (alias)
-		strscpy(pci_dev->alias, alias, sizeof(pci_dev->alias));
 
 	list_add_tail(&pci_dev->list, &config->pci_devices);
 	config->pci_device_count++;
@@ -1001,38 +970,6 @@ static int mk_dt_emit_devices(struct mk_instance *instance, void *fdt)
 	return fdt_end_node(fdt);
 }
 
-static int mk_dt_emit_aliases(struct mk_instance *instance, void *fdt)
-{
-	struct mk_pci_device *pci_dev;
-	bool open = false;
-	int ret;
-
-	if (!instance->pci_devices_valid)
-		return 0;
-
-	list_for_each_entry(pci_dev, &instance->pci_devices, list) {
-		char path[128];
-
-		if (!pci_dev->alias[0])
-			continue;
-
-		if (!open) {
-			ret = fdt_begin_node(fdt, "aliases");
-			if (ret)
-				return ret;
-			open = true;
-		}
-
-		if (mk_dt_pci_node_path(pci_dev, path, sizeof(path)))
-			continue;
-		ret = fdt_property_string(fdt, pci_dev->alias, path);
-		if (ret)
-			return ret;
-	}
-
-	return open ? fdt_end_node(fdt) : 0;
-}
-
 #ifdef CONFIG_PCI
 /* phys.hi of a PCI unit address: bbbbbbbb dddddfff 00000000 */
 static u32 mk_dt_pci_phys_hi(u8 bus, u8 devfn)
@@ -1044,17 +981,6 @@ static u32 mk_dt_pci_phys_hi(u8 bus, u8 devfn)
 static int mk_dt_pci_bus_name(char *buf, size_t size, u16 domain, u8 bus)
 {
 	return scnprintf(buf, size, "pci@%x,%x", domain, bus);
-}
-
-static int mk_dt_pci_node_path(const struct mk_pci_device *dev, char *buf,
-			       size_t size)
-{
-	int pos;
-
-	pos = scnprintf(buf, size, "/");
-	pos += mk_dt_pci_bus_name(buf + pos, size - pos, dev->domain, dev->bus);
-	scnprintf(buf + pos, size - pos, "/pci@%x,%x", dev->slot, dev->func);
-	return 0;
 }
 
 static int mk_dt_emit_pci_reg(void *fdt, u8 bus, u8 devfn)
@@ -1317,12 +1243,6 @@ int mk_dt_emit_pci_buses(void *fdt)
 	return ret;
 }
 #else /* !CONFIG_PCI */
-static int mk_dt_pci_node_path(const struct mk_pci_device *dev, char *buf,
-			       size_t size)
-{
-	return -ENODEV;
-}
-
 static int mk_dt_emit_host_bridges(struct mk_instance *instance, void *fdt)
 {
 	return 0;
@@ -1364,36 +1284,12 @@ static int mk_dt_emit_of_node(void *fdt, struct device_node *np)
 /*
  * A spawn's devices are the nodes of its boot tree, with a lent device
  * marked reserved there, so the tree it serves is a projection of that
- * tree: its aliases and host bridges with the reserved devices left out.
+ * tree: its host bridges with the reserved devices left out.
  */
 static int mk_dt_emit_own_devices(void *fdt)
 {
 	struct device_node *np;
-	struct property *pp;
 	int ret;
-
-	if (of_aliases) {
-		ret = fdt_begin_node(fdt, "aliases");
-		if (ret)
-			return ret;
-		for_each_property_of_node(of_aliases, pp) {
-			struct device_node *target;
-
-			if (!strcmp(pp->name, "name") || !strcmp(pp->name, "phandle"))
-				continue;
-			target = of_find_node_by_path(pp->value);
-			if (!target)
-				continue;
-			ret = of_device_is_available(target) ?
-			      fdt_property(fdt, pp->name, pp->value, pp->length) : 0;
-			of_node_put(target);
-			if (ret)
-				return ret;
-		}
-		ret = fdt_end_node(fdt);
-		if (ret)
-			return ret;
-	}
 
 	for_each_compatible_node(np, NULL, "multikernel,pci-host-bridge") {
 		ret = mk_dt_emit_of_node(fdt, np);
@@ -1482,13 +1378,10 @@ static int mk_dt_emit_tree(struct mk_instance *instance, void *fdt,
 	if (!ret)
 		ret = fdt_end_node(fdt);	/* /resources */
 	if (!ret) {
-		if (instance == mk_self && mk_manifest_phys()) {
+		if (instance == mk_self && mk_manifest_phys())
 			ret = mk_dt_emit_own_devices(fdt);
-		} else {
-			ret = mk_dt_emit_aliases(instance, fdt);
-			if (!ret)
-				ret = mk_dt_emit_host_bridges(instance, fdt);
-		}
+		else
+			ret = mk_dt_emit_host_bridges(instance, fdt);
 	}
 	if (!ret && chosen) {
 		ret = fdt_begin_node(fdt, "chosen");

@@ -57,23 +57,19 @@ int mk_handle_cpu_remove(struct mk_instance *from, struct mk_cpu_resource_payloa
  */
 int mk_pool_cpu_add(mk_phys_cpu_t cpu_id);
 int mk_pool_cpu_remove(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags);
-int mk_pool_device_add(u16 domain, u8 bus, u8 devfn, const char *alias,
-		       const char *label);
+int mk_pool_device_add(u16 domain, u8 bus, u8 devfn, const char *label);
 int mk_pool_device_remove(u16 domain, u8 bus, u8 devfn,
 			  const char *driver_override, u32 flags);
 
 /* Root pool bookkeeping for PCI devices, see core.c */
 bool mk_root_has_pci_device(u16 domain, u8 bus, u8 devfn);
 void mk_root_pci_label(u16 domain, u8 bus, u8 devfn, char *label, size_t size);
-int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn, const char *alias,
-			   const char *label);
+int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn, const char *label);
 int mk_root_del_pci_device(u16 domain, u8 bus, u8 devfn);
 
 /* baseline.c */
 int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size);
 
-/* dts.c */
-const char *mk_dt_node_alias(const void *fdt, int node);
 /* of_devices.c: a spawn's devices are the nodes of its tree */
 #ifdef CONFIG_OF
 struct device_node *mk_of_pci_node(u16 domain, u8 bus, u8 devfn);

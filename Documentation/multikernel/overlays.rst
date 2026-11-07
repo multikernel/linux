@@ -167,8 +167,6 @@ Operation Sections
     Subnodes are ``pci@N`` items:
 
       - ``pci-id``: "DDDD:BB:SS.F" (string)
-      - ``alias``: stable name for the device tree ``/aliases`` node, such
-        as "nvme0" (string, optional, ``device-add`` to the pool only)
       - ``label``: the device's name in this kernel, such as "enP1s1f1",
         which every kernel it moves to names it by (string of at most 31
         characters, optional, ``device-add`` to the pool only)
