@@ -40,6 +40,7 @@ struct mk_baseline_mem_req {
  * is owned by nobody and free to assign.
  */
 struct mk_pool *mk_pool;
+DEFINE_MUTEX(mk_park_lock);
 
 static int mk_baseline_parse_cpus(const void *fdt, int resources_node,
 				  struct mk_cpu_set *requested)
@@ -543,7 +544,6 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 		}
 		INIT_LIST_HEAD(&pool->chunks);
 		mutex_init(&pool->mem_lock);
-		mutex_init(&pool->park_lock);
 		mk_pool = pool;
 	}
 

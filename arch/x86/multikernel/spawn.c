@@ -217,7 +217,7 @@ static int mk_publish_repark(struct mk_spawn_context *from, u32 apic_id,
 			     unsigned long park_phys, unsigned long park_cr3,
 			     unsigned long slot_phys, const char *what)
 {
-	lockdep_assert_held(&mk_pool->park_lock);
+	lockdep_assert_held(&mk_park_lock);
 
 	from->repark_park_phys = park_phys;
 	from->repark_park_cr3 = park_cr3;
@@ -283,7 +283,7 @@ int mk_spawn_cpu(struct mk_instance *instance, int cpu,
 		return -ENODEV;
 	}
 
-	guard(mutex)(&mk_pool->park_lock);
+	guard(mutex)(&mk_park_lock);
 
 	/*
 	 * Move every secondary still parked on the host slot onto the
@@ -524,7 +524,7 @@ int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_c
 	if (ret)
 		return ret;
 
-	guard(mutex)(&mk_pool->park_lock);
+	guard(mutex)(&mk_park_lock);
 
 	if (mk_cpu_set_contains(on_slot, phys_cpu))
 		return 0;
@@ -551,7 +551,7 @@ int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 	struct mk_spawn_context *ctx = instance->arch.spawn_ctx;
 	int ret;
 
-	guard(mutex)(&mk_pool->park_lock);
+	guard(mutex)(&mk_park_lock);
 
 	/* Already on the host slot: nothing watches this context for it */
 	if (!mk_cpu_set_contains(instance->cpus_on_slot, phys_cpu))
@@ -568,6 +568,24 @@ int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 	return ret;
 }
 
+/*
+ * Where @instance's CPUs park: its own context, or on a spawn's record
+ * of its host, the host's pool slot, which a backup maps on first use.
+ */
+static struct mk_spawn_context *mk_park_slot(struct mk_instance *instance)
+{
+	lockdep_assert_held(&mk_park_lock);
+
+	if (!instance->arch.spawn_ctx && instance->pool_slot_phys) {
+		instance->arch.spawn_ctx = memremap(instance->pool_slot_phys,
+						    sizeof(struct mk_spawn_context),
+						    MEMREMAP_WB);
+		if (instance->arch.spawn_ctx)
+			instance->arch.spawn_ctx_phys = instance->pool_slot_phys;
+	}
+	return instance->arch.spawn_ctx;
+}
+
 /**
  * mk_arch_confirm_parked - Verify a CPU has reached the instance's park loop
  * @instance: Instance the CPU belongs to
@@ -582,13 +600,14 @@ int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
  */
 int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {
-	struct mk_spawn_context *ctx = instance->arch.spawn_ctx;
+	struct mk_spawn_context *ctx;
 	int ret;
 
+	guard(mutex)(&mk_park_lock);
+
+	ctx = mk_park_slot(instance);
 	if (!ctx || !ctx->park_phys)
 		return -ENODEV;
-
-	guard(mutex)(&mk_pool->park_lock);
 
 	ret = mk_publish_repark(ctx, (u32)phys_cpu, ctx->park_phys,
 				ctx->park_cr3, instance->arch.spawn_ctx_phys,
@@ -641,7 +660,7 @@ int mk_repark_instance_to_host(struct mk_instance *instance)
 	if (mk_cpu_set_empty(on_slot) || !ctx || !mk_pool || !mk_pool->arch.slot)
 		return 0;
 
-	guard(mutex)(&mk_pool->park_lock);
+	guard(mutex)(&mk_park_lock);
 
 	/*
 	 * Only the CPUs actually watching this context: waking one that is
@@ -916,27 +935,17 @@ static int mk_build_trampoline_pgtable(unsigned long trampoline_va,
  */
 /*
  * Where to publish a wakeup for @apicid. A CPU the fence parked on the
- * host's slot is woken from that slot, which this kernel adopted as
- * its own after fencing (host_instance->pool_slot_phys); every other
- * secondary is woken from this kernel's own context. The returned slot
- * is memremapped when it differs from @own and must be released with
- * mk_put_wake_slot().
+ * host's slot is woken from that slot, which the fence mapped while
+ * confirming it parked there; every other secondary is woken from this
+ * kernel's own context.
  */
 static struct mk_spawn_context *mk_wake_slot(u32 apicid,
 					     struct mk_spawn_context *own)
 {
-	if (host_instance && host_instance->pool_slot_phys &&
+	if (host_instance &&
 	    mk_cpu_set_contains(host_instance->cpus_on_slot, apicid))
-		return memremap(host_instance->pool_slot_phys,
-				sizeof(struct mk_spawn_context), MEMREMAP_WB);
+		return host_instance->arch.spawn_ctx;
 	return own;
-}
-
-static void mk_put_wake_slot(struct mk_spawn_context *slot,
-			     struct mk_spawn_context *own)
-{
-	if (slot && slot != own)
-		memunmap(slot);
 }
 
 int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
@@ -1024,7 +1033,6 @@ int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 	smp_wmb();
 	WRITE_ONCE(slot->ready, 1);
 
-	mk_put_wake_slot(slot, own);
 	return 0;
 }
 
@@ -1355,7 +1363,7 @@ void *mk_setup_park_page(struct mk_instance *instance, unsigned long *phys_out)
 		return ERR_PTR(-ENODEV);
 
 	/* Runs under kexec_lock, which nothing takes under this mutex */
-	guard(mutex)(&mk_pool->park_lock);
+	guard(mutex)(&mk_park_lock);
 
 	if (!mk_pool->arch.pgt)
 		return ERR_PTR(-ENODEV);
@@ -1429,7 +1437,7 @@ static int __mk_pool_park_setup(void)
 	phys_addr_t phys;
 	int rc;
 
-	lockdep_assert_held(&mk_pool->park_lock);
+	lockdep_assert_held(&mk_park_lock);
 
 	if (mk_pool->arch.slot)
 		return 0;
@@ -1518,7 +1526,7 @@ int mk_arch_pool_chunk_added(phys_addr_t start, size_t size)
 	if (!mk_pool)
 		return -ENODEV;
 
-	guard(mutex)(&mk_pool->park_lock);
+	guard(mutex)(&mk_park_lock);
 
 	/*
 	 * A pool emptied of memory has no park area, so the chunk that
@@ -1545,7 +1553,7 @@ int mk_pool_park_setup(void)
 	if (!mk_pool)
 		return -ENODEV;
 
-	guard(mutex)(&mk_pool->park_lock);
+	guard(mutex)(&mk_park_lock);
 
 	return __mk_pool_park_setup();
 }
@@ -1601,7 +1609,7 @@ int mk_pool_park_regions(u64 *pairs, int max)
 	if (!mk_pool)
 		return 0;
 
-	guard(mutex)(&mk_pool->park_lock);
+	guard(mutex)(&mk_park_lock);
 
 	if (!mk_pool->arch.slot)
 		return 0;
@@ -1647,7 +1655,7 @@ bool mk_pool_park_uses(phys_addr_t start, size_t size)
 	if (!mk_pool)
 		return false;
 
-	guard(mutex)(&mk_pool->park_lock);
+	guard(mutex)(&mk_park_lock);
 
 	if (!mk_pool->arch.slot)
 		return false;
@@ -1674,7 +1682,7 @@ int mk_pool_park_teardown(void)
 	if (!mk_pool)
 		return 0;
 
-	guard(mutex)(&mk_pool->park_lock);
+	guard(mutex)(&mk_park_lock);
 
 	if (!mk_pool->arch.slot)
 		return 0;
@@ -1702,38 +1710,15 @@ int mk_pool_park_teardown(void)
 }
 
 /*
- * Announce arrival before parking, so a kernel that fenced us can tell
- * we stopped safely here rather than still running its image. Written
- * on this kernel's own mappings, before any switch to a park page
- * table, and on every park path so the record never depends on a later
- * re-NMI reaching an already-parked CPU.
- */
-static void mk_mark_parked(void)
-{
-	int rank;
-
-	if (!mk_self || !mk_self->ipi_data)
-		return;
-
-	rank = mk_cpu_rank(read_apic_id());
-	if (rank < MK_PARKED_MAX) {
-		WRITE_ONCE(mk_self->ipi_data->parked[rank], 1);
-		/* Presence visible before the CPU vanishes into HLT */
-		smp_wmb();
-	}
-}
-
-/*
  * Park this offlined pool CPU. On the host, wait in the pool park area
- * watching the host slot; on a spawn kernel returning a CPU to the
- * host, wait on our own instance context like any pool CPU of this
- * instance. Returns only if neither park area exists.
+ * watching the host slot; on a spawn kernel, wait on our own instance
+ * context like any pool CPU of this instance, where the host reparks a
+ * returned CPU and this kernel wakes one it only took offline. Returns
+ * only if neither park area exists.
  */
 void mk_pool_park_cpu(void)
 {
 	mk_pool_park_fn park;
-
-	mk_mark_parked();
 
 	if (mk_pool && mk_pool->arch.slot) {
 		park = (mk_pool_park_fn)mk_pool->arch.park_va;
@@ -1782,8 +1767,6 @@ void mk_park_cpu(void)
 		       &ctx->self_phys, ctx->park_phys, ctx->park_cr3);
 		return;
 	}
-
-	mk_mark_parked();
 
 	park = (mk_pool_park_fn)__va(ctx->park_phys);
 	park(ctx->park_cr3, virt_to_phys(ctx), read_apic_id(),

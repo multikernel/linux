@@ -1906,11 +1906,11 @@ static int mk_force_halt_targets(struct mk_instance *instance,
 }
 
 /*
- * A CPU's dense index into the presence table: its rank in the sorted
- * list of every possible physical CPU id. Both the parking CPU and the
- * kernel confirming the fence compute it from the same cpu_possible
- * set, so they agree without sharing an APIC-id-to-slot map, and the
- * table stays CPU-count sized whatever the ids are.
+ * A CPU's dense index into a per-CPU table in the shared area: its rank
+ * in the sorted list of every possible physical CPU id. Both kernels
+ * compute it from the same cpu_possible set, so they agree without
+ * sharing a physical-id-to-slot map, and the table stays CPU-count
+ * sized whatever the ids are.
  */
 int mk_cpu_rank(mk_phys_cpu_t phys)
 {
@@ -1923,48 +1923,19 @@ int mk_cpu_rank(mk_phys_cpu_t phys)
 }
 EXPORT_SYMBOL_GPL(mk_cpu_rank);
 
-/* A CPU that parked records its presence in the shared area */
-bool __weak mk_arch_cpu_fenced(struct mk_instance *instance,
-			       mk_phys_cpu_t phys_cpu)
-{
-	int rank = mk_cpu_rank(phys_cpu);
-
-	return rank < MK_PARKED_MAX &&
-	       READ_ONCE(instance->ipi_data->parked[rank]);
-}
-
-/* How many fence targets have not yet left the host's kernel */
-static int mk_fence_missing(struct mk_instance *instance,
-			    struct mk_cpu_set *targets)
-{
-	mk_phys_cpu_t phys;
-	unsigned int i;
-	int missing = 0;
-
-	mk_cpu_set_for_each(i, phys, targets)
-		if (!mk_arch_cpu_fenced(instance, phys))
-			missing++;
-	return missing;
-}
-
 /*
  * After NMIing the fence targets, confirm each reached the park loop
- * by the presence byte it sets there, and record the arrivals in
- * cpus_on_slot. A target still missing after the timeout never took
- * the NMI (wedged in NMI context) and leaves the fence incomplete:
- * -ETIMEDOUT, so no foreign baseline claims a machine with a CPU
- * possibly still running the dead host.
+ * the same way a child's CPUs are confirmed, and record the arrivals
+ * in cpus_on_slot. A target that never parks (wedged in NMI context)
+ * leaves the fence incomplete: -ETIMEDOUT, so no foreign baseline
+ * claims a machine with a CPU possibly still running the dead host.
  */
 static int mk_confirm_fenced(struct mk_instance *instance,
 			     struct mk_cpu_set *targets)
 {
-	struct mk_shared_data *sd = instance->ipi_data;
 	mk_phys_cpu_t phys;
 	unsigned int i;
-	int missing, ret;
-
-	if (!sd)
-		return -ENODEV;
+	int missing = 0;
 
 	if (!instance->cpus_on_slot) {
 		instance->cpus_on_slot = mk_cpu_set_alloc();
@@ -1972,21 +1943,21 @@ static int mk_confirm_fenced(struct mk_instance *instance,
 			return -ENOMEM;
 	}
 
-	ret = read_poll_timeout(mk_fence_missing, missing, !missing,
-				20 * USEC_PER_MSEC, 5 * USEC_PER_SEC, false,
-				instance, targets);
-
-	mk_cpu_set_for_each(i, phys, targets)
-		if (mk_arch_cpu_fenced(instance, phys))
+	mk_cpu_set_for_each(i, phys, targets) {
+		if (mk_arch_confirm_parked(instance, phys))
+			missing++;
+		else
 			mk_cpu_set_add(instance->cpus_on_slot, phys);
+	}
 
-	if (ret)
+	if (missing) {
 		pr_err("Fence incomplete: %d of the host's CPUs never parked\n",
 		       missing);
-	else
-		pr_info("Host fenced: %u CPUs confirmed parked\n",
-			mk_cpu_set_count(instance->cpus_on_slot));
-	return ret;
+		return -ETIMEDOUT;
+	}
+	pr_info("Host fenced: %u CPUs confirmed parked\n",
+		mk_cpu_set_count(instance->cpus_on_slot));
+	return 0;
 }
 
 int multikernel_force_halt_by_id(int mk_id)
@@ -2054,9 +2025,8 @@ int multikernel_force_halt_by_id(int mk_id)
 	 * A child instance parks on its own context, so wait for it to
 	 * settle exactly as the graceful path does. Fencing the host has
 	 * no such settle: confirm each target actually reached the park
-	 * loop through the presence it records in the shared area, and
-	 * record the ones that did in cpus_on_slot, the gate a later
-	 * foreign baseline checks. A target that never parks fails the
+	 * loop, and record the ones that did in cpus_on_slot, the gate a
+	 * later foreign baseline checks. A target that never parks fails the
 	 * fence, so a baseline cannot claim a machine with a CPU still
 	 * running the dead host.
 	 */

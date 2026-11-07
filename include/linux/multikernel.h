@@ -106,8 +106,8 @@ struct mk_ipi_ring {
 /* Room the manifest leaves for a user-provided host tree */
 #define MK_HOST_TREE_MAX SZ_128K
 
-/* Presence table capacity, in CPUs (see mk_cpu_rank) */
-#define MK_PARKED_MAX 512
+/* CPUs a per-CPU table indexed by mk_cpu_rank() has room for */
+#define MK_CPU_RANK_MAX 512
 
 /*
  * Shared with one child instance. Each ring has producers in one kernel
@@ -126,25 +126,14 @@ struct mk_shared_data {
 	 */
 	u32 force_halt;
 	/*
-	 * Parked-CPU presence, indexed by mk_cpu_rank() (a CPU's position
-	 * in the machine's sorted physical-id list, dense so x2APIC ids
-	 * need no room). A CPU sets its byte in mk_park_cpu() as it enters
-	 * the pool park loop; the kernel that armed a force halt reads it
-	 * to confirm each target actually parked (versus never taking the
-	 * NMI), the proof a fence needs that the dead peer's own state
-	 * cannot give. Each CPU owns one byte, so no atomics; cleared with
-	 * the struct on re-exec.
-	 */
-	u8 parked[MK_PARKED_MAX];
-	/*
-	 * CPUs that firmware can stop out of band, indexed like parked[]
+	 * CPUs that firmware can stop out of band, indexed by mk_cpu_rank()
 	 * and written by each CPU for itself: set once the architecture's
 	 * firmware stop event can reach it, cleared before it stops being
 	 * reachable. A force halt only asks firmware to stop the CPUs set
 	 * here, because a request to any other CPU may leave it unable to
 	 * take the stop interrupt as well.
 	 */
-	u8 fw_stop[MK_PARKED_MAX];
+	u8 fw_stop[MK_CPU_RANK_MAX];
 };
 
 struct mk_instance;
@@ -516,21 +505,24 @@ struct mk_pool {
 	struct gen_pool *node_pools[MAX_NUMNODES];
 	struct mutex mem_lock;		/* Protects chunks and node_pools */
 	struct mk_pool_arch arch;	/* Park area for unassigned CPUs */
-	/*
-	 * The park world's one lock: arch setup, teardown and growth
-	 * mapping, and every wake or repark publication on the pool slot
-	 * or a child instance context. Each mailbox is single-producer
-	 * (this kernel), but spawn, hotplug repark, parked-confirmation
-	 * and pool reshaping run from different syscall paths with no
-	 * common lock, and a publication must never overlap the teardown
-	 * of the slot it writes. Nests outside mem_lock: park setup
-	 * allocates pool memory while holding it.
-	 */
-	struct mutex park_lock;
 };
 
 /* The pool this kernel manages; NULL until a baseline creates it */
 extern struct mk_pool *mk_pool;
+
+/*
+ * The park world's one lock: arch setup, teardown and growth mapping,
+ * and every wake or repark publication on the pool slot, a child
+ * instance context or a fenced host's slot. Each mailbox is
+ * single-producer (this kernel), but spawn, hotplug repark,
+ * parked-confirmation and pool reshaping run from different syscall
+ * paths with no common lock, and a publication must never overlap the
+ * teardown of the slot it writes. This kernel's, not the pool's: a
+ * backup confirms its host's CPUs parked before it has a pool. Nests
+ * outside mk_pool->mem_lock: park setup allocates pool memory while
+ * holding it.
+ */
+extern struct mutex mk_park_lock;
 
 int mk_pool_mem_grow(size_t size, int node, phys_addr_t *out_base);
 int mk_pool_mem_claim(phys_addr_t start, size_t size, int node);
@@ -1346,9 +1338,6 @@ int mk_arch_release_instance(struct mk_instance *instance);
 
 /* Verify one of an instance's CPUs has reached its park loop */
 int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
-
-/* Whether a CPU the fence of the host stopped is out of the host's kernel; never sleeps */
-bool mk_arch_cpu_fenced(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
 
 /*
  * Wait until every CPU an instance owns is parked. Its kernel image may

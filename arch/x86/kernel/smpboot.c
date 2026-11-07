@@ -1537,7 +1537,9 @@ void __noreturn native_play_dead(void)
 	if (cpu_feature_enabled(X86_FEATURE_KERNEL_IBRS))
 		__update_spec_ctrl(0);
 
-	if (IS_ENABLED(CONFIG_MULTIKERNEL) && cpu_departing(smp_processor_id()))
+	/* A spawn cannot send INIT/SIPI: it wakes a CPU only from its park slot */
+	if (IS_ENABLED(CONFIG_MULTIKERNEL) &&
+	    (cpu_departing(smp_processor_id()) || mk_spawned()))
 		multikernel_play_dead();
 
 	play_dead_common();

@@ -186,13 +186,6 @@ static int mk_wait_cpu_off(mk_phys_cpu_t mpidr)
 				 1000, MK_CPU_OFF_TIMEOUT_US, false, mpidr, 0);
 }
 
-/* A fenced CPU executes nothing: firmware holds it off */
-bool mk_arch_cpu_fenced(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
-{
-	return psci_ops.affinity_info &&
-	       psci_ops.affinity_info(phys_cpu, 0) == PSCI_0_2_AFFINITY_LEVEL_OFF;
-}
-
 /*
  * The spawn reads these with the MMU and caches off, so what the host
  * wrote through its cacheable mapping has to be in memory by then.
@@ -272,7 +265,7 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 	if (ret)
 		return ret;
 
-	guard(mutex)(&mk_pool->park_lock);
+	guard(mutex)(&mk_park_lock);
 
 	ret = psci_cpu_on_context(mpidr, image->start, image->arch.dtb_mem);
 	if (ret) {
@@ -342,7 +335,7 @@ int mk_repark_instance_to_host(struct mk_instance *instance)
 	if (mk_cpu_set_empty(started))
 		return 0;
 
-	guard(mutex)(&mk_pool->park_lock);
+	guard(mutex)(&mk_park_lock);
 
 	/* Back to front, so deleting never shifts entries yet to be visited */
 	for (i = mk_cpu_set_count(started); i-- > 0; ) {
@@ -372,7 +365,7 @@ int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_c
 	if (!started)
 		return -ENOMEM;
 
-	guard(mutex)(&mk_pool->park_lock);
+	guard(mutex)(&mk_park_lock);
 
 	if (mk_cpu_set_contains(started, phys_cpu))
 		return 0;
@@ -393,7 +386,7 @@ int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {
 	int ret;
 
-	guard(mutex)(&mk_pool->park_lock);
+	guard(mutex)(&mk_park_lock);
 
 	if (!mk_cpu_set_contains(instance->cpus_on_slot, phys_cpu))
 		return 0;
