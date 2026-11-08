@@ -228,6 +228,8 @@ SYM_CODE_END(mk_secondary_identity)
  * Args: %rdi=park_cr3, %rsi=ctx_phys, %rdx=apic_id, %rcx=park_phys,
  *       %r8=mwait_usable
  */
+	/* The park page copy starts here; its tables keep their alignment */
+	.balign 16
 	.globl mk_pool_park_start
 mk_pool_park_start:
 SYM_CODE_START_NOALIGN(mk_pool_park)
@@ -480,12 +482,17 @@ mk_gdt_64:
 	.word	mk_gdt_entries_end - mk_gdt_entries - 1
 	.quad	mk_gdt_entries
 
+	/*
+	 * Descriptors come with Accessed set: setting it on first load is a
+	 * locked write, a split lock (#AC) if a descriptor crosses a cache
+	 * line and a fault if the table is read-only.
+	 */
 	.balign 16
 mk_gdt_entries:
 	.quad	0x0000000000000000
 	.quad	0x0000000000000000
-	.quad	0x00af9a000000ffff
-	.quad	0x00cf92000000ffff
+	.quad	0x00af9b000000ffff
+	.quad	0x00cf93000000ffff
 mk_gdt_entries_end:
 
 /*
@@ -505,8 +512,8 @@ mk_park_gdt:
 mk_park_gdt_entries:
 	.quad	0x0000000000000000
 	.quad	0x0000000000000000
-	.quad	0x00af9a000000ffff	/* __KERNEL_CS */
-	.quad	0x00cf92000000ffff	/* __KERNEL_DS */
+	.quad	0x00af9b000000ffff	/* __KERNEL_CS, accessed */
+	.quad	0x00cf93000000ffff	/* __KERNEL_DS, accessed */
 mk_park_gdt_end:
 
 	.balign 16
