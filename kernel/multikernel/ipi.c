@@ -7,6 +7,7 @@
 #include <linux/init.h>
 #include <linux/smp.h>
 #include <linux/percpu.h>
+#include <linux/ratelimit.h>
 #include <linux/spinlock.h>
 #include <linux/multikernel.h>
 #include <linux/kexec.h>
@@ -20,6 +21,7 @@ static raw_spinlock_t mk_handlers_lock = __RAW_SPIN_LOCK_UNLOCKED(mk_handlers_lo
 
 static DEFINE_RAW_SPINLOCK(mk_drain_lock);
 static DEFINE_PER_CPU(bool, mk_draining);
+static DEFINE_RATELIMIT_STATE(mk_ipi_full_rs, DEFAULT_RATELIMIT_INTERVAL, 1);
 
 /* Children whose to_parent ring this kernel drains, under mk_drain_lock */
 static LIST_HEAD(mk_ipi_rx_list);
@@ -194,7 +196,8 @@ int mk_ipi_send(struct mk_instance *instance, void *data, size_t data_size,
 	unsigned int head, next_head, tail;
 	mk_phys_cpu_t target;
 
-	if (READ_ONCE(instance->silent))
+	/* Messages go only to a running kernel, as only a running one drains them */
+	if (READ_ONCE(instance->state) != MK_STATE_ACTIVE || READ_ONCE(instance->silent))
 		return -EHOSTDOWN;
 	if (data_size > MK_MAX_DATA_SIZE)
 		return -EINVAL;
@@ -239,7 +242,11 @@ int mk_ipi_send(struct mk_instance *instance, void *data, size_t data_size,
 			 * Console output reaches this path, so a plain printk
 			 * here re-enters the console write that called us and
 			 * deadlocks on its lock with interrupts already off.
+			 * Rate limited, as that output comes straight back here
+			 * while the ring stays full.
 			 */
+			if (!__ratelimit(&mk_ipi_full_rs))
+				return -ENOSPC;
 			printk_deferred(KERN_WARNING
 					"multikernel: IPI ring full for instance %d (head=%u, tail=%u)\n",
 					instance_id, head, tail);

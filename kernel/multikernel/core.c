@@ -373,7 +373,8 @@ void mk_instance_set_state(struct mk_instance *instance,
 	if (old_state == state)
 		return;
 
-	instance->state = state;
+	/* Senders read it without the instance lock */
+	WRITE_ONCE(instance->state, state);
 	mk_instance_track_dump(instance, old_state, state);
 
 	/* Whatever stopped it, its ring is no longer ours to drain */
@@ -2034,6 +2035,7 @@ int multikernel_force_halt_by_id(int mk_id)
 		ret = mk_confirm_fenced(instance, targets);
 		if (!ret) {
 			mk_pcifront_host_fenced();
+			mk_instance_set_state(instance, MK_STATE_FENCED);
 			WRITE_ONCE(mk_host_is_fenced, true);
 		}
 	} else {

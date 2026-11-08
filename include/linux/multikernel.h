@@ -618,6 +618,7 @@ enum mk_instance_state {
 	MK_STATE_LOADED,        /* Kernel loaded, ready to start */
 	MK_STATE_ACTIVE,        /* Kernel running */
 	MK_STATE_FAILED,        /* Error occurred */
+	MK_STATE_FENCED,        /* The host, its CPUs parked by this kernel */
 };
 
 /**

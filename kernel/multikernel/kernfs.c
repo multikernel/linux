@@ -83,6 +83,7 @@ static const char * const mk_state_strings[] = {
 	[MK_STATE_LOADED]  = "loaded",
 	[MK_STATE_ACTIVE]  = "active",
 	[MK_STATE_FAILED]  = "failed",
+	[MK_STATE_FENCED]  = "fenced",
 };
 
 const char *mk_state_to_string(enum mk_instance_state state)
