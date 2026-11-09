@@ -357,10 +357,17 @@ kimage_file_prepare_segments(struct kimage *image, int kernel_fd, int initrd_fd,
 	if (image->type != KEXEC_TYPE_MULTIKERNEL)
 		ima_add_kexec_buffer(image);
 
-	/* If KHO is active, add its images to the list */
-	ret = kho_fill_kimage(image);
-	if (ret)
-		goto out;
+	/*
+	 * If KHO is active, add its images to the list.
+	 *
+	 * Not for a spawn kernel: the scratch areas and the preserved memory
+	 * it would be told about lie in the host's memory, outside its own.
+	 */
+	if (image->type != KEXEC_TYPE_MULTIKERNEL) {
+		ret = kho_fill_kimage(image);
+		if (ret)
+			goto out;
+	}
 
 	/* Call image load handler */
 	ldata = kexec_image_load_default(image);
