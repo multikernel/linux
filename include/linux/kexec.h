@@ -262,6 +262,7 @@ int kexec_kernel_verify_appended_sig(const char *kernel, unsigned long kernel_le
 
 extern int kexec_add_buffer(struct kexec_buf *kbuf);
 int kexec_locate_mem_hole(struct kexec_buf *kbuf);
+void kexec_drop_segments(struct kimage *image, unsigned long nr);
 
 #ifndef arch_kexec_locate_mem_hole
 /**

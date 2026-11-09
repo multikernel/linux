@@ -198,7 +198,7 @@ int load_other_segments(struct kimage *image,
 	return 0;
 
 out_err:
-	image->nr_segments = orig_segments;
+	kexec_drop_segments(image, orig_segments);
 	kvfree(dtb);
 	return ret;
 }

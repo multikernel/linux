@@ -939,6 +939,24 @@ static int kexec_alloc_multikernel(struct kexec_buf *kbuf)
 }
 
 /**
+ * kexec_drop_segments - drop the segments added after the first @nr
+ * @image: image whose segments to drop
+ * @nr: number of segments to keep
+ *
+ * For an arch that unwinds a placement to retry it elsewhere. A multikernel
+ * segment's destination was taken from the instance pool and goes back to it.
+ */
+void kexec_drop_segments(struct kimage *image, unsigned long nr)
+{
+	while (image->nr_segments > nr) {
+		struct kexec_segment *seg = &image->segment[--image->nr_segments];
+
+		if (image->type == KEXEC_TYPE_MULTIKERNEL)
+			mk_kimage_free(image, phys_to_virt(seg->mem), seg->memsz);
+	}
+}
+
+/**
  * kexec_locate_mem_hole - find free memory for the purgatory or the next kernel
  * @kbuf:	Parameters for the memory search.
  *
