@@ -395,32 +395,55 @@ void multikernel_destroy_instance_pool(void *pool_handle)
 		gen_pool_destroy(pool_handle);
 }
 
+struct mk_pool_range {
+	unsigned long min, max, align;
+};
+
+/* First fit like gen_pool_first_fit_align(), kept inside [min, max] */
+static unsigned long mk_pool_algo_range(unsigned long *map, unsigned long size,
+					unsigned long start, unsigned int nr,
+					void *data, struct gen_pool *pool,
+					unsigned long start_addr)
+{
+	struct mk_pool_range *r = data;
+	int order = pool->min_alloc_order;
+	unsigned long align_mask = (r->align >> order) - 1;
+	unsigned long align_off = (start_addr & (r->align - 1)) >> order;
+	unsigned long bit;
+
+	if (r->min > start_addr)
+		start = max(start, DIV_ROUND_UP(r->min - start_addr, 1UL << order));
+	if (start >= size)
+		return size;
+	bit = bitmap_find_next_zero_area_off(map, size, start, nr,
+					     align_mask, align_off);
+	if (bit >= size || start_addr + ((bit + nr) << order) - 1 > r->max)
+		return size;
+	return bit;
+}
+
 /**
  * multikernel_instance_alloc() - Allocate from an instance pool
  * @pool_handle: Handle returned by multikernel_create_instance_pool()
  * @size: Size to allocate
  * @align: Alignment requirement (must be power of 2)
+ * @min: Lowest physical address the allocation may start at
+ * @max: Highest physical address the allocation may end at
  *
  * Returns physical address of allocated memory, or 0 on failure
  */
-phys_addr_t multikernel_instance_alloc(void *pool_handle, size_t size, size_t align)
+phys_addr_t multikernel_instance_alloc(void *pool_handle, size_t size, size_t align,
+				       phys_addr_t min, phys_addr_t max)
 {
 	struct gen_pool *instance_pool = (struct gen_pool *)pool_handle;
-	unsigned long addr;
+	struct mk_pool_range r = { .min = min, .max = max };
 
 	if (!instance_pool)
 		return 0;
 
-	if (align <= 1) {
-		addr = gen_pool_alloc(instance_pool, size);
-	} else {
-		/* Ensure alignment is at least the pool's minimum allocation order */
-		size_t a = max_t(size_t, align, BIT(instance_pool->min_alloc_order));
-		struct genpool_data_align data = { .align = a };
-		addr = gen_pool_alloc_algo(instance_pool, size, gen_pool_first_fit_align, &data);
-	}
-
-	return (phys_addr_t)addr;
+	r.align = roundup_pow_of_two(max_t(size_t, align,
+					   BIT(instance_pool->min_alloc_order)));
+	return gen_pool_alloc_algo(instance_pool, size, mk_pool_algo_range, &r);
 }
 
 /**

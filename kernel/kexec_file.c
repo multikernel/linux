@@ -906,30 +906,15 @@ static int kexec_alloc_multikernel(struct kexec_buf *kbuf)
 	pr_info("kexec_alloc_multikernel: called for segment size=0x%lx, buf_min=0x%lx, buf_max=0x%lx, align=0x%lx\n",
 		kbuf->memsz, kbuf->buf_min, kbuf->buf_max, kbuf->buf_align);
 
-	/* Allocate from the multikernel instance pool using the proper API */
-	virt_addr = mk_kimage_alloc(kbuf->image, kbuf->memsz, kbuf->buf_align);
+	virt_addr = mk_kimage_alloc(kbuf->image, kbuf->memsz, kbuf->buf_align,
+				    kbuf->buf_min, kbuf->buf_max);
 	if (!virt_addr) {
-		pr_info("Failed to allocate %lu bytes from multikernel instance pool (align=0x%lx)\n",
-			kbuf->memsz, kbuf->buf_align);
+		pr_info("Failed to allocate %lu bytes from multikernel instance pool (align=0x%lx, min=0x%lx, max=0x%lx)\n",
+			kbuf->memsz, kbuf->buf_align, kbuf->buf_min, kbuf->buf_max);
 		return -ENOMEM;
 	}
 
-	/* Convert virtual address to physical */
 	phys_addr = virt_to_phys(virt_addr);
-
-	if (!IS_ALIGNED(phys_addr, kbuf->buf_align)) {
-		pr_info("Multikernel allocation not aligned: phys=0x%llx, required=0x%lx\n",
-			 (unsigned long long)phys_addr, kbuf->buf_align);
-		mk_kimage_free(kbuf->image, virt_addr, kbuf->memsz);
-		return -ENOMEM;
-	}
-
-	if (phys_addr < kbuf->buf_min || (phys_addr + kbuf->memsz - 1) > kbuf->buf_max) {
-		pr_info("Multikernel allocation out of bounds: phys=0x%llx, min=0x%lx, max=0x%lx\n",
-			 (unsigned long long)phys_addr, kbuf->buf_min, kbuf->buf_max);
-		mk_kimage_free(kbuf->image, virt_addr, kbuf->memsz);
-		return -ENOMEM;
-	}
 
 	if (kimage_is_destination_range(kbuf->image, phys_addr, phys_addr + kbuf->memsz - 1)) {
 		pr_info("Multikernel allocation conflicts with existing segments: 0x%llx+0x%lx\n",

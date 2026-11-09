@@ -1512,17 +1512,8 @@ void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
 	return instance->ctrl_va + off;
 }
 
-/**
- * mk_instance_mem_alloc() - Allocate memory from instance pool
- * @instance: Instance to allocate from
- * @size: Size to allocate
- * @align: Alignment requirement (must be power of 2)
- *
- * Returns virtual address of allocated memory, or NULL on failure.
- * The returned address is a direct-mapped kernel virtual address,
- * which can be converted back to physical using virt_to_phys().
- */
-void *mk_instance_mem_alloc(struct mk_instance *instance, size_t size, size_t align)
+static void *mk_instance_mem_alloc_range(struct mk_instance *instance, size_t size,
+					 size_t align, phys_addr_t min, phys_addr_t max)
 {
 	phys_addr_t phys_addr;
 	void *virt_addr;
@@ -1533,7 +1524,8 @@ void *mk_instance_mem_alloc(struct mk_instance *instance, size_t size, size_t al
 	}
 
 	scoped_guard(mutex, &instance->pool_lock)
-		phys_addr = multikernel_instance_alloc(instance->instance_pool, size, align);
+		phys_addr = multikernel_instance_alloc(instance->instance_pool, size, align,
+						       min, max);
 	if (!phys_addr) {
 		pr_debug("Failed to allocate %zu bytes from instance pool (align=0x%zx)\n", size, align);
 		return NULL;
@@ -1547,6 +1539,21 @@ void *mk_instance_mem_alloc(struct mk_instance *instance, size_t size, size_t al
 	}
 
 	return virt_addr;
+}
+
+/**
+ * mk_instance_mem_alloc() - Allocate memory from instance pool
+ * @instance: Instance to allocate from
+ * @size: Size to allocate
+ * @align: Alignment requirement (must be power of 2)
+ *
+ * Returns virtual address of allocated memory, or NULL on failure.
+ * The returned address is a direct-mapped kernel virtual address,
+ * which can be converted back to physical using virt_to_phys().
+ */
+void *mk_instance_mem_alloc(struct mk_instance *instance, size_t size, size_t align)
+{
+	return mk_instance_mem_alloc_range(instance, size, align, 0, PHYS_ADDR_MAX);
 }
 
 /**
@@ -1578,12 +1585,15 @@ void mk_instance_mem_free(struct mk_instance *instance, void *virt_addr, size_t 
  * @image: kimage with associated mk_instance
  * @size: Size to allocate
  * @align: Alignment requirement (must be power of 2)
+ * @min: Lowest physical address the allocation may start at
+ * @max: Highest physical address the allocation may end at
  *
  * Returns virtual address of allocated memory, or NULL on failure.
  */
-void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align)
+void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align,
+		      phys_addr_t min, phys_addr_t max)
 {
-	return mk_instance_mem_alloc(image->mk_instance, size, align);
+	return mk_instance_mem_alloc_range(image->mk_instance, size, align, min, max);
 }
 
 /**

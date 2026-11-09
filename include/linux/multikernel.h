@@ -605,7 +605,8 @@ static inline phys_addr_t mk_pool_park_slot(void)
 extern void *multikernel_create_instance_pool(int instance_id, size_t pool_size,
 					      int min_alloc_order, int node);
 extern void multikernel_destroy_instance_pool(void *pool_handle);
-extern phys_addr_t multikernel_instance_alloc(void *pool_handle, size_t size, size_t align);
+extern phys_addr_t multikernel_instance_alloc(void *pool_handle, size_t size, size_t align,
+					      phys_addr_t min, phys_addr_t max);
 extern void multikernel_instance_free(void *pool_handle, phys_addr_t addr, size_t size);
 extern size_t multikernel_instance_pool_avail(void *pool_handle);
 
@@ -1117,7 +1118,8 @@ int mk_lease_allow_msi(struct mk_lease *lease, phys_addr_t doorbell);
 int mk_arch_lease_grant(struct mk_instance *instance, struct pci_dev *pdev);
 
 /* Kimage-based access to the instance memory pool */
-void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align);
+void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align,
+		      phys_addr_t min, phys_addr_t max);
 void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size);
 
 /* Device probe filtering against the instance's allowlist */
@@ -1172,7 +1174,8 @@ static inline void mk_instance_set_state(struct mk_instance *instance,
 {
 }
 static inline void *mk_kimage_alloc(struct kimage *image, size_t size,
-				    size_t align)
+				    size_t align, phys_addr_t min,
+				    phys_addr_t max)
 {
 	return NULL;
 }
