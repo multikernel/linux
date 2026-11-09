@@ -140,24 +140,28 @@ static int mk_pcifront_direct(struct mk_pcifront_bus *fb, unsigned int devfn,
  * mk_pcifront_host_fenced - The host can no longer touch config space
  *
  * Called once a fence has confirmed every CPU of the host parked. From
- * then on this kernel reaches the config space of its devices itself.
+ * then on this kernel reaches the config space of its devices itself,
+ * and may adopt the host's functions, also when it was armed with no
+ * device and has no bus of its own yet.
  */
 void mk_pcifront_host_fenced(void)
 {
 	struct mk_pcifront_bus *fb;
-	bool direct = false;
+	bool any = false, direct = false;
 
-	if (READ_ONCE(mk_pcifront_direct_access) ||
-	    list_empty(&mk_pcifront_buses))
+	if (READ_ONCE(mk_pcifront_direct_access))
 		return;
 	WRITE_ONCE(mk_pcifront_direct_access, true);
 
 	rcu_read_lock();
-	list_for_each_entry_rcu(fb, &mk_pcifront_buses, list)
+	list_for_each_entry_rcu(fb, &mk_pcifront_buses, list) {
+		any = true;
 		direct |= !!fb->ecam;
+	}
 	rcu_read_unlock();
-	pr_info("Host fenced: config space is reached %s\n",
-		direct ? "directly through ECAM" : "nowhere");
+	if (any)
+		pr_info("Host fenced: config space is reached %s\n",
+			direct ? "directly through ECAM" : "nowhere");
 }
 
 static int mk_pcifront_access(struct mk_pcifront_bus *fb, unsigned int devfn,
