@@ -1936,16 +1936,25 @@ int mk_cpu_rank(mk_phys_cpu_t phys)
 }
 EXPORT_SYMBOL_GPL(mk_cpu_rank);
 
-/*
- * After NMIing the fence targets, confirm each reached the park loop
- * the same way a child's CPUs are confirmed, and record the arrivals
- * in cpus_on_slot. A target that never parks (wedged in NMI context)
- * leaves the fence incomplete: -ETIMEDOUT, so no foreign baseline
- * claims a machine with a CPU possibly still running the dead host.
- */
-static int mk_confirm_fenced(struct mk_instance *instance,
-			     struct mk_cpu_set *targets)
+int __weak mk_arch_fence_cpu(struct mk_instance *instance,
+			     mk_phys_cpu_t phys_cpu)
 {
+	mk_force_stop_cpu(instance, phys_cpu);
+	return mk_arch_confirm_parked(instance, phys_cpu);
+}
+
+/*
+ * Stop the fence targets one at a time and record the ones confirmed
+ * parked in cpus_on_slot, the gate a later foreign baseline checks. A
+ * target that never parks leaves the fence incomplete: -ETIMEDOUT, so no
+ * baseline claims a machine with a CPU possibly still running the dead
+ * host. The host hears nothing more from here on: every doorbell is one
+ * more interrupt aimed at a CPU on its way off.
+ */
+static int mk_fence_host(struct mk_instance *instance,
+			 struct mk_cpu_set *targets)
+{
+	ktime_t start = ktime_get();
 	mk_phys_cpu_t phys;
 	unsigned int i;
 	int missing = 0;
@@ -1956,11 +1965,15 @@ static int mk_confirm_fenced(struct mk_instance *instance,
 			return -ENOMEM;
 	}
 
+	WRITE_ONCE(instance->silent, true);
+
 	mk_cpu_set_for_each(i, phys, targets) {
-		if (mk_arch_confirm_parked(instance, phys))
+		if (mk_arch_fence_cpu(instance, phys)) {
+			pr_err("Host CPU 0x%llx never parked\n", phys);
 			missing++;
-		else
+		} else {
 			mk_cpu_set_add(instance->cpus_on_slot, phys);
+		}
 	}
 
 	if (missing) {
@@ -1968,8 +1981,9 @@ static int mk_confirm_fenced(struct mk_instance *instance,
 		       missing);
 		return -ETIMEDOUT;
 	}
-	pr_info("Host fenced: %u CPUs confirmed parked\n",
-		mk_cpu_set_count(instance->cpus_on_slot));
+	pr_info("Host fenced: %u CPUs confirmed parked in %lld ms\n",
+		mk_cpu_set_count(instance->cpus_on_slot),
+		ktime_ms_delta(ktime_get(), start));
 	return 0;
 }
 
@@ -2027,30 +2041,20 @@ int multikernel_force_halt_by_id(int mk_id)
 	if (ret)
 		pr_err("Failed to arm force-halt marker: %d (sending NMI anyway)\n", ret);
 
-	mk_cpu_set_for_each(i, phys_cpu, targets) {
-		mk_force_stop_cpu(instance, phys_cpu);
-		cpu_count++;
-	}
-
-	pr_info("Sent NMI to %d CPUs in instance %d\n", cpu_count, mk_id);
-
-	/*
-	 * A child instance parks on its own context, so wait for it to
-	 * settle exactly as the graceful path does. Fencing the host has
-	 * no such settle: confirm each target actually reached the park
-	 * loop, and record the ones that did in cpus_on_slot, the gate a
-	 * later foreign baseline checks. A target that never parks fails the
-	 * fence, so a baseline cannot claim a machine with a CPU still
-	 * running the dead host.
-	 */
 	if (instance == host_instance) {
-		ret = mk_confirm_fenced(instance, targets);
+		ret = mk_fence_host(instance, targets);
 		if (!ret) {
 			mk_pcifront_host_fenced();
 			mk_instance_set_state(instance, MK_STATE_FENCED);
 			WRITE_ONCE(mk_host_is_fenced, true);
 		}
 	} else {
+		/* A child parks on its own context and settles as a graceful halt does */
+		mk_cpu_set_for_each(i, phys_cpu, targets) {
+			mk_force_stop_cpu(instance, phys_cpu);
+			cpu_count++;
+		}
+		pr_info("Sent NMI to %d CPUs in instance %d\n", cpu_count, mk_id);
 		mk_instance_settle_halted(instance);
 	}
 

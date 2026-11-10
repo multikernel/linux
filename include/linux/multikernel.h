@@ -1344,6 +1344,7 @@ int mk_arch_release_instance(struct mk_instance *instance);
 
 /* Verify one of an instance's CPUs has reached its park loop */
 int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
+int mk_arch_fence_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
 
 /*
  * Wait until every CPU an instance owns is parked. Its kernel image may

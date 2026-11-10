@@ -128,6 +128,18 @@ static int __init mk_spawn_reboot_init(void)
 }
 core_initcall(mk_spawn_reboot_init);
 
+static int mk_wait_cpu_off(mk_phys_cpu_t mpidr)
+{
+	int state;
+
+	if (!psci_ops.affinity_info)
+		return -EOPNOTSUPP;
+
+	return read_poll_timeout(psci_ops.affinity_info, state,
+				 state == PSCI_0_2_AFFINITY_LEVEL_OFF,
+				 1000, MK_CPU_OFF_TIMEOUT_US, false, mpidr, 0);
+}
+
 /*
  * PSCI cannot turn another CPU off, so a kernel that no longer answers
  * has to be made to turn its CPUs off itself. SDEI reaches a CPU whatever
@@ -145,6 +157,28 @@ void mk_force_stop_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 	ret = gic_v3_send_sgi_to_mpidr(phys_cpu, IPI_CPU_STOP_NMI);
 	if (ret)
 		pr_err("No stop SGI to CPU 0x%llx: %d\n", phys_cpu, ret);
+}
+
+/*
+ * A fenced host's CPUs go off one at a time with a single stop event in
+ * flight each: firmware can wedge a core whose power down is interrupted,
+ * and many cores powering down at once did wedge one. SDEI is only for a
+ * CPU the stop SGI did not get off.
+ */
+int mk_arch_fence_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
+{
+	int ret;
+
+	if (psci_ops.affinity_info &&
+	    psci_ops.affinity_info(phys_cpu, 0) == PSCI_0_2_AFFINITY_LEVEL_OFF)
+		return 0;
+
+	ret = gic_v3_send_sgi_to_mpidr(phys_cpu, IPI_CPU_STOP_NMI);
+	if (!ret)
+		ret = mk_wait_cpu_off(phys_cpu);
+	if (ret && !mk_sdei_stop_cpu(instance, phys_cpu))
+		ret = mk_wait_cpu_off(phys_cpu);
+	return ret;
 }
 
 /*
@@ -172,18 +206,6 @@ static struct mk_cpu_set *mk_started_set(struct mk_instance *instance)
 		instance->cpus_on_slot = mk_cpu_set_alloc();
 
 	return instance->cpus_on_slot;
-}
-
-static int mk_wait_cpu_off(mk_phys_cpu_t mpidr)
-{
-	int state;
-
-	if (!psci_ops.affinity_info)
-		return -EOPNOTSUPP;
-
-	return read_poll_timeout(psci_ops.affinity_info, state,
-				 state == PSCI_0_2_AFFINITY_LEVEL_OFF,
-				 1000, MK_CPU_OFF_TIMEOUT_US, false, mpidr, 0);
 }
 
 /*

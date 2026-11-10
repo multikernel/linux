@@ -104,18 +104,19 @@ void mk_sdei_unreachable(void)
 	mk_sdei_set_reachable(false);
 }
 
-void mk_sdei_stop_cpu(struct mk_instance *instance, u64 mpidr)
+int mk_sdei_stop_cpu(struct mk_instance *instance, u64 mpidr)
 {
 	struct mk_shared_data *sd = instance->ipi_data;
 	int rank = mk_cpu_rank(mpidr);
 	int ret;
 
 	if (!sd || rank >= MK_CPU_RANK_MAX || !READ_ONCE(sd->fw_stop[rank]))
-		return;
+		return -ENODEV;
 
 	ret = sdei_event_signal(MK_SDEI_STOP_EVENT, mpidr);
 	if (ret)
 		pr_err_ratelimited("No SDEI stop to CPU 0x%llx: %d\n", mpidr, ret);
+	return ret;
 }
 
 static int mk_sdei_stop(u32 event, struct pt_regs *regs, void *arg)
