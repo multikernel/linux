@@ -1427,9 +1427,8 @@ static int mk_dt_copy_node(const void *src, int node, void *fdt)
 	return 0;
 }
 
-/* Keep @node of @src as a tree of its own, rooted at the node's contents. */
-static int mk_dt_store_host_tree(const void *src, int node,
-				 struct mk_instance *instance)
+/* @node of @src as a tree of its own, rooted at the node's contents. */
+static void *mk_dt_keep_node(const void *src, int node)
 {
 	size_t size = SZ_1K;
 	void *fdt;
@@ -1438,7 +1437,7 @@ static int mk_dt_store_host_tree(const void *src, int node,
 	for (;;) {
 		fdt = kmalloc(size, GFP_KERNEL);
 		if (!fdt)
-			return -ENOMEM;
+			return ERR_PTR(-ENOMEM);
 		ret = fdt_create(fdt, size);
 		if (!ret)
 			ret = fdt_finish_reservemap(fdt);
@@ -1454,11 +1453,20 @@ static int mk_dt_store_host_tree(const void *src, int node,
 			break;
 		kfree(fdt);
 		if (ret != -FDT_ERR_NOSPACE || size >= MK_HOST_TREE_MAX)
-			return -EINVAL;
+			return ERR_PTR(-EINVAL);
 		size *= 2;
 	}
 	fdt_pack(fdt);
+	return fdt;
+}
 
+static int mk_dt_store_host_tree(const void *src, int node,
+				 struct mk_instance *instance)
+{
+	void *fdt = mk_dt_keep_node(src, node);
+
+	if (IS_ERR(fdt))
+		return PTR_ERR(fdt);
 	kfree(instance->host_tree);
 	instance->host_tree = fdt;
 	instance->host_tree_len = fdt_totalsize(fdt);
@@ -1467,10 +1475,27 @@ static int mk_dt_store_host_tree(const void *src, int node,
 	return 0;
 }
 
+/* The screen the spawn draws its console on, as the loader sees it now */
+static int mk_dt_store_framebuffer(const void *src, int node,
+				   struct mk_instance *instance)
+{
+	void *fdt;
+
+	if (fdt_node_check_compatible(src, node, "simple-framebuffer"))
+		return -EINVAL;
+	fdt = mk_dt_keep_node(src, node);
+	if (IS_ERR(fdt))
+		return PTR_ERR(fdt);
+	kfree(instance->framebuffer);
+	instance->framebuffer = fdt;
+	return 0;
+}
+
 /*
  * The boot handoff user space asked for: a chosen node holding a
- * multikernel,host-tree subtree, which the spawn boots with under its
- * own /chosen.
+ * multikernel,host-tree subtree and a simple-framebuffer framebuffer
+ * node, either optional, which the spawn boots with under its own
+ * /chosen.
  */
 int mk_dt_parse_chosen(const void *fdt, int chosen_node,
 		       struct mk_instance *instance)
@@ -1478,7 +1503,7 @@ int mk_dt_parse_chosen(const void *fdt, int chosen_node,
 	int node;
 
 	if (fdt_first_property_offset(fdt, chosen_node) >= 0) {
-		pr_err("Instance '%s': chosen carries properties; only a multikernel,host-tree node is accepted\n",
+		pr_err("Instance '%s': chosen carries properties; only multikernel,host-tree and framebuffer nodes are accepted\n",
 		       instance->name);
 		return -EINVAL;
 	}
@@ -1486,43 +1511,71 @@ int mk_dt_parse_chosen(const void *fdt, int chosen_node,
 		const char *name = fdt_get_name(fdt, node, NULL);
 		int ret;
 
-		if (!name || strcmp(name, "multikernel,host-tree")) {
+		if (name && !strcmp(name, "multikernel,host-tree")) {
+			ret = mk_dt_store_host_tree(fdt, node, instance);
+			if (ret) {
+				pr_err("Instance '%s': cannot keep multikernel,host-tree (limit %d bytes): %d\n",
+				       instance->name, MK_HOST_TREE_MAX, ret);
+				return ret;
+			}
+		} else if (name && !strcmp(name, "framebuffer")) {
+			ret = mk_dt_store_framebuffer(fdt, node, instance);
+			if (ret) {
+				pr_err("Instance '%s': framebuffer is not a simple-framebuffer: %d\n",
+				       instance->name, ret);
+				return ret;
+			}
+		} else {
 			pr_err("Instance '%s': unsupported chosen node '%s'\n",
 			       instance->name, name ? name : "?");
 			return -EINVAL;
-		}
-		ret = mk_dt_store_host_tree(fdt, node, instance);
-		if (ret) {
-			pr_err("Instance '%s': cannot keep multikernel,host-tree (limit %d bytes): %d\n",
-			       instance->name, MK_HOST_TREE_MAX, ret);
-			return ret;
 		}
 	}
 	return 0;
 }
 
-/* The stored host tree, as the multikernel,host-tree node of an open /chosen. */
-int mk_dt_emit_host_tree(void *fdt, const struct mk_instance *instance)
+static int mk_dt_emit_kept(void *fdt, const char *name, const void *tree)
 {
 	int ret;
 
-	ret = fdt_begin_node(fdt, "multikernel,host-tree");
+	ret = fdt_begin_node(fdt, name);
 	if (!ret)
-		ret = mk_dt_copy_node(instance->host_tree, 0, fdt);
+		ret = mk_dt_copy_node(tree, 0, fdt);
 	if (!ret)
 		ret = fdt_end_node(fdt);
 	return ret;
 }
 
+/* The stored host tree, as the multikernel,host-tree node of an open /chosen. */
+int mk_dt_emit_host_tree(void *fdt, const struct mk_instance *instance)
+{
+	return mk_dt_emit_kept(fdt, "multikernel,host-tree", instance->host_tree);
+}
+
+/* The stored framebuffer, if any, as the framebuffer node of an open /chosen. */
+int mk_dt_emit_framebuffer(void *fdt, const struct mk_instance *instance)
+{
+	if (!instance->framebuffer)
+		return 0;
+	return mk_dt_emit_kept(fdt, "framebuffer", instance->framebuffer);
+}
+
 static int mk_dt_emit_requested_chosen(void *fdt, void *data)
 {
-	return mk_dt_emit_host_tree(fdt, data);
+	struct mk_instance *instance = data;
+	int ret = 0;
+
+	if (instance->host_tree)
+		ret = mk_dt_emit_host_tree(fdt, instance);
+	if (!ret)
+		ret = mk_dt_emit_framebuffer(fdt, instance);
+	return ret;
 }
 
 static int mk_dt_emit_instance(struct mk_instance *instance, void *fdt,
 			       size_t size)
 {
-	if (instance->host_tree)
+	if (instance->host_tree || instance->framebuffer)
 		return mk_dt_emit_tree(instance, fdt, size,
 				       mk_dt_emit_requested_chosen, instance);
 	return mk_dt_emit_tree(instance, fdt, size, NULL, NULL);

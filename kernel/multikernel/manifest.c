@@ -434,12 +434,25 @@ static int mk_manifest_chosen(void *fdt, void *data)
 	if (ret)
 		return ret;
 
+	/* Without these, the framebuffer's reg does not translate */
+	if (ctx->instance->framebuffer) {
+		ret = fdt_property_u32(fdt, "#address-cells", 2);
+		if (!ret)
+			ret = fdt_property_u32(fdt, "#size-cells", 2);
+		if (!ret)
+			ret = fdt_property(fdt, "ranges", NULL, 0);
+		if (ret)
+			return ret;
+	}
+
 	ret = mk_arch_manifest_chosen(fdt, ctx->instance);
 	if (ret)
 		return ret;
 
 	/* A node's properties precede its subnodes: those close /chosen */
-	ret = mk_manifest_add_host_tree(fdt, ctx->instance);
+	ret = mk_dt_emit_framebuffer(fdt, ctx->instance);
+	if (!ret)
+		ret = mk_manifest_add_host_tree(fdt, ctx->instance);
 	/* A backup, which user space arms with a host tree, takes over buses */
 	if (!ret && ctx->instance->host_tree)
 		ret = mk_dt_emit_pci_buses(fdt);

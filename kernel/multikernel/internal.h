@@ -28,6 +28,7 @@ int mk_instance_destroy(struct mk_instance *instance);
 int mk_dt_parse_chosen(const void *fdt, int chosen_node,
 		       struct mk_instance *instance);
 int mk_dt_emit_host_tree(void *fdt, const struct mk_instance *instance);
+int mk_dt_emit_framebuffer(void *fdt, const struct mk_instance *instance);
 int mk_dt_parse_resources(const void *fdt, int resources_node,
 			  const char *instance_name, struct mk_dt_config *config);
 int mk_dt_emit_boot_tree(struct mk_instance *instance, void *fdt, size_t size,

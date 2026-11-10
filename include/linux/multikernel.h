@@ -830,6 +830,8 @@ struct mk_instance {
 	void *host_tree;
 	size_t host_tree_len;
 	bool dumps_host;		/* its host tree carries a vmcore node */
+	/* A simple-framebuffer node from that chosen node, or NULL */
+	void *framebuffer;
 
 	/* Sysfs representation */
 	struct kernfs_node *kn;            /* Kernfs node for this instance */
