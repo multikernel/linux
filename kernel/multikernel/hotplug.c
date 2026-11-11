@@ -110,8 +110,6 @@ static int mk_cpu_to_logical(mk_phys_cpu_t cpu_id)
 			return cpu;
 	}
 
-	pr_err("Multikernel hotplug: Physical CPU %llu not found in present CPUs\n",
-	       cpu_id);
 	return -EINVAL;
 }
 
