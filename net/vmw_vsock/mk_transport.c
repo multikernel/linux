@@ -143,9 +143,19 @@ static void mk_vsock_rx_pkt(struct sk_buff *skb)
 
 	sk = vsock_find_connected_socket(&src, &dst);
 	if (!sk) {
+		/*
+		 * A socket still connecting is only bound, so the answer to its
+		 * request comes this way. A listener takes nothing but requests,
+		 * though: anything else belongs to a connection that is gone,
+		 * and a late RST taken by the listener would close it for good.
+		 */
 		sk = vsock_find_bound_socket(&dst);
-		if (!sk) {
-			mk_vsock_send_rst(hdr);
+		if (!sk || (sk->sk_state == TCP_LISTEN &&
+			    le16_to_cpu(hdr->op) != VIRTIO_VSOCK_OP_REQUEST)) {
+			if (sk)
+				sock_put(sk);
+			if (le16_to_cpu(hdr->op) != VIRTIO_VSOCK_OP_RST)
+				mk_vsock_send_rst(hdr);
 			kfree_skb(skb);
 			return;
 		}
