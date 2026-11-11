@@ -162,8 +162,10 @@ void mk_force_stop_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 /*
  * A fenced host's CPUs go off one at a time with a single stop event in
  * flight each: firmware can wedge a core whose power down is interrupted,
- * and many cores powering down at once did wedge one. SDEI is only for a
- * CPU the stop SGI did not get off.
+ * and many cores powering down at once did wedge one. SDEI goes first: a
+ * stop SGI taken as an NMI inside an interrupt handler leaves both
+ * interrupts active at the GIC through CPU_OFF, and that wedged a busy
+ * core. The SGI is for a CPU that cannot take the event.
  */
 int mk_arch_fence_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {
@@ -173,10 +175,10 @@ int mk_arch_fence_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 	    psci_ops.affinity_info(phys_cpu, 0) == PSCI_0_2_AFFINITY_LEVEL_OFF)
 		return 0;
 
-	ret = gic_v3_send_sgi_to_mpidr(phys_cpu, IPI_CPU_STOP_NMI);
+	ret = mk_sdei_stop_cpu(instance, phys_cpu);
 	if (!ret)
 		ret = mk_wait_cpu_off(phys_cpu);
-	if (ret && !mk_sdei_stop_cpu(instance, phys_cpu))
+	if (ret && !gic_v3_send_sgi_to_mpidr(phys_cpu, IPI_CPU_STOP_NMI))
 		ret = mk_wait_cpu_off(phys_cpu);
 	return ret;
 }
