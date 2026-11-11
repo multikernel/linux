@@ -1948,8 +1948,7 @@ int __weak mk_arch_fence_cpu(struct mk_instance *instance,
  * parked in cpus_on_slot, the gate a later foreign baseline checks. A
  * target that never parks leaves the fence incomplete: -ETIMEDOUT, so no
  * baseline claims a machine with a CPU possibly still running the dead
- * host. The host hears nothing more from here on: every doorbell is one
- * more interrupt aimed at a CPU on its way off.
+ * host.
  */
 static int mk_fence_host(struct mk_instance *instance,
 			 struct mk_cpu_set *targets)
@@ -1964,8 +1963,6 @@ static int mk_fence_host(struct mk_instance *instance,
 		if (!instance->cpus_on_slot)
 			return -ENOMEM;
 	}
-
-	WRITE_ONCE(instance->silent, true);
 
 	mk_cpu_set_for_each(i, phys, targets) {
 		if (mk_arch_fence_cpu(instance, phys)) {
@@ -2034,6 +2031,13 @@ int multikernel_force_halt_by_id(int mk_id)
 		mk_instance_put(instance);
 		return ret;
 	}
+
+	/*
+	 * The host hears nothing more from here on, this line included: a
+	 * doorbell interrupts a host CPU that is about to be stopped.
+	 */
+	if (instance == host_instance)
+		WRITE_ONCE(instance->silent, true);
 
 	pr_info("Force halting multikernel instance %d via NMI\n", mk_id);
 
