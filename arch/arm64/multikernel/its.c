@@ -228,9 +228,8 @@ int mk_arch_iommu_claim(u64 base)
 {
 	struct device_node *np = mk_its_unit(base);
 	struct mk_its_claimed *c;
-	u32 node;
 	u64 size;
-	int ret;
+	int node, ret;
 
 	if (!np)
 		return -ENODEV;
@@ -243,8 +242,8 @@ int mk_arch_iommu_claim(u64 base)
 		ret = -EINVAL;
 		goto free;
 	}
-	if (of_property_read_u32(np, "numa-node-id", &node))
-		node = NUMA_NO_NODE;
+	/* The host's node of the ITS need not be online here */
+	node = numa_map_to_online_node(of_node_to_nid(np));
 
 	scoped_guard(mutex, &mk_its_claimed_lock) {
 		struct mk_its_claimed *done;
