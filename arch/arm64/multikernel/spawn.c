@@ -89,6 +89,7 @@ void __noreturn mk_enter_pool_state(void *info)
 	local_daif_mask();
 	mk_sdei_unreachable();
 	sdei_mask_local_cpu();
+	gic_v3_cpu_leave();
 
 	if (ops && ops->cpu_die)
 		ops->cpu_die(cpu);

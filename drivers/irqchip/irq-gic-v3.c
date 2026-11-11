@@ -1181,6 +1181,25 @@ static void gic_cpu_sys_reg_enable(void)
 
 }
 
+static void gic_clear_ap1r(u32 pribits)
+{
+	switch (pribits) {
+	case 8:
+	case 7:
+		write_gicreg(0, ICC_AP1R3_EL1);
+		write_gicreg(0, ICC_AP1R2_EL1);
+		fallthrough;
+	case 6:
+		write_gicreg(0, ICC_AP1R1_EL1);
+		fallthrough;
+	case 5:
+	case 4:
+		write_gicreg(0, ICC_AP1R0_EL1);
+	}
+
+	isb();
+}
+
 static void gic_cpu_sys_reg_init(void)
 {
 	int i, cpu = smp_processor_id();
@@ -1243,21 +1262,7 @@ static void gic_cpu_sys_reg_init(void)
 		isb();
 	}
 
-	switch(pribits) {
-	case 8:
-	case 7:
-		write_gicreg(0, ICC_AP1R3_EL1);
-		write_gicreg(0, ICC_AP1R2_EL1);
-		fallthrough;
-	case 6:
-		write_gicreg(0, ICC_AP1R1_EL1);
-		fallthrough;
-	case 5:
-	case 4:
-		write_gicreg(0, ICC_AP1R0_EL1);
-	}
-
-	isb();
+	gic_clear_ap1r(pribits);
 
 	/* ... and let's hit the road... */
 	gic_write_grpen1(1);
@@ -1456,6 +1461,38 @@ int gic_v3_send_sgi_to_mpidr(u64 mpidr, unsigned int sgi)
 	gic_send_sgi(MPIDR_TO_SGI_CLUSTER_ID(mpidr), BIT(mpidr & 0xf), sgi);
 	isb();
 	return 0;
+}
+
+/**
+ * gic_v3_cpu_leave - Hand the calling CPU's interrupts back as hotplug does
+ *
+ * A CPU that another kernel stops goes off from whatever it was doing,
+ * often an interrupt handler interrupted by the stop itself, with
+ * interrupts active, pending and aimed at it. Hotplug never powers a CPU
+ * down like that, and firmware waits on the redistributor to quiesce
+ * before it does. Only this CPU's own interface and redistributor are
+ * touched; the next CPU_ON sets both up again.
+ */
+void gic_v3_cpu_leave(void)
+{
+	void __iomem *rbase;
+	unsigned int i;
+
+	if (!gic_data.domain)
+		return;
+
+	gic_write_grpen1(0);
+	isb();
+
+	rbase = gic_data_rdist_sgi_base();
+	for (i = 0; i < gic_data.ppi_nr + SGI_NR; i += 32) {
+		writel_relaxed(~0U, rbase + GICR_ICENABLER0 + i / 8);
+		writel_relaxed(~0U, rbase + GICR_ICPENDR0 + i / 8);
+		writel_relaxed(~0U, rbase + GICR_ICACTIVER0 + i / 8);
+	}
+	gic_redist_wait_for_rwp();
+
+	gic_clear_ap1r(gic_get_pribits());
 }
 
 static void __init gic_smp_init(void)
