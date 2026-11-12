@@ -47,22 +47,6 @@ static void __used common(void)
 
 #ifdef CONFIG_MULTIKERNEL
 	BLANK();
-	OFFSET(MK_CTX_self_phys, mk_spawn_context, self_phys);
-	OFFSET(MK_CTX_identity_cr3, mk_spawn_context, identity_cr3);
-	OFFSET(MK_CTX_kernel_entry, mk_spawn_context, kernel_entry);
-	OFFSET(MK_CTX_trampoline_phys, mk_spawn_context, trampoline_phys);
-	OFFSET(MK_CTX_secondary_trampoline_phys, mk_spawn_context,
-	       secondary_trampoline_phys);
-	OFFSET(MK_CTX_gs_base, mk_spawn_context, gs_base);
-	OFFSET(MK_CTX_stack, mk_spawn_context, stack);
-	OFFSET(MK_CTX_spawn_cr3, mk_spawn_context, spawn_cr3);
-	OFFSET(MK_CTX_repark_park_phys, mk_spawn_context, repark_park_phys);
-	OFFSET(MK_CTX_repark_park_cr3, mk_spawn_context, repark_park_cr3);
-	OFFSET(MK_CTX_repark_slot_phys, mk_spawn_context, repark_slot_phys);
-	OFFSET(MK_CTX_target_apic_id, mk_spawn_context, target_apic_id);
-	OFFSET(MK_CTX_flags, mk_spawn_context, flags);
-	OFFSET(MK_CTX_ready, mk_spawn_context, ready);
-	OFFSET(MK_CTX_bp, mk_spawn_context, bp);
 	OFFSET(MK_CELL_word, mk_park_cell, word);
 	OFFSET(MK_CELL_cmd, mk_park_cell, cmd);
 	OFFSET(MK_CELL_arg, mk_park_cell, arg);

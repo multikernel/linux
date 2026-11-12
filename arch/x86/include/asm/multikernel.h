@@ -4,10 +4,6 @@
 
 #include <linux/bits.h>
 
-/* Spawn context flags */
-#define MK_SPAWN_F_SECONDARY	BIT(0)	/* Secondary CPU joining existing kernel */
-#define MK_SPAWN_F_REPARK	BIT(1)	/* Move the CPU to another park slot */
-
 /* Park cell state, written only by the CPU the cell belongs to */
 #define MK_PARK_RUNNING		0
 #define MK_PARK_PARKED		1
@@ -45,24 +41,6 @@ struct mk_instance_arch {
 	struct mk_ident_pgtable *ident_pgt;
 	void *trampoline_va;
 };
-
-/*
- * The pool's park area, set up when the baseline is applied.
- * Unassigned pool CPUs park here watching the pool slot; once an
- * instance first spawns, its CPUs are re-parked onto the instance's
- * own context so the spawn kernel can wake secondaries by writing
- * memory it can address. The page table identity-maps the whole
- * pool, so park pages and contexts of every instance are reachable
- * from it.
- */
-struct mk_pool_arch {
-	struct mk_spawn_context *slot;
-	unsigned long slot_phys;
-	void *park_va;
-	unsigned long park_phys;
-	struct mk_ident_pgtable *pgt;
-	unsigned long cr3;
-};
 #endif
 
 /*
@@ -87,61 +65,25 @@ static inline int arch_cpu_from_physical_id(u64 phys_id)
 }
 
 /*
- * Spawn context - combines boot_params with spawn-specific fields.
- * Lives in shared memory (multikernel pool), reused for both primary
- * boot and secondary CPU wakeup.
+ * Spawn context: what a parent hands an instance it boots, around the
+ * boot_params the instance's kernel starts with. The spawn kernel finds
+ * it by subtracting offsetof(bp) from its boot_params pointer, so the
+ * fixed-size fields come first and their offsets are a cross-kernel
+ * ABI; struct boot_params can vary between builds.
  *
- * IMPORTANT: Fixed-size fields must come FIRST, before struct boot_params.
- * The size of struct boot_params can vary between kernel builds, so if it
- * comes first, the offsets of subsequent fields would differ between host
- * and spawn kernels built with different configs.
- *
- * The field offsets are a cross-kernel ABI: the pool park code reads them
- * from a page written by the host while running on CPUs parked by (possibly
- * differently built) spawn kernels.
- *
- * The fields fall into three classes that must not be mixed up:
- *
- *  - Anchor fields (self_phys, park_table, ctrl_phys,
- *    ctrl_size): the context's own identity, written once when the
- *    context is set up. The spawn kernel reads them whenever it parks a
- *    CPU on halt or offline, so they must stay valid for the context's
- *    whole lifetime.
- *
- *  - Primary boot data (bp and the calibration values appended after it):
- *    written before the boot CPU is released and consumed while that kernel
- *    initializes. Secondary and repark publications do not rewrite it.
- *
- *  - Dispatch fields (the remaining fixed-size fields): the wake mailbox,
- *    rewritten for every publication and staged into registers by the CPU
- *    that claims it. Reparking gets its own repark_* dispatch fields so a
- *    repark publication never overwrites the anchor: the two used to
- *    share fields, and a repark left the anchor pointing at another
- *    kernel's park area, which triple-faulted the next halt.
+ * The parent writes it before every boot of the instance and the
+ * instance's kernel reads it while it initializes. It is no mailbox:
+ * CPUs are started through their park table cells.
  */
 struct mk_spawn_context {
-	/* Fixed-size fields first - offsets are same regardless of kernel config */
-	unsigned long self_phys;	/* Physical address of this struct (for spawn to find itself) */
-	unsigned long identity_cr3;	/* Identity-mapped page tables */
-	unsigned long kernel_entry;	/* Entry point */
-	unsigned long trampoline_virt;	/* Trampoline virtual address */
-	unsigned long trampoline_phys;	/* Trampoline physical address (base) */
-	unsigned long secondary_trampoline_phys;  /* Secondary CPU trampoline physical address */
-	unsigned long gs_base;		/* Per-CPU GS base (for secondary) */
-	unsigned long stack;		/* Stack pointer (for secondary) */
-	unsigned long spawn_cr3;	/* Spawn kernel's CR3 (for secondary CPU final switch) */
+	unsigned long self_phys;	/* Physical address of this struct, a layout check */
+	unsigned long identity_cr3;	/* Page table the boot CPU switches to */
+	unsigned long kernel_entry;	/* Entry point of the instance's kernel */
+	unsigned long trampoline_phys;	/* Trampoline page, the instance's to reuse */
 	unsigned long park_table;	/* Park table every kernel parks its CPUs in */
-	unsigned long reserved_park;
-	unsigned long repark_park_phys;	/* REPARK dispatch: park page to move to */
-	unsigned long repark_park_cr3;	/* REPARK dispatch: page table for it */
-	unsigned long repark_slot_phys;	/* REPARK dispatch: slot to watch there */
 	unsigned long ctrl_phys;	/* Host control area: this context, trampoline, */
-	unsigned long ctrl_size;	/* park page, page tables. Spawn must not reuse it */
-	u32 target_apic_id;		/* Target CPU's APIC ID */
-	u32 flags;			/* MK_SPAWN_F_* flags */
-	u32 ready;			/* Signal flag */
-	u32 reserved;			/* Padding for alignment */
-	/* Keep all existing context offsets unchanged. */
+	unsigned long ctrl_size;	/* page tables. Spawn must not reuse it */
+	unsigned long reserved;
 	struct boot_params bp;		/* Standard x86 boot params */
 	/* Optional boot data belongs after boot_params, in the zeroed tail. */
 	unsigned long boot_lps;		/* Host delay loops per second */
@@ -150,9 +92,9 @@ struct mk_spawn_context {
 	unsigned long boot_apic_hz;	/* Host local APIC timer frequency */
 } __aligned(PAGE_SIZE);
 
-static_assert(offsetof(struct mk_spawn_context, bp) == 144);
+static_assert(offsetof(struct mk_spawn_context, bp) == 64);
 static_assert(offsetof(struct mk_spawn_context, boot_lps) ==
-	      144 + sizeof(struct boot_params));
+	      64 + sizeof(struct boot_params));
 static_assert(sizeof(struct mk_spawn_context) == 2 * PAGE_SIZE);
 
 /*
@@ -228,9 +170,6 @@ int mk_add_trampoline_mapping(struct mk_ident_pgtable *pgt,
 			      unsigned long virt, unsigned long phys);
 unsigned long mk_default_page_offset(void);
 
-/* Pool park loop code, copied by the host into per-instance park pages */
-extern char mk_pool_park_start[];
-extern char mk_pool_park_end[];
 
 /* Build a spawn E820 table from the instance's current memory grant */
 struct mk_instance;
@@ -242,8 +181,8 @@ void __noreturn multikernel_play_dead(void);
 
 
 /*
- * Control block: spawn context, trampoline page, park page and identity
- * page tables, plus slack for alignment. Sized once so the whole thing is
+ * Control block: spawn context, trampoline page and identity page
+ * tables, plus slack for alignment. Sized once so the whole thing is
  * one contiguous range the spawn kernel can reserve with a single call.
  */
 #define MK_CTRL_PGTABLE_PAGES	64
@@ -260,7 +199,6 @@ struct boot_params *mk_spawn_context_boot_params(struct mk_spawn_context *ctx);
 void mk_set_spawn_context(struct mk_spawn_context *ctx,
 			  unsigned long identity_cr3,
 			  unsigned long kernel_entry,
-			  unsigned long trampoline_virt,
 			  unsigned long trampoline_phys,
 			  unsigned long park_table);
 

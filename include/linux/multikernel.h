@@ -22,8 +22,6 @@
 #else
 struct mk_instance_arch {
 };
-struct mk_pool_arch {
-};
 #endif
 
 /**
@@ -504,7 +502,6 @@ struct mk_pool {
 	struct list_head chunks;	/* Donated memory (struct mk_pool_chunk) */
 	struct gen_pool *node_pools[MAX_NUMNODES];
 	struct mutex mem_lock;		/* Protects chunks and node_pools */
-	struct mk_pool_arch arch;	/* Park area for unassigned CPUs */
 };
 
 /* The pool this kernel manages; NULL until a baseline creates it */
@@ -512,15 +509,13 @@ extern struct mk_pool *mk_pool;
 
 /*
  * The park world's one lock: arch setup, teardown and growth mapping,
- * and every wake or repark publication on the pool slot, a child
- * instance context or a fenced host's slot. Each mailbox is
- * single-producer (this kernel), but spawn, hotplug repark,
+ * and every CPU start and park confirmation. Spawn, hotplug repark,
  * parked-confirmation and pool reshaping run from different syscall
- * paths with no common lock, and a publication must never overlap the
- * teardown of the slot it writes. This kernel's, not the pool's: a
- * backup confirms its host's CPUs parked before it has a pool. Nests
- * outside mk_pool->mem_lock: park setup allocates pool memory while
- * holding it.
+ * paths with no common lock, and a CPU start must never overlap the
+ * teardown of the park area it starts from. This kernel's, not the
+ * pool's: a backup confirms its host's CPUs parked before it has a
+ * pool. Nests outside mk_pool->mem_lock: park setup allocates pool
+ * memory while holding it.
  */
 extern struct mutex mk_park_lock;
 
@@ -565,10 +560,8 @@ int mk_pool_park_setup(void);
 int mk_arch_pool_chunk_added(phys_addr_t start, size_t size);
 bool mk_pool_park_uses(phys_addr_t start, size_t size);
 int mk_pool_park_teardown(void);
-/* The pool park set (park page, slot, page tables) as base,size pairs */
+/* The memory parked CPUs run on, as base,size pairs */
 int mk_pool_park_regions(u64 *pairs, int max);
-/* The slot pool CPUs watch, 0 when there is none */
-phys_addr_t mk_pool_park_slot(void);
 #else
 static inline int mk_pool_park_setup(void)
 {
@@ -591,11 +584,6 @@ static inline int mk_pool_park_teardown(void)
 }
 
 static inline int mk_pool_park_regions(u64 *pairs, int max)
-{
-	return 0;
-}
-
-static inline phys_addr_t mk_pool_park_slot(void)
 {
 	return 0;
 }
@@ -776,13 +764,6 @@ struct mk_instance {
 	 * freed with the instance; a zero here means the host owns neither.
 	 */
 	phys_addr_t manifest_phys;
-	/*
-	 * On a spawn's record of its host: the physical address of the
-	 * host's pool wake slot, where the host's CPUs park. A backup
-	 * adopts it after fencing to wake the fenced CPUs (in cpus_on_slot)
-	 * into itself. Zero when not a host record or not published.
-	 */
-	phys_addr_t pool_slot_phys;
 	/*
 	 * Doorbell CPU for the instance's inbox. MK_PHYS_CPU_INVALID means
 	 * derive it from the instance's first owned CPU (its boot CPU);

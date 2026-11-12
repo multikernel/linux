@@ -218,9 +218,9 @@ out:
  * The memory the takeover machinery itself lives in, which a backup
  * must never treat as free after fencing the host: both ends' message
  * rings, each image's boot tree page, and the pool park set. Fenced
- * CPUs execute the park page and spin watching the slot on the pool
- * page table, and mk_has_pending_shutdown() reads the IPI area for as
- * long as the backup runs. Published as (base, size) pairs.
+ * CPUs run the park loop and wait in their cells, and
+ * mk_has_pending_shutdown() reads the IPI area for as long as the
+ * backup runs. Published as (base, size) pairs.
  */
 #define MK_RESERVED_PAIRS 80
 
@@ -394,7 +394,6 @@ static int mk_manifest_chosen(void *fdt, void *data)
 {
 	struct mk_manifest_ctx *ctx = data;
 	struct kimage *image = ctx->image;
-	phys_addr_t slot;
 	int ret;
 
 	ret = mk_manifest_add_reserved(fdt, image);
@@ -411,17 +410,6 @@ static int mk_manifest_chosen(void *fdt, void *data)
 		if (!ret)
 			ret = fdt_property_u64(fdt, "multikernel,host-ipi-cpu",
 					       arch_cpu_physical_id(0));
-		if (ret)
-			return ret;
-	}
-
-	/*
-	 * Where this host's pool CPUs park. A backup adopts this as its
-	 * own pool slot after fencing, to wake the fenced CPUs from it.
-	 */
-	slot = mk_pool_park_slot();
-	if (slot) {
-		ret = fdt_property_u64(fdt, "multikernel,pool-slot", slot);
 		if (ret)
 			return ret;
 	}

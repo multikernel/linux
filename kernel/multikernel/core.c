@@ -698,10 +698,6 @@ bool mk_pool_cpus_returned(void)
 	if (mk_pool && !mk_cpu_set_empty(mk_pool->cpus))
 		return false;
 
-	/* A fenced host is off the list, its CPUs still parked on its slot */
-	if (host_instance && !mk_cpu_set_empty(host_instance->cpus_on_slot))
-		return false;
-
 	mutex_lock(&mk_instance_mutex);
 	list_for_each_entry(instance, &mk_instance_list, list) {
 		if (instance == mk_self)
@@ -1350,17 +1346,15 @@ void mk_instance_free_memory(struct mk_instance *instance)
 	 * The arch's boot structures are all carved from the control block,
 	 * so they are returned to the pool as one allocation rather than
 	 * individually. Freeing them piecemeal would punch holes in the
-	 * block's bitmap and leave the rest of it allocated. The arch moves
-	 * CPUs still parked in this instance's memory back to the host pool
-	 * before the block goes away.
+	 * block's bitmap and leave the rest of it allocated. The arch first
+	 * waits for every CPU the instance started to park.
 	 */
 	if (instance->instance_pool && mk_arch_release_instance(instance)) {
 		/*
-		 * A CPU never claimed its repark: it is still parked on this
-		 * instance's context, executing from the park page inside
-		 * this instance's memory. Handing the memory back would let
-		 * the next instance overwrite code a CPU is running, so leak
-		 * all of it instead.
+		 * A CPU never parked: it may still run this instance's
+		 * kernel. Handing the memory back would let the next
+		 * instance overwrite code a CPU is running, so leak all of
+		 * it instead.
 		 */
 		pr_err("Instance %d (%s): leaking its %zu byte pool, a lost CPU still parks in it\n",
 		       instance->id, instance->name, instance->pool_size);
@@ -1947,11 +1941,9 @@ int __weak mk_arch_fence_cpu(struct mk_instance *instance,
 }
 
 /*
- * Stop the fence targets one at a time and record the ones confirmed
- * parked in cpus_on_slot, the gate a later foreign baseline checks. A
- * target that never parks leaves the fence incomplete: -ETIMEDOUT, so no
- * baseline claims a machine with a CPU possibly still running the dead
- * host.
+ * Stop the fence targets one at a time. A target that never parks leaves
+ * the fence incomplete: -ETIMEDOUT, so this kernel never takes over a
+ * machine with a CPU possibly still running the dead host.
  */
 static int mk_fence_host(struct mk_instance *instance,
 			 struct mk_cpu_set *targets)
@@ -1961,18 +1953,10 @@ static int mk_fence_host(struct mk_instance *instance,
 	unsigned int i;
 	int missing = 0;
 
-	if (!instance->cpus_on_slot) {
-		instance->cpus_on_slot = mk_cpu_set_alloc();
-		if (!instance->cpus_on_slot)
-			return -ENOMEM;
-	}
-
 	mk_cpu_set_for_each(i, phys, targets) {
 		if (mk_arch_fence_cpu(instance, phys)) {
 			pr_err("Host CPU 0x%llx never parked\n", phys);
 			missing++;
-		} else {
-			mk_cpu_set_add(instance->cpus_on_slot, phys);
 		}
 	}
 
@@ -1982,7 +1966,7 @@ static int mk_fence_host(struct mk_instance *instance,
 		return -ETIMEDOUT;
 	}
 	pr_info("Host fenced: %u CPUs confirmed parked in %lld ms\n",
-		mk_cpu_set_count(instance->cpus_on_slot),
+		mk_cpu_set_count(targets),
 		ktime_ms_delta(ktime_get(), start));
 	return 0;
 }

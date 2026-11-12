@@ -1,25 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * arch/x86/multikernel/spawn.c - Direct 64-bit spawn trigger via IPI
+ * Starting spawn kernels on parked CPUs
  *
- * This implements the spawn trigger mechanism for multikernel. When a spawn
- * kernel needs to be started on a pool CPU:
- *
- * 1. The pool CPU is waiting in multikernel_play_dead() with APIC enabled
- * 2. Host calls mk_spawn_cpu() which sets spawn context and sends IPI
- * 3. The CPU wakes from halt, checks spawn context, and jumps to trampoline
- * 4. Trampoline switches page tables and jumps to spawn kernel
- *
- * For secondary CPU bringup in spawn kernel:
- * - Reuse the same spawn context from primary boot
- * - Update entry point to secondary_startup_64
- * - Reuse identity page tables and trampoline
+ * Every CPU a kernel does not run on waits in its park table cell (see
+ * park.c). The host boots an instance by sending the instance's boot
+ * CPU into the trampoline, which switches to the instance's identity
+ * page table and jumps to its kernel. The spawn kernel then starts its
+ * secondaries from their cells the same way, through its own copy of
+ * the trampoline.
  *
  * Copyright (C) 2026 Multikernel Technologies, Inc.
  */
 
 #include <linux/kernel.h>
-#include <linux/sort.h>
 #include <linux/compiler.h>
 #include <linux/iopoll.h>
 #include <linux/delay.h>
@@ -92,10 +85,6 @@ typedef void (*mk_secondary_trampoline_fn)(unsigned long identity_cr3, unsigned 
 					   unsigned long gs_base, unsigned long stack,
 					   unsigned long trampoline_phys, unsigned long spawn_cr3);
 
-/* Pool park loop: park_cr3, slot_phys, apic_id, park_phys, mwait_usable */
-typedef void (*mk_pool_park_fn)(unsigned long park_cr3, unsigned long slot_phys,
-				unsigned long apic_id, unsigned long park_phys,
-				unsigned long mwait_usable);
 
 struct mk_spawn_context *mk_alloc_spawn_context(struct mk_instance *instance,
 						phys_addr_t *phys_out)
@@ -107,7 +96,7 @@ struct mk_spawn_context *mk_alloc_spawn_context(struct mk_instance *instance,
 		return NULL;
 
 	memset(ctx, 0, sizeof(*ctx));
-	/* A slot watches itself unless a publication redirects it */
+	/* The spawn checks this against where it found the context */
 	ctx->self_phys = virt_to_phys(ctx);
 
 	/* Tell the spawn kernel which memory it must leave alone */
@@ -127,20 +116,14 @@ struct boot_params *mk_spawn_context_boot_params(struct mk_spawn_context *ctx)
 void mk_set_spawn_context(struct mk_spawn_context *ctx,
 			  unsigned long identity_cr3,
 			  unsigned long kernel_entry,
-			  unsigned long trampoline_virt,
 			  unsigned long trampoline_phys,
 			  unsigned long park_table)
 {
 	ctx->identity_cr3 = identity_cr3;
 	ctx->kernel_entry = kernel_entry;
-	ctx->trampoline_virt = trampoline_virt;
 	ctx->trampoline_phys = trampoline_phys;
 	/* Where the instance's kernel parks its CPUs and finds them */
 	ctx->park_table = park_table;
-	ctx->gs_base = 0;
-	ctx->stack = 0;
-	ctx->flags = 0;
-	ctx->ready = 0;
 }
 
 /* The CPUs started for an instance and not seen parked since */
@@ -314,7 +297,6 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 	mk_set_spawn_context(instance->arch.spawn_ctx,
 			     mk_get_identity_cr3(instance->arch.ident_pgt),
 			     image->arch.mk_kernel_entry,
-			     (unsigned long)instance->arch.trampoline_va,
 			     virt_to_phys(instance->arch.trampoline_va),
 			     mk_park_table_phys());
 	instance->arch.spawn_ctx->boot_lps = cpu_data(cpu).loops_per_jiffy;
@@ -718,26 +700,6 @@ struct mk_ident_pgtable {
 
 void mk_free_identity_pgtable(struct mk_ident_pgtable *pgt);
 
-/* Host-owned pool memory, mapped back for this kernel to use */
-static void *mk_pool_ctrl_alloc(size_t size)
-{
-	phys_addr_t phys = multikernel_alloc(size, NUMA_NO_NODE);
-
-	if (!phys)
-		return NULL;
-	if (mk_pool_map(phys, size)) {
-		multikernel_free(phys, size);
-		return NULL;
-	}
-	return __va(phys);
-}
-
-static void mk_pool_ctrl_free(phys_addr_t phys, size_t size)
-{
-	mk_pool_unmap(phys, size);
-	multikernel_free(phys, size);
-}
-
 static unsigned long *mk_alloc_pgtable_page(struct mk_ident_pgtable *pgt)
 {
 	unsigned long *page;
@@ -748,10 +710,8 @@ static unsigned long *mk_alloc_pgtable_page(struct mk_ident_pgtable *pgt)
 	if (pgt->arena)
 		page = pgt->next_page < pgt->arena_pages ?
 		       pgt->arena + pgt->next_page * PAGE_SIZE : NULL;
-	else if (pgt->instance)
-		page = mk_instance_ctrl_alloc(pgt->instance, PAGE_SIZE, PAGE_SIZE);
 	else
-		page = mk_pool_ctrl_alloc(PAGE_SIZE);
+		page = mk_instance_ctrl_alloc(pgt->instance, PAGE_SIZE, PAGE_SIZE);
 
 	if (page) {
 		memset(page, 0, PAGE_SIZE);
@@ -1030,112 +990,6 @@ void *mk_setup_trampoline(struct mk_instance *instance,
 	return trampoline_va;
 }
 
-/*
- * Map the whole pool from a snapshot rather than under mk_pool_for_each_chunk():
- * mk_ident_map_range() allocates its page table pages from the pool, which
- * would recurse into the pool mutex the callback runs under.
- */
-static int mk_pool_park_map_pool(struct mk_ident_pgtable *pgt)
-{
-	struct mk_pool_chunk_range *snap = NULL;
-	int max = 0, n, i, rc = 0;
-
-	for (;;) {
-		n = mk_pool_snapshot_chunks(snap, max);
-		if (n <= max)
-			break;
-		kfree(snap);
-		max = n;
-		snap = kmalloc_array(max, sizeof(*snap), GFP_KERNEL);
-		if (!snap)
-			return -ENOMEM;
-	}
-
-	for (i = 0; i < n && !rc; i++)
-		rc = mk_ident_map_range(pgt, snap[i].start,
-					snap[i].start + snap[i].size);
-
-	kfree(snap);
-	return rc;
-}
-
-static int __mk_pool_park_setup(void)
-{
-	size_t size = mk_pool_park_end - mk_pool_park_start;
-	struct mk_ident_pgtable *pgt;
-	phys_addr_t phys;
-	int rc;
-
-	lockdep_assert_held(&mk_park_lock);
-
-	if (mk_pool->arch.slot)
-		return 0;
-
-	if (mk_pool_empty())
-		return -ENODEV;
-
-	rc = mk_park_table_create();
-	if (rc)
-		return rc;
-
-	pgt = mk_build_identity_pgtable(NULL);
-	if (IS_ERR(pgt))
-		return PTR_ERR(pgt);
-
-	rc = mk_pool_park_map_pool(pgt);
-	if (rc) {
-		mk_free_identity_pgtable(pgt);
-		return rc;
-	}
-	mk_pool->arch.pgt = pgt;
-	mk_pool->arch.cr3 = mk_get_identity_cr3(pgt);
-
-	mk_pool->arch.park_va = mk_pool_ctrl_alloc(PAGE_SIZE);
-	if (!mk_pool->arch.park_va) {
-		rc = -ENOMEM;
-		goto err_pgt;
-	}
-	mk_pool->arch.park_phys = __pa(mk_pool->arch.park_va);
-
-	memcpy(mk_pool->arch.park_va, mk_pool_park_start, size);
-
-	rc = set_memory_x((unsigned long)mk_pool->arch.park_va, 1);
-	if (rc)
-		goto err_page;
-
-	/* The host enters its park page through its own direct map */
-	rc = mk_add_trampoline_mapping(pgt,
-				       (unsigned long)mk_pool->arch.park_va,
-				       mk_pool->arch.park_phys);
-	if (rc)
-		goto err_page;
-
-	mk_pool->arch.slot = mk_pool_ctrl_alloc(ALIGN(sizeof(struct mk_spawn_context),
-						      PAGE_SIZE));
-	if (!mk_pool->arch.slot) {
-		rc = -ENOMEM;
-		goto err_page;
-	}
-	phys = __pa(mk_pool->arch.slot);
-	mk_pool->arch.slot_phys = phys;
-	memset(mk_pool->arch.slot, 0, sizeof(*mk_pool->arch.slot));
-	mk_pool->arch.slot->self_phys = phys;
-
-	pr_info("mk_spawn: pool park area at %pa (slot %pa)\n",
-		&mk_pool->arch.park_phys, &mk_pool->arch.slot_phys);
-	return 0;
-
-err_page:
-	mk_pool_ctrl_free(mk_pool->arch.park_phys, PAGE_SIZE);
-	mk_pool->arch.park_va = NULL;
-	mk_pool->arch.park_phys = 0;
-err_pgt:
-	mk_free_identity_pgtable(mk_pool->arch.pgt);
-	mk_pool->arch.pgt = NULL;
-	mk_pool->arch.cr3 = 0;
-	return rc;
-}
-
 int mk_arch_pool_map(phys_addr_t start, size_t size)
 {
 	init_memory_mapping(start, start + size, PAGE_KERNEL);
@@ -1155,24 +1009,19 @@ int mk_arch_pool_chunk_added(phys_addr_t start, size_t size)
 	guard(mutex)(&mk_park_lock);
 
 	/*
-	 * A pool emptied of memory has no park area, so the chunk that
+	 * A pool emptied of memory has no park table, so the chunk that
 	 * refills it has to bring one back: a CPU handed to a pool with
 	 * nowhere to park would halt permanently.
 	 */
-	if (!mk_pool->arch.pgt)
-		return __mk_pool_park_setup();
-
-	return mk_ident_map_range(mk_pool->arch.pgt, start, start + size);
+	return mk_park_table_create();
 }
 
 /**
- * mk_pool_park_setup() - Set up the pool park area
+ * mk_pool_park_setup() - Set up pool parking
  *
  * Called when the baseline is applied, once the memory pool exists.
- * Builds the pool-wide identity page table every parked CPU runs on,
- * the pool park page, and the pool wake slot that unassigned pool CPUs
- * watch. All of it is host-owned pool memory, alive for as long as the
- * pool has memory.
+ * Builds the park table in pool memory, unless this kernel inherited
+ * one from the kernel that spawned it.
  */
 int mk_pool_park_setup(void)
 {
@@ -1181,126 +1030,37 @@ int mk_pool_park_setup(void)
 
 	guard(mutex)(&mk_park_lock);
 
-	return __mk_pool_park_setup();
+	if (!mk_park_table_phys() && mk_pool_empty())
+		return -ENODEV;
+
+	return mk_park_table_create();
 }
 
-static bool mk_phys_in_range(phys_addr_t addr, phys_addr_t start, size_t size)
-{
-	return addr >= start && addr - start < size;
-}
-
-static bool mk_ident_pgtable_in_range(struct mk_ident_pgtable *pgt,
-				      phys_addr_t start, size_t size)
-{
-	int i;
-
-	if (!pgt)
-		return false;
-
-	for (i = 0; i < pgt->next_page; i++) {
-		if (pgt->pages[i] &&
-		    mk_phys_in_range(virt_to_phys(pgt->pages[i]), start, size))
-			return true;
-	}
-
-	return false;
-}
-
-static int mk_phys_addr_cmp(const void *a, const void *b)
-{
-	const u64 *x = a, *y = b;
-
-	return *x < *y ? -1 : *x > *y;
-}
-
-/**
- * mk_pool_park_regions() - List the pool park set as physical ranges
- * @pairs: filled with base,size pairs
- * @max: capacity of @pairs in pairs
- *
- * The park table, the park page, the wake slot, and every pool page
- * table page, sorted and coalesced: the memory a fenced or parked CPU still
- * executes and watches, which must never be handed to another
- * kernel's page allocator.
- *
- * Returns the number of pairs used, 0 when no park area exists, or
- * -E2BIG when @max is too small.
- */
+/* The park table, which no later kernel may hand out, as base,size pairs */
 int mk_pool_park_regions(u64 *pairs, int max)
 {
-	u64 page[MK_CTRL_PGTABLE_PAGES + 3];
-	unsigned int n = 0, i;
-	int out;
-
 	guard(mutex)(&mk_park_lock);
 
-	out = mk_park_table_regions(pairs, max);
-	if (out < 0 || !mk_pool || !mk_pool->arch.slot)
-		return out;
-
-	page[n++] = mk_pool->arch.park_phys;
-	page[n++] = mk_pool->arch.slot_phys;
-	page[n++] = mk_pool->arch.slot_phys + PAGE_SIZE;
-	for (i = 0; i < mk_pool->arch.pgt->next_page; i++)
-		page[n++] = virt_to_phys(mk_pool->arch.pgt->pages[i]);
-
-	sort(page, n, sizeof(*page), mk_phys_addr_cmp, NULL);
-
-	for (i = 0; i < n; i++) {
-		if (out && pairs[2 * (out - 1)] + pairs[2 * out - 1] == page[i]) {
-			pairs[2 * out - 1] += PAGE_SIZE;
-			continue;
-		}
-		if (out == max)
-			return -E2BIG;
-		pairs[2 * out] = page[i];
-		pairs[2 * out + 1] = PAGE_SIZE;
-		out++;
-	}
-
-	return out;
+	return mk_park_table_regions(pairs, max);
 }
 
-phys_addr_t mk_pool_park_slot(void)
-{
-	return mk_pool ? mk_pool->arch.slot_phys : 0;
-}
-
-/**
- * mk_pool_park_uses() - Does the pool park area live in this range?
- * @start: Physical base of the range
- * @size: Size of the range in bytes
- *
- * Covers the park page, the host wake slot and every page of the
- * pool-wide identity table.
- */
+/* Does the park table live in this range? */
 bool mk_pool_park_uses(phys_addr_t start, size_t size)
 {
-	if (!mk_pool)
-		return false;
-
 	guard(mutex)(&mk_park_lock);
 
-	if (!mk_pool->arch.slot)
-		return false;
-
-	return mk_park_table_uses(start, size) ||
-	       mk_phys_in_range(mk_pool->arch.park_phys, start, size) ||
-	       mk_phys_in_range(mk_pool->arch.slot_phys, start, size) ||
-	       mk_ident_pgtable_in_range(mk_pool->arch.pgt, start, size);
+	return mk_park_table_uses(start, size);
 }
 
 /**
- * mk_pool_park_teardown() - Return the pool park area to the pool
+ * mk_pool_park_teardown() - Return the park table to the pool
  *
- * The area is pool memory, so the chunk holding it cannot be removed
- * while it exists. Every parked CPU executes the park page and runs on
- * the identity table, whether it watches the host slot or an instance
- * context, so the area may only go back while no CPU is in the pool at
- * all. The next baseline builds it again, possibly elsewhere.
+ * The table is pool memory, so the chunk holding it cannot be removed
+ * while it exists, and it may only go while no CPU waits in it. The
+ * next baseline builds it again, possibly elsewhere.
  *
- * Returns 0 if there was nothing to tear down, -EBUSY if the pool still
- * has CPUs.
+ * Returns 0 if there was nothing to tear down, -EBUSY if a CPU may still
+ * be parked.
  */
 int mk_pool_park_teardown(void)
 {
@@ -1309,46 +1069,15 @@ int mk_pool_park_teardown(void)
 
 	guard(mutex)(&mk_park_lock);
 
-	if (!mk_pool->arch.slot)
-		return 0;
-
-	if (!mk_pool_cpus_returned() || mk_park_table_destroy())
+	if (!mk_pool_cpus_returned())
 		return -EBUSY;
 
-	mk_pool_ctrl_free(mk_pool->arch.slot_phys,
-			  ALIGN(sizeof(struct mk_spawn_context), PAGE_SIZE));
-	mk_pool->arch.slot = NULL;
-	mk_pool->arch.slot_phys = 0;
-
-	/* Hand the page back as ordinary pool memory, not as code */
-	WARN_ON_ONCE(set_memory_nx((unsigned long)mk_pool->arch.park_va, 1));
-	mk_pool_ctrl_free(mk_pool->arch.park_phys, PAGE_SIZE);
-	mk_pool->arch.park_va = NULL;
-	mk_pool->arch.park_phys = 0;
-
-	mk_free_identity_pgtable(mk_pool->arch.pgt);
-	mk_pool->arch.pgt = NULL;
-	mk_pool->arch.cr3 = 0;
-
-	pr_info("mk_spawn: released the pool park area\n");
-	return 0;
+	return mk_park_table_destroy();
 }
 
+/* The pages live in an instance's control block or an arena, freed with it */
 void mk_free_identity_pgtable(struct mk_ident_pgtable *pgt)
 {
-	int i;
-
-	if (!pgt)
-		return;
-
-	for (i = 0; i < pgt->next_page; i++) {
-		if (!pgt->pages[i])
-			continue;
-		/* Instance page tables live in the control block */
-		if (!pgt->instance && !pgt->arena)
-			mk_pool_ctrl_free(virt_to_phys(pgt->pages[i]), PAGE_SIZE);
-	}
-
 	kfree(pgt);
 }
 

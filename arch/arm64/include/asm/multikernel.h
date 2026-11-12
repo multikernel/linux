@@ -15,9 +15,6 @@
  */
 struct mk_instance_arch {
 };
-
-struct mk_pool_arch {
-};
 #endif
 
 /* Physical CPU IDs are MPIDR affinity values, as in the logical map */
