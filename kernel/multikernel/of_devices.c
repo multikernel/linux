@@ -4,11 +4,13 @@
  *
  * A spawn kernel's PCI devices are the nodes of its boot tree, and the
  * tree is their only record: a node without a status property is this
- * kernel's to use and to lend, status = "reserved" marks one lent to an
- * instance of its own, as the devicetree specification spells a device
- * in use by another entity. Lending and returning are edits to the live
- * tree, so every reader, the probe gate, the trees served to user space
- * and the boot tree of a nested spawn, sees the same ownership.
+ * kernel's, status = "reserved" marks one lent to an instance of its
+ * own, as the devicetree specification spells a device in use by another
+ * entity. A device of this kernel is free to lend while none of its
+ * drivers has it, as a host's pool device is. Lending and returning are
+ * edits to the live tree, so every reader, the probe gate, the trees
+ * served to user space and the boot tree of a nested spawn, sees the
+ * same ownership.
  */
 
 #include <linux/kernel.h>
@@ -68,16 +70,43 @@ struct device_node *mk_of_pci_node(u16 domain, u8 bus, u8 devfn)
 	return NULL;
 }
 
+static bool mk_of_pci_driven(struct device_node *np)
+{
+	struct device *dev = bus_find_device_by_of_node(&pci_bus_type, np);
+	bool driven;
+
+	if (!dev)
+		return false;
+	driven = mk_lease_driven(to_pci_dev(dev));
+	put_device(dev);
+	return driven;
+}
+
 /**
- * mk_of_pci_available - Whether a PCI function is this kernel's and not lent
+ * mk_of_pci_node_free - Whether a node's function is free to lend
+ * @np: A node of this kernel's tree
+ *
+ * Returns: true when the function is not lent and no driver of this
+ * kernel has it
  */
-bool mk_of_pci_available(u16 domain, u8 bus, u8 devfn)
+bool mk_of_pci_node_free(struct device_node *np)
+{
+	return of_device_is_available(np) && !mk_of_pci_driven(np);
+}
+
+/**
+ * mk_of_pci_free - Whether a PCI function is this kernel's and free to lend
+ * @domain: PCI domain
+ * @bus: PCI bus
+ * @devfn: PCI device and function
+ */
+bool mk_of_pci_free(u16 domain, u8 bus, u8 devfn)
 {
 	struct device_node *np = mk_of_pci_node(domain, bus, devfn);
-	bool available = np && of_device_is_available(np);
+	bool free = np && mk_of_pci_node_free(np);
 
 	of_node_put(np);
-	return available;
+	return free;
 }
 
 /**
@@ -157,7 +186,8 @@ static void mk_of_pci_describe(struct device_node *np, u16 domain, u8 bus,
  * @devfn: PCI device and function
  *
  * Returns: 0 on success, -ENOENT if the tree does not describe the device
- * or it is already lent, or a negative error code
+ * or it is already lent, -EBUSY if a driver of this kernel has it, or a
+ * negative error code
  */
 int mk_of_pci_lend(struct mk_instance *instance, u16 domain, u8 bus, u8 devfn)
 {
@@ -168,6 +198,10 @@ int mk_of_pci_lend(struct mk_instance *instance, u16 domain, u8 bus, u8 devfn)
 	if (!np || !of_device_is_available(np)) {
 		of_node_put(np);
 		return -ENOENT;
+	}
+	if (mk_of_pci_driven(np)) {
+		of_node_put(np);
+		return -EBUSY;
 	}
 
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);

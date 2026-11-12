@@ -747,8 +747,8 @@ static int mk_instance_transfer_pci_devices(struct mk_instance *instance,
 		list_for_each_entry(req_dev, requested_devices, list) {
 			u8 devfn = PCI_DEVFN(req_dev->slot, req_dev->func);
 
-			if (!mk_of_pci_available(req_dev->domain, req_dev->bus, devfn)) {
-				pr_err("PCI device %04x:%02x:%02x.%x is not this kernel's to lend\n",
+			if (!mk_of_pci_free(req_dev->domain, req_dev->bus, devfn)) {
+				pr_err("PCI device %04x:%02x:%02x.%x is not this kernel's to lend, or a driver has it\n",
 				       req_dev->domain, req_dev->bus, req_dev->slot,
 				       req_dev->func);
 				not_found++;
@@ -1078,7 +1078,7 @@ bool mk_root_has_pci_device(u16 domain, u8 bus, u8 devfn)
 	u8 func = PCI_FUNC(devfn);
 
 	if (mk_manifest_phys())
-		return mk_of_pci_available(domain, bus, devfn);
+		return mk_of_pci_free(domain, bus, devfn);
 
 	if (!mk_self || !mk_self->pci_devices_valid)
 		return false;

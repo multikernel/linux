@@ -75,12 +75,17 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size);
 /* of_devices.c: a spawn's devices are the nodes of its tree */
 #ifdef CONFIG_OF
 struct device_node *mk_of_pci_node(u16 domain, u8 bus, u8 devfn);
-bool mk_of_pci_available(u16 domain, u8 bus, u8 devfn);
+bool mk_of_pci_node_free(struct device_node *np);
+bool mk_of_pci_free(u16 domain, u8 bus, u8 devfn);
 int mk_of_pci_lend(struct mk_instance *instance, u16 domain, u8 bus, u8 devfn);
 void mk_of_pci_take_back(u16 domain, u8 bus, u8 devfn);
 void mk_of_pci_label(u16 domain, u8 bus, u8 devfn, char *label, size_t size);
 #else
-static inline bool mk_of_pci_available(u16 domain, u8 bus, u8 devfn)
+static inline bool mk_of_pci_node_free(struct device_node *np)
+{
+	return false;
+}
+static inline bool mk_of_pci_free(u16 domain, u8 bus, u8 devfn)
 {
 	return false;
 }
@@ -120,6 +125,7 @@ static inline int mk_dt_emit_pci_buses(void *fdt)
 /* lease.c */
 struct pci_dev;
 #ifdef CONFIG_PCI
+bool mk_lease_driven(struct pci_dev *pdev);
 int mk_lease_bind(struct pci_dev *pdev);
 int mk_lease_unbind(struct pci_dev *pdev);
 int mk_lease_grant(struct mk_instance *instance, struct pci_dev *pdev);
@@ -134,6 +140,10 @@ void mk_instance_unmap_devices(struct mk_instance *instance,
 /* pciback.c: config space of a leased function, served to its instance */
 int mk_pciback_lend(struct mk_instance *instance, struct pci_dev *pdev);
 #else
+static inline bool mk_lease_driven(struct pci_dev *pdev)
+{
+	return false;
+}
 static inline int mk_lease_bind(struct pci_dev *pdev)
 {
 	return 0;

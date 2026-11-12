@@ -52,6 +52,12 @@ static struct mk_lease *mk_lease_of(struct pci_dev *pdev)
 	return pci_get_drvdata(pdev);
 }
 
+/* Whether a driver of this kernel has the function, which it then cannot lend */
+bool mk_lease_driven(struct pci_dev *pdev)
+{
+	return pdev->dev.driver && !mk_lease_of(pdev);
+}
+
 static int mk_lease_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct mk_lease *lease;

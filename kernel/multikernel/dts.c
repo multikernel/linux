@@ -1269,7 +1269,7 @@ static int mk_dt_emit_of_node(void *fdt, struct device_node *np)
 	}
 
 	for_each_child_of_node(np, child) {
-		if (!of_device_is_available(child))
+		if (!mk_of_pci_node_free(child))
 			continue;
 		ret = mk_dt_emit_of_node(fdt, child);
 		if (ret) {
@@ -1284,7 +1284,8 @@ static int mk_dt_emit_of_node(void *fdt, struct device_node *np)
 /*
  * A spawn's devices are the nodes of its boot tree, with a lent device
  * marked reserved there, so the tree it serves is a projection of that
- * tree: its host bridges with the reserved devices left out.
+ * tree: its host bridges with only the devices free to lend, as a host
+ * serves its pool.
  */
 static int mk_dt_emit_own_devices(void *fdt)
 {
