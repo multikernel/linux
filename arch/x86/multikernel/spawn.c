@@ -1041,6 +1041,9 @@ struct mk_ident_pgtable {
 	int next_page;
 	unsigned long pgd_phys;
 	struct mk_instance *instance;
+	/* Pages carved from memory the owner frees as a whole */
+	void *arena;
+	int arena_pages;
 };
 
 void mk_free_identity_pgtable(struct mk_ident_pgtable *pgt);
@@ -1072,7 +1075,10 @@ static unsigned long *mk_alloc_pgtable_page(struct mk_ident_pgtable *pgt)
 	if (pgt->next_page >= MK_CTRL_PGTABLE_PAGES)
 		return NULL;
 
-	if (pgt->instance)
+	if (pgt->arena)
+		page = pgt->next_page < pgt->arena_pages ?
+		       pgt->arena + pgt->next_page * PAGE_SIZE : NULL;
+	else if (pgt->instance)
 		page = mk_instance_ctrl_alloc(pgt->instance, PAGE_SIZE, PAGE_SIZE);
 	else
 		page = mk_pool_ctrl_alloc(PAGE_SIZE);
@@ -1195,7 +1201,8 @@ int mk_ident_map_range(struct mk_ident_pgtable *pgt, unsigned long start,
 	return mk_build_ident_p4d(pgt, __va(pgt->pgd_phys), start, end);
 }
 
-struct mk_ident_pgtable *mk_build_identity_pgtable(struct mk_instance *instance)
+static struct mk_ident_pgtable *mk_build_pgtable(struct mk_instance *instance,
+						 void *arena, int arena_pages)
 {
 	struct mk_ident_pgtable *pgt;
 	unsigned long *pgd;
@@ -1205,6 +1212,8 @@ struct mk_ident_pgtable *mk_build_identity_pgtable(struct mk_instance *instance)
 		return ERR_PTR(-ENOMEM);
 
 	pgt->instance = instance;
+	pgt->arena = arena;
+	pgt->arena_pages = arena_pages;
 
 	pgd = mk_alloc_pgtable_page(pgt);
 	if (!pgd) {
@@ -1216,8 +1225,19 @@ struct mk_ident_pgtable *mk_build_identity_pgtable(struct mk_instance *instance)
 	return pgt;
 }
 
-static int mk_add_trampoline_mapping(struct mk_ident_pgtable *pgt,
-				     unsigned long virt, unsigned long phys)
+struct mk_ident_pgtable *mk_build_identity_pgtable(struct mk_instance *instance)
+{
+	return mk_build_pgtable(instance, NULL, 0);
+}
+
+/* A page table whose pages all come from @arena, freed by its owner */
+struct mk_ident_pgtable *mk_build_arena_pgtable(void *arena, int pages)
+{
+	return mk_build_pgtable(NULL, arena, pages);
+}
+
+int mk_add_trampoline_mapping(struct mk_ident_pgtable *pgt,
+			      unsigned long virt, unsigned long phys)
 {
 	unsigned long *pgd = __va(pgt->pgd_phys);
 	unsigned long pgd_idx, p4d_idx, pud_idx, pmd_idx;
@@ -1287,7 +1307,7 @@ static size_t mk_get_trampoline_size(void)
  * set it), so this is where their direct map always sits, regardless of
  * their CONFIG_RANDOMIZE_MEMORY setting.
  */
-static unsigned long mk_default_page_offset(void)
+unsigned long mk_default_page_offset(void)
 {
 	return pgtable_l5_enabled() ? __PAGE_OFFSET_BASE_L5 :
 				      __PAGE_OFFSET_BASE_L4;
@@ -1445,6 +1465,10 @@ static int __mk_pool_park_setup(void)
 	if (mk_pool_empty())
 		return -ENODEV;
 
+	rc = mk_park_table_create();
+	if (rc)
+		return rc;
+
 	pgt = mk_build_identity_pgtable(NULL);
 	if (IS_ERR(pgt))
 		return PTR_ERR(pgt);
@@ -1592,8 +1616,8 @@ static int mk_phys_addr_cmp(const void *a, const void *b)
  * @pairs: filled with base,size pairs
  * @max: capacity of @pairs in pairs
  *
- * The park page, the wake slot, and every pool page table page,
- * sorted and coalesced: the memory a fenced or parked CPU still
+ * The park table, the park page, the wake slot, and every pool page
+ * table page, sorted and coalesced: the memory a fenced or parked CPU still
  * executes and watches, which must never be handed to another
  * kernel's page allocator.
  *
@@ -1604,15 +1628,13 @@ int mk_pool_park_regions(u64 *pairs, int max)
 {
 	u64 page[MK_CTRL_PGTABLE_PAGES + 3];
 	unsigned int n = 0, i;
-	int out = 0;
-
-	if (!mk_pool)
-		return 0;
+	int out;
 
 	guard(mutex)(&mk_park_lock);
 
-	if (!mk_pool->arch.slot)
-		return 0;
+	out = mk_park_table_regions(pairs, max);
+	if (out < 0 || !mk_pool || !mk_pool->arch.slot)
+		return out;
 
 	page[n++] = mk_pool->arch.park_phys;
 	page[n++] = mk_pool->arch.slot_phys;
@@ -1660,7 +1682,8 @@ bool mk_pool_park_uses(phys_addr_t start, size_t size)
 	if (!mk_pool->arch.slot)
 		return false;
 
-	return mk_phys_in_range(mk_pool->arch.park_phys, start, size) ||
+	return mk_park_table_uses(start, size) ||
+	       mk_phys_in_range(mk_pool->arch.park_phys, start, size) ||
 	       mk_phys_in_range(mk_pool->arch.slot_phys, start, size) ||
 	       mk_ident_pgtable_in_range(mk_pool->arch.pgt, start, size);
 }
@@ -1687,7 +1710,7 @@ int mk_pool_park_teardown(void)
 	if (!mk_pool->arch.slot)
 		return 0;
 
-	if (!mk_pool_cpus_returned())
+	if (!mk_pool_cpus_returned() || mk_park_table_destroy())
 		return -EBUSY;
 
 	mk_pool_ctrl_free(mk_pool->arch.slot_phys,
@@ -1784,7 +1807,7 @@ void mk_free_identity_pgtable(struct mk_ident_pgtable *pgt)
 		if (!pgt->pages[i])
 			continue;
 		/* Instance page tables live in the control block */
-		if (!pgt->instance)
+		if (!pgt->instance && !pgt->arena)
 			mk_pool_ctrl_free(virt_to_phys(pgt->pages[i]), PAGE_SIZE);
 	}
 

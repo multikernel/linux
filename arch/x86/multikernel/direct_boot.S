@@ -473,6 +473,206 @@ SYM_CODE_START_LOCAL_NOALIGN(mk_park_nmi)
 	iretq
 SYM_CODE_END(mk_park_nmi)
 
+/*
+ * mk_cell_park - Wait in this CPU's park table cell
+ *
+ * Copied once into the park table's code page, which no kernel ever
+ * rewrites, and entered by any kernel through its direct map. Runs with
+ * interrupts disabled on the park table's page table, which maps the
+ * table and nothing else, so nothing of the kernel that parked us is in
+ * use once the cell reads PARKED.
+ *
+ * A command is claimed by swapping the cell word from (PARKED, cmd) to
+ * (RUNNING, NONE), after its arguments are in registers. The CPU then
+ * switches to the waker's identity page table, which maps this page
+ * too, and jumps to the waker's trampoline.
+ *
+ * Args: %rdi=park_cr3, %rsi=cell_phys, %rdx=code_phys, %rcx=mwait_usable
+ */
+	.balign 16
+	.globl mk_cell_park_start
+mk_cell_park_start:
+SYM_CODE_START_NOALIGN(mk_cell_park)
+	UNWIND_HINT_END_OF_STACK
+	ENDBR
+
+	cli
+
+	movq	%rsi, %r12		/* cell */
+	movq	%rdx, %rbx		/* code page */
+	movq	%rcx, %r15		/* MWAIT usable */
+
+	movq	%cr4, %rax
+	andq	$~X86_CR4_PGE, %rax
+	movq	%rax, %cr4
+
+	movq	%rdi, %cr3
+	movq	%cr3, %rax
+	movq	%rax, %cr3
+
+	leaq	mk_cell_park_identity - mk_cell_park(%rbx), %rax
+	ANNOTATE_RETPOLINE_SAFE
+	jmp	*%rax
+SYM_CODE_END(mk_cell_park)
+
+/* Registers: R12=cell, RBX=code page, R15=mwait_usable, all identity */
+SYM_CODE_START_LOCAL_NOALIGN(mk_cell_park_identity)
+	UNWIND_HINT_END_OF_STACK
+	ENDBR
+
+	/*
+	 * The descriptor tables of the kernel that parked us are not
+	 * mapped here. Use the cell's own, so that a stray fault stops
+	 * this CPU and an NMI returns to the wait loop.
+	 */
+	leaq	PAGE_SIZE - 64(%r12), %rsp
+
+	leaq	MK_CELL_gdt_entries(%r12), %rdi
+	movq	$0, (%rdi)
+	movq	$0, 8(%rdi)
+	movabsq	$0x00af9b000000ffff, %rax	/* __KERNEL_CS, accessed */
+	movq	%rax, 16(%rdi)
+	movabsq	$0x00cf93000000ffff, %rax	/* __KERNEL_DS, accessed */
+	movq	%rax, 24(%rdi)
+	leaq	MK_CELL_gdt(%r12), %rdx
+	movw	$(4 * 8 - 1), (%rdx)
+	movq	%rdi, 2(%rdx)
+	lgdt	(%rdx)
+
+	leaq	mk_cell_park_fault - mk_cell_park(%rbx), %rax
+	leaq	MK_CELL_idt_entries(%r12), %rdi
+	movl	$32, %ecx
+1:	movw	%ax, (%rdi)		/* offset 15:0 */
+	movw	$__KERNEL_CS, 2(%rdi)
+	movb	$0, 4(%rdi)		/* no IST */
+	movb	$0x8e, 5(%rdi)		/* present, DPL0, interrupt gate */
+	movq	%rax, %rdx
+	shrq	$16, %rdx
+	movw	%dx, 6(%rdi)		/* offset 31:16 */
+	shrq	$16, %rdx
+	movl	%edx, 8(%rdi)		/* offset 63:32 */
+	movl	$0, 12(%rdi)
+	addq	$16, %rdi
+	decl	%ecx
+	jnz	1b
+
+	leaq	mk_cell_park_nmi - mk_cell_park(%rbx), %rax
+	leaq	MK_CELL_idt_entries + 2 * 16(%r12), %rdi
+	movw	%ax, (%rdi)
+	movq	%rax, %rdx
+	shrq	$16, %rdx
+	movw	%dx, 6(%rdi)
+	shrq	$16, %rdx
+	movl	%edx, 8(%rdi)
+
+	leaq	MK_CELL_idt_entries(%r12), %rax
+	leaq	MK_CELL_idt(%r12), %rdx
+	movw	$(32 * 16 - 1), (%rdx)
+	movq	%rax, 2(%rdx)
+	lidt	(%rdx)
+
+	movq	$MK_PARK_PARKED, MK_CELL_word(%r12)
+
+.Lcell_wait:
+	movl	MK_CELL_cmd(%r12), %eax
+	testl	%eax, %eax
+	jnz	.Lcell_pending
+
+	testq	%r15, %r15
+	jz	.Lcell_relax
+
+	leaq	MK_CELL_word(%r12), %rax
+	xorl	%ecx, %ecx
+	xorl	%edx, %edx
+	monitor
+	movl	MK_CELL_cmd(%r12), %eax
+	testl	%eax, %eax
+	jnz	.Lcell_pending
+	xorl	%eax, %eax
+	xorl	%ecx, %ecx
+	mwait
+	jmp	.Lcell_wait
+
+.Lcell_relax:
+	pause
+	jmp	.Lcell_wait
+
+.Lcell_pending:
+	cmpl	$MK_PARK_CMD_BOOT, %eax
+	je	.Lcell_boot
+	cmpl	$MK_PARK_CMD_SECONDARY, %eax
+	je	.Lcell_secondary
+	jmp	.Lcell_relax
+
+.Lcell_boot:
+	/*
+	 * multikernel_relocate_kernel(identity_cr3, boot_params, entry,
+	 *                             trampoline_phys)
+	 */
+	movq	MK_CELL_arg + 0 * 8(%r12), %rdi
+	movq	MK_CELL_arg + 1 * 8(%r12), %rsi
+	movq	MK_CELL_arg + 2 * 8(%r12), %rdx
+	movq	MK_CELL_arg + 3 * 8(%r12), %rcx
+	movq	%rcx, %r11
+	movabsq	$((MK_PARK_CMD_BOOT << 32) | MK_PARK_PARKED), %rax
+	jmp	.Lcell_claim
+
+.Lcell_secondary:
+	/*
+	 * mk_secondary_trampoline(identity_cr3, entry, gs_base, stack,
+	 *                         trampoline_phys, spawn_cr3)
+	 */
+	movq	MK_CELL_arg + 0 * 8(%r12), %rdi
+	movq	MK_CELL_arg + 1 * 8(%r12), %rsi
+	movq	MK_CELL_arg + 2 * 8(%r12), %rdx
+	movq	MK_CELL_arg + 3 * 8(%r12), %rcx
+	movq	MK_CELL_arg + 4 * 8(%r12), %r8
+	movq	MK_CELL_arg + 5 * 8(%r12), %r9
+	movq	%r8, %r11
+	movabsq	$((MK_PARK_CMD_SECONDARY << 32) | MK_PARK_PARKED), %rax
+
+.Lcell_claim:
+	/* (PARKED, cmd) -> (RUNNING, NONE); a waker that revoked first wins */
+	xorl	%r10d, %r10d
+	lock cmpxchgq %r10, MK_CELL_word(%r12)
+	jnz	.Lcell_wait
+
+	movq	%rdi, %cr3
+	ANNOTATE_RETPOLINE_SAFE
+	jmp	*%r11
+SYM_CODE_END(mk_cell_park_identity)
+
+/* A stray fault while parked stops this CPU; tell COM1, as mk_park_fault does */
+SYM_CODE_START_LOCAL_NOALIGN(mk_cell_park_fault)
+	UNWIND_HINT_END_OF_STACK
+	ENDBR
+	cli
+
+	leaq	mk_cell_park_msg - mk_cell_park(%rbx), %rsi
+1:	lodsb
+	testb	%al, %al
+	jz	3f
+	movb	%al, %ah
+	movw	$0x3fd, %dx		/* COM1 line status */
+2:	inb	%dx, %al
+	testb	$0x20, %al		/* transmit holding register empty */
+	jz	2b
+	movw	$0x3f8, %dx
+	movb	%ah, %al
+	outb	%al, %dx
+	jmp	1b
+
+3:	hlt
+	jmp	3b
+SYM_CODE_END(mk_cell_park_fault)
+
+/* An NMI, such as a force halt aimed at a CPU already parked, resumes the wait */
+SYM_CODE_START_LOCAL_NOALIGN(mk_cell_park_nmi)
+	UNWIND_HINT_END_OF_STACK
+	ENDBR
+	iretq
+SYM_CODE_END(mk_cell_park_nmi)
+
 
 
 	.section .data..multikernel_relocate, "a"
@@ -526,6 +726,12 @@ mk_park_idt_entries:
 
 	.globl mk_pool_park_end
 mk_pool_park_end:
+
+mk_cell_park_msg:
+	.asciz	"\r\nmultikernel: fault while parked, CPU halted\r\n"
+
+	.globl mk_cell_park_end
+mk_cell_park_end:
 
 	.globl multikernel_relocate_kernel_end
 multikernel_relocate_kernel_end:

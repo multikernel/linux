@@ -65,6 +65,13 @@ static void __used common(void)
 	OFFSET(MK_CTX_flags, mk_spawn_context, flags);
 	OFFSET(MK_CTX_ready, mk_spawn_context, ready);
 	OFFSET(MK_CTX_bp, mk_spawn_context, bp);
+	OFFSET(MK_CELL_word, mk_park_cell, word);
+	OFFSET(MK_CELL_cmd, mk_park_cell, cmd);
+	OFFSET(MK_CELL_arg, mk_park_cell, arg);
+	OFFSET(MK_CELL_gdt, mk_park_cell, gdt);
+	OFFSET(MK_CELL_gdt_entries, mk_park_cell, gdt_entries);
+	OFFSET(MK_CELL_idt, mk_park_cell, idt);
+	OFFSET(MK_CELL_idt_entries, mk_park_cell, idt_entries);
 #endif
 
 	BLANK();

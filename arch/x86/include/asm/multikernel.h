@@ -8,6 +8,20 @@
 #define MK_SPAWN_F_SECONDARY	BIT(0)	/* Secondary CPU joining existing kernel */
 #define MK_SPAWN_F_REPARK	BIT(1)	/* Move the CPU to another park slot */
 
+/* Park cell state, written only by the CPU the cell belongs to */
+#define MK_PARK_RUNNING		0
+#define MK_PARK_PARKED		1
+
+/* Park cell commands */
+#define MK_PARK_CMD_NONE	0
+#define MK_PARK_CMD_BOOT	1	/* boot a kernel, see mk_cell_park */
+#define MK_PARK_CMD_SECONDARY	2	/* join a running kernel, see mk_cell_park */
+#define MK_PARK_CMD_MOVE	3	/* reserved: move to a new park code page */
+
+#define MK_PARK_MAGIC		0x4b504b4d	/* "MKPK" */
+#define MK_PARK_VERSION		1
+#define MK_PARK_PGTABLE_PAGES	16
+
 #ifndef __ASSEMBLY__
 
 #include <linux/build_bug.h>
@@ -141,6 +155,78 @@ static_assert(offsetof(struct mk_spawn_context, bp) == 144);
 static_assert(offsetof(struct mk_spawn_context, boot_lps) ==
 	      144 + sizeof(struct boot_params));
 static_assert(sizeof(struct mk_spawn_context) == 2 * PAGE_SIZE);
+
+/*
+ * The park table: where every CPU of the machine waits while no kernel
+ * runs on it, one cell per CPU. The first kernel on the machine builds
+ * it and every later kernel inherits it, so a CPU parks in the same
+ * cell whichever kernel parked it and whichever one wakes it. Its
+ * layout is a cross-kernel ABI, versioned in the header.
+ *
+ * One contiguous range: this header with the APIC ID of each cell's
+ * CPU, the park code page, the cells, then the page table parked CPUs
+ * run on, which maps the table and nothing else.
+ */
+struct mk_park_table {
+	u32 magic;
+	u32 version;
+	u32 nr_cells;
+	u32 reserved;
+	u64 size;
+	u64 code_phys;
+	u64 park_cr3;
+	u64 cells_phys;
+	u32 apic_id[];
+};
+
+/*
+ * A CPU's cell. state and cmd form one word, so that claiming a command
+ * and leaving the park loop is a single atomic step, as is publishing
+ * one only to a CPU that is parked. The rest of the page is the CPU's
+ * own descriptor tables and fault stack while parked.
+ */
+struct mk_park_cell {
+	union {
+		struct {
+			u32 state;
+			u32 cmd;
+		};
+		u64 word;
+	};
+	u64 arg[6];
+	u64 reserved;
+	u8 gdt[16];
+	u64 gdt_entries[4];
+	u8 idt[16];
+	u8 idt_entries[32 * 16];
+} __aligned(PAGE_SIZE);
+
+static_assert(offsetof(struct mk_park_cell, gdt) == 64);
+static_assert(sizeof(struct mk_park_cell) == PAGE_SIZE);
+
+/* Cell park loop, copied once into the park table's code page */
+extern char mk_cell_park_start[];
+extern char mk_cell_park_end[];
+
+struct mk_ident_pgtable;
+
+int mk_park_table_create(void);
+int mk_park_table_destroy(void);
+void mk_park_table_set_boot(phys_addr_t phys);
+phys_addr_t mk_park_table_phys(void);
+bool mk_park_table_uses(phys_addr_t start, size_t size);
+int mk_park_table_regions(u64 *pairs, int max);
+phys_addr_t mk_park_code_phys(void);
+int mk_park_dispatch(u32 apic_id, u32 cmd, const u64 *args, unsigned int nargs);
+int mk_park_wait(u32 apic_id);
+void mk_park_this_cpu(void);
+bool mk_park_ready(void);
+
+/* Page table helpers the park table shares with spawn */
+struct mk_ident_pgtable *mk_build_arena_pgtable(void *arena, int pages);
+int mk_add_trampoline_mapping(struct mk_ident_pgtable *pgt,
+			      unsigned long virt, unsigned long phys);
+unsigned long mk_default_page_offset(void);
 
 /* Pool park loop code, copied by the host into per-instance park pages */
 extern char mk_pool_park_start[];
