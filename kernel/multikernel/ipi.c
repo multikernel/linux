@@ -354,7 +354,7 @@ advance_tail:
 static void multikernel_interrupt_handler(void)
 {
 	struct mk_shared_data *ipi_data;
-	struct mk_instance *child;
+	struct mk_instance *child, *host;
 	unsigned long flags;
 
 	if (!mk_self)
@@ -378,8 +378,9 @@ static void multikernel_interrupt_handler(void)
 	 */
 	raw_spin_lock_irqsave(&mk_drain_lock, flags);
 	this_cpu_write(mk_draining, true);
-	if (mk_self->ipi_data && host_instance)
-		mk_ipi_drain_ring(&mk_self->ipi_data->to_child, host_instance);
+	host = READ_ONCE(host_instance);
+	if (mk_self->ipi_data && host)
+		mk_ipi_drain_ring(&mk_self->ipi_data->to_child, host);
 	list_for_each_entry(child, &mk_ipi_rx_list, ipi_rx_node) {
 		ipi_data = READ_ONCE(child->ipi_data);
 		if (ipi_data)

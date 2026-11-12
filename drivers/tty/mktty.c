@@ -377,10 +377,11 @@ static ssize_t mktty_spawn_write(struct tty_struct *tty, const u8 *buf,
 				 size_t count)
 {
 	struct mktty_message *msg;
+	struct mk_instance *host = READ_ONCE(host_instance);
 	size_t sent = 0, chunk;
 	int ret;
 
-	if (tty->index != 0 || !host_instance)
+	if (tty->index != 0 || !host)
 		return -ENODEV;
 
 	msg = kmalloc(sizeof(*msg), GFP_KERNEL);
@@ -395,7 +396,7 @@ static ssize_t mktty_spawn_write(struct tty_struct *tty, const u8 *buf,
 		msg->reserved = 0;
 		memcpy(msg->data, buf + sent, chunk);
 
-		ret = mk_ipi_send(host_instance, msg,
+		ret = mk_ipi_send(host, msg,
 				  sizeof(*msg) - MKTTY_MAX_DATA + chunk,
 				  MKTTY_IPI_TYPE);
 		if (ret < 0) {
@@ -449,10 +450,11 @@ static DEFINE_SPINLOCK(mktty_console_lock);
 static void mktty_spawn_console_write(struct console *con, const char *s,
 				      unsigned int count)
 {
+	struct mk_instance *host = READ_ONCE(host_instance);
 	unsigned long flags;
 	size_t chunk;
 
-	if (!host_instance)
+	if (!host)
 		return;
 
 	spin_lock_irqsave(&mktty_console_lock, flags);
@@ -464,7 +466,7 @@ static void mktty_spawn_console_write(struct console *con, const char *s,
 		mktty_console_msg.reserved = 0;
 		memcpy(mktty_console_msg.data, s, chunk);
 
-		mk_ipi_send(host_instance, &mktty_console_msg,
+		mk_ipi_send(host, &mktty_console_msg,
 			    sizeof(mktty_console_msg) - MKTTY_MAX_DATA + chunk,
 			    MKTTY_IPI_TYPE);
 		s += chunk;
@@ -586,15 +588,21 @@ static void mktty_spawn_cleanup(void)
  * =============================================================================
  */
 
-/* By role, not by ID: a spawn that took over from its host has ID 0 */
+/*
+ * By role, not by ID: a spawn that took over from its host has ID 0.
+ * Taking over clears host_instance, so the role is the one at init.
+ */
+static bool mktty_is_spawn;
+
 static int __init mktty_init(void)
 {
-	return host_instance ? mktty_spawn_init() : mktty_host_init();
+	mktty_is_spawn = host_instance;
+	return mktty_is_spawn ? mktty_spawn_init() : mktty_host_init();
 }
 
 static void __exit mktty_exit(void)
 {
-	if (host_instance)
+	if (mktty_is_spawn)
 		mktty_spawn_cleanup();
 	else
 		mktty_host_cleanup();

@@ -92,10 +92,13 @@ static int mk_pcifront_ask(struct mk_pcifront_bus *fb, unsigned int devfn,
 		.size = size,
 		.val = *val,
 	};
+	struct mk_instance *host = READ_ONCE(host_instance);
 	struct mk_pci_cfg_payload ack;
 	int ret;
 
-	ret = mk_request_sync(host_instance, MK_MSG_PCI, subtype, req.seq,
+	if (!host)
+		return -ENODEV;
+	ret = mk_request_sync(host, MK_MSG_PCI, subtype, req.seq,
 			      &req, sizeof(req), &ack, sizeof(ack));
 	if (ret)
 		return ret;
@@ -583,7 +586,7 @@ int mk_pcifront_add_function(u16 domain, u8 bus, u8 devfn, u16 vendor,
 	bool new_bus;
 	int ret = 0;
 
-	if (!mk_manifest_phys() || !host_instance)
+	if (!mk_manifest_phys())
 		return -ENODEV;
 
 	mutex_lock(&mk_pcifront_mutex);

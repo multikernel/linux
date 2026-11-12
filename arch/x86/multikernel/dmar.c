@@ -350,14 +350,16 @@ static int mk_irte_write(u64 unit, u32 index, u32 mask, u64 low, u64 high)
 		.sender_instance_id = mk_self->id,
 	};
 	struct mk_irte_payload ack;
+	struct mk_instance *host;
 	int ret;
 
 	/* The entry is in this kernel's table, live once it claims the unit */
 	if (mk_host_fenced())
 		return 0;
-	if (!host_instance)
+	host = READ_ONCE(host_instance);
+	if (!host)
 		return -ENODEV;
-	ret = mk_request_sync(host_instance, MK_MSG_IO, MK_IO_IRTE_WRITE, req.seq,
+	ret = mk_request_sync(host, MK_MSG_IO, MK_IO_IRTE_WRITE, req.seq,
 			      &req, sizeof(req), &ack, sizeof(ack));
 	return ret ? ret : ack.result;
 }

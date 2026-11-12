@@ -1639,14 +1639,15 @@ struct mk_shutdown_work {
  */
 static void __noreturn mk_notify_down_and_park(u32 subtype)
 {
+	struct mk_instance *host = READ_ONCE(host_instance);
 	struct mk_resource_ack ack;
 
 	ack.operation = MK_SYS_SHUTDOWN;
 	ack.result = 0;
 	ack.resource_id = mk_self->id;
 
-	if (host_instance)
-		mk_send_message_to(host_instance, MK_MSG_SYSTEM, subtype, &ack,
+	if (host)
+		mk_send_message_to(host, MK_MSG_SYSTEM, subtype, &ack,
 				   sizeof(ack));
 
 	pr_info("Multikernel instance %d shutting down\n", mk_self->id);
@@ -1974,8 +1975,9 @@ static int mk_fence_host(struct mk_instance *instance,
 /*
  * A fenced host is gone for good, which leaves this kernel the root of
  * the machine. It takes ID 0, as a host booted there has it, and the
- * host leaves the instance namespace. host_instance keeps the record:
- * the host's CPUs stay parked on its slot until woken into this kernel.
+ * host leaves the instance namespace and host_instance. The record
+ * itself is never freed: a reader that loaded host_instance just before
+ * may still send to it, which the silent host then never answers.
  */
 static void mk_promote(struct mk_instance *host)
 {
@@ -1995,6 +1997,7 @@ static void mk_promote(struct mk_instance *host)
 	self_kn = mk_self->kn;
 	mk_self->kn = NULL;
 	WRITE_ONCE(mk_host_is_fenced, true);
+	WRITE_ONCE(host_instance, NULL);
 	mutex_unlock(&mk_instance_mutex);
 
 	mk_instance_remove_dir(host, host_kn);

@@ -342,10 +342,12 @@ static int mk_msi_request(struct mk_io_msi_payload *req,
 			  bool (*wait)(struct mk_msi_request *r))
 {
 	struct mk_msi_request r;
+	struct mk_instance *host;
 	int ret;
 
 	/* A fenced host never answers */
-	if (!host_instance || mk_host_fenced())
+	host = READ_ONCE(host_instance);
+	if (!host || mk_host_fenced())
 		return -ENODEV;
 	req->sender_instance_id = mk_self->id;
 	r.msg = *req;
@@ -354,7 +356,7 @@ static int mk_msi_request(struct mk_io_msi_payload *req,
 	scoped_guard(raw_spinlock_irqsave, &mk_msi_requests_lock)
 		list_add(&r.list, &mk_msi_requests);
 
-	ret = mk_send_message_to(host_instance, MK_MSG_IO, req->request, req,
+	ret = mk_send_message_to(host, MK_MSG_IO, req->request, req,
 				 sizeof(*req));
 	if (!ret && !wait(&r))
 		ret = -ETIMEDOUT;
