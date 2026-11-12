@@ -73,19 +73,6 @@
 /* Set in spawn kernels: the context this kernel booted from */
 static struct mk_spawn_context *mk_boot_context;
 
-/*
- * This kernel's own context: where its CPUs park and wake. A spawn's
- * is the boot context its parent gave it; a kernel with no parent has
- * the pool slot it builds at baseline time. NULL only on a host with
- * no pool yet.
- */
-static struct mk_spawn_context *mk_own_context(void)
-{
-	if (mk_boot_context)
-		return mk_boot_context;
-	return mk_pool ? mk_pool->arch.slot : NULL;
-}
-
 extern char multikernel_relocate_kernel_start[];
 extern char multikernel_relocate_kernel_end[];
 extern char mk_secondary_trampoline[];
@@ -142,66 +129,22 @@ void mk_set_spawn_context(struct mk_spawn_context *ctx,
 			  unsigned long kernel_entry,
 			  unsigned long trampoline_virt,
 			  unsigned long trampoline_phys,
-			  unsigned long park_phys)
+			  unsigned long park_table)
 {
 	ctx->identity_cr3 = identity_cr3;
 	ctx->kernel_entry = kernel_entry;
 	ctx->trampoline_virt = trampoline_virt;
 	ctx->trampoline_phys = trampoline_phys;
-	/*
-	 * Where the instance's CPUs wait after it shuts down. The park page
-	 * and the host's pool-wide page table survive re-loads of this
-	 * instance, unlike the kernel image the CPUs came from. The pool
-	 * page table (rather than the instance's own) is used so a re-park
-	 * can move a CPU between any two park pages in the pool.
-	 */
-	ctx->park_phys = park_phys;
-	ctx->park_cr3 = mk_pool->arch.cr3;
+	/* Where the instance's kernel parks its CPUs and finds them */
+	ctx->park_table = park_table;
 	ctx->gs_base = 0;
 	ctx->stack = 0;
 	ctx->flags = 0;
 	ctx->ready = 0;
 }
 
-/*
- * Publish a wakeup in @slot for the CPU with @apic_id and wait for the
- * parked CPU to claim it. The dispatch fields must be set before the
- * call; parked CPUs stage them in registers before claiming, so once the
- * claim is observed the slot may be reused. On timeout the publication
- * is revoked; if the CPU claims concurrently, the wakeup proceeds.
- */
-static int mk_slot_wake(struct mk_spawn_context *slot, u32 apic_id,
-			const char *what)
-{
-	phys_addr_t slot_phys = virt_to_phys(slot);
-	u32 ready;
-	int ret;
-
-	slot->target_apic_id = apic_id;
-	/* Ensure the publication is visible before setting ready */
-	smp_wmb();
-	WRITE_ONCE(slot->ready, 1);
-
-	ret = read_poll_timeout(READ_ONCE, ready, !ready, 100, USEC_PER_SEC,
-				false, slot->ready);
-	if (ret) {
-		if (cmpxchg(&slot->ready, 1, 0) == 1)
-			pr_err("mk_spawn: %s: CPU (APIC %u) did not claim wakeup on slot %pa - CPU is not parked there\n",
-			       what, apic_id, &slot_phys);
-		else
-			ret = 0;
-	}
-
-	return ret;
-}
-
-/*
- * Point the instance's secondary CPUs, currently watching the host slot,
- * at the instance's own context, so the spawn kernel can wake them by
- * writing memory inside its own partition.
- */
-/* The instance's set of CPUs parked on its own context, allocated on demand */
-static struct mk_cpu_set *mk_slot_set(struct mk_instance *instance)
+/* The CPUs started for an instance and not seen parked since */
+static struct mk_cpu_set *mk_started_set(struct mk_instance *instance)
 {
 	if (!instance->cpus_on_slot)
 		instance->cpus_on_slot = mk_cpu_set_alloc();
@@ -210,114 +153,42 @@ static struct mk_cpu_set *mk_slot_set(struct mk_instance *instance)
 }
 
 /*
- * Publish a repark in @from, dispatching the CPU with @apic_id to the
- * park area described by @park_phys/@park_cr3, watching @slot_phys there.
+ * Boot the instance on @cpu, which waits in its park cell like every
+ * CPU the instance owns. The instance's kernel starts the others from
+ * their cells without telling the host, so all of them count as started
+ * from here on and have to be seen parked before the image is reused.
  */
-static int mk_publish_repark(struct mk_spawn_context *from, u32 apic_id,
-			     unsigned long park_phys, unsigned long park_cr3,
-			     unsigned long slot_phys, const char *what)
+int mk_spawn_cpu(struct mk_instance *instance, int cpu,
+		 struct mk_spawn_context *ctx)
 {
-	lockdep_assert_held(&mk_park_lock);
-
-	from->repark_park_phys = park_phys;
-	from->repark_park_cr3 = park_cr3;
-	from->repark_slot_phys = slot_phys;
-	from->flags = MK_SPAWN_F_REPARK;
-	return mk_slot_wake(from, apic_id, what);
-}
-
-static int mk_repark_to_instance(struct mk_instance *instance,
-				 struct mk_spawn_context *ctx, u32 boot_apic_id)
-{
-	struct mk_spawn_context *slot = mk_pool ? mk_pool->arch.slot : NULL;
-	struct mk_cpu_set *on_slot = mk_slot_set(instance);
+	struct mk_cpu_set *started = mk_started_set(instance);
+	u32 apic_id = per_cpu(x86_cpu_to_apicid, cpu);
+	const u64 args[] = {
+		ctx->identity_cr3,
+		virt_to_phys(&ctx->bp),
+		ctx->kernel_entry,
+		ctx->trampoline_phys,
+	};
 	mk_phys_cpu_t phys_cpu;
 	unsigned int i;
 	int ret;
 
-	if (!on_slot)
+	/* Make the adds below infallible before anything runs */
+	if (!started)
 		return -ENOMEM;
-
-	/*
-	 * Guarantee the tracking add after each successful wake cannot
-	 * fail: a CPU that moved but was not recorded would be woken
-	 * through the wrong mailbox forever after.
-	 */
-	ret = mk_cpu_set_reserve(on_slot, mk_cpu_set_count(instance->cpus));
+	ret = mk_cpu_set_reserve(started, mk_cpu_set_count(instance->cpus));
 	if (ret)
 		return ret;
-
-	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
-		if ((u32)phys_cpu == boot_apic_id)
-			continue;
-
-		/*
-		 * Skip CPUs already watching this context; the rest are on
-		 * the host slot, either because the instance has never run
-		 * or because they were assigned to it while it was stopped.
-		 */
-		if (mk_cpu_set_contains(on_slot, phys_cpu))
-			continue;
-
-		ret = mk_publish_repark(slot, (u32)phys_cpu, ctx->park_phys,
-					ctx->park_cr3, virt_to_phys(ctx),
-					"repark to instance");
-		if (ret)
-			return ret;
-
-		mk_cpu_set_add(on_slot, phys_cpu);
-	}
-
-	return 0;
-}
-
-int mk_spawn_cpu(struct mk_instance *instance, int cpu,
-		 struct mk_spawn_context *ctx)
-{
-	u32 apic_id = per_cpu(x86_cpu_to_apicid, cpu);
-	struct mk_spawn_context *slot = mk_pool ? mk_pool->arch.slot : NULL;
-	int ret;
-
-	if (!slot) {
-		pr_err("mk_spawn: pool park area not initialized\n");
-		return -ENODEV;
-	}
 
 	guard(mutex)(&mk_park_lock);
 
-	/*
-	 * Move every secondary still parked on the host slot onto the
-	 * instance context, where this instance's kernel wakes them. A
-	 * re-spawn can need this too: CPUs assigned while the instance was
-	 * stopped are on the host slot even though the ones it already ran
-	 * on are not.
-	 */
-	ret = mk_repark_to_instance(instance, ctx, apic_id);
+	ret = mk_park_dispatch(apic_id, MK_PARK_CMD_BOOT, args, ARRAY_SIZE(args));
 	if (ret)
 		return ret;
 
-	if (mk_cpu_set_contains(instance->cpus_on_slot, apic_id)) {
-		/* The boot CPU parked on this context when the instance halted */
-		ctx->flags = 0;
-		return mk_slot_wake(ctx, apic_id, "re-spawn boot cpu");
-	}
-
-	slot->identity_cr3 = ctx->identity_cr3;
-	slot->kernel_entry = ctx->kernel_entry;
-	slot->trampoline_phys = ctx->trampoline_phys;
-	slot->self_phys = virt_to_phys(ctx);
-	slot->flags = 0;
-	ret = mk_slot_wake(slot, apic_id, "first spawn boot cpu");
-	if (!ret) {
-		/*
-		 * It is running the instance's kernel now, and will park on
-		 * that kernel's context when the instance halts. The add
-		 * cannot fail: mk_repark_to_instance() reserved room for
-		 * every CPU of the instance.
-		 */
-		mk_cpu_set_add(instance->cpus_on_slot, apic_id);
-	}
-	return ret;
+	mk_cpu_set_for_each(i, phys_cpu, instance->cpus)
+		mk_cpu_set_add(started, phys_cpu);
+	return 0;
 }
 
 /**
@@ -326,25 +197,27 @@ int mk_spawn_cpu(struct mk_instance *instance, int cpu,
  * @instance: Instance being spawned
  * @cpu: Logical CPU, currently parked in the pool, to boot the instance on
  *
- * Builds or reuses the identity page tables, trampoline, park page and
- * spawn context, stamps in the boot parameters the loader prepared, and
+ * Builds or reuses the identity page tables, trampoline and spawn
+ * context, stamps in the boot parameters the loader prepared, and
  * releases the parked CPU into the trampoline.
  *
  * Each resource is stored in the instance as soon as it is built and is
  * never unwound, even when the spawn itself fails: all of them are carved
  * from the instance's control block, which only ever grows, and a partial
- * spawn may already have reparked CPUs onto the new park page, so tearing
- * it down would free memory a CPU is executing. A retry picks up exactly
+ * spawn may already have released its boot CPU into the trampoline, so
+ * tearing it down would free memory a CPU is executing. A retry picks up exactly
  * where this attempt stopped; everything is returned to the pool together
  * when the instance's memory is torn down.
  */
 int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 			   int cpu)
 {
+	phys_addr_t code_phys = mk_park_code_phys();
 	struct boot_params *src_bp;
-	unsigned long park_phys;
-	void *park_va;
 	int ret;
+
+	if (!code_phys)
+		return -ENODEV;
 
 	if (!instance->arch.ident_pgt) {
 		struct mk_ident_pgtable *pgt;
@@ -393,16 +266,13 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 	       multikernel_relocate_kernel_end - multikernel_relocate_kernel_start);
 
 	/*
-	 * Unconditional: the page itself survives a re-spawn, but the host
-	 * park table it must be mapped in may have been rebuilt since.
+	 * The boot CPU leaves its park cell on this page table, so it must
+	 * map the park code. Every exec, as the table may have been rebuilt.
 	 */
-	park_va = mk_setup_park_page(instance, &park_phys);
-	if (IS_ERR(park_va)) {
-		pr_err("Failed to set up pool park page: %ld\n",
-		       PTR_ERR(park_va));
-		return PTR_ERR(park_va);
-	}
-	instance->arch.park_va = park_va;
+	ret = mk_add_trampoline_mapping(instance->arch.ident_pgt, code_phys,
+					code_phys);
+	if (ret)
+		return ret;
 
 	if (!instance->arch.spawn_ctx) {
 		struct mk_spawn_context *ctx;
@@ -446,7 +316,7 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 			     image->arch.mk_kernel_entry,
 			     (unsigned long)instance->arch.trampoline_va,
 			     virt_to_phys(instance->arch.trampoline_va),
-			     park_phys);
+			     mk_park_table_phys());
 	instance->arch.spawn_ctx->boot_lps = cpu_data(cpu).loops_per_jiffy;
 	if (!instance->arch.spawn_ctx->boot_lps)
 		instance->arch.spawn_ctx->boot_lps = loops_per_jiffy;
@@ -463,14 +333,13 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
  * mk_arch_release_instance - Free an instance's spawn resources
  * @instance: Instance being torn down
  *
- * Returns parked CPUs to the host slot and frees the identity page
- * tables. The trampoline, park page and spawn context are carved from
- * the instance's control block, which the caller returns to the pool as
- * one allocation; only the pointers are cleared here.
+ * Waits for every CPU the instance started to park, then frees the
+ * identity page tables. The trampoline and spawn context are carved
+ * from the instance's control block, which the caller returns to the
+ * pool as one allocation; only the pointers are cleared here.
  *
- * Fails without releasing anything if a CPU could not be moved off the
- * instance's context: that CPU still executes the park page and watches
- * the context, so the caller must keep the instance's memory alive.
+ * Fails without releasing anything if a CPU never parked: it may still
+ * run the instance's kernel, so the caller must keep its memory alive.
  */
 int mk_arch_release_instance(struct mk_instance *instance)
 {
@@ -481,7 +350,7 @@ int mk_arch_release_instance(struct mk_instance *instance)
 		char buf[256];
 
 		mk_cpu_set_format(buf, sizeof(buf), instance->cpus_on_slot);
-		pr_err("Instance %d (%s): CPUs %s still watch its park area, keeping spawn resources\n",
+		pr_err("Instance %d (%s): CPUs %s never parked, keeping spawn resources\n",
 		       instance->id, instance->name, buf);
 		return ret;
 	}
@@ -492,191 +361,86 @@ int mk_arch_release_instance(struct mk_instance *instance)
 	mk_free_identity_pgtable(instance->arch.ident_pgt);
 	instance->arch.ident_pgt = NULL;
 	instance->arch.trampoline_va = NULL;
-	instance->arch.park_va = NULL;
 	instance->arch.spawn_ctx = NULL;
 	instance->arch.spawn_ctx_phys = 0;
 	return 0;
 }
 
 /**
- * mk_repark_cpu_to_instance - Point one parked pool CPU at an instance
+ * mk_repark_cpu_to_instance - Hand one parked pool CPU to a live instance
  * @instance: Running instance the CPU is being hot-added to
- * @phys_cpu: Physical (APIC) ID of the parked CPU
+ * @phys_cpu: Physical (APIC) ID of the CPU
  *
- * A hot-added CPU is parked on the host slot, but the spawn kernel wakes
- * secondaries by publishing into its own context, so the CPU must watch
- * that context before the spawn's bringup can reach it. First spawn moves
- * the initial CPUs in bulk (mk_repark_to_instance); this is the per-CPU
- * variant for hotplug on a live instance.
+ * The CPU stays in its cell, where the instance's kernel starts it; the
+ * host only starts counting it among the CPUs that kernel may run on.
  */
 int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {
-	struct mk_spawn_context *ctx = instance->arch.spawn_ctx;
-	struct mk_spawn_context *slot = mk_pool ? mk_pool->arch.slot : NULL;
-	struct mk_cpu_set *on_slot = mk_slot_set(instance);
-	int ret;
+	struct mk_cpu_set *started = mk_started_set(instance);
 
-	if (!ctx || !slot || !ctx->park_phys || !on_slot)
-		return -ENODEV;
-
-	/* Make the tracking add below infallible before moving the CPU */
-	ret = mk_cpu_set_reserve(on_slot, 1);
-	if (ret)
-		return ret;
+	if (!started)
+		return -ENOMEM;
 
 	guard(mutex)(&mk_park_lock);
 
-	if (mk_cpu_set_contains(on_slot, phys_cpu))
-		return 0;
-
-	ret = mk_publish_repark(slot, (u32)phys_cpu, ctx->park_phys,
-				ctx->park_cr3, instance->arch.spawn_ctx_phys,
-				"repark hot-added cpu");
-	if (!ret)
-		mk_cpu_set_add(on_slot, phys_cpu);
-	return ret;
+	return mk_cpu_set_add(started, phys_cpu);
 }
 
 /**
- * mk_repark_cpu_to_host - Return one parked CPU to the host slot
+ * mk_repark_cpu_to_host - Take one CPU back from an instance
  * @instance: Instance the CPU was removed from
- * @phys_cpu: Physical (APIC) ID of the parked CPU
+ * @phys_cpu: Physical (APIC) ID of the CPU
  *
- * After the spawn kernel offlines a CPU it parks on the instance's
- * context. Move it back to the host slot so it can be spawned or
- * hot-added elsewhere. Counterpart of mk_repark_cpu_to_instance().
+ * The instance's kernel reports the CPU offline before the CPU reaches
+ * its cell; until it has, it stays accounted to the instance.
  */
 int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {
-	struct mk_spawn_context *ctx = instance->arch.spawn_ctx;
 	int ret;
 
 	guard(mutex)(&mk_park_lock);
 
-	/* Already on the host slot: nothing watches this context for it */
 	if (!mk_cpu_set_contains(instance->cpus_on_slot, phys_cpu))
 		return 0;
 
-	if (!ctx || !mk_pool || !mk_pool->arch.slot)
-		return -ENODEV;
-
-	ret = mk_publish_repark(ctx, (u32)phys_cpu, mk_pool->arch.park_phys,
-				mk_pool->arch.cr3, mk_pool->arch.slot_phys,
-				"repark removed cpu to host");
+	ret = mk_park_wait((u32)phys_cpu);
 	if (!ret)
 		mk_cpu_set_del(instance->cpus_on_slot, phys_cpu);
 	return ret;
 }
 
-/*
- * Where @instance's CPUs park: its own context, or on a spawn's record
- * of its host, the host's pool slot, which a backup maps on first use.
- */
-static struct mk_spawn_context *mk_park_slot(struct mk_instance *instance)
-{
-	lockdep_assert_held(&mk_park_lock);
-
-	if (!instance->arch.spawn_ctx && instance->pool_slot_phys) {
-		instance->arch.spawn_ctx = memremap(instance->pool_slot_phys,
-						    sizeof(struct mk_spawn_context),
-						    MEMREMAP_WB);
-		if (instance->arch.spawn_ctx)
-			instance->arch.spawn_ctx_phys = instance->pool_slot_phys;
-	}
-	return instance->arch.spawn_ctx;
-}
-
-/**
- * mk_arch_confirm_parked - Verify a CPU has reached the instance's park loop
- * @instance: Instance the CPU belongs to
- * @phys_cpu: Physical (APIC) ID of the CPU
- *
- * Publishes a repark that moves the CPU to the slot it is already on, so
- * the move itself is a no-op and the claim is the answer: only a CPU
- * sitting in the park loop can take it. A CPU still running the
- * instance's kernel, on its way down, cannot.
- *
- * Returns 0 once the CPU is known to be parked.
- */
+/* 0 once @phys_cpu waits in its cell, whichever kernel parked it */
 int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {
-	struct mk_spawn_context *ctx;
-	int ret;
-
-	guard(mutex)(&mk_park_lock);
-
-	ctx = mk_park_slot(instance);
-	if (!ctx || !ctx->park_phys)
-		return -ENODEV;
-
-	ret = mk_publish_repark(ctx, (u32)phys_cpu, ctx->park_phys,
-				ctx->park_cr3, instance->arch.spawn_ctx_phys,
-				"confirm parked");
-	if (!ret || !mk_pool || !mk_pool->arch.slot)
-		return ret;
-
-	/*
-	 * Not on the context we recorded. It may still be parked on the host
-	 * slot, which our bookkeeping can miss: an instance rebuilt while a
-	 * CPU was elsewhere starts with an empty set. Ask the host slot the
-	 * same way. A claim there answers the question this function exists
-	 * for - the CPU is parked, not running the image we are about to
-	 * overwrite - so believe it and correct the record.
-	 */
-	if (!mk_publish_repark(mk_pool->arch.slot, (u32)phys_cpu,
-			       mk_pool->arch.park_phys, mk_pool->arch.cr3,
-			       mk_pool->arch.slot_phys, "confirm parked (host slot)")) {
-		pr_warn("mk_spawn: CPU %llu was parked on the host slot, not instance %d\n",
-			phys_cpu, instance->id);
-		mk_cpu_set_del(instance->cpus_on_slot, phys_cpu);
-		return 0;
-	}
-
-	pr_err("mk_spawn: CPU %llu is parked nowhere: not on instance %d context %pa, not on host slot %pa\n",
-		 phys_cpu, instance->id, &instance->arch.spawn_ctx_phys,
-		 &mk_pool->arch.slot_phys);
-	return ret;
+	return mk_park_wait((u32)phys_cpu);
 }
 
 /**
- * mk_repark_instance_to_host - Return an instance's CPUs to the host slot
+ * mk_repark_instance_to_host - See every CPU an instance started parked
  * @instance: Instance being torn down
  *
- * Moves every CPU watching the instance's context back to the pool park
- * area before the instance's park page, context and page tables are
- * freed. No-op if the CPUs never left the host slot.
- *
- * A CPU that fails to claim the repark stays tracked in cpus_on_slot: it
- * is still parked on this instance's context, so the caller must not free
- * the context or park page while the set is non-empty.
+ * A CPU that does not park stays tracked, and the caller must not free
+ * the instance's memory.
  */
 int mk_repark_instance_to_host(struct mk_instance *instance)
 {
-	struct mk_cpu_set *on_slot = instance->cpus_on_slot;
-	struct mk_spawn_context *ctx = instance->arch.spawn_ctx;
+	struct mk_cpu_set *started = instance->cpus_on_slot;
 	unsigned int i;
 	int failed = 0;
 
-	if (mk_cpu_set_empty(on_slot) || !ctx || !mk_pool || !mk_pool->arch.slot)
+	if (mk_cpu_set_empty(started))
 		return 0;
 
 	guard(mutex)(&mk_park_lock);
 
-	/*
-	 * Only the CPUs actually watching this context: waking one that is
-	 * already on the host slot would just time out, a second per CPU.
-	 * Walk back-to-front so deleting the moved CPUs never shifts
-	 * entries the walk has yet to visit.
-	 */
-	for (i = mk_cpu_set_count(on_slot); i-- > 0; ) {
-		mk_phys_cpu_t phys_cpu = on_slot->ids[i];
+	/* Back to front, so deleting never shifts entries yet to be visited */
+	for (i = mk_cpu_set_count(started); i-- > 0; ) {
+		mk_phys_cpu_t phys_cpu = started->ids[i];
 
-		if (mk_publish_repark(ctx, (u32)phys_cpu,
-				      mk_pool->arch.park_phys, mk_pool->arch.cr3,
-				      mk_pool->arch.slot_phys, "repark to host"))
+		if (mk_park_wait((u32)phys_cpu))
 			failed++;
 		else
-			mk_cpu_set_del(on_slot, phys_cpu);
+			mk_cpu_set_del(started, phys_cpu);
 	}
 
 	return failed ? -ETIMEDOUT : 0;
@@ -749,13 +513,14 @@ void mk_init_boot_context(phys_addr_t ctx_phys)
 		lapic_timer_period =
 			DIV_ROUND_CLOSEST_ULL(ctx->boot_apic_hz, HZ);
 
+	mk_park_table_set_boot(ctx->park_table);
+
 	/*
-	 * The host's control area (this context, the trampoline and park
-	 * pages, the identity page tables) sits in our memory and is handed
-	 * to us as ordinary RAM, so it stays mapped in the direct map and
-	 * we can execute from the trampoline and park pages. Keep the page
-	 * allocator away from it: recycling it destroys the context our
-	 * CPUs need when this kernel shuts down and they return to the pool.
+	 * The host's control area (this context, the trampoline page, the
+	 * identity page tables) sits in our memory and is handed to us as
+	 * ordinary RAM, so it stays mapped in the direct map and we can
+	 * execute from the trampoline. Keep the page allocator away from
+	 * it: the next spawn of this instance boots from it.
 	 */
 	if (ctx->ctrl_phys && ctx->ctrl_size &&
 	    memblock_reserve(ctx->ctrl_phys, ctx->ctrl_size))
@@ -764,11 +529,9 @@ void mk_init_boot_context(phys_addr_t ctx_phys)
 }
 
 /*
- * Make this kernel's trampoline and park pages executable while the
- * kernel is fully alive. On the way down they are entered from an
- * offline CPU (in the forcible case straight from the NMI stop handler)
- * where changing page attributes is unsafe: CPA takes sleeping locks,
- * can allocate to split a large page, and issues TLB shootdown IPIs.
+ * Make this kernel's trampoline page executable while the kernel is
+ * fully alive, as is done for the park code page when the park table
+ * is attached.
  *
  * One physical page serves every wake path of this instance: the host
  * allocates it once in mk_setup_trampoline() and reuses it across
@@ -779,42 +542,26 @@ void mk_init_boot_context(phys_addr_t ctx_phys)
  */
 static int __init mk_prepare_trampoline(void)
 {
-	struct mk_spawn_context *ctx = mk_own_context();
+	struct mk_spawn_context *ctx = mk_boot_context;
 	unsigned long virt;
 	int ret;
 
 	if (!ctx)
 		return 0;
 
-	/*
-	 * Put our own copy of the trampoline in the page the host set
-	 * aside, while the kernel is fully alive: after shutdown this page
-	 * is entered from an offline CPU, where changing page attributes
-	 * is not allowed.
-	 */
+	/* Put our own copy of the trampoline in the page the host set aside */
 	memcpy(__va(ctx->trampoline_phys), multikernel_relocate_kernel_start,
 	       multikernel_relocate_kernel_end - multikernel_relocate_kernel_start);
 
 	/*
-	 * Both pages are executed from the direct map, which is writable,
-	 * so drop write before adding execute. Leaving them writable and
-	 * executable trips the kernel's own W^X check.
+	 * It is executed from the direct map, which is writable, so drop
+	 * write before adding execute. Leaving it writable and executable
+	 * trips the kernel's own W^X check.
 	 */
 	virt = (unsigned long)__va(ctx->trampoline_phys) & PAGE_MASK;
 	ret = set_memory_ro(virt, 1);
 	if (!ret)
 		ret = set_memory_x(virt, 1);
-	if (ret)
-		return ret;
-
-	/* The pool park page is entered the same way when this kernel dies */
-	if (ctx->park_phys) {
-		virt = (unsigned long)__va(ctx->park_phys) & PAGE_MASK;
-		ret = set_memory_ro(virt, 1);
-		if (!ret)
-			ret = set_memory_x(virt, 1);
-	}
-
 	return ret;
 }
 early_initcall(mk_prepare_trampoline);
@@ -885,43 +632,29 @@ static int mk_add_2mb_mapping(pgd_t *pgd, unsigned long virt, unsigned long phys
  */
 
 /*
- * Build identity page table for secondary CPU trampoline execution.
- * Maps the trampoline at its virtual address(es) and identity-mapped.
+ * The identity page table a parked CPU switches to on its way into this
+ * kernel: it leaves its cell from the park code page and continues in
+ * the trampoline, both at their physical addresses.
  */
-static int mk_build_trampoline_pgtable(unsigned long trampoline_va,
-				       unsigned long host_trampoline_va,
-				       unsigned long trampoline_phys,
+static int mk_build_trampoline_pgtable(unsigned long trampoline_phys,
 				       unsigned long *cr3_out)
 {
+	phys_addr_t code_phys = mk_park_code_phys();
 	pgd_t *pgd;
 	int ret;
+
+	if (!code_phys)
+		return -ENODEV;
 
 	pgd = (pgd_t *)get_zeroed_page(GFP_KERNEL);
 	if (!pgd)
 		return -ENOMEM;
 
-	/* Map trampoline at its virtual address (initial execution) */
-	ret = mk_add_2mb_mapping(pgd, trampoline_va, trampoline_phys,
+	ret = mk_add_2mb_mapping(pgd, code_phys, code_phys,
 				 __PAGE_KERNEL_LARGE_EXEC);
-	if (ret)
-		return ret;
-
-	/*
-	 * The pool CPU enters the trampoline through the HOST kernel's
-	 * direct map. With CONFIG_RANDOMIZE_MEMORY the host's
-	 * page_offset_base differs from ours, so its VA of the trampoline
-	 * is not covered by the mapping above. Map it too: the CPU keeps
-	 * fetching from that VA right after the first CR3 switch, and an
-	 * unmapped fetch there triple-faults the whole machine.
-	 */
-	ret = mk_add_2mb_mapping(pgd, host_trampoline_va, trampoline_phys,
-				 __PAGE_KERNEL_LARGE_EXEC);
-	if (ret)
-		return ret;
-
-	/* Map trampoline identity (virt=phys, for after CR3 switch) */
-	ret = mk_add_2mb_mapping(pgd, trampoline_phys, trampoline_phys,
-				 __PAGE_KERNEL_LARGE_EXEC);
+	if (!ret)
+		ret = mk_add_2mb_mapping(pgd, trampoline_phys, trampoline_phys,
+					 __PAGE_KERNEL_LARGE_EXEC);
 	if (ret)
 		return ret;
 
@@ -929,111 +662,48 @@ static int mk_build_trampoline_pgtable(unsigned long trampoline_va,
 	return 0;
 }
 
-/*
- * Custom wakeup function for multikernel spawn kernels.
- * Wakes a pool CPU to join this spawn kernel as a secondary CPU.
- */
-/*
- * Where to publish a wakeup for @apicid. A CPU the fence parked on the
- * host's slot is woken from that slot, which the fence mapped while
- * confirming it parked there; every other secondary is woken from this
- * kernel's own context.
- */
-static struct mk_spawn_context *mk_wake_slot(u32 apicid,
-					     struct mk_spawn_context *own)
-{
-	if (host_instance &&
-	    mk_cpu_set_contains(host_instance->cpus_on_slot, apicid))
-		return host_instance->arch.spawn_ctx;
-	return own;
-}
-
+/* Start a CPU waiting in its park cell as a secondary of this spawn kernel */
 int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 					unsigned int cpu)
 {
-	struct mk_spawn_context *own = mk_own_context();
-	struct mk_spawn_context *slot;
-	unsigned long trampoline_phys, trampoline_va;
-	unsigned long identity_cr3;
+	struct mk_spawn_context *own = mk_boot_context;
+	unsigned long trampoline_phys, identity_cr3;
+	u64 args[6];
 	int ret;
 
-	if (!own) {
-		pr_err("mk_spawn: Boot context not initialized\n");
-		return -ENODEV;
-	}
-
-	if (!own->trampoline_phys) {
-		pr_err("mk_spawn: trampoline not prepared\n");
+	if (!own || !own->trampoline_phys) {
+		pr_err("mk_spawn: no trampoline to start CPU %u with\n", cpu);
 		return -ENODEV;
 	}
 	/* mk_prepare_trampoline() put this kernel's own copy in the page */
 	trampoline_phys = own->trampoline_phys;
-	trampoline_va = (unsigned long)__va(trampoline_phys);
 
-	/* Build identity page table for two-stage CR3 switch */
-	ret = mk_build_trampoline_pgtable(trampoline_va, own->trampoline_virt,
-					  trampoline_phys, &identity_cr3);
+	ret = mk_build_trampoline_pgtable(trampoline_phys, &identity_cr3);
 	if (ret)
 		return ret;
 
 	/*
-	 * Add the identity mapping to init_mm, not the current CR3: this runs
-	 * in the cpuhp kthread, which may be borrowing a user mm (lazy TLB).
-	 * Writing into a user PGD corrupts that process, and the new CPU
-	 * would come up on page tables that are freed when the process exits.
-	 * swapper_pg_dir maps everything the secondary needs, including the
-	 * vmalloc'ed idle stack.
-	 */
-	/*
-	 * This one lands in the running kernel's page tables and stays
-	 * there, so it must not be writable and executable at once. The
-	 * secondary trampoline only executes from it; it uses the idle
-	 * task stack, not this page.
+	 * The trampoline switches to init_mm's page table while still
+	 * running at its physical address, so map it there too, in init_mm
+	 * rather than the current CR3: this runs in the cpuhp kthread,
+	 * which may be borrowing a user mm (lazy TLB). The mapping stays,
+	 * so it must not be writable and executable at once.
 	 */
 	ret = mk_add_2mb_mapping(init_mm.pgd, trampoline_phys, trampoline_phys,
 				 __PAGE_KERNEL_LARGE_EXEC & ~_PAGE_RW);
 	if (ret)
 		return ret;
 
-	slot = mk_wake_slot(apicid, own);
-	if (!slot)
-		return -ENODEV;
+	args[0] = identity_cr3;
+	args[1] = (unsigned long)multikernel_secondary_startup;
+	args[2] = per_cpu_offset(cpu);
+	args[3] = (unsigned long)idle_task(cpu)->thread.sp;
+	args[4] = trampoline_phys +
+		  (mk_secondary_trampoline - multikernel_relocate_kernel_start);
+	args[5] = __sme_pa(init_mm.pgd);
 
-	/*
-	 * Revoke any unconsumed wakeup left over from a failed earlier
-	 * bringup, so a parked CPU cannot wake mid-rewrite and read a mix
-	 * of old and new fields. A CPU that already claimed the context
-	 * still sees the old, consistent snapshot.
-	 */
-	cmpxchg(&slot->ready, 1, 0);
-
-	/*
-	 * The dispatch is this kernel's (its trampoline, its secondary
-	 * entry, its page tables), even when published into an adopted
-	 * host slot: the parked CPU transitions from wherever it waits
-	 * into this kernel.
-	 */
-	slot->identity_cr3 = identity_cr3;
-	slot->trampoline_phys = trampoline_phys;
-	slot->secondary_trampoline_phys = trampoline_phys +
-		(mk_secondary_trampoline - multikernel_relocate_kernel_start);
-	slot->kernel_entry = (unsigned long)multikernel_secondary_startup;
-	slot->gs_base = per_cpu_offset(cpu);
-	slot->stack = (unsigned long)idle_task(cpu)->thread.sp;
-	slot->spawn_cr3 = __sme_pa(init_mm.pgd);
-	slot->target_apic_id = apicid;
-	slot->flags = MK_SPAWN_F_SECONDARY;
-
-	/*
-	 * Publish the wakeup. The parked CPU watches this slot with
-	 * MONITOR/MWAIT (or a poll loop), so the write itself wakes it;
-	 * no IPI is needed and none could be delivered anyway, since
-	 * parked CPUs keep interrupts disabled.
-	 */
-	smp_wmb();
-	WRITE_ONCE(slot->ready, 1);
-
-	return 0;
+	return mk_park_dispatch(apicid, MK_PARK_CMD_SECONDARY, args,
+				ARRAY_SIZE(args));
 }
 
 struct mk_ident_pgtable {
@@ -1360,67 +1030,6 @@ void *mk_setup_trampoline(struct mk_instance *instance,
 	return trampoline_va;
 }
 
-/**
- * mk_setup_park_page() - Set up the per-instance pool park page
- * @instance: Instance to allocate the page for
- * @phys_out: Physical address of the park page
- *
- * Copies the pool park loop into a page the host owns for the lifetime
- * of the instance. Unlike the trampoline page, which each spawn kernel
- * overwrites with its own copy, this page is written exactly once by the
- * host and never touched again: CPUs may execute from it while a new
- * kernel image is loaded and booted, so its contents must never change.
- * The spawn context field offsets it reads are a cross-kernel ABI.
- */
-void *mk_setup_park_page(struct mk_instance *instance, unsigned long *phys_out)
-{
-	size_t size = mk_pool_park_end - mk_pool_park_start;
-	unsigned long park_phys;
-	void *park_va;
-	int rc;
-
-	if (!mk_pool)
-		return ERR_PTR(-ENODEV);
-
-	/* Runs under kexec_lock, which nothing takes under this mutex */
-	guard(mutex)(&mk_park_lock);
-
-	if (!mk_pool->arch.pgt)
-		return ERR_PTR(-ENODEV);
-
-	park_va = instance->arch.park_va;
-	if (!park_va) {
-		park_va = mk_instance_ctrl_alloc(instance, PAGE_SIZE, PAGE_SIZE);
-		if (!park_va)
-			return ERR_PTR(-ENOMEM);
-
-		memcpy(park_va, mk_pool_park_start, size);
-
-		rc = set_memory_x((unsigned long)park_va, 1);
-		if (rc)
-			return ERR_PTR(rc);
-	}
-
-	park_phys = virt_to_phys(park_va);
-
-	/*
-	 * A dying spawn kernel enters the park page through its own direct
-	 * map at the default base; the first instructions run at that VA
-	 * until the CR3 switch, so it must be mapped in the pool park page
-	 * table. The identity mapping is covered by the per-chunk build.
-	 * A page table rebuilt since the last spawn carries no such mapping,
-	 * so install it on every spawn rather than only on the first.
-	 */
-	rc = mk_add_trampoline_mapping(mk_pool->arch.pgt,
-				       mk_default_page_offset() + park_phys,
-				       park_phys);
-	if (rc)
-		return ERR_PTR(rc);
-
-	*phys_out = park_phys;
-	return park_va;
-}
-
 /*
  * Map the whole pool from a snapshot rather than under mk_pool_for_each_chunk():
  * mk_ident_map_range() allocates its page table pages from the pool, which
@@ -1511,13 +1120,6 @@ static int __mk_pool_park_setup(void)
 	mk_pool->arch.slot_phys = phys;
 	memset(mk_pool->arch.slot, 0, sizeof(*mk_pool->arch.slot));
 	mk_pool->arch.slot->self_phys = phys;
-	/*
-	 * Park anchors, so a kernel with no parent-given boot context
-	 * (the machine host) can park its own CPUs here: mk_own_context()
-	 * hands out this slot when there is no boot context.
-	 */
-	mk_pool->arch.slot->park_phys = mk_pool->arch.park_phys;
-	mk_pool->arch.slot->park_cr3 = mk_pool->arch.cr3;
 
 	pr_info("mk_spawn: pool park area at %pa (slot %pa)\n",
 		&mk_pool->arch.park_phys, &mk_pool->arch.slot_phys);
@@ -1730,70 +1332,6 @@ int mk_pool_park_teardown(void)
 
 	pr_info("mk_spawn: released the pool park area\n");
 	return 0;
-}
-
-/*
- * Park this offlined pool CPU. On the host, wait in the pool park area
- * watching the host slot; on a spawn kernel, wait on our own instance
- * context like any pool CPU of this instance, where the host reparks a
- * returned CPU and this kernel wakes one it only took offline. Returns
- * only if neither park area exists.
- */
-void mk_pool_park_cpu(void)
-{
-	mk_pool_park_fn park;
-
-	if (mk_pool && mk_pool->arch.slot) {
-		park = (mk_pool_park_fn)mk_pool->arch.park_va;
-		park(mk_pool->arch.cr3, mk_pool->arch.slot_phys, read_apic_id(),
-		     mk_pool->arch.park_phys,
-		     boot_cpu_has(X86_FEATURE_MWAIT));
-	}
-
-	mk_park_cpu();
-}
-
-/* Once its host is fenced, this kernel's spawns wake its CPUs from its pool slot */
-static struct mk_spawn_context *mk_park_context(void)
-{
-	if (mk_host_fenced() && mk_pool && mk_pool->arch.slot)
-		return mk_pool->arch.slot;
-	return mk_own_context();
-}
-
-/*
- * Park this CPU in the instance's pool park page. Called on the way into
- * pool state by a dying spawn kernel; the park page and its page table
- * are host-owned and survive re-loads of this instance, unlike the
- * kernel image this code is running from.
- */
-/* True only in a spawn kernel whose boot context carries a park area */
-bool mk_cpu_parkable(void)
-{
-	struct mk_spawn_context *ctx = mk_park_context();
-
-	return ctx && ctx->park_phys && ctx->park_cr3;
-}
-
-void mk_park_cpu(void)
-{
-	struct mk_spawn_context *ctx = mk_park_context();
-	mk_pool_park_fn park;
-
-	if (!ctx) {
-		pr_err("mk_spawn: no boot context, cannot park\n");
-		return;
-	}
-
-	if (!ctx->park_phys || !ctx->park_cr3) {
-		pr_err("mk_spawn: context %pa has no park area: park_phys=0x%lx park_cr3=0x%lx\n",
-		       &ctx->self_phys, ctx->park_phys, ctx->park_cr3);
-		return;
-	}
-
-	park = (mk_pool_park_fn)__va(ctx->park_phys);
-	park(ctx->park_cr3, virt_to_phys(ctx), read_apic_id(),
-	     ctx->park_phys, boot_cpu_has(X86_FEATURE_MWAIT));
 }
 
 void mk_free_identity_pgtable(struct mk_ident_pgtable *pgt)

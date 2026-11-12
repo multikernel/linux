@@ -364,19 +364,16 @@ void __noreturn mk_enter_pool_state(void *info)
 
 	local_irq_disable();
 
-	/*
-	 * Park in the instance's host-owned park page, which survives
-	 * re-loads of this instance's kernel image.
-	 */
-	mk_park_cpu();
+	/* Park in this CPU's cell, which no kernel image load touches */
+	mk_park_this_cpu();
 
 	/*
-	 * No park page: this kernel was not spawned through the normal
-	 * path, which always provides one. Waiting in this kernel's own
+	 * No park cell: this kernel has no park table, which pool parking
+	 * setup and the normal spawn path always provide. Waiting in this kernel's own
 	 * text would take the whole machine down when the next image load
 	 * overwrites it, so stop dead instead; INIT can still revive us.
 	 */
-	pr_emerg("CPU %d: no pool park page, halting permanently\n",
+	pr_emerg("CPU %d: no park cell, halting permanently\n",
 		 smp_processor_id());
 	while (1)
 		native_halt();
@@ -436,7 +433,7 @@ static int mk_stop_nmi_unknown(unsigned int val, struct pt_regs *regs)
 void noinstr mk_nmi_offline_park(void)
 {
 	instrumentation_begin();
-	if (mk_cpu_parkable() && mk_has_pending_shutdown()) {
+	if (mk_park_ready() && mk_has_pending_shutdown()) {
 		cpu_emergency_disable_virtualization();
 		mk_enter_pool_state(NULL);
 	}

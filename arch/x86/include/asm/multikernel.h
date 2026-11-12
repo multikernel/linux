@@ -44,7 +44,6 @@ struct mk_instance_arch {
 	phys_addr_t spawn_ctx_phys;
 	struct mk_ident_pgtable *ident_pgt;
 	void *trampoline_va;
-	void *park_va;			/* Pool park page, written once by the host */
 };
 
 /*
@@ -103,7 +102,7 @@ static inline int arch_cpu_from_physical_id(u64 phys_id)
  *
  * The fields fall into three classes that must not be mixed up:
  *
- *  - Anchor fields (self_phys, park_phys, park_cr3, ctrl_phys,
+ *  - Anchor fields (self_phys, park_table, ctrl_phys,
  *    ctrl_size): the context's own identity, written once when the
  *    context is set up. The spawn kernel reads them whenever it parks a
  *    CPU on halt or offline, so they must stay valid for the context's
@@ -131,8 +130,8 @@ struct mk_spawn_context {
 	unsigned long gs_base;		/* Per-CPU GS base (for secondary) */
 	unsigned long stack;		/* Stack pointer (for secondary) */
 	unsigned long spawn_cr3;	/* Spawn kernel's CR3 (for secondary CPU final switch) */
-	unsigned long park_phys;	/* Pool park code page (host owned, never reloaded) */
-	unsigned long park_cr3;		/* Page table parked CPUs run on (host owned) */
+	unsigned long park_table;	/* Park table every kernel parks its CPUs in */
+	unsigned long reserved_park;
 	unsigned long repark_park_phys;	/* REPARK dispatch: park page to move to */
 	unsigned long repark_park_cr3;	/* REPARK dispatch: page table for it */
 	unsigned long repark_slot_phys;	/* REPARK dispatch: slot to watch there */
@@ -220,6 +219,7 @@ phys_addr_t mk_park_code_phys(void);
 int mk_park_dispatch(u32 apic_id, u32 cmd, const u64 *args, unsigned int nargs);
 int mk_park_wait(u32 apic_id);
 void mk_park_this_cpu(void);
+void mk_park_cpu_running(void);
 bool mk_park_ready(void);
 
 /* Page table helpers the park table shares with spawn */
@@ -232,23 +232,10 @@ unsigned long mk_default_page_offset(void);
 extern char mk_pool_park_start[];
 extern char mk_pool_park_end[];
 
-/*
- * Park this CPU in the instance's pool park page. Returns only when no
- * park page is available (older spawn context), in which case the caller
- * must fall back to an in-kernel wait loop.
- */
-void mk_park_cpu(void);
-
-/* True once this kernel has an own context with a park area */
-bool mk_cpu_parkable(void);
-
 /* Build a spawn E820 table from the instance's current memory grant */
 struct mk_instance;
 struct boot_params;
 int mk_e820_fill(struct mk_instance *instance, struct boot_params *params);
-
-/* Park an offlined pool CPU (host park area, or instance context) */
-void mk_pool_park_cpu(void);
 
 /* Park a pool CPU leaving this kernel (play_dead path) */
 void __noreturn multikernel_play_dead(void);
@@ -275,7 +262,7 @@ void mk_set_spawn_context(struct mk_spawn_context *ctx,
 			  unsigned long kernel_entry,
 			  unsigned long trampoline_virt,
 			  unsigned long trampoline_phys,
-			  unsigned long park_phys);
+			  unsigned long park_table);
 
 /* Trigger spawn on a pool CPU */
 int mk_spawn_cpu(struct mk_instance *instance, int cpu,
@@ -294,7 +281,6 @@ unsigned long mk_get_identity_cr3(struct mk_ident_pgtable *pgt);
 void *mk_setup_trampoline(struct mk_instance *instance,
 			  struct mk_ident_pgtable *pgt,
 			  unsigned long *phys_out);
-void *mk_setup_park_page(struct mk_instance *instance, unsigned long *phys_out);
 
 /* Secondary CPU wakeup for spawn kernels (reuses boot context) */
 int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,

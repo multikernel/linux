@@ -56,8 +56,6 @@ static void __used common(void)
 	OFFSET(MK_CTX_gs_base, mk_spawn_context, gs_base);
 	OFFSET(MK_CTX_stack, mk_spawn_context, stack);
 	OFFSET(MK_CTX_spawn_cr3, mk_spawn_context, spawn_cr3);
-	OFFSET(MK_CTX_park_phys, mk_spawn_context, park_phys);
-	OFFSET(MK_CTX_park_cr3, mk_spawn_context, park_cr3);
 	OFFSET(MK_CTX_repark_park_phys, mk_spawn_context, repark_park_phys);
 	OFFSET(MK_CTX_repark_park_cr3, mk_spawn_context, repark_park_cr3);
 	OFFSET(MK_CTX_repark_slot_phys, mk_spawn_context, repark_slot_phys);

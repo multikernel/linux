@@ -281,6 +281,9 @@ static void notrace __noendbr start_secondary(void *unused)
 
 	ap_starting();
 
+	if (IS_ENABLED(CONFIG_MULTIKERNEL))
+		mk_park_cpu_running();
+
 	/* Check TSC synchronization with the control CPU. */
 	check_tsc_sync_target();
 
@@ -1510,11 +1513,9 @@ void __noreturn hlt_play_dead(void)
 /*
  * multikernel_play_dead - Park a multikernel pool CPU
  *
- * The CPU waits in the pool park area (host park area on the host,
- * instance context on a spawn kernel returning a CPU), where a spawn
- * publication dispatches it to the trampolines. This function never
- * returns; a CPU with no park area available halts dead, still
- * revivable via INIT.
+ * The CPU waits in its park table cell, where whichever kernel owns it
+ * next starts it. This function never returns; a CPU with no cell halts
+ * dead, still revivable via INIT.
  */
 void __noreturn multikernel_play_dead(void)
 {
@@ -1523,9 +1524,9 @@ void __noreturn multikernel_play_dead(void)
 
 	play_dead_common();
 
-	mk_pool_park_cpu();
+	mk_park_this_cpu();
 
-	pr_emerg("CPU %d: no pool park area, halting permanently\n",
+	pr_emerg("CPU %d: no park cell, halting permanently\n",
 		 smp_processor_id());
 	while (1)
 		native_halt();
@@ -1537,7 +1538,7 @@ void __noreturn native_play_dead(void)
 	if (cpu_feature_enabled(X86_FEATURE_KERNEL_IBRS))
 		__update_spec_ctrl(0);
 
-	/* A spawn cannot send INIT/SIPI: it wakes a CPU only from its park slot */
+	/* A spawn cannot send INIT/SIPI: it wakes a CPU only from its park cell */
 	if (IS_ENABLED(CONFIG_MULTIKERNEL) &&
 	    (cpu_departing(smp_processor_id()) || mk_spawned()))
 		multikernel_play_dead();
