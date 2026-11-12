@@ -129,10 +129,10 @@ void mk_set_spawn_context(struct mk_spawn_context *ctx,
 /* The CPUs started for an instance and not seen parked since */
 static struct mk_cpu_set *mk_started_set(struct mk_instance *instance)
 {
-	if (!instance->cpus_on_slot)
-		instance->cpus_on_slot = mk_cpu_set_alloc();
+	if (!instance->cpus_started)
+		instance->cpus_started = mk_cpu_set_alloc();
 
-	return instance->cpus_on_slot;
+	return instance->cpus_started;
 }
 
 /*
@@ -331,14 +331,14 @@ int mk_arch_release_instance(struct mk_instance *instance)
 	if (ret) {
 		char buf[256];
 
-		mk_cpu_set_format(buf, sizeof(buf), instance->cpus_on_slot);
+		mk_cpu_set_format(buf, sizeof(buf), instance->cpus_started);
 		pr_err("Instance %d (%s): CPUs %s never parked, keeping spawn resources\n",
 		       instance->id, instance->name, buf);
 		return ret;
 	}
 
-	mk_cpu_set_free(instance->cpus_on_slot);
-	instance->cpus_on_slot = NULL;
+	mk_cpu_set_free(instance->cpus_started);
+	instance->cpus_started = NULL;
 
 	mk_free_identity_pgtable(instance->arch.ident_pgt);
 	instance->arch.ident_pgt = NULL;
@@ -382,12 +382,12 @@ int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 
 	guard(mutex)(&mk_park_lock);
 
-	if (!mk_cpu_set_contains(instance->cpus_on_slot, phys_cpu))
+	if (!mk_cpu_set_contains(instance->cpus_started, phys_cpu))
 		return 0;
 
 	ret = mk_park_wait((u32)phys_cpu);
 	if (!ret)
-		mk_cpu_set_del(instance->cpus_on_slot, phys_cpu);
+		mk_cpu_set_del(instance->cpus_started, phys_cpu);
 	return ret;
 }
 
@@ -406,7 +406,7 @@ int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
  */
 int mk_repark_instance_to_host(struct mk_instance *instance)
 {
-	struct mk_cpu_set *started = instance->cpus_on_slot;
+	struct mk_cpu_set *started = instance->cpus_started;
 	unsigned int i;
 	int failed = 0;
 

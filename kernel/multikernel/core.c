@@ -41,7 +41,7 @@ static void mk_instance_return_pci_devices(struct mk_instance *instance)
 		return;
 
 	/* A CPU still on may drive them, BARs mapped: they stay with nobody */
-	if (!mk_cpu_set_empty(instance->cpus_on_slot)) {
+	if (!mk_cpu_set_empty(instance->cpus_started)) {
 		pr_warn("Instance %d (%s): keeping its PCI devices, a CPU of it is still on\n",
 			instance->id, instance->name);
 		goto cleanup;
@@ -531,7 +531,7 @@ int mk_instance_confirm_parked(struct mk_instance *instance)
 	int ret, failed = 0;
 
 	/* Empty until the instance first ran, so nothing of it is executing */
-	mk_cpu_set_for_each(i, phys_cpu, instance->cpus_on_slot) {
+	mk_cpu_set_for_each(i, phys_cpu, instance->cpus_started) {
 		ret = mk_arch_confirm_parked(instance, phys_cpu);
 		if (ret) {
 			pr_err("Instance %d (%s): CPU %llu is not parked: %d\n",
@@ -704,7 +704,7 @@ bool mk_pool_cpus_returned(void)
 			continue;
 
 		if (!mk_cpu_set_empty(instance->cpus) ||
-		    !mk_cpu_set_empty(instance->cpus_on_slot)) {
+		    !mk_cpu_set_empty(instance->cpus_started)) {
 			returned = false;
 			break;
 		}

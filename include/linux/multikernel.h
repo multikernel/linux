@@ -790,16 +790,14 @@ struct mk_instance {
 	size_t ctrl_used;
 
 	/*
-	 * CPUs the host pool cannot reach yet: parked inside this instance's
-	 * memory (its arch park area), or, where firmware holds parked CPUs,
-	 * handed to this instance's kernel and not seen off since. They must
-	 * be confirmed parked before the image is rewritten and they pin the
-	 * pool until they leave. Membership is per CPU because it changes one
-	 * CPU at a time: hotplug moves CPUs in and out while the instance
-	 * runs, and a stopped instance can gain CPUs that still sit in the
-	 * host pool.
+	 * CPUs handed to this instance's kernel and not yet seen parked
+	 * again. They must be confirmed parked before the image is rewritten
+	 * and they pin the pool until they are. Membership is per CPU
+	 * because it changes one CPU at a time: hotplug moves CPUs in and out
+	 * while the instance runs, and a stopped instance can gain CPUs that
+	 * still sit in the host pool.
 	 */
-	struct mk_cpu_set *cpus_on_slot;
+	struct mk_cpu_set *cpus_started;
 
 	/*
 	 * The host tree user space handed over in the instance-create
