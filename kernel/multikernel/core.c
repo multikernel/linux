@@ -23,7 +23,7 @@ static void mk_instance_return_all_cpus(struct mk_instance *instance)
 	if (!instance || mk_cpu_set_empty(instance->cpus))
 		return;
 
-	if (instance == mk_self || instance->id == 0)
+	if (instance == mk_self || instance == host_instance)
 		return;
 
 	mk_instance_return_cpus(instance, instance->cpus);
@@ -37,7 +37,7 @@ static void mk_instance_return_pci_devices(struct mk_instance *instance)
 	if (!instance || !instance->pci_devices_valid)
 		return;
 
-	if (instance == mk_self || instance->id == 0)
+	if (instance == mk_self || instance == host_instance)
 		return;
 
 	/* A CPU still on may drive them, BARs mapped: they stay with nobody */
@@ -107,7 +107,7 @@ static void mk_instance_return_platform_devices(struct mk_instance *instance)
 	if (!instance || !instance->platform_devices_valid)
 		return;
 
-	if (instance == mk_self || instance->id == 0)
+	if (instance == mk_self || instance == host_instance)
 		return;
 
 	if (!mk_self) {
@@ -485,8 +485,7 @@ bool multikernel_allow_emergency_restart(void)
 
 	mutex_lock(&mk_instance_mutex);
 	list_for_each_entry(instance, &mk_instance_list, list) {
-		/* Skip root/host instance (ID 0) */
-		if (instance->id == 0)
+		if (instance == mk_self || instance == host_instance)
 			continue;
 
 		if (instance->state == MK_STATE_ACTIVE ||
@@ -697,6 +696,10 @@ bool mk_pool_cpus_returned(void)
 	bool returned = true;
 
 	if (mk_pool && !mk_cpu_set_empty(mk_pool->cpus))
+		return false;
+
+	/* A fenced host is off the list, its CPUs still parked on its slot */
+	if (host_instance && !mk_cpu_set_empty(host_instance->cpus_on_slot))
 		return false;
 
 	mutex_lock(&mk_instance_mutex);
@@ -1984,6 +1987,39 @@ static int mk_fence_host(struct mk_instance *instance,
 	return 0;
 }
 
+/*
+ * A fenced host is gone for good, which leaves this kernel the root of
+ * the machine. It takes ID 0, as a host booted there has it, and the
+ * host leaves the instance namespace. host_instance keeps the record:
+ * the host's CPUs stay parked on its slot until woken into this kernel.
+ */
+static void mk_promote(struct mk_instance *host)
+{
+	struct kernfs_node *host_kn, *self_kn;
+	int old_id;
+
+	mk_instance_set_state(host, MK_STATE_FENCED);
+
+	mutex_lock(&mk_instance_mutex);
+	old_id = mk_self->id;
+	list_del_init(&host->list);
+	idr_replace(&mk_instance_idr, mk_self, 0);
+	idr_remove(&mk_instance_idr, old_id);
+	WRITE_ONCE(mk_self->id, 0);
+	host_kn = host->kn;
+	host->kn = NULL;
+	self_kn = mk_self->kn;
+	mk_self->kn = NULL;
+	WRITE_ONCE(mk_host_is_fenced, true);
+	mutex_unlock(&mk_instance_mutex);
+
+	mk_instance_remove_dir(host, host_kn);
+	mk_instance_remove_dir(mk_self, self_kn);
+
+	pr_info("Host fenced: this kernel (was instance %d) is now instance 0\n",
+		old_id);
+}
+
 int multikernel_force_halt_by_id(int mk_id)
 {
 	struct mk_instance *instance;
@@ -2049,8 +2085,7 @@ int multikernel_force_halt_by_id(int mk_id)
 		ret = mk_fence_host(instance, targets);
 		if (!ret) {
 			mk_pcifront_host_fenced();
-			mk_instance_set_state(instance, MK_STATE_FENCED);
-			WRITE_ONCE(mk_host_is_fenced, true);
+			mk_promote(instance);
 		}
 	} else {
 		/* A child parks on its own context and settles as a graceful halt does */

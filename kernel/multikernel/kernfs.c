@@ -272,7 +272,7 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 
 	/* Allocate instance ID early so resource reservation logs show correct ID */
 	if (id == 0) {
-		pr_err("Instance ID 0 is reserved for the host kernel\n");
+		pr_err("Instance ID 0 is reserved for this kernel\n");
 		ret = -ENOMEM;
 		goto err_remove_dir;
 	}
@@ -412,6 +412,8 @@ void __weak mk_arch_instance_destroy(struct mk_instance *instance)
  */
 int mk_instance_destroy(struct mk_instance *instance)
 {
+	struct kernfs_node *kn;
+
 	lockdep_assert_held(&mk_instance_mutex);
 
 	if (!instance) {
@@ -434,14 +436,21 @@ int mk_instance_destroy(struct mk_instance *instance)
 	list_del(&instance->list);
 	idr_remove(&mk_instance_idr, instance->id);
 	mk_arch_instance_destroy(instance);
-	if (instance->kn) {
-		kernfs_remove(instance->kn);
-		instance->kn = NULL;
-		mk_instance_put(instance);
-	}
+	kn = instance->kn;
+	instance->kn = NULL;
+	mk_instance_remove_dir(instance, kn);
 	mk_instance_put(instance);
 
 	return 0;
+}
+
+/* Remove a directory detached from @instance, and the reference it held */
+void mk_instance_remove_dir(struct mk_instance *instance, struct kernfs_node *kn)
+{
+	if (!kn)
+		return;
+	kernfs_remove(kn);
+	mk_instance_put(instance);
 }
 
 /**

@@ -495,7 +495,7 @@ static struct console mktty_spawn_console = {
 
 static int __init mktty_spawn_console_init(void)
 {
-	if (!mk_self || mk_self->id == 0)
+	if (!mk_self || !host_instance)
 		return 0;
 
 	mktty_spawn.instance_id = mk_self->id;
@@ -586,19 +586,18 @@ static void mktty_spawn_cleanup(void)
  * =============================================================================
  */
 
+/* By role, not by ID: a spawn that took over from its host has ID 0 */
 static int __init mktty_init(void)
 {
-	int id = mk_self ? mk_self->id : 0;
-	return (id == 0) ? mktty_host_init() : mktty_spawn_init();
+	return host_instance ? mktty_spawn_init() : mktty_host_init();
 }
 
 static void __exit mktty_exit(void)
 {
-	int id = mk_self ? mk_self->id : 0;
-	if (id == 0)
-		mktty_host_cleanup();
-	else
+	if (host_instance)
 		mktty_spawn_cleanup();
+	else
+		mktty_host_cleanup();
 }
 
 module_init(mktty_init);

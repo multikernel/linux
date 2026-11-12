@@ -625,7 +625,8 @@ enum mk_instance_state {
 /**
  * The self instance: the record describing this running kernel.
  * In the host kernel its id is 0; in a spawn kernel it is the
- * spawned instance's id (1, 2, etc.).
+ * spawned instance's id (1, 2, etc.) until it fences its host and
+ * takes 0.
  */
 int mk_cpu_rank(mk_phys_cpu_t phys);
 
@@ -634,7 +635,8 @@ extern struct mk_instance *mk_self;
 /**
  * The host instance: this spawn's record of the kernel that spawned
  * it, or NULL in the host itself. "Is this the host" is a pointer
- * test against it.
+ * test against it. Once fenced, the host is out of the instance
+ * namespace, and the record only tracks its parked CPUs.
  */
 extern struct mk_instance *host_instance;
 
