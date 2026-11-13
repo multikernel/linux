@@ -6,7 +6,8 @@
  * what x86 splits between boot_params and the manifest: the instance tree
  * the generic code wrote, with its /resources and /chosen, is the base,
  * and the nodes the RISC-V boot path itself reads go on top: /memory and
- * /cpus, whose nodes also hold each hart's local interrupt controller.
+ * /cpus, whose nodes also hold each hart's local interrupt controller,
+ * and the IMSIC that takes the instance's MSIs.
  *
  * It is rebuilt on every spawn, into the device tree segment the loader
  * left room for: the memory grant and the harts can change between load
@@ -252,6 +253,8 @@ int mk_build_boot_dtb(struct kimage *image, struct mk_instance *instance)
 		ret = mk_dtb_add_memory(fdt, instance);
 	if (!ret)
 		ret = mk_dtb_add_cpus(fdt, instance);
+	if (!ret)
+		ret = mk_dtb_add_imsic(fdt);
 	if (!ret)
 		ret = mk_dtb_add_chosen(fdt, image->arch.fdt);
 	if (!ret)
