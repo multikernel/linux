@@ -1459,7 +1459,12 @@ int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node,
 	 * can't use hugepage mappings for 2-level page table because in case of
 	 * memory hotplug, we are not able to update all the page tables with
 	 * the new PMDs.
+	 *
+	 * Part of a section gets base pages: one 2M block holds the memmap of
+	 * a whole section, and removing that part again would free all of it.
 	 */
+	if (end - start < PAGES_PER_SECTION * sizeof(struct page))
+		return vmemmap_populate_basepages(start, end, node, altmap);
 	return vmemmap_populate_hugepages(start, end, node, altmap);
 }
 #endif
