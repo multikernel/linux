@@ -88,9 +88,38 @@ void mk_wrap_hart_entry(unsigned int cpu, unsigned long *entry,
 	mb();
 }
 
+/*
+ * Ring the doorbell of a hart another kernel runs on: an SBI IPI, which
+ * firmware delivers as a supervisor software interrupt. sbi_send_ipi()
+ * takes a logical CPU of this kernel, so the hart is named directly. The
+ * console can be what is sending, so a failure is reported deferred.
+ */
 void mk_arch_send_ipi(mk_phys_cpu_t phys_cpu)
 {
-	pr_warn_once("RISC-V multikernel IPI support is not implemented\n");
+	static bool reported;
+	struct sbiret ret;
+
+	ret = sbi_ecall(SBI_EXT_IPI, SBI_EXT_IPI_SEND_IPI, 1, phys_cpu,
+			0, 0, 0, 0);
+	if (ret.error && !xchg(&reported, true)) {
+		guard(preempt)();
+		printk_deferred_enter();
+		pr_err("No doorbell IPI to hart %llu: %ld\n", phys_cpu, ret.error);
+		printk_deferred_exit();
+	}
+}
+
+/*
+ * The receiving end, on every software interrupt. Where software
+ * interrupts also carry this kernel's own IPIs, one interrupt can stand
+ * for a local IPI and a doorbell at once, so the rings cannot be skipped
+ * on an interrupt that came with IPIs pending. Draining only looks at
+ * this kernel's own rings, which no other sender can fill: there is no
+ * foreign doorbell to filter.
+ */
+void mk_handle_doorbell(void)
+{
+	generic_multikernel_interrupt();
 }
 
 void __init mk_arch_register_cpu(mk_phys_cpu_t phys_id)
