@@ -170,6 +170,17 @@ static long mk_hsm_status(mk_phys_cpu_t hartid)
 	return ret.error ? sbi_err_map_linux_errno(ret.error) : ret.value;
 }
 
+/*
+ * OpenSBI refuses a hart of another of its domains as if there were no
+ * such hart. A kernel only learns of harts in its own domain, so this
+ * one is in another: the machine is statically partitioned, and the
+ * hart can never be part of a pool.
+ */
+static void mk_hsm_outside_domain(mk_phys_cpu_t hartid)
+{
+	pr_err("Hart %llu is outside this kernel's OpenSBI domain\n", hartid);
+}
+
 static int mk_wait_hart_stopped(mk_phys_cpu_t hartid)
 {
 	long state;
@@ -178,6 +189,8 @@ static int mk_wait_hart_stopped(mk_phys_cpu_t hartid)
 	ret = read_poll_timeout(mk_hsm_status, state,
 				state == SBI_HSM_STATE_STOPPED || state < 0,
 				1000, MK_HART_STOP_TIMEOUT_US, false, hartid);
+	if (!ret && state == -EINVAL)
+		mk_hsm_outside_domain(hartid);
 	return ret ?: (state < 0 ? state : 0);
 }
 
@@ -188,6 +201,8 @@ static int mk_hsm_start(mk_phys_cpu_t hartid, phys_addr_t entry,
 
 	ret = sbi_ecall(SBI_EXT_HSM, SBI_EXT_HSM_HART_START, hartid,
 			entry, opaque, 0, 0, 0);
+	if (ret.error == SBI_ERR_INVALID_PARAM || ret.error == SBI_ERR_DENIED)
+		mk_hsm_outside_domain(hartid);
 	return ret.error ? sbi_err_map_linux_errno(ret.error) : 0;
 }
 
