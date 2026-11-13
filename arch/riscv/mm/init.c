@@ -1829,4 +1829,24 @@ void __ref vmemmap_free(unsigned long start, unsigned long end, struct vmem_altm
 {
 	remove_pgd_mapping(start, end, true, altmap);
 }
+
+/*
+ * A user that hot-removed memory for good, so that no stray pointer
+ * reaches it, may still need a few of its pages at their linear map
+ * address. They are mapped with pages only: removing a range clears any
+ * leaf it touches whole, so a leaf must never cover more than the range.
+ */
+void __ref map_linear_range(phys_addr_t start, phys_addr_t size)
+{
+	pgprot_t prot = PAGE_KERNEL;
+
+	create_linear_mapping_range(start, start + size, PAGE_SIZE, &prot);
+	flush_tlb_all();
+}
+
+void __ref unmap_linear_range(phys_addr_t start, phys_addr_t size)
+{
+	remove_linear_mapping(start, size);
+	flush_tlb_all();
+}
 #endif /* CONFIG_MEMORY_HOTPLUG */
