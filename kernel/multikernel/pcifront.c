@@ -381,6 +381,8 @@ static int mk_pcifront_probe(struct platform_device *pdev)
 
 err_node:
 	of_node_put(np);
+	if (fb->ecam)
+		iounmap(fb->ecam);
 	resource_list_for_each_entry(entry, &bridge->windows)
 		kfree(entry->res);
 	pci_free_host_bridge(bridge);
