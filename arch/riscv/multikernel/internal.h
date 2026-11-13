@@ -16,5 +16,6 @@ int mk_build_boot_dtb(struct kimage *image, struct mk_instance *instance);
  */
 int mk_dtb_set_reg(void *fdt, int node, const u64 *pairs, int nr);
 int mk_dtb_copy_node(void *fdt, int parent, struct device_node *np);
+int mk_dtb_add_imsic(void *fdt);
 
 #endif /* _RISCV_MULTIKERNEL_INTERNAL_H */
