@@ -20,11 +20,14 @@
 #include <linux/libfdt.h>
 #include <linux/multikernel.h>
 #include <linux/of.h>
+#include <linux/of_fdt.h>
 #include <linux/panic.h>
 #include <asm/mmu.h>
 #include <asm/processor.h>
 #include <asm/sbi.h>
 #include <asm/sections.h>
+
+#include "internal.h"
 
 /* A halting kernel acknowledges first and stops its harts afterwards */
 #define MK_HART_STOP_TIMEOUT_US	USEC_PER_SEC
@@ -94,8 +97,27 @@ void __init mk_arch_register_cpu(mk_phys_cpu_t phys_id)
 {
 }
 
+static phys_addr_t mk_ram_start __initdata = PHYS_ADDR_MAX;
+
+/* Hot-added RAM must fall inside the linear map, which starts at boot */
 void __init mk_arch_register_ram(phys_addr_t start, u64 size)
 {
+	if (size)
+		mk_ram_start = min(mk_ram_start, start);
+}
+
+phys_addr_t __init mk_linear_map_start(phys_addr_t dram_start)
+{
+	return min(dram_start, mk_ram_start);
+}
+
+void __init mk_spawn_accept_boot_tree(phys_addr_t dt_phys)
+{
+	if (!initial_boot_params ||
+	    !of_flat_dt_is_compatible(of_get_flat_dt_root(), MK_FDT_COMPATIBLE))
+		return;
+
+	mk_manifest_populate(dt_phys, fdt_totalsize(initial_boot_params));
 }
 
 static long mk_hsm_status(mk_phys_cpu_t hartid)
@@ -227,6 +249,13 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 	ret = mk_cpu_set_reserve(started, mk_cpu_set_count(instance->cpus));
 	if (ret)
 		return ret;
+
+	ret = mk_build_boot_dtb(image, instance);
+	if (ret) {
+		pr_err("No boot device tree for instance %d: %d\n",
+		       instance->id, ret);
+		return ret;
+	}
 
 	guard(mutex)(&mk_park_lock);
 

@@ -28,6 +28,7 @@
 #include <asm/io.h>
 #include <asm/kasan.h>
 #include <asm/module.h>
+#include <asm/multikernel.h>
 #include <asm/numa.h>
 #include <asm/pgtable.h>
 #include <asm/sections.h>
@@ -243,7 +244,7 @@ static void __init setup_bootmem(void)
 	 * at worst, we map the linear mapping with PMD mappings.
 	 */
 	if (!IS_ENABLED(CONFIG_XIP_KERNEL)) {
-		phys_ram_base = memblock_start_of_DRAM() & PMD_MASK;
+		phys_ram_base = mk_linear_map_start(memblock_start_of_DRAM()) & PMD_MASK;
 #ifdef CONFIG_SPARSEMEM_VMEMMAP
 		vmemmap_start_pfn = round_down(phys_ram_base, VMEMMAP_ADDR_ALIGN) >> PAGE_SHIFT;
 #endif
