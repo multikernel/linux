@@ -186,6 +186,16 @@ static void mk_vsock_rx_pkt(struct sk_buff *skb)
         struct sock *child;
         int ret;
 
+		/*
+		 * A peer that reuses its port can get the answer meant for the
+		 * connect() it gave up on, and so be connected already when its
+		 * own request lands here. Drop the request, as virtio vsock does:
+		 * a reset would close the peer and leave its connection here open
+		 * for good.
+		 */
+		if (sk->sk_state == TCP_ESTABLISHED)
+			break;
+
 		if (sk->sk_state != TCP_LISTEN)
 			goto reset;
 
@@ -268,7 +278,17 @@ reset:
 	}
 
 	case VIRTIO_VSOCK_OP_RESPONSE:
+		/*
+		 * A connect() that gave up leaves its socket bound but closed.
+		 * Reset the late answer, as virtio vsock does, or the peer keeps
+		 * a connection nobody will ever use or close.
+		 */
+		if (sk->sk_state != TCP_SYN_SENT) {
+			mk_vsock_send_rst(hdr);
+			break;
+		}
 		sk->sk_state = TCP_ESTABLISHED;
+		vsock_insert_connected(vsk);
 		sk->sk_state_change(sk);
 		break;
 
