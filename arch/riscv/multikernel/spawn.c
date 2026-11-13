@@ -119,6 +119,18 @@ void mk_arch_send_ipi(mk_phys_cpu_t phys_cpu)
  */
 void mk_handle_doorbell(void)
 {
+	/*
+	 * First, as the drain waits for a lock the hart this force halt is
+	 * meant for may be holding. The marker is in a ring area only a
+	 * kernel this one has a link with can write.
+	 */
+	if (mk_force_halt_armed()) {
+		pr_emerg("CPU%u: forcibly stopped by another kernel\n",
+			 smp_processor_id());
+		set_cpu_online(smp_processor_id(), false);
+		mk_enter_pool_state(NULL);
+	}
+
 	generic_multikernel_interrupt();
 }
 
@@ -231,9 +243,20 @@ static int __init mk_spawn_reboot_init(void)
 }
 core_initcall(mk_spawn_reboot_init);
 
+/*
+ * S-mode has no NMI and SBI cannot stop another hart, so a kernel that no
+ * longer answers is made to stop its harts itself: the force-halt marker
+ * is armed before this is called, and the doorbell makes the hart look
+ * at it. That reaches a hart that takes interrupts, not one spinning
+ * with them masked: such a hart never reports STOPPED, and the host
+ * keeps the instance's memory rather than overwrite code it may run.
+ * SBI SSE events, delivered whatever the hart has masked, are the way to
+ * reach that one once the kernel has them.
+ */
 void mk_force_stop_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {
-	pr_warn_once("RISC-V multikernel force-stop is not implemented\n");
+	pr_warn_once("Force halt on RISC-V reaches only harts that take interrupts\n");
+	mk_arch_send_ipi(phys_cpu);
 }
 
 static struct mk_cpu_set *mk_started_set(struct mk_instance *instance)
