@@ -86,8 +86,7 @@ typedef void (*mk_secondary_trampoline_fn)(unsigned long identity_cr3, unsigned 
 					   unsigned long trampoline_phys, unsigned long spawn_cr3);
 
 
-struct mk_spawn_context *mk_alloc_spawn_context(struct mk_instance *instance,
-						phys_addr_t *phys_out)
+struct mk_spawn_context *mk_alloc_spawn_context(struct mk_instance *instance)
 {
 	struct mk_spawn_context *ctx;
 
@@ -102,9 +101,6 @@ struct mk_spawn_context *mk_alloc_spawn_context(struct mk_instance *instance,
 	/* Tell the spawn kernel which memory it must leave alone */
 	ctx->ctrl_phys = instance->ctrl_phys;
 	ctx->ctrl_size = MK_CTRL_BLOCK_SIZE;
-
-	if (phys_out)
-		*phys_out = virt_to_phys(ctx);
 	return ctx;
 }
 
@@ -246,15 +242,13 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 
 	if (!instance->arch.spawn_ctx) {
 		struct mk_spawn_context *ctx;
-		phys_addr_t phys;
 
-		ctx = mk_alloc_spawn_context(instance, &phys);
+		ctx = mk_alloc_spawn_context(instance);
 		if (!ctx) {
 			pr_err("Failed to allocate spawn context\n");
 			return -ENOMEM;
 		}
 		instance->arch.spawn_ctx = ctx;
-		instance->arch.spawn_ctx_phys = phys;
 	}
 
 	/* Copy the boot_params the loader prepared into the spawn context */
@@ -330,7 +324,6 @@ int mk_arch_release_instance(struct mk_instance *instance)
 	instance->arch.ident_pgt = NULL;
 	instance->arch.trampoline_va = NULL;
 	instance->arch.spawn_ctx = NULL;
-	instance->arch.spawn_ctx_phys = 0;
 	return 0;
 }
 

@@ -37,7 +37,6 @@ struct mk_ident_pgtable;
 /* Per-instance spawn state, carved from the control block on first spawn */
 struct mk_instance_arch {
 	struct mk_spawn_context *spawn_ctx;
-	phys_addr_t spawn_ctx_phys;
 	struct mk_ident_pgtable *ident_pgt;
 	void *trampoline_va;
 };
@@ -190,8 +189,7 @@ void __noreturn multikernel_play_dead(void);
 struct mk_ident_pgtable;
 
 /* Allocate spawn context (includes boot_params) */
-struct mk_spawn_context *mk_alloc_spawn_context(struct mk_instance *instance,
-						phys_addr_t *phys_out);
+struct mk_spawn_context *mk_alloc_spawn_context(struct mk_instance *instance);
 struct boot_params *mk_spawn_context_boot_params(struct mk_spawn_context *ctx);
 
 /* Set up spawn context for kernel boot */
