@@ -20,6 +20,7 @@
 #include <linux/libfdt.h>
 #include <linux/multikernel.h>
 #include <linux/of.h>
+#include <linux/panic.h>
 #include <asm/mmu.h>
 #include <asm/processor.h>
 #include <asm/sbi.h>
@@ -142,6 +143,42 @@ void __noreturn mk_enter_pool_state(void *info)
 	while (1)
 		wait_for_interrupt();
 }
+
+/*
+ * SRST and the legacy shutdown call act on the whole machine, so a spawn
+ * that reached them would take the host down with it. Every way down
+ * ends here first, and in a spawn it does not return.
+ */
+void mk_spawn_machine_halt(void)
+{
+	if (mk_spawned())
+		mk_halt_to_pool();
+}
+
+/*
+ * A spawn's image is about to be overwritten, and a host's harts are what
+ * a backup kernel takes over once it has fenced the host: firmware hands
+ * out only harts that are stopped. A kernel outside any multikernel keeps
+ * the stock WFI loop.
+ */
+void mk_stop_this_cpu(void)
+{
+	if (mk_self)
+		mk_enter_pool_state(NULL);
+}
+
+/*
+ * A panicked spawn kernel spinning in the panic loop holds its harts
+ * hostage. "Reboot on panic" is mk_spawn_machine_halt() here, which
+ * notifies the host and stops the harts, so make it the default.
+ */
+static int __init mk_spawn_reboot_init(void)
+{
+	if (mk_spawned() && !panic_timeout)
+		panic_timeout = -1;
+	return 0;
+}
+core_initcall(mk_spawn_reboot_init);
 
 void mk_force_stop_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {

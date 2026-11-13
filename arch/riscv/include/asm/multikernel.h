@@ -50,9 +50,26 @@ struct mk_instance_arch {
 /* Have a hart this kernel starts for itself enter through mk_hart_entry */
 void mk_wrap_hart_entry(unsigned int cpu, unsigned long *entry,
 			unsigned long *opaque);
+
+/*
+ * The ways down. Stock RISC-V resets the whole machine through SBI SRST
+ * and leaves stopped harts in a WFI loop inside the kernel image; a
+ * multikernel kernel stops its harts through SBI HSM instead, where
+ * another kernel can start them. The halt returns on a host.
+ */
+void mk_spawn_machine_halt(void);
+void mk_stop_this_cpu(void);
 #else
 static inline void mk_wrap_hart_entry(unsigned int cpu, unsigned long *entry,
 				      unsigned long *opaque)
+{
+}
+
+static inline void mk_spawn_machine_halt(void)
+{
+}
+
+static inline void mk_stop_this_cpu(void)
 {
 }
 #endif
