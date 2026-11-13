@@ -17,13 +17,72 @@
 #include <linux/iopoll.h>
 #include <linux/irqflags.h>
 #include <linux/kexec.h>
+#include <linux/libfdt.h>
 #include <linux/multikernel.h>
+#include <linux/of.h>
 #include <asm/mmu.h>
 #include <asm/processor.h>
 #include <asm/sbi.h>
+#include <asm/sections.h>
 
 /* A halting kernel acknowledges first and stops its harts afterwards */
 #define MK_HART_STOP_TIMEOUT_US	USEC_PER_SEC
+
+#define MK_HART_ENTRY_PROP	"multikernel,hart-entry"
+
+asmlinkage void mk_hart_entry(void);
+static_assert(offsetof(struct mk_boot_record, a1) == 0);
+static_assert(offsetof(struct mk_boot_record, entry) == 8);
+
+/*
+ * The mk_hart_entry every hart of this kernel's instances and of this
+ * kernel itself enters through: the first host's, handed down to each
+ * spawn, so that it is text of a kernel no image load overwrites.
+ */
+static phys_addr_t mk_entry_pa;
+
+static int __init mk_hart_entry_init(void)
+{
+	u64 pa;
+
+	if (mk_spawned() && of_chosen &&
+	    !of_property_read_u64(of_chosen, MK_HART_ENTRY_PROP, &pa))
+		mk_entry_pa = pa;
+	else
+		mk_entry_pa = __pa_symbol(mk_hart_entry);
+	return 0;
+}
+/* Before smp_init() starts the secondaries */
+early_initcall(mk_hart_entry_init);
+
+int mk_arch_manifest_chosen(void *fdt, struct mk_instance *instance)
+{
+	return fdt_property_u64(fdt, MK_HART_ENTRY_PROP, mk_entry_pa);
+}
+
+static struct mk_boot_record mk_secondary_boot[NR_CPUS];
+
+/*
+ * A spawn kernel's image is loaded where an earlier one ran, and its
+ * secondaries are harts that earlier one stopped, so they go through
+ * mk_hart_entry as its boot hart did. A host's image is never replaced
+ * while it runs, so its own harts enter directly.
+ */
+void mk_wrap_hart_entry(unsigned int cpu, unsigned long *entry,
+			unsigned long *opaque)
+{
+	struct mk_boot_record *boot = &mk_secondary_boot[cpu];
+
+	if (!mk_spawned())
+		return;
+
+	boot->a1 = *opaque;
+	boot->entry = *entry;
+	*entry = mk_entry_pa;
+	*opaque = __pa(boot);
+	/* The hart reads the record with its MMU off, before anything else */
+	mb();
+}
 
 void mk_arch_send_ipi(mk_phys_cpu_t phys_cpu)
 {
@@ -134,9 +193,11 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 
 	guard(mutex)(&mk_park_lock);
 
+	instance->arch.boot.a1 = image->arch.fdt_addr;
+	instance->arch.boot.entry = image->start;
 	/* What the hart reads first must be in memory before it starts */
 	mb();
-	ret = mk_hsm_start(hartid, image->start, image->arch.fdt_addr);
+	ret = mk_hsm_start(hartid, mk_entry_pa, __pa(&instance->arch.boot));
 	if (ret) {
 		pr_err("HART_START of hart %llu for instance %d failed: %d\n",
 		       hartid, instance->id, ret);
