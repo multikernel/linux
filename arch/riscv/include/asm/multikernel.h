@@ -59,7 +59,22 @@ void mk_wrap_hart_entry(unsigned int cpu, unsigned long *entry,
  */
 void mk_spawn_machine_halt(void);
 void mk_stop_this_cpu(void);
+
+/* The boot tree is the manifest when another kernel wrote it */
+void mk_spawn_accept_boot_tree(phys_addr_t dt_phys);
+
+/* Where the linear map starts: @dram_start, or lower for RAM registered to come */
+phys_addr_t mk_linear_map_start(phys_addr_t dram_start);
 #else
+static inline void mk_spawn_accept_boot_tree(phys_addr_t dt_phys)
+{
+}
+
+static inline phys_addr_t mk_linear_map_start(phys_addr_t dram_start)
+{
+	return dram_start;
+}
+
 static inline void mk_wrap_hart_entry(unsigned int cpu, unsigned long *entry,
 				      unsigned long *opaque)
 {
