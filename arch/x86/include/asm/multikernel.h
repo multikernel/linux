@@ -79,11 +79,10 @@ struct mk_spawn_context {
 	unsigned long self_phys;	/* Physical address of this struct, a layout check */
 	unsigned long identity_cr3;	/* Page table the boot CPU switches to */
 	unsigned long kernel_entry;	/* Entry point of the instance's kernel */
-	unsigned long trampoline_phys;	/* Trampoline page, the instance's to reuse */
 	unsigned long park_table;	/* Park table every kernel parks its CPUs in */
 	unsigned long ctrl_phys;	/* Host control area: this context, trampoline, */
 	unsigned long ctrl_size;	/* page tables. Spawn must not reuse it */
-	unsigned long reserved;
+	unsigned long reserved[2];
 	struct boot_params bp;		/* Standard x86 boot params */
 	/* Optional boot data belongs after boot_params, in the zeroed tail. */
 	unsigned long boot_lps;		/* Host delay loops per second */
@@ -199,7 +198,6 @@ struct boot_params *mk_spawn_context_boot_params(struct mk_spawn_context *ctx);
 void mk_set_spawn_context(struct mk_spawn_context *ctx,
 			  unsigned long identity_cr3,
 			  unsigned long kernel_entry,
-			  unsigned long trampoline_phys,
 			  unsigned long park_table);
 
 /* Trigger spawn on a pool CPU */

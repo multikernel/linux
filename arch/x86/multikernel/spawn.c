@@ -116,12 +116,10 @@ struct boot_params *mk_spawn_context_boot_params(struct mk_spawn_context *ctx)
 void mk_set_spawn_context(struct mk_spawn_context *ctx,
 			  unsigned long identity_cr3,
 			  unsigned long kernel_entry,
-			  unsigned long trampoline_phys,
 			  unsigned long park_table)
 {
 	ctx->identity_cr3 = identity_cr3;
 	ctx->kernel_entry = kernel_entry;
-	ctx->trampoline_phys = trampoline_phys;
 	/* Where the instance's kernel parks its CPUs and finds them */
 	ctx->park_table = park_table;
 }
@@ -150,7 +148,7 @@ int mk_spawn_cpu(struct mk_instance *instance, int cpu,
 		ctx->identity_cr3,
 		virt_to_phys(&ctx->bp),
 		ctx->kernel_entry,
-		ctx->trampoline_phys,
+		virt_to_phys(instance->arch.trampoline_va),
 	};
 	mk_phys_cpu_t phys_cpu;
 	unsigned int i;
@@ -238,17 +236,6 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 	}
 
 	/*
-	 * The previous spawn overwrote this page with its own build's
-	 * trampoline (mk_prepare_trampoline()). The CPU released below must
-	 * run THIS kernel's trampoline, with this kernel's fixes; an old
-	 * build's copy can fault on state the fixes handle (CR4.CET vs
-	 * CR0.WP), and a fault there lands in the park page's handler and
-	 * halts the CPU. Restore our copy on every exec.
-	 */
-	memcpy(instance->arch.trampoline_va, multikernel_relocate_kernel_start,
-	       multikernel_relocate_kernel_end - multikernel_relocate_kernel_start);
-
-	/*
 	 * The boot CPU leaves its park cell on this page table, so it must
 	 * map the park code. Every exec, as the table may have been rebuilt.
 	 */
@@ -297,7 +284,6 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 	mk_set_spawn_context(instance->arch.spawn_ctx,
 			     mk_get_identity_cr3(instance->arch.ident_pgt),
 			     image->arch.mk_kernel_entry,
-			     virt_to_phys(instance->arch.trampoline_va),
 			     mk_park_table_phys());
 	instance->arch.spawn_ctx->boot_lps = cpu_data(cpu).loops_per_jiffy;
 	if (!instance->arch.spawn_ctx->boot_lps)
@@ -498,11 +484,10 @@ void mk_init_boot_context(phys_addr_t ctx_phys)
 	mk_park_table_set_boot(ctx->park_table);
 
 	/*
-	 * The host's control area (this context, the trampoline page, the
-	 * identity page tables) sits in our memory and is handed to us as
-	 * ordinary RAM, so it stays mapped in the direct map and we can
-	 * execute from the trampoline. Keep the page allocator away from
-	 * it: the next spawn of this instance boots from it.
+	 * The host's control area (this context, the host's boot trampoline,
+	 * the identity page tables) sits in our memory and is handed to us
+	 * as ordinary RAM. Keep the page allocator away from it: the next
+	 * spawn of this instance boots from it.
 	 */
 	if (ctx->ctrl_phys && ctx->ctrl_size &&
 	    memblock_reserve(ctx->ctrl_phys, ctx->ctrl_size))
@@ -511,40 +496,35 @@ void mk_init_boot_context(phys_addr_t ctx_phys)
 }
 
 /*
- * Make this kernel's trampoline page executable while the kernel is
- * fully alive, as is done for the park code page when the park table
- * is attached.
- *
- * One physical page serves every wake path of this instance: the host
- * allocates it once in mk_setup_trampoline() and reuses it across
- * re-spawns, and mk_prepare_trampoline() places our own trampoline copy
- * (including the secondary entry) in the same page. The copy matters:
- * the page arrives holding the HOST kernel's trampoline code, and when
- * the two binaries differ its offsets are wrong for this kernel.
+ * The trampoline this kernel starts its secondaries through, in a page
+ * of its own memory that no other kernel writes. The page an instance's
+ * parent booted it through stays the parent's.
  */
+static phys_addr_t mk_trampoline_phys;
+
 static int __init mk_prepare_trampoline(void)
 {
-	struct mk_spawn_context *ctx = mk_boot_context;
-	unsigned long virt;
+	unsigned long page;
 	int ret;
 
-	if (!ctx)
+	if (!mk_boot_context)
 		return 0;
 
-	/* Put our own copy of the trampoline in the page the host set aside */
-	memcpy(__va(ctx->trampoline_phys), multikernel_relocate_kernel_start,
+	page = __get_free_page(GFP_KERNEL);
+	if (!page)
+		return -ENOMEM;
+
+	memcpy((void *)page, multikernel_relocate_kernel_start,
 	       multikernel_relocate_kernel_end - multikernel_relocate_kernel_start);
 
-	/*
-	 * It is executed from the direct map, which is writable, so drop
-	 * write before adding execute. Leaving it writable and executable
-	 * trips the kernel's own W^X check.
-	 */
-	virt = (unsigned long)__va(ctx->trampoline_phys) & PAGE_MASK;
-	ret = set_memory_ro(virt, 1);
-	if (!ret)
-		ret = set_memory_x(virt, 1);
-	return ret;
+	ret = set_memory_rox(page, 1);
+	if (ret) {
+		free_page(page);
+		return ret;
+	}
+
+	mk_trampoline_phys = __pa(page);
+	return 0;
 }
 early_initcall(mk_prepare_trampoline);
 
@@ -608,12 +588,6 @@ static int mk_add_2mb_mapping(pgd_t *pgd, unsigned long virt, unsigned long phys
 }
 
 /*
- * Initialize spawn kernel's trampoline (one-time setup).
- * Copies spawn kernel's trampoline code to the pool memory page
- * that was allocated by the host kernel during initial spawn boot.
- */
-
-/*
  * The identity page table a parked CPU switches to on its way into this
  * kernel: it leaves its cell from the park code page and continues in
  * the trampoline, both at their physical addresses.
@@ -648,17 +622,14 @@ static int mk_build_trampoline_pgtable(unsigned long trampoline_phys,
 int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 					unsigned int cpu)
 {
-	struct mk_spawn_context *own = mk_boot_context;
-	unsigned long trampoline_phys, identity_cr3;
+	unsigned long trampoline_phys = mk_trampoline_phys, identity_cr3;
 	u64 args[6];
 	int ret;
 
-	if (!own || !own->trampoline_phys) {
+	if (!trampoline_phys) {
 		pr_err("mk_spawn: no trampoline to start CPU %u with\n", cpu);
 		return -ENODEV;
 	}
-	/* mk_prepare_trampoline() put this kernel's own copy in the page */
-	trampoline_phys = own->trampoline_phys;
 
 	ret = mk_build_trampoline_pgtable(trampoline_phys, &identity_cr3);
 	if (ret)
