@@ -1831,6 +1831,67 @@ void __ref vmemmap_free(unsigned long start, unsigned long end, struct vmem_altm
 	remove_pgd_mapping(start, end, true, altmap);
 }
 
+#ifdef CONFIG_MEMORY_HOTREMOVE
+static bool addr_splits_kernel_leaf(unsigned long addr)
+{
+	pgd_t *pgdp = pgd_offset_k(addr);
+	p4d_t *p4dp, p4d;
+	pud_t *pudp, pud;
+	pmd_t *pmdp, pmd;
+
+	if (pgd_none(pgdp_get(pgdp)))
+		return false;
+
+	p4dp = p4d_offset(pgdp, addr);
+	p4d = p4dp_get(p4dp);
+	if (p4d_none(p4d))
+		return false;
+	if (p4d_leaf(p4d))
+		return !IS_ALIGNED(addr, P4D_SIZE);
+
+	pudp = pud_offset(p4dp, addr);
+	pud = pudp_get(pudp);
+	if (pud_none(pud))
+		return false;
+	if (pud_leaf(pud))
+		return !IS_ALIGNED(addr, PUD_SIZE);
+
+	pmdp = pmd_offset(pudp, addr);
+	pmd = pmdp_get(pmdp);
+	return pmd_leaf(pmd) && !IS_ALIGNED(addr, PMD_SIZE);
+}
+
+/*
+ * An early section keeps the memmap of the part of it that goes, so only
+ * a section that was added back frees memmap, and a 2M vmemmap block
+ * holds the memmap of a whole section.
+ */
+static bool memmap_edge_splits_leaf(unsigned long edge_pfn,
+				    unsigned long section_pfn)
+{
+	if (early_section(__pfn_to_section(section_pfn)))
+		return false;
+	return addr_splits_kernel_leaf((unsigned long)pfn_to_page(edge_pfn));
+}
+
+/*
+ * Removing a range clears every leaf it touches whole, so the linear map
+ * leaves at its edges are split first, as for a permission change. The
+ * vmemmap is never split.
+ */
+int arch_prepare_remove_subsections(u64 start, u64 size)
+{
+	unsigned long start_pfn = PHYS_PFN(start);
+	unsigned long end_pfn = PHYS_PFN(start + size);
+
+	if (memmap_edge_splits_leaf(start_pfn, start_pfn) ||
+	    memmap_edge_splits_leaf(end_pfn, end_pfn - 1))
+		return -EBUSY;
+
+	return split_linear_range(start, size);
+}
+#endif
+
 /*
  * A user that hot-removed memory for good, so that no stray pointer
  * reaches it, may still need a few of its pages at their linear map
