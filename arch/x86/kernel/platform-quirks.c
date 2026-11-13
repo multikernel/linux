@@ -59,16 +59,6 @@ static void __init multikernel_setup_calibration(void)
 	setup_force_cpu_cap(X86_FEATURE_TSC_KNOWN_FREQ);
 }
 
-/*
- * Custom wakeup for multikernel spawn kernels.
- * Uses shared spawn table instead of realmode trampoline.
- */
-static int multikernel_wakeup_cpu(u32 apicid, unsigned long start_eip,
-				  unsigned int cpu)
-{
-	return multikernel_wakeup_secondary_cpu_64(apicid, start_eip, cpu);
-}
-
 #ifdef CONFIG_X86_64
 /*
  * Multikernel pagetable initialization.
@@ -129,12 +119,6 @@ static void __init multikernel_parse_smp_config(void)
 	 * No dereference - pool memory may not be mapped during early boot.
 	 */
 	mk_init_boot_context(orig_boot_params - offsetof(struct mk_spawn_context, bp));
-
-	/*
-	 * Set custom wakeup function for secondary CPU bringup.
-	 * This uses the shared spawn table instead of realmode trampoline.
-	 */
-	apic_update_callback(wakeup_secondary_cpu_64, multikernel_wakeup_cpu);
 }
 
 /*

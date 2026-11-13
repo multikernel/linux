@@ -281,9 +281,6 @@ static void notrace __noendbr start_secondary(void *unused)
 
 	ap_starting();
 
-	if (IS_ENABLED(CONFIG_MULTIKERNEL))
-		mk_park_cpu_running();
-
 	/* Check TSC synchronization with the control CPU. */
 	check_tsc_sync_target();
 
@@ -1065,12 +1062,15 @@ static int do_boot_cpu(u32 apicid, unsigned int cpu, struct task_struct *idle)
 
 	/*
 	 * Wake up a CPU in difference cases:
+	 * - A multikernel CPU waiting in its park cell leaves through it.
 	 * - Use a method from the APIC driver if one defined, with wakeup
 	 *   straight to 64-bit mode preferred over wakeup to RM.
 	 * Otherwise,
 	 * - Use an INIT boot APIC message
 	 */
-	if (apic->wakeup_secondary_cpu_64)
+	if (IS_ENABLED(CONFIG_MULTIKERNEL) && mk_starts_from_cell(apicid))
+		ret = mk_start_from_cell(apicid, cpu);
+	else if (apic->wakeup_secondary_cpu_64)
 		ret = apic->wakeup_secondary_cpu_64(apicid, start_ip, cpu);
 	else if (apic->wakeup_secondary_cpu)
 		ret = apic->wakeup_secondary_cpu(apicid, start_ip, cpu);

@@ -329,22 +329,13 @@ bool mk_park_ready(void)
 	return mk_park_index(read_apic_id()) >= 0;
 }
 
-/*
- * A CPU that left its cell through INIT, as the first kernel starts its
- * own CPUs, never claimed a command, so it reports itself running.
- */
-void mk_park_cpu_running(void)
+/* Whether a CPU waits in its cell right now */
+bool mk_park_parked(u32 apic_id)
 {
-	int index = mk_park_index(read_apic_id());
-	struct mk_park_cell *cell;
+	int index = mk_park_index(apic_id);
 
-	if (index < 0)
-		return;
-
-	cell = mk_park_cell(index);
-	if (READ_ONCE(cell->state) != MK_PARK_RUNNING)
-		WRITE_ONCE(cell->word,
-			   mk_park_word(MK_PARK_RUNNING, MK_PARK_CMD_NONE));
+	return index >= 0 &&
+	       READ_ONCE(mk_park_cell(index)->state) == MK_PARK_PARKED;
 }
 
 /* Park this CPU in its cell; returns only if it has none */

@@ -160,7 +160,7 @@ phys_addr_t mk_park_code_phys(void);
 int mk_park_dispatch(u32 apic_id, u32 cmd, const u64 *args, unsigned int nargs);
 int mk_park_wait(u32 apic_id);
 void mk_park_this_cpu(void);
-void mk_park_cpu_running(void);
+bool mk_park_parked(u32 apic_id);
 bool mk_park_ready(void);
 
 /* Page table helpers the park table shares with spawn */
@@ -218,9 +218,9 @@ void *mk_setup_trampoline(struct mk_instance *instance,
 			  struct mk_ident_pgtable *pgt,
 			  unsigned long *phys_out);
 
-/* Secondary CPU wakeup for spawn kernels (reuses boot context) */
-int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
-					unsigned int cpu);
+/* Starting a CPU from its park cell as a secondary */
+bool mk_starts_from_cell(u32 apicid);
+int mk_start_from_cell(u32 apicid, unsigned int cpu);
 
 /* Restore AP to spawn context (used by hibernation/switch) */
 int multikernel_restore_ap(unsigned int cpu, unsigned long cr3,

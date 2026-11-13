@@ -5,9 +5,9 @@
  * Every CPU a kernel does not run on waits in its park table cell (see
  * park.c). The host boots an instance by sending the instance's boot
  * CPU into the trampoline, which switches to the instance's identity
- * page table and jumps to its kernel. The spawn kernel then starts its
- * secondaries from their cells the same way, through its own copy of
- * the trampoline.
+ * page table and jumps to its kernel. Every kernel starts a CPU waiting
+ * in its cell as a secondary the same way, through its own copy of the
+ * trampoline.
  *
  * Copyright (C) 2026 Multikernel Technologies, Inc.
  */
@@ -496,9 +496,9 @@ void mk_init_boot_context(phys_addr_t ctx_phys)
 }
 
 /*
- * The trampoline this kernel starts its secondaries through, in a page
- * of its own memory that no other kernel writes. The page an instance's
- * parent booted it through stays the parent's.
+ * The trampoline this kernel starts CPUs from their park cells through,
+ * in a page of its own memory that no other kernel writes. The page an
+ * instance's parent booted it through stays the parent's.
  */
 static phys_addr_t mk_trampoline_phys;
 
@@ -506,9 +506,6 @@ static int __init mk_prepare_trampoline(void)
 {
 	unsigned long page;
 	int ret;
-
-	if (!mk_boot_context)
-		return 0;
 
 	page = __get_free_page(GFP_KERNEL);
 	if (!page)
@@ -618,9 +615,18 @@ static int mk_build_trampoline_pgtable(unsigned long trampoline_phys,
 	return 0;
 }
 
-/* Start a CPU waiting in its park cell as a secondary of this spawn kernel */
-int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
-					unsigned int cpu)
+/*
+ * Whether cpuhp starts @apicid from its park cell. A spawn has no other
+ * way. The first kernel starts its CPUs by INIT, except one waiting in
+ * its cell: that one leaves through the cell, which then reads RUNNING.
+ */
+bool mk_starts_from_cell(u32 apicid)
+{
+	return mk_spawned() || mk_park_parked(apicid);
+}
+
+/* Start a CPU waiting in its park cell as a secondary of this kernel */
+int mk_start_from_cell(u32 apicid, unsigned int cpu)
 {
 	unsigned long trampoline_phys = mk_trampoline_phys, identity_cr3;
 	u64 args[6];
