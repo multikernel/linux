@@ -58,8 +58,13 @@ machine_kexec_prepare(struct kimage *image)
 		return -EINVAL;
 	}
 
-	/* Copy the assembler code for relocation to the control page */
-	if (image->type != KEXEC_TYPE_CRASH) {
+	/*
+	 * Copy the assembler code for relocation to the control page. A
+	 * multikernel image is loaded in place and started on another hart,
+	 * never through it.
+	 */
+	if (image->type != KEXEC_TYPE_CRASH &&
+	    image->type != KEXEC_TYPE_MULTIKERNEL) {
 		control_code_buffer = page_address(image->control_code_page);
 		control_code_buffer_sz = page_size(image->control_code_page);
 
