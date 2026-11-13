@@ -40,6 +40,11 @@ typedef struct {
 
 void __meminit create_pgd_mapping(pgd_t *pgdp, uintptr_t va, phys_addr_t pa, phys_addr_t sz,
 				  pgprot_t prot);
+
+#ifdef CONFIG_MEMORY_HOTPLUG
+void map_linear_range(phys_addr_t start, phys_addr_t size);
+void unmap_linear_range(phys_addr_t start, phys_addr_t size);
+#endif
 #endif /* __ASSEMBLER__ */
 
 #endif /* _ASM_RISCV_MMU_H */
