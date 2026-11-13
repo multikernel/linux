@@ -496,36 +496,6 @@ void mk_init_boot_context(phys_addr_t ctx_phys)
 }
 
 /*
- * The trampoline this kernel starts CPUs from their park cells through,
- * in a page of its own memory that no other kernel writes. The page an
- * instance's parent booted it through stays the parent's.
- */
-static phys_addr_t mk_trampoline_phys;
-
-static int __init mk_prepare_trampoline(void)
-{
-	unsigned long page;
-	int ret;
-
-	page = __get_free_page(GFP_KERNEL);
-	if (!page)
-		return -ENOMEM;
-
-	memcpy((void *)page, multikernel_relocate_kernel_start,
-	       multikernel_relocate_kernel_end - multikernel_relocate_kernel_start);
-
-	ret = set_memory_rox(page, 1);
-	if (ret) {
-		free_page(page);
-		return ret;
-	}
-
-	mk_trampoline_phys = __pa(page);
-	return 0;
-}
-early_initcall(mk_prepare_trampoline);
-
-/*
  * Add a 2MB executable mapping to a page table.
  * Allocates P4D/PUD/PMD levels as needed, reusing existing entries if present.
  * Handles both 4-level and 5-level paging.
@@ -585,35 +555,63 @@ static int mk_add_2mb_mapping(pgd_t *pgd, unsigned long virt, unsigned long phys
 }
 
 /*
- * The identity page table a parked CPU switches to on its way into this
- * kernel: it leaves its cell from the park code page and continues in
- * the trampoline, both at their physical addresses.
+ * The trampoline this kernel starts CPUs from their park cells through,
+ * in a page of its own memory that no other kernel writes. The page an
+ * instance's parent booted it through stays the parent's.
+ *
+ * A CPU leaving its cell switches to mk_wake_pgd, which maps the park
+ * code page and the trampoline at their physical addresses. Both are
+ * built once; a wake only maps the park code page, which moves when
+ * the first kernel rebuilds the table.
  */
-static int mk_build_trampoline_pgtable(unsigned long trampoline_phys,
-				       unsigned long *cr3_out)
+static phys_addr_t mk_trampoline_phys;
+static pgd_t *mk_wake_pgd;
+
+static int __init mk_prepare_trampoline(void)
 {
-	phys_addr_t code_phys = mk_park_code_phys();
+	unsigned long page;
+	phys_addr_t phys;
 	pgd_t *pgd;
 	int ret;
 
-	if (!code_phys)
-		return -ENODEV;
+	page = __get_free_page(GFP_KERNEL);
+	if (!page)
+		return -ENOMEM;
+
+	memcpy((void *)page, multikernel_relocate_kernel_start,
+	       multikernel_relocate_kernel_end - multikernel_relocate_kernel_start);
+
+	ret = set_memory_rox(page, 1);
+	if (ret) {
+		free_page(page);
+		return ret;
+	}
+	phys = __pa(page);
 
 	pgd = (pgd_t *)get_zeroed_page(GFP_KERNEL);
 	if (!pgd)
 		return -ENOMEM;
-
-	ret = mk_add_2mb_mapping(pgd, code_phys, code_phys,
-				 __PAGE_KERNEL_LARGE_EXEC);
-	if (!ret)
-		ret = mk_add_2mb_mapping(pgd, trampoline_phys, trampoline_phys,
-					 __PAGE_KERNEL_LARGE_EXEC);
+	ret = mk_add_2mb_mapping(pgd, phys, phys, __PAGE_KERNEL_LARGE_EXEC);
 	if (ret)
 		return ret;
 
-	*cr3_out = __pa(pgd);
+	/*
+	 * The trampoline switches to init_mm's page table while still
+	 * running at its physical address, so map it there too, in init_mm
+	 * rather than the current CR3: a wake runs in the cpuhp kthread,
+	 * which may be borrowing a user mm (lazy TLB). The mapping stays,
+	 * so it must not be writable and executable at once.
+	 */
+	ret = mk_add_2mb_mapping(init_mm.pgd, phys, phys,
+				 __PAGE_KERNEL_LARGE_EXEC & ~_PAGE_RW);
+	if (ret)
+		return ret;
+
+	mk_wake_pgd = pgd;
+	mk_trampoline_phys = phys;
 	return 0;
 }
+early_initcall(mk_prepare_trampoline);
 
 /*
  * Whether cpuhp starts @apicid from its park cell. A spawn has no other
@@ -628,36 +626,27 @@ bool mk_starts_from_cell(u32 apicid)
 /* Start a CPU waiting in its park cell as a secondary of this kernel */
 int mk_start_from_cell(u32 apicid, unsigned int cpu)
 {
-	unsigned long trampoline_phys = mk_trampoline_phys, identity_cr3;
+	phys_addr_t code_phys = mk_park_code_phys();
 	u64 args[6];
 	int ret;
 
-	if (!trampoline_phys) {
+	if (!mk_trampoline_phys) {
 		pr_err("mk_spawn: no trampoline to start CPU %u with\n", cpu);
 		return -ENODEV;
 	}
+	if (!code_phys)
+		return -ENODEV;
 
-	ret = mk_build_trampoline_pgtable(trampoline_phys, &identity_cr3);
+	ret = mk_add_2mb_mapping(mk_wake_pgd, code_phys, code_phys,
+				 __PAGE_KERNEL_LARGE_EXEC);
 	if (ret)
 		return ret;
 
-	/*
-	 * The trampoline switches to init_mm's page table while still
-	 * running at its physical address, so map it there too, in init_mm
-	 * rather than the current CR3: this runs in the cpuhp kthread,
-	 * which may be borrowing a user mm (lazy TLB). The mapping stays,
-	 * so it must not be writable and executable at once.
-	 */
-	ret = mk_add_2mb_mapping(init_mm.pgd, trampoline_phys, trampoline_phys,
-				 __PAGE_KERNEL_LARGE_EXEC & ~_PAGE_RW);
-	if (ret)
-		return ret;
-
-	args[0] = identity_cr3;
+	args[0] = __pa(mk_wake_pgd);
 	args[1] = (unsigned long)multikernel_secondary_startup;
 	args[2] = per_cpu_offset(cpu);
 	args[3] = (unsigned long)idle_task(cpu)->thread.sp;
-	args[4] = trampoline_phys +
+	args[4] = mk_trampoline_phys +
 		  (mk_secondary_trampoline - multikernel_relocate_kernel_start);
 	args[5] = __sme_pa(init_mm.pgd);
 
