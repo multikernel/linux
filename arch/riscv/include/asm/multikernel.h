@@ -77,6 +77,14 @@ static inline void mk_stop_this_cpu(void)
 /* Nothing of RISC-V's lives in the control block, so it is never allocated */
 #define MK_CTRL_BLOCK_SIZE	PAGE_SIZE
 
+/*
+ * Room for an instance's boot device tree, a segment of its kimage: the
+ * manifest (MK_MANIFEST_SIZE) with the RISC-V boot nodes on top. The tree
+ * is rebuilt in place on every spawn, as the memory grant can have
+ * changed since the load.
+ */
+#define MK_BOOT_DTB_SIZE	SZ_512K
+
 #endif /* !__ASSEMBLY__ */
 
 #endif /* _ASM_RISCV_MULTIKERNEL_H */
