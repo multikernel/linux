@@ -29,6 +29,7 @@
 #include <asm/cacheflush.h>
 #include <asm/cpufeature.h>
 #include <asm/early_ioremap.h>
+#include <asm/multikernel.h>
 #include <asm/pgtable.h>
 #include <asm/setup.h>
 #include <asm/set_memory.h>
@@ -321,6 +322,8 @@ void __init setup_arch(char **cmdline_p)
 	*cmdline_p = boot_command_line;
 
 	early_ioremap_setup();
+	/* Before paging_init() lays out memory, which the manifest has a say in */
+	mk_spawn_accept_boot_tree(dtb_early_pa);
 	sbi_init();
 	jump_label_init();
 	parse_early_param();
