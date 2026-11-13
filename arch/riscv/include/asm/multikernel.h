@@ -29,23 +29,36 @@ static inline int arch_cpu_from_physical_id(u64 hartid)
 }
 
 /*
- * The RISC-V spawn path will use one page for its context, up to 64 KiB
- * for the generated DTB, and one page for the fence.i entry stub. SBI HSM
- * starts a hart in the existing address space, so no trampoline page tables
- * are needed.
+ * What a hart started through mk_hart_entry finds in a1: the a1 it is to
+ * enter with and where to enter. mk_hart_entry reads it as data.
  */
-#define MK_CTRL_BLOCK_SIZE	(SZ_64K + 2 * PAGE_SIZE)
+struct mk_boot_record {
+	u64 a1;
+	u64 entry;
+};
 
+#ifdef CONFIG_MULTIKERNEL
 /*
- * Architecture-private spawn and park state is added with the SBI HSM
- * and Image loader support. The compile-only skeleton intentionally has
- * none.
+ * Pool harts are held by firmware in the SBI HSM STOPPED state and
+ * started with HART_START, so an instance needs no trampoline, park page
+ * or page tables: what its boot hart is started with is all there is.
  */
 struct mk_instance_arch {
+	struct mk_boot_record boot;
 };
 
-struct mk_pool_arch {
-};
+/* Have a hart this kernel starts for itself enter through mk_hart_entry */
+void mk_wrap_hart_entry(unsigned int cpu, unsigned long *entry,
+			unsigned long *opaque);
+#else
+static inline void mk_wrap_hart_entry(unsigned int cpu, unsigned long *entry,
+				      unsigned long *opaque)
+{
+}
+#endif
+
+/* Nothing of RISC-V's lives in the control block, so it is never allocated */
+#define MK_CTRL_BLOCK_SIZE	PAGE_SIZE
 
 #endif /* !__ASSEMBLY__ */
 
