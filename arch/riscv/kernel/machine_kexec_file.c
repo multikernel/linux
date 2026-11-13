@@ -266,7 +266,8 @@ int load_extra_segments(struct kimage *image, unsigned long kernel_start,
 	char *modified_cmdline = NULL;
 
 	kbuf.image = image;
-	kbuf.buf_min = kernel_start + kernel_len;
+	/* The new kernel reserves itself up to the next PMD boundary */
+	kbuf.buf_min = ALIGN(kernel_start + kernel_len, PMD_SIZE);
 	kbuf.buf_max = ULONG_MAX;
 
 #ifdef CONFIG_CRASH_DUMP
