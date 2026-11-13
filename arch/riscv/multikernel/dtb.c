@@ -188,6 +188,22 @@ static int mk_dtb_add_cpus(void *fdt, struct mk_instance *instance)
 	return 0;
 }
 
+/*
+ * A platform device's interrupts are wired, and every wired source goes
+ * through the one PLIC or APLIC, whose priority, enable and target
+ * registers stay with the host. The boot tree has no wired controller.
+ */
+static int mk_dtb_check_devices(struct mk_instance *instance)
+{
+	if (instance->platform_devices_valid &&
+	    !list_empty(&instance->platform_devices)) {
+		pr_err("Instance %d: platform devices cannot be given to an instance on RISC-V\n",
+		       instance->id);
+		return -FDT_ERR_BADSTATE;
+	}
+	return 0;
+}
+
 static int mk_dtb_add_chosen(void *fdt, const void *loader_fdt)
 {
 	int from, to, i;
@@ -248,7 +264,10 @@ int mk_build_boot_dtb(struct kimage *image, struct mk_instance *instance)
 	fdt = memremap(seg->mem, seg->memsz, MEMREMAP_WB);
 	if (!fdt)
 		return -ENOMEM;
-	ret = fdt_open_into(phys_to_virt(instance->manifest_phys), fdt, seg->memsz);
+	ret = mk_dtb_check_devices(instance);
+	if (!ret)
+		ret = fdt_open_into(phys_to_virt(instance->manifest_phys), fdt,
+				    seg->memsz);
 	if (!ret)
 		ret = mk_dtb_add_memory(fdt, instance);
 	if (!ret)
