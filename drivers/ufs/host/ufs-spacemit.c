@@ -393,6 +393,7 @@ static int ufs_spacemit_negotiate_pwr_mode(struct ufs_hba *hba,
 
 static int ufs_spacemit_pwr_change_notify(struct ufs_hba *hba,
 					  enum ufs_notify_change_status status,
+					  const struct ufs_pa_layer_attr *dev_max_params,
 					  struct ufs_pa_layer_attr *dev_req_params)
 {
 	struct ufs_spacemit_host *host = ufshcd_get_variant(hba);
@@ -405,7 +406,8 @@ static int ufs_spacemit_pwr_change_notify(struct ufs_hba *hba,
 
 	switch (status) {
 	case PRE_CHANGE:
-		break;
+		return ufs_spacemit_negotiate_pwr_mode(hba, dev_max_params,
+						       dev_req_params);
 	case POST_CHANGE:
 		/* Cache the power mode parameters to use internally */
 		memcpy(&host->dev_req_params, dev_req_params, sizeof(*dev_req_params));
@@ -648,7 +650,6 @@ static const struct ufs_hba_variant_ops ufs_hba_spacemit_vops = {
 	.name = "ufshcd-spacemit",
 	.init = ufs_spacemit_init,
 	.link_startup_notify = ufs_spacemit_link_startup_notify,
-	.negotiate_pwr_mode = ufs_spacemit_negotiate_pwr_mode,
 	.pwr_change_notify = ufs_spacemit_pwr_change_notify,
 	.device_reset = ufs_spacemit_device_reset,
 	.event_notify = ufs_spacemit_event_notify,
