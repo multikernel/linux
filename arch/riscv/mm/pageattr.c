@@ -257,6 +257,19 @@ static int split_linear_mapping(unsigned long start, unsigned long end)
 {
 	return __split_linear_mapping_pgd(pgd_offset_k(start), start, end);
 }
+
+#ifdef CONFIG_MEMORY_HOTREMOVE
+int split_linear_range(phys_addr_t start, phys_addr_t size)
+{
+	int ret;
+
+	mmap_write_lock(&init_mm);
+	ret = split_linear_mapping((unsigned long)__va(start),
+				   (unsigned long)__va(start + size));
+	mmap_write_unlock(&init_mm);
+	return ret;
+}
+#endif
 #endif	/* CONFIG_64BIT */
 
 static int __set_memory(unsigned long addr, int numpages, pgprot_t set_mask,
