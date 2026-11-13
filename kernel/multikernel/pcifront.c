@@ -306,6 +306,16 @@ static void mk_pcifront_add_windows(struct device_node *np,
  * Each bus node is a host bridge of its own, and its platform device is
  * the bridge's parent, from which the PCI core configures DMA.
  */
+/*
+ * The PCI core takes a domain number set in a bridge for one it allocated
+ * for emulation and frees it with the bridge. Ours is the host's number,
+ * which several buses can share.
+ */
+static void mk_pcifront_release_bridge(struct pci_host_bridge *bridge)
+{
+	bridge->domain_nr = PCI_DOMAIN_NR_NOT_SET;
+}
+
 static int mk_pcifront_probe(struct platform_device *pdev)
 {
 	struct device_node *np = pdev->dev.of_node;
@@ -352,8 +362,10 @@ static int mk_pcifront_probe(struct platform_device *pdev)
 	bridge->dev.of_node = of_node_get(np);
 	bridge->busnr = range[0];
 	bridge->ops = &mk_pcifront_ops;
-	if (IS_ENABLED(CONFIG_PCI_DOMAINS_GENERIC))
+	if (IS_ENABLED(CONFIG_PCI_DOMAINS_GENERIC)) {
 		bridge->domain_nr = domain;
+		bridge->release_fn = mk_pcifront_release_bridge;
+	}
 
 	ret = mk_arch_pcifront_prepare(bridge, domain);
 	if (ret)
