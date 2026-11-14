@@ -1570,10 +1570,22 @@ struct execmem_info __init *execmem_arch_setup(void)
 #endif /* CONFIG_EXECMEM */
 
 #ifdef CONFIG_MEMORY_HOTPLUG
-static void __meminit free_pte_table(pte_t *pte_start, pmd_t *pmd)
+/* Boot and vmemmap page tables never went through a constructor */
+static void __meminit free_pgtable_page(struct page *page, bool is_vmemmap)
 {
-	struct page *page = pmd_page(*pmd);
 	struct ptdesc *ptdesc = page_ptdesc(page);
+
+	if (PageReserved(page)) {
+		free_reserved_page(page);
+		return;
+	}
+	if (!is_vmemmap)
+		pagetable_dtor(ptdesc);
+	pagetable_free(ptdesc);
+}
+
+static void __meminit free_pte_table(pte_t *pte_start, pmd_t *pmd, bool is_vmemmap)
+{
 	pte_t *pte;
 	int i;
 
@@ -1583,18 +1595,12 @@ static void __meminit free_pte_table(pte_t *pte_start, pmd_t *pmd)
 			return;
 	}
 
-	pagetable_dtor(ptdesc);
-	if (PageReserved(page))
-		free_reserved_page(page);
-	else
-		pagetable_free(ptdesc);
+	free_pgtable_page(pmd_page(*pmd), is_vmemmap);
 	pmd_clear(pmd);
 }
 
 static void __meminit free_pmd_table(pmd_t *pmd_start, pud_t *pud, bool is_vmemmap)
 {
-	struct page *page = pud_page(*pud);
-	struct ptdesc *ptdesc = page_ptdesc(page);
 	pmd_t *pmd;
 	int i;
 
@@ -1604,12 +1610,7 @@ static void __meminit free_pmd_table(pmd_t *pmd_start, pud_t *pud, bool is_vmemm
 			return;
 	}
 
-	if (!is_vmemmap)
-		pagetable_dtor(ptdesc);
-	if (PageReserved(page))
-		free_reserved_page(page);
-	else
-		pagetable_free(ptdesc);
+	free_pgtable_page(pud_page(*pud), is_vmemmap);
 	pud_clear(pud);
 }
 
@@ -1698,7 +1699,7 @@ static void __meminit remove_pmd_mapping(pmd_t *pmd_base, unsigned long addr, un
 
 		pte_base = (pte_t *)pmd_page_vaddr(*pmdp);
 		remove_pte_mapping(pte_base, addr, next, is_vmemmap, altmap);
-		free_pte_table(pte_base, pmdp);
+		free_pte_table(pte_base, pmdp, is_vmemmap);
 	}
 }
 
