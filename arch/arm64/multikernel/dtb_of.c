@@ -31,18 +31,31 @@ static bool mk_prop_is_addressing(const char *name)
 	       !strcmp(name, "#address-cells") || !strcmp(name, "#size-cells");
 }
 
+/* Addressing is only valid below @np's parent bus, so reg is translated to CPU addresses */
+static int mk_dtb_copy_of_reg(void *fdt, int node, struct device_node *np)
+{
+	struct resource res;
+	int i, ret;
+
+	for (i = 0; !of_address_to_resource(np, i, &res); i++) {
+		ret = fdt_appendprop_u64(fdt, node, "reg", res.start);
+		if (!ret)
+			ret = fdt_appendprop_u64(fdt, node, "reg", resource_size(&res));
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 /*
  * Copy @np to a new node under the root and return its offset. The
  * phandle comes along, so interrupt-parent references between copied
- * nodes keep working. Addressing is only valid below @np's parent bus,
- * so reg is written again, translated to CPU addresses.
+ * nodes keep working.
  */
 static int mk_dtb_copy_of_node(void *fdt, struct device_node *np)
 {
-	u64 reg[2 * MK_DTB_MAX_REG];
 	struct property *pp;
-	struct resource res;
-	int node, nr = 0, ret;
+	int node, ret;
 
 	node = fdt_add_subnode(fdt, 0, np->full_name);
 	if (node < 0)
@@ -56,17 +69,8 @@ static int mk_dtb_copy_of_node(void *fdt, struct device_node *np)
 			return ret;
 	}
 
-	while (nr < MK_DTB_MAX_REG && !of_address_to_resource(np, nr, &res)) {
-		reg[2 * nr] = res.start;
-		reg[2 * nr + 1] = resource_size(&res);
-		nr++;
-	}
-	if (nr) {
-		ret = mk_dtb_set_reg(fdt, node, reg, nr);
-		if (ret)
-			return ret;
-	}
-	return node;
+	ret = mk_dtb_copy_of_reg(fdt, node, np);
+	return ret ? ret : node;
 }
 
 static int mk_dtb_copy_matching(void *fdt, const struct of_device_id *ids,
