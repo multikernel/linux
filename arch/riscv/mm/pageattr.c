@@ -109,23 +109,27 @@ static int __split_linear_mapping_pmd(pud_t *pudp,
 			continue;
 
 		if (pmd_leaf(pmdp_get(pmdp))) {
-			struct page *pte_page;
 			unsigned long pfn = _pmd_pfn(pmdp_get(pmdp));
 			pgprot_t prot = __pgprot(pmd_val(pmdp_get(pmdp)) & ~_PAGE_PFN_MASK);
+			struct ptdesc *ptdesc;
 			pte_t *ptep_new;
 			int i;
 
-			pte_page = alloc_page(GFP_KERNEL);
-			if (!pte_page)
+			ptdesc = pagetable_alloc(GFP_KERNEL, 0);
+			if (!ptdesc)
 				return -ENOMEM;
+			if (!pagetable_pte_ctor(NULL, ptdesc)) {
+				pagetable_free(ptdesc);
+				return -ENOMEM;
+			}
 
-			ptep_new = (pte_t *)page_address(pte_page);
+			ptep_new = (pte_t *)ptdesc_address(ptdesc);
 			for (i = 0; i < PTRS_PER_PTE; ++i, ++ptep_new)
 				set_pte(ptep_new, pfn_pte(pfn + i, prot));
 
 			smp_wmb();
 
-			set_pmd(pmdp, pfn_pmd(page_to_pfn(pte_page), PAGE_TABLE));
+			set_pmd(pmdp, pfn_pmd(page_to_pfn(ptdesc_page(ptdesc)), PAGE_TABLE));
 		}
 	} while (pmdp++, vaddr = next, vaddr != end);
 
@@ -149,24 +153,28 @@ static int __split_linear_mapping_pud(p4d_t *p4dp,
 			continue;
 
 		if (pud_leaf(pudp_get(pudp))) {
-			struct page *pmd_page;
 			unsigned long pfn = _pud_pfn(pudp_get(pudp));
 			pgprot_t prot = __pgprot(pud_val(pudp_get(pudp)) & ~_PAGE_PFN_MASK);
+			struct ptdesc *ptdesc;
 			pmd_t *pmdp_new;
 			int i;
 
-			pmd_page = alloc_page(GFP_KERNEL);
-			if (!pmd_page)
+			ptdesc = pagetable_alloc(GFP_KERNEL, 0);
+			if (!ptdesc)
 				return -ENOMEM;
+			if (!pagetable_pmd_ctor(NULL, ptdesc)) {
+				pagetable_free(ptdesc);
+				return -ENOMEM;
+			}
 
-			pmdp_new = (pmd_t *)page_address(pmd_page);
+			pmdp_new = (pmd_t *)ptdesc_address(ptdesc);
 			for (i = 0; i < PTRS_PER_PMD; ++i, ++pmdp_new)
 				set_pmd(pmdp_new,
 					pfn_pmd(pfn + ((i * PMD_SIZE) >> PAGE_SHIFT), prot));
 
 			smp_wmb();
 
-			set_pud(pudp, pfn_pud(page_to_pfn(pmd_page), PAGE_TABLE));
+			set_pud(pudp, pfn_pud(page_to_pfn(ptdesc_page(ptdesc)), PAGE_TABLE));
 		}
 
 		ret = __split_linear_mapping_pmd(pudp, vaddr, next);
