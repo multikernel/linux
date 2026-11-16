@@ -173,7 +173,7 @@ static void mk_hsm_outside_domain(mk_phys_cpu_t hartid)
 	pr_err("Hart %llu is outside this kernel's OpenSBI domain\n", hartid);
 }
 
-static int mk_wait_hart_stopped(mk_phys_cpu_t hartid)
+int mk_wait_hart_stopped(mk_phys_cpu_t hartid)
 {
 	long state;
 	int ret;
@@ -186,8 +186,8 @@ static int mk_wait_hart_stopped(mk_phys_cpu_t hartid)
 	return ret ?: (state < 0 ? state : 0);
 }
 
-static int mk_hsm_start(mk_phys_cpu_t hartid, phys_addr_t entry,
-			phys_addr_t opaque)
+int mk_hsm_start(mk_phys_cpu_t hartid, phys_addr_t entry,
+		 phys_addr_t opaque)
 {
 	int ret = sbi_hsm_hart_start(hartid, entry, opaque);
 
@@ -276,7 +276,8 @@ static struct mk_cpu_set *mk_started_set(struct mk_instance *instance)
  * mk_arch_spawn_instance - Start an instance's boot hart on its image
  * @image: Loaded kimage for the instance
  * @instance: Instance being spawned
- * @cpu: Logical CPU, stopped in the pool, to boot the instance on
+ * @cpu: Unused: the boot hart is the first the instance owns, which
+ *       need not be a CPU of this kernel
  *
  * Once the boot hart runs, the instance's kernel may start any other hart
  * it was given without telling the host, so all of them count as started
@@ -287,7 +288,7 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 			   int cpu)
 {
 	struct mk_cpu_set *started = mk_started_set(instance);
-	mk_phys_cpu_t hartid = arch_cpu_physical_id(cpu);
+	mk_phys_cpu_t hartid = mk_cpu_set_first(instance->cpus);
 	mk_phys_cpu_t phys_cpu;
 	unsigned int i;
 	int ret;

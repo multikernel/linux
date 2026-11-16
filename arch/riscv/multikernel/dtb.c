@@ -119,15 +119,24 @@ static int mk_dtb_add_memory(void *fdt, struct mk_instance *instance)
 	return 0;
 }
 
-static struct device_node *mk_of_hart_node(mk_phys_cpu_t hartid)
+/*
+ * Copy a hart's node, enabled if the instance's kernel can run on the
+ * hart and disabled if it is of another kind than the instance's harts.
+ */
+static int mk_dtb_copy_hart(void *fdt, int parent, struct device_node *np,
+			    bool enabled)
 {
-	struct device_node *np;
+	int node, ret;
 
-	for_each_of_cpu_node(np) {
-		if (of_get_cpu_hwid(np, 0) == hartid)
-			return np;
-	}
-	return NULL;
+	node = mk_dtb_copy_node(fdt, parent, np);
+	if (node < 0)
+		return node;
+
+	if (!enabled)
+		return fdt_setprop_string(fdt, node, "status", "disabled");
+
+	ret = fdt_delprop(fdt, node, "status");
+	return ret == -FDT_ERR_NOTFOUND ? 0 : ret;
 }
 
 /*
@@ -135,17 +144,22 @@ static struct device_node *mk_of_hart_node(mk_phys_cpu_t hartid)
  * in instance->cpus, so they get the low logical numbers. Every other
  * hart of the machine follows: a kernel can only ever online a hart it
  * enumerated at boot, and the generic code prunes the ones the instance
- * does not own from the present mask.
+ * does not own from the present mask. A hart of another kind than the
+ * instance's is one its kernel can never run on: it stays in the tree,
+ * as the interrupt controllers index their harts by position, disabled.
  *
- * The host's nodes are copied verbatim: the ISA strings, the MMU type and
- * the cache block sizes describe that hart as firmware set it up, and a
- * spawn probing an extension firmware left off on a hart would trap.
+ * The nodes are otherwise copied verbatim: the ISA strings, the MMU type
+ * and the cache block sizes describe that hart as firmware set it up,
+ * and a spawn probing an extension firmware left off on a hart would
+ * trap. The harts this kernel never booted have nodes like any other by
+ * now, see discover.c.
  *
  * fdt_add_subnode() puts a new node ahead of its siblings, hence the
  * instance's harts last and from the last to the first.
  */
 static int mk_dtb_add_cpus(void *fdt, struct mk_instance *instance)
 {
+	mk_phys_cpu_t boot = mk_cpu_set_first(instance->cpus);
 	struct device_node *cpus, *np;
 	unsigned int i;
 	int node, ret;
@@ -163,10 +177,13 @@ static int mk_dtb_add_cpus(void *fdt, struct mk_instance *instance)
 		return ret;
 
 	for_each_of_cpu_node(np) {
-		if (mk_cpu_set_contains(instance->cpus, of_get_cpu_hwid(np, 0)))
+		mk_phys_cpu_t hartid = of_get_cpu_hwid(np, 0);
+
+		if (mk_cpu_set_contains(instance->cpus, hartid))
 			continue;
-		ret = mk_dtb_copy_node(fdt, node, np);
-		if (ret < 0) {
+		ret = mk_dtb_copy_hart(fdt, node, np,
+				       mk_cpus_same_kind(hartid, boot));
+		if (ret) {
 			of_node_put(np);
 			return ret;
 		}
@@ -180,9 +197,9 @@ static int mk_dtb_add_cpus(void *fdt, struct mk_instance *instance)
 			pr_err("The host tree has no hart %llu\n", hartid);
 			return -FDT_ERR_NOTFOUND;
 		}
-		ret = mk_dtb_copy_node(fdt, node, np);
+		ret = mk_dtb_copy_hart(fdt, node, np, true);
 		of_node_put(np);
-		if (ret < 0)
+		if (ret)
 			return ret;
 	}
 	return 0;
