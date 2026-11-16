@@ -693,6 +693,9 @@ static int mk_dt_validate_cpus(const struct mk_dt_config *config)
 
 	/* Check that all physical CPU IDs can be found in present CPUs */
 	mk_cpu_set_for_each(i, phys_cpu_id, config->cpus) {
+		if (mk_arch_cpu_unclaimed(phys_cpu_id))
+			continue;
+
 		logical_cpu = arch_cpu_from_physical_id(phys_cpu_id);
 		if (logical_cpu < 0) {
 			pr_err("Physical CPU ID %llu not found in present CPUs\n",
@@ -837,23 +840,16 @@ static int mk_dt_emit_cpu_prop(void *fdt, const char *name,
 	return ret;
 }
 
-/**
- * mk_dt_emit_pool_members() - Emit every CPU the pool owns
- *
- * A CPU lent to an instance is still a pool member, so the set is the
- * union of the free CPUs and the ones the instances hold.
+/*
+ * A CPU lent to an instance is still a pool member, so the pool's CPUs
+ * are the free ones and the ones the instances hold.
  */
-static int mk_dt_emit_pool_members(void *fdt)
+static int mk_dt_pool_members(struct mk_cpu_set *members)
 {
 	struct mk_instance *instance;
-	struct mk_cpu_set *members;
 	mk_phys_cpu_t phys_cpu_id;
 	unsigned int i;
 	int ret;
-
-	members = mk_cpu_set_alloc();
-	if (!members)
-		return -ENOMEM;
 
 	/*
 	 * The root device tree is only generated from kernfs reads, which
@@ -878,11 +874,89 @@ static int mk_dt_emit_pool_members(void *fdt)
 		}
 	}
 	mutex_unlock(&mk_instance_mutex);
+	return ret;
+}
 
+/*
+ * "cpus" is every pool CPU, "cpus-unclaimed" those of them this kernel
+ * never booted: they are in the pool without having been asked for, and
+ * cannot be taken out of it.
+ */
+static int mk_dt_emit_pool_members(void *fdt)
+{
+	struct mk_cpu_set *members = mk_cpu_set_alloc();
+	struct mk_cpu_set *unclaimed = mk_cpu_set_alloc();
+	mk_phys_cpu_t phys_cpu_id;
+	unsigned int i;
+	int ret = -ENOMEM;
+
+	if (!members || !unclaimed)
+		goto out;
+
+	ret = mk_dt_pool_members(members);
+	mk_cpu_set_for_each(i, phys_cpu_id, members) {
+		if (!ret && mk_arch_cpu_unclaimed(phys_cpu_id))
+			ret = mk_cpu_set_add(unclaimed, phys_cpu_id);
+	}
 	if (!ret)
 		ret = mk_dt_emit_cpu_prop(fdt, "cpus", members);
-
+	if (!ret)
+		ret = mk_dt_emit_cpu_prop(fdt, "cpus-unclaimed", unclaimed);
+out:
+	mk_cpu_set_free(unclaimed);
 	mk_cpu_set_free(members);
+	return ret;
+}
+
+/*
+ * /cpu-kinds, one node for each kind with the CPUs of that kind, this
+ * kernel's and the pool's. Left out where every CPU is alike.
+ */
+static int mk_dt_emit_cpu_kinds(void *fdt)
+{
+	struct mk_cpu_set *cpus = mk_cpu_set_alloc();
+	struct mk_cpu_set *kind_cpus = mk_cpu_set_alloc();
+	unsigned int i, kind, nr_kinds = 1;
+	mk_phys_cpu_t phys_cpu_id;
+	char name[32];
+	int cpu, ret = -ENOMEM;
+
+	if (!cpus || !kind_cpus)
+		goto out;
+
+	ret = mk_dt_pool_members(cpus);
+	for_each_possible_cpu(cpu) {
+		if (!ret)
+			ret = mk_cpu_set_add(cpus, arch_cpu_physical_id(cpu));
+	}
+	mk_cpu_set_for_each(i, phys_cpu_id, cpus)
+		nr_kinds = max(nr_kinds, mk_arch_cpu_kind(phys_cpu_id) + 1);
+	if (ret || nr_kinds == 1)
+		goto out;
+
+	ret = fdt_begin_node(fdt, "cpu-kinds");
+	for (kind = 0; !ret && kind < nr_kinds; kind++) {
+		mk_cpu_set_clear(kind_cpus);
+		mk_cpu_set_for_each(i, phys_cpu_id, cpus) {
+			if (!ret && mk_arch_cpu_kind(phys_cpu_id) == kind)
+				ret = mk_cpu_set_add(kind_cpus, phys_cpu_id);
+		}
+
+		snprintf(name, sizeof(name), "kind@%u", kind);
+		if (!ret)
+			ret = fdt_begin_node(fdt, name);
+		if (!ret)
+			ret = fdt_property_u32(fdt, "reg", kind);
+		if (!ret)
+			ret = mk_dt_emit_cpu_prop(fdt, "cpus", kind_cpus);
+		if (!ret)
+			ret = fdt_end_node(fdt);
+	}
+	if (!ret)
+		ret = fdt_end_node(fdt);
+out:
+	mk_cpu_set_free(kind_cpus);
+	mk_cpu_set_free(cpus);
 	return ret;
 }
 
@@ -1378,6 +1452,8 @@ static int mk_dt_emit_tree(struct mk_instance *instance, void *fdt,
 	ret = mk_dt_emit_devices(instance, fdt);
 	if (!ret)
 		ret = fdt_end_node(fdt);	/* /resources */
+	if (!ret && pool)
+		ret = mk_dt_emit_cpu_kinds(fdt);
 	if (!ret) {
 		if (instance == mk_self && mk_manifest_phys())
 			ret = mk_dt_emit_own_devices(fdt);
