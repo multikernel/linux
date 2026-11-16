@@ -22,6 +22,7 @@
 #include <linux/of.h>
 #include <linux/of_fdt.h>
 #include <linux/panic.h>
+#include <asm/cpu_ops_sbi.h>
 #include <asm/mmu.h>
 #include <asm/processor.h>
 #include <asm/sbi.h>
@@ -161,15 +162,6 @@ void __init mk_spawn_accept_boot_tree(phys_addr_t dt_phys)
 	mk_manifest_populate(dt_phys, fdt_totalsize(initial_boot_params));
 }
 
-static long mk_hsm_status(mk_phys_cpu_t hartid)
-{
-	struct sbiret ret;
-
-	ret = sbi_ecall(SBI_EXT_HSM, SBI_EXT_HSM_HART_STATUS, hartid,
-			0, 0, 0, 0, 0);
-	return ret.error ? sbi_err_map_linux_errno(ret.error) : ret.value;
-}
-
 /*
  * OpenSBI refuses a hart of another of its domains as if there were no
  * such hart. A kernel only learns of harts in its own domain, so this
@@ -186,7 +178,7 @@ static int mk_wait_hart_stopped(mk_phys_cpu_t hartid)
 	long state;
 	int ret;
 
-	ret = read_poll_timeout(mk_hsm_status, state,
+	ret = read_poll_timeout(sbi_hsm_hart_get_status, state,
 				state == SBI_HSM_STATE_STOPPED || state < 0,
 				1000, MK_HART_STOP_TIMEOUT_US, false, hartid);
 	if (!ret && state == -EINVAL)
@@ -197,13 +189,11 @@ static int mk_wait_hart_stopped(mk_phys_cpu_t hartid)
 static int mk_hsm_start(mk_phys_cpu_t hartid, phys_addr_t entry,
 			phys_addr_t opaque)
 {
-	struct sbiret ret;
+	int ret = sbi_hsm_hart_start(hartid, entry, opaque);
 
-	ret = sbi_ecall(SBI_EXT_HSM, SBI_EXT_HSM_HART_START, hartid,
-			entry, opaque, 0, 0, 0);
-	if (ret.error == SBI_ERR_INVALID_PARAM || ret.error == SBI_ERR_DENIED)
+	if (ret == -EINVAL || ret == -EPERM)
 		mk_hsm_outside_domain(hartid);
-	return ret.error ? sbi_err_map_linux_errno(ret.error) : 0;
+	return ret;
 }
 
 /*
