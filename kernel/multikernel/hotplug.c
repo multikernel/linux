@@ -1187,6 +1187,10 @@ int mk_pool_cpu_add(mk_phys_cpu_t cpu_id)
 	int logical_cpu;
 	int ret;
 
+	/* Already there, and never this kernel's to give */
+	if (mk_arch_cpu_unclaimed(cpu_id))
+		return 0;
+
 	/*
 	 * An offline CPU never reaches the park loop, so the pool would
 	 * record a CPU nothing can ever wake.
@@ -1233,6 +1237,12 @@ int mk_pool_cpu_remove(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 		pr_err("Multikernel hotplug: CPU %llu is not free in the pool\n",
 		       cpu_id);
 		return -EBUSY;
+	}
+
+	if (mk_arch_cpu_unclaimed(cpu_id)) {
+		pr_err("Multikernel hotplug: CPU %llu is not one this kernel can run on\n",
+		       cpu_id);
+		return -EINVAL;
 	}
 
 	ret = mk_do_cpu_add(cpu_id, numa_node, flags);
@@ -1474,6 +1484,15 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 		pr_err("Multikernel hotplug: CPU %llu is not in this kernel's pool\n",
 		       cpu_id);
 		ret = -EBUSY;
+		goto out;
+	}
+
+	/* The instance's kernel has that CPU disabled, and cannot say why */
+	if (!mk_cpu_set_empty(target_instance->cpus) &&
+	    !mk_cpus_same_kind(cpu_id, mk_cpu_set_first(target_instance->cpus))) {
+		pr_err("Multikernel hotplug: CPU %llu is not of the same kind as the CPUs of instance %d\n",
+		       cpu_id, instance_id);
+		ret = -EINVAL;
 		goto out;
 	}
 

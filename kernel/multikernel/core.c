@@ -577,7 +577,7 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 			       const struct mk_cpu_set *cpus)
 {
 	unsigned int i, requested_count;
-	mk_phys_cpu_t phys_cpu;
+	mk_phys_cpu_t phys_cpu, kind;
 	int unavailable = 0;
 	char buf[256];
 	int ret;
@@ -594,6 +594,9 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 		return 0;
 	}
 
+	kind = mk_cpu_set_first(mk_cpu_set_empty(instance->cpus) ?
+				cpus : instance->cpus);
+
 	mk_cpu_set_for_each(i, phys_cpu, cpus) {
 		if (!mk_cpu_set_contains(mk_pool->cpus, phys_cpu)) {
 			pr_err("CPU %llu not available in the pool\n",
@@ -602,9 +605,17 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 			continue;
 		}
 
-		if (arch_cpu_from_physical_id(phys_cpu) < 0) {
+		if (!mk_arch_cpu_unclaimed(phys_cpu) &&
+		    arch_cpu_from_physical_id(phys_cpu) < 0) {
 			pr_err("Physical CPU %llu not found in logical CPU map\n",
 			       phys_cpu);
+			unavailable++;
+			continue;
+		}
+
+		if (!mk_cpus_same_kind(phys_cpu, kind)) {
+			pr_err("CPU %llu is not of the same kind as CPU %llu\n",
+			       phys_cpu, kind);
 			unavailable++;
 		}
 	}
@@ -1954,6 +1965,21 @@ int mk_cpu_rank(mk_phys_cpu_t phys)
 	return rank;
 }
 EXPORT_SYMBOL_GPL(mk_cpu_rank);
+
+int __weak mk_arch_pool_discover(struct mk_cpu_set *found)
+{
+	return 0;
+}
+
+bool __weak mk_arch_cpu_unclaimed(mk_phys_cpu_t phys_cpu)
+{
+	return false;
+}
+
+unsigned int __weak mk_arch_cpu_kind(mk_phys_cpu_t phys_cpu)
+{
+	return 0;
+}
 
 int __weak mk_arch_fence_cpu(struct mk_instance *instance,
 			     mk_phys_cpu_t phys_cpu)
