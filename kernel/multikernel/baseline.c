@@ -49,11 +49,10 @@ static int mk_baseline_parse_cpus(const void *fdt, int resources_node,
 	int len, i, cpu_count;
 	char buf[256];
 
+	/* None is a pool of memory, and of the CPUs this kernel never booted */
 	prop = fdt_getprop(fdt, resources_node, "cpus", &len);
-	if (!prop) {
-		pr_err("No 'cpus' property in baseline /resources node\n");
-		return -EINVAL;
-	}
+	if (!prop)
+		return 0;
 
 	if (len % sizeof(fdt64_t) != 0) {
 		pr_err("Invalid 'cpus' property length: %d (must be an array of 64-bit physical CPU IDs)\n",
@@ -62,10 +61,6 @@ static int mk_baseline_parse_cpus(const void *fdt, int resources_node,
 	}
 
 	cpu_count = len / sizeof(fdt64_t);
-	if (cpu_count == 0) {
-		pr_err("Empty CPU list in baseline\n");
-		return -EINVAL;
-	}
 
 	for (i = 0; i < cpu_count; i++) {
 		mk_phys_cpu_t cpu_id = fdt64_to_cpu(prop[i]);
@@ -184,6 +179,22 @@ static void mk_baseline_clear_resources(struct mk_instance *instance)
 	}
 	instance->platform_device_count = 0;
 	instance->platform_devices_valid = false;
+}
+
+/* CPUs this kernel gave up; the ones it never booted are always there */
+static bool mk_baseline_pool_has_cpus(void)
+{
+	mk_phys_cpu_t cpu_id;
+	unsigned int i;
+
+	if (!mk_pool)
+		return false;
+
+	mk_cpu_set_for_each(i, cpu_id, mk_pool->cpus) {
+		if (!mk_arch_cpu_unclaimed(cpu_id))
+			return true;
+	}
+	return false;
 }
 
 static int mk_baseline_validate_cpus(const struct mk_cpu_set *requested)
@@ -406,6 +417,53 @@ static int mk_baseline_initialize_cpus(const struct mk_cpu_set *requested)
 	return 0;
 }
 
+/* In the pool's free set, or lent to an instance */
+static bool mk_baseline_pool_holds(mk_phys_cpu_t cpu_id)
+{
+	struct mk_instance *instance;
+	bool holds = mk_cpu_set_contains(mk_pool->cpus, cpu_id);
+
+	mutex_lock(&mk_instance_mutex);
+	list_for_each_entry(instance, &mk_instance_list, list) {
+		if (instance != mk_self &&
+		    mk_cpu_set_contains(instance->cpus, cpu_id))
+			holds = true;
+	}
+	mutex_unlock(&mk_instance_mutex);
+	return holds;
+}
+
+/*
+ * Take the CPUs this kernel never booted into the pool. There is nothing
+ * to offline: firmware has kept such a CPU idle since boot. One that does
+ * not turn out idle is left out, and tried again with the next baseline.
+ */
+static void mk_baseline_discover_cpus(void)
+{
+	struct mk_cpu_set *found = mk_cpu_set_alloc();
+	mk_phys_cpu_t cpu_id;
+	unsigned int i;
+	int ret;
+
+	if (!found)
+		return;
+
+	ret = mk_arch_pool_discover(found);
+	if (ret)
+		pr_err("Baseline: looking for unclaimed CPUs failed: %d\n", ret);
+
+	mk_cpu_set_for_each(i, cpu_id, found) {
+		if (mk_baseline_pool_holds(cpu_id))
+			continue;
+		ret = mk_arch_confirm_parked(NULL, cpu_id) ?:
+		      mk_cpu_set_add(mk_pool->cpus, cpu_id);
+		if (ret)
+			pr_err("Baseline: unclaimed CPU %llu stays out of the pool: %d\n",
+			       cpu_id, ret);
+	}
+	mk_cpu_set_free(found);
+}
+
 static int mk_baseline_initialize_devices(struct list_head *pci_list)
 {
 	struct mk_pci_device *pci_dev;
@@ -462,7 +520,7 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 		return -ENOMEM;
 	}
 
-	if (!mk_pool_empty() || (mk_pool && !mk_cpu_set_empty(mk_pool->cpus)) ||
+	if (!mk_pool_empty() || mk_baseline_pool_has_cpus() ||
 	    mk_self->pci_device_count) {
 		pr_err("Baseline already applied; change the pool with an overlay targeting /resources\n");
 		return -EBUSY;
@@ -564,6 +622,8 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 		pr_err("Baseline CPU initialization failed: %d\n", ret);
 		goto out;
 	}
+
+	mk_baseline_discover_cpus();
 
 	ret = mk_baseline_initialize_devices(&pci_list);
 	if (ret) {
