@@ -55,13 +55,23 @@ panics stops every one of its harts with ``HART_STOP`` instead, so the
 host keeps running and can start the harts again. A spawn's
 ``panic_timeout`` is -1 for the same reason.
 
-**Force halt** is best effort. RISC-V has no S-mode NMI, so the host
-marks the instance as being halted and rings the doorbell of each of its
-harts; a hart that takes the interrupt stops itself. A hart that spins
-with interrupts masked stays out of reach, and the instance cannot be
-started again until the machine is rebooted. The SBI Supervisor Software
-Events extension, once Linux supports it, is the way to reach such a
-hart.
+**Force halt** has to make each hart of the instance stop itself, as SBI
+cannot stop another hart. The host marks the instance as being halted and
+then reaches each of its harts twice. The first is the software-injected
+event of the SBI Supervisor Software Events extension: firmware raises it
+with an M-mode interrupt, so it enters the handler the instance's kernel
+registered whatever the hart has masked. The handler uses nothing of the
+interrupted context, only the two registers firmware saves for it, and
+stops the hart if the mark is set. The second is the doorbell, for a
+kernel that has not registered the event yet.
+
+Without SSE in firmware the doorbell is all there is. RISC-V has no
+S-mode NMI, so a hart that spins with interrupts masked then stays out of
+reach, and the instance cannot be started again until the machine is
+rebooted.
+
+OpenSBI 1.6 prints "Event N in invalid state at exit" on its console for
+each hart stopped this way; later releases are silent.
 
 The Boot Tree
 =============

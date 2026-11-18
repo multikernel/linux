@@ -249,18 +249,24 @@ static int __init mk_spawn_reboot_init(void)
 core_initcall(mk_spawn_reboot_init);
 
 /*
- * S-mode has no NMI and SBI cannot stop another hart, so a kernel that no
- * longer answers is made to stop its harts itself: the force-halt marker
- * is armed before this is called, and the doorbell makes the hart look
- * at it. That reaches a hart that takes interrupts, not one spinning
- * with them masked: such a hart never reports STOPPED, and the host
- * keeps the instance's memory rather than overwrite code it may run.
- * SBI SSE events, delivered whatever the hart has masked, are the way to
- * reach that one once the kernel has them.
+ * SBI cannot stop another hart, so a kernel that no longer answers is
+ * made to stop its harts itself: the force-halt marker is armed before
+ * this is called, and each hart is made to look at it. An SSE event does
+ * that whatever the hart has masked. The doorbell does it for a hart
+ * that takes interrupts, which is all there is without SSE in firmware,
+ * and what reaches a kernel too young to have registered the event. A
+ * hart neither reaches never reports STOPPED, and the host keeps the
+ * instance's memory rather than overwrite code it may run.
  */
 void mk_force_stop_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {
-	pr_warn_once("Force halt on RISC-V reaches only harts that take interrupts\n");
+	int ret = mk_sse_stop_hart(phys_cpu);
+
+	if (ret == -ENODEV)
+		pr_warn_once("Without SBI SSE, force halt reaches only harts that take interrupts\n");
+	else if (ret)
+		pr_err_ratelimited("No SSE stop to hart %llu: %d\n", phys_cpu, ret);
+
 	mk_arch_send_ipi(phys_cpu);
 }
 
