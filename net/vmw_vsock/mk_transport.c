@@ -16,6 +16,8 @@
 
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
@@ -118,6 +120,13 @@ static void mk_vsock_send_rst(struct virtio_vsock_hdr *hdr)
 
 	mk_send_pkt(skb);
 	kfree_skb(skb);
+}
+
+static void mk_vsock_reset_sock(struct sock *sk)
+{
+	sk->sk_state = TCP_CLOSE;
+	sk->sk_err = ECONNRESET;
+	sk_error_report(sk);
 }
 
 static void mk_queue_rx_pkt(struct sk_buff *skb)
@@ -298,9 +307,7 @@ reset:
 		break;
 
 	case VIRTIO_VSOCK_OP_RST:
-		sk->sk_state = TCP_CLOSE;
-		sk->sk_err = ECONNRESET;
-		sk->sk_error_report(sk);
+		mk_vsock_reset_sock(sk);
 		break;
 
 	default:
@@ -772,6 +779,39 @@ static struct vsock_transport mk_transport = {
 	.shutdown                   = mk_transport_shutdown,
 };
 
+static DEFINE_MUTEX(mk_vsock_stop_lock);
+static u32 mk_vsock_stopped_cid;
+
+static void mk_vsock_reset_stopped(struct sock *sk)
+{
+	if (vsock_sk(sk)->remote_addr.svm_cid == mk_vsock_stopped_cid)
+		mk_vsock_reset_sock(sk);
+}
+
+/*
+ * A kernel that stopped sends no RST or SHUTDOWN for its connections, so
+ * a reader here would wait on them for good.
+ */
+static int mk_vsock_instance_stopped(struct notifier_block *nb,
+				     unsigned long action, void *data)
+{
+	struct mk_instance *instance = data;
+
+	/* A late RESPONSE must not connect a socket after the reset */
+	flush_work(&mk_vsock_dev.rx_work);
+
+	mutex_lock(&mk_vsock_stop_lock);
+	mk_vsock_stopped_cid = instance->id;
+	vsock_for_each_connected_socket(&mk_transport, mk_vsock_reset_stopped);
+	mutex_unlock(&mk_vsock_stop_lock);
+
+	return NOTIFY_OK;
+}
+
+static struct notifier_block mk_vsock_stop_nb = {
+	.notifier_call = mk_vsock_instance_stopped,
+};
+
 /*
  * Module initialization
  */
@@ -806,6 +846,8 @@ static int __init mk_vsock_transport_init(void)
 		return ret;
 	}
 
+	mk_register_stop_notifier(&mk_vsock_stop_nb);
+
 	pr_info("Multikernel vsock transport registered\n");
 	return 0;
 }
@@ -814,6 +856,7 @@ static void __exit mk_vsock_transport_exit(void)
 {
 	struct mk_vsock *mk = &mk_vsock_dev;
 
+	mk_unregister_stop_notifier(&mk_vsock_stop_nb);
 	vsock_core_unregister(&mk_transport);
 	mk_unregister_msg_handler(MK_MSG_NETWORK, mk_vsock_ipi_handler);
 
