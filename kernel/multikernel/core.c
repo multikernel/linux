@@ -12,11 +12,31 @@
 #include <linux/io.h>
 #include <linux/kexec.h>
 #include <linux/multikernel.h>
+#include <linux/notifier.h>
 #include <linux/pci.h>
 #include <linux/reboot.h>
 #include <linux/suspend.h>
 #include <linux/vmalloc.h>
 #include "internal.h"
+
+static BLOCKING_NOTIFIER_HEAD(mk_stop_notifiers);
+
+int mk_register_stop_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&mk_stop_notifiers, nb);
+}
+EXPORT_SYMBOL_GPL(mk_register_stop_notifier);
+
+int mk_unregister_stop_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_unregister(&mk_stop_notifiers, nb);
+}
+EXPORT_SYMBOL_GPL(mk_unregister_stop_notifier);
+
+static void mk_instance_notify_stopped(struct mk_instance *instance)
+{
+	blocking_notifier_call_chain(&mk_stop_notifiers, 0, instance);
+}
 
 static void mk_instance_return_all_cpus(struct mk_instance *instance)
 {
@@ -1710,6 +1730,7 @@ static void mk_instance_settle_halted(struct mk_instance *instance)
 		instance->id, instance->name);
 	mk_instance_fence_devices(instance);
 	mk_instance_set_state(instance, MK_STATE_LOADED);
+	mk_instance_notify_stopped(instance);
 }
 
 struct mk_halted_work {
@@ -1985,6 +2006,8 @@ static void mk_promote(struct mk_instance *host)
 	int old_id;
 
 	mk_instance_set_state(host, MK_STATE_FENCED);
+	/* While the host still has the ID its connections were made to */
+	mk_instance_notify_stopped(host);
 
 	mutex_lock(&mk_instance_mutex);
 	old_id = mk_self->id;

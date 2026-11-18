@@ -937,6 +937,7 @@ int mk_instance_start(struct mk_instance *instance, struct kimage *image,
  * the CONFIG_MULTIKERNEL=n build.
  */
 struct kimage;
+struct notifier_block;
 struct pci_bus;
 struct pci_dev;
 
@@ -953,6 +954,13 @@ struct mk_instance *mk_instance_find(int mk_id);
 void mk_instance_put(struct mk_instance *instance);
 void mk_instance_set_state(struct mk_instance *instance,
 			   enum mk_instance_state state);
+
+/*
+ * Stop notifiers run in process context once an instance is no longer
+ * running, however it stopped, with the instance as their data.
+ */
+int mk_register_stop_notifier(struct notifier_block *nb);
+int mk_unregister_stop_notifier(struct notifier_block *nb);
 
 /* The PCI root buses of a spawn kernel's tree */
 #define MK_PCI_HOST_BRIDGE	"multikernel,pci-host-bridge"
