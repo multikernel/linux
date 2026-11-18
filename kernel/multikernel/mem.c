@@ -706,9 +706,10 @@ int mk_instance_remove_memory_region(struct mk_instance *instance,
 /*
  * Pool chunks are hot-removed from this kernel: their pages, struct
  * pages and direct mapping all go, so no stray pointer here can reach
- * memory another kernel runs on. Zones are scanned from the top down
- * (higher addresses are less likely to hold pinned kernel allocations),
- * ZONE_MOVABLE before ZONE_NORMAL.
+ * memory another kernel runs on. Zones are tried in the page allocator's
+ * fallback order, which leaves the low zones that devices with narrow DMA
+ * masks depend on for last, and each is scanned from the top down (higher
+ * addresses are less likely to hold pinned kernel allocations).
  */
 static int mk_take_from_zone(struct zone *zone, u64 size, phys_addr_t *start)
 {
@@ -746,21 +747,21 @@ static int mk_take_from_zone(struct zone *zone, u64 size, phys_addr_t *start)
 static int mk_take_memory(u64 size, int node, phys_addr_t *start, int *nid,
 			  bool *movable)
 {
-	static const enum zone_type zone_order[] = { ZONE_MOVABLE, ZONE_NORMAL };
-	int n, i;
+	struct zonelist *zonelist;
+	struct zoneref *z;
+	struct zone *zone;
 
-	for_each_online_node(n) {
-		if (node != NUMA_NO_NODE && n != node)
+	if (node == NUMA_NO_NODE)
+		zonelist = node_zonelist(numa_mem_id(), GFP_KERNEL);
+	else
+		zonelist = node_zonelist(node, __GFP_THISNODE);
+
+	for_each_zone_zonelist(zone, z, zonelist, ZONE_MOVABLE) {
+		if (mk_take_from_zone(zone, size, start))
 			continue;
-
-		for (i = 0; i < ARRAY_SIZE(zone_order); i++) {
-			if (mk_take_from_zone(&NODE_DATA(n)->node_zones[zone_order[i]],
-					      size, start))
-				continue;
-			*nid = n;
-			*movable = zone_order[i] == ZONE_MOVABLE;
-			return 0;
-		}
+		*nid = zone_to_nid(zone);
+		*movable = zone_idx(zone) == ZONE_MOVABLE;
+		return 0;
 	}
 	return -ENOMEM;
 }
