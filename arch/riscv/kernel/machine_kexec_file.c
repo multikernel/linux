@@ -16,6 +16,7 @@
 #include <linux/vmalloc.h>
 #include <asm/setup.h>
 #include <asm/insn.h>
+#include <asm/multikernel.h>
 
 const struct kexec_file_ops * const kexec_file_loaders[] = {
 	&elf_kexec_ops,
@@ -265,7 +266,8 @@ int load_extra_segments(struct kimage *image, unsigned long kernel_start,
 	char *modified_cmdline = NULL;
 
 	kbuf.image = image;
-	kbuf.buf_min = kernel_start + kernel_len;
+	/* The new kernel reserves itself up to the next PMD boundary */
+	kbuf.buf_min = ALIGN(kernel_start + kernel_len, PMD_SIZE);
 	kbuf.buf_max = ULONG_MAX;
 
 #ifdef CONFIG_CRASH_DUMP
@@ -311,21 +313,27 @@ int load_extra_segments(struct kimage *image, unsigned long kernel_start,
 #endif
 
 #ifdef CONFIG_ARCH_SUPPORTS_KEXEC_PURGATORY
-	/* Add purgatory to the image */
-	kbuf.top_down = true;
-	kbuf.mem = KEXEC_BUF_MEM_UNKNOWN;
-	ret = kexec_load_purgatory(image, &kbuf);
-	if (ret) {
-		pr_err("Error loading purgatory ret=%d\n", ret);
-		goto out;
-	}
-	kexec_dprintk("Loaded purgatory at 0x%lx\n", kbuf.mem);
+	/*
+	 * A multikernel instance is started on its own hart straight at the
+	 * Image entry, never through the relocation code: no purgatory.
+	 */
+	if (image->type != KEXEC_TYPE_MULTIKERNEL) {
+		/* Add purgatory to the image */
+		kbuf.top_down = true;
+		kbuf.mem = KEXEC_BUF_MEM_UNKNOWN;
+		ret = kexec_load_purgatory(image, &kbuf);
+		if (ret) {
+			pr_err("Error loading purgatory ret=%d\n", ret);
+			goto out;
+		}
+		kexec_dprintk("Loaded purgatory at 0x%lx\n", kbuf.mem);
 
-	ret = kexec_purgatory_get_set_symbol(image, "riscv_kernel_entry",
-					     &kernel_start,
-					     sizeof(kernel_start), 0);
-	if (ret)
-		pr_err("Error update purgatory ret=%d\n", ret);
+		ret = kexec_purgatory_get_set_symbol(image, "riscv_kernel_entry",
+						     &kernel_start,
+						     sizeof(kernel_start), 0);
+		if (ret)
+			pr_err("Error update purgatory ret=%d\n", ret);
+	}
 #endif /* CONFIG_ARCH_SUPPORTS_KEXEC_PURGATORY */
 
 	/* Add the initrd to the image */
@@ -354,6 +362,12 @@ int load_extra_segments(struct kimage *image, unsigned long kernel_start,
 	fdt_pack(fdt);
 	kbuf.buffer = fdt;
 	kbuf.bufsz = kbuf.memsz = fdt_totalsize(fdt);
+	/*
+	 * A multikernel instance does not boot from this tree but from one
+	 * rebuilt in its place on every spawn. Leave room for that.
+	 */
+	if (image->type == KEXEC_TYPE_MULTIKERNEL)
+		kbuf.memsz = max_t(unsigned long, kbuf.bufsz, MK_BOOT_DTB_SIZE);
 	kbuf.buf_align = PAGE_SIZE;
 	kbuf.mem = KEXEC_BUF_MEM_UNKNOWN;
 	kbuf.top_down = true;
@@ -364,6 +378,7 @@ int load_extra_segments(struct kimage *image, unsigned long kernel_start,
 	}
 	/* Cache the fdt buffer address for memory cleanup */
 	image->arch.fdt = fdt;
+	image->arch.fdt_addr = kbuf.mem;
 	kexec_dprintk("Loaded device tree at 0x%lx\n", kbuf.mem);
 	goto out;
 

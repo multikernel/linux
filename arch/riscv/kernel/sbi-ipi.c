@@ -11,12 +11,14 @@
 #include <linux/irq.h>
 #include <linux/irqchip/chained_irq.h>
 #include <linux/irqdomain.h>
+#include <asm/multikernel.h>
 #include <asm/sbi.h>
 
 DEFINE_STATIC_KEY_FALSE(riscv_sbi_for_rfence);
 EXPORT_SYMBOL_GPL(riscv_sbi_for_rfence);
 
 static int sbi_ipi_virq;
+static bool sbi_ipi_muxed;
 
 static void sbi_ipi_handle(struct irq_desc *desc)
 {
@@ -25,7 +27,9 @@ static void sbi_ipi_handle(struct irq_desc *desc)
 	chained_irq_enter(chip, desc);
 
 	csr_clear(CSR_IP, IE_SIE);
-	ipi_mux_process();
+	if (sbi_ipi_muxed)
+		ipi_mux_process();
+	mk_handle_doorbell();
 
 	chained_irq_exit(chip, desc);
 }
@@ -38,10 +42,15 @@ static int sbi_ipi_starting_cpu(unsigned int cpu)
 
 void __init sbi_ipi_init(void)
 {
-	int virq;
+	int virq = 0;
 	struct irq_domain *domain;
 
-	if (riscv_ipi_have_virq_range())
+	/*
+	 * Another kernel of a multikernel rings this one's doorbell with an
+	 * SBI IPI whatever provides its own IPIs, so it takes software
+	 * interrupts even then, for the doorbell alone.
+	 */
+	if (riscv_ipi_have_virq_range() && !IS_ENABLED(CONFIG_MULTIKERNEL))
 		return;
 
 	domain = irq_find_matching_fwnode(riscv_get_intc_hwnode(),
@@ -51,17 +60,26 @@ void __init sbi_ipi_init(void)
 		return;
 	}
 
+	/* Software interrupts can already be what provides the IPIs */
+	if (riscv_ipi_have_virq_range() && irq_find_mapping(domain, RV_IRQ_SOFT)) {
+		pr_warn("software interrupts are taken, no multikernel doorbell\n");
+		return;
+	}
+
 	sbi_ipi_virq = irq_create_mapping(domain, RV_IRQ_SOFT);
 	if (!sbi_ipi_virq) {
 		pr_err("unable to create INTC IRQ mapping\n");
 		return;
 	}
 
-	virq = ipi_mux_create(BITS_PER_BYTE, sbi_send_ipi);
-	if (virq <= 0) {
-		pr_err("unable to create muxed IPIs\n");
-		irq_dispose_mapping(sbi_ipi_virq);
-		return;
+	if (!riscv_ipi_have_virq_range()) {
+		virq = ipi_mux_create(BITS_PER_BYTE, sbi_send_ipi);
+		if (virq <= 0) {
+			pr_err("unable to create muxed IPIs\n");
+			irq_dispose_mapping(sbi_ipi_virq);
+			return;
+		}
+		sbi_ipi_muxed = true;
 	}
 
 	irq_set_chained_handler(sbi_ipi_virq, sbi_ipi_handle);
@@ -74,6 +92,11 @@ void __init sbi_ipi_init(void)
 	cpuhp_setup_state(CPUHP_AP_IRQ_RISCV_SBI_IPI_STARTING,
 			  "irqchip/sbi-ipi:starting",
 			  sbi_ipi_starting_cpu, NULL);
+
+	if (!sbi_ipi_muxed) {
+		pr_info("taking multikernel doorbells as SBI IPIs\n");
+		return;
+	}
 
 	riscv_ipi_set_virq_range(virq, BITS_PER_BYTE);
 	pr_info("providing IPIs using SBI IPI extension\n");

@@ -28,6 +28,7 @@
 #include <asm/io.h>
 #include <asm/kasan.h>
 #include <asm/module.h>
+#include <asm/multikernel.h>
 #include <asm/numa.h>
 #include <asm/pgtable.h>
 #include <asm/sections.h>
@@ -243,7 +244,7 @@ static void __init setup_bootmem(void)
 	 * at worst, we map the linear mapping with PMD mappings.
 	 */
 	if (!IS_ENABLED(CONFIG_XIP_KERNEL)) {
-		phys_ram_base = memblock_start_of_DRAM() & PMD_MASK;
+		phys_ram_base = mk_linear_map_start(memblock_start_of_DRAM()) & PMD_MASK;
 #ifdef CONFIG_SPARSEMEM_VMEMMAP
 		vmemmap_start_pfn = round_down(phys_ram_base, VMEMMAP_ADDR_ALIGN) >> PAGE_SHIFT;
 #endif
@@ -1458,7 +1459,12 @@ int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node,
 	 * can't use hugepage mappings for 2-level page table because in case of
 	 * memory hotplug, we are not able to update all the page tables with
 	 * the new PMDs.
+	 *
+	 * Part of a section gets base pages: one 2M block holds the memmap of
+	 * a whole section, and removing that part again would free all of it.
 	 */
+	if (end - start < PAGES_PER_SECTION * sizeof(struct page))
+		return vmemmap_populate_basepages(start, end, node, altmap);
 	return vmemmap_populate_hugepages(start, end, node, altmap);
 }
 #endif
@@ -1564,10 +1570,22 @@ struct execmem_info __init *execmem_arch_setup(void)
 #endif /* CONFIG_EXECMEM */
 
 #ifdef CONFIG_MEMORY_HOTPLUG
-static void __meminit free_pte_table(pte_t *pte_start, pmd_t *pmd)
+/* Boot and vmemmap page tables never went through a constructor */
+static void __meminit free_pgtable_page(struct page *page, bool is_vmemmap)
 {
-	struct page *page = pmd_page(*pmd);
 	struct ptdesc *ptdesc = page_ptdesc(page);
+
+	if (PageReserved(page)) {
+		free_reserved_page(page);
+		return;
+	}
+	if (!is_vmemmap)
+		pagetable_dtor(ptdesc);
+	pagetable_free(ptdesc);
+}
+
+static void __meminit free_pte_table(pte_t *pte_start, pmd_t *pmd, bool is_vmemmap)
+{
 	pte_t *pte;
 	int i;
 
@@ -1577,18 +1595,12 @@ static void __meminit free_pte_table(pte_t *pte_start, pmd_t *pmd)
 			return;
 	}
 
-	pagetable_dtor(ptdesc);
-	if (PageReserved(page))
-		free_reserved_page(page);
-	else
-		pagetable_free(ptdesc);
+	free_pgtable_page(pmd_page(*pmd), is_vmemmap);
 	pmd_clear(pmd);
 }
 
 static void __meminit free_pmd_table(pmd_t *pmd_start, pud_t *pud, bool is_vmemmap)
 {
-	struct page *page = pud_page(*pud);
-	struct ptdesc *ptdesc = page_ptdesc(page);
 	pmd_t *pmd;
 	int i;
 
@@ -1598,12 +1610,7 @@ static void __meminit free_pmd_table(pmd_t *pmd_start, pud_t *pud, bool is_vmemm
 			return;
 	}
 
-	if (!is_vmemmap)
-		pagetable_dtor(ptdesc);
-	if (PageReserved(page))
-		free_reserved_page(page);
-	else
-		pagetable_free(ptdesc);
+	free_pgtable_page(pud_page(*pud), is_vmemmap);
 	pud_clear(pud);
 }
 
@@ -1692,7 +1699,7 @@ static void __meminit remove_pmd_mapping(pmd_t *pmd_base, unsigned long addr, un
 
 		pte_base = (pte_t *)pmd_page_vaddr(*pmdp);
 		remove_pte_mapping(pte_base, addr, next, is_vmemmap, altmap);
-		free_pte_table(pte_base, pmdp);
+		free_pte_table(pte_base, pmdp, is_vmemmap);
 	}
 }
 
@@ -1828,5 +1835,86 @@ void __ref arch_remove_memory(u64 start, u64 size, struct vmem_altmap *altmap)
 void __ref vmemmap_free(unsigned long start, unsigned long end, struct vmem_altmap *altmap)
 {
 	remove_pgd_mapping(start, end, true, altmap);
+}
+
+#ifdef CONFIG_MEMORY_HOTREMOVE
+static bool addr_splits_kernel_leaf(unsigned long addr)
+{
+	pgd_t *pgdp = pgd_offset_k(addr);
+	p4d_t *p4dp, p4d;
+	pud_t *pudp, pud;
+	pmd_t *pmdp, pmd;
+
+	if (pgd_none(pgdp_get(pgdp)))
+		return false;
+
+	p4dp = p4d_offset(pgdp, addr);
+	p4d = p4dp_get(p4dp);
+	if (p4d_none(p4d))
+		return false;
+	if (p4d_leaf(p4d))
+		return !IS_ALIGNED(addr, P4D_SIZE);
+
+	pudp = pud_offset(p4dp, addr);
+	pud = pudp_get(pudp);
+	if (pud_none(pud))
+		return false;
+	if (pud_leaf(pud))
+		return !IS_ALIGNED(addr, PUD_SIZE);
+
+	pmdp = pmd_offset(pudp, addr);
+	pmd = pmdp_get(pmdp);
+	return pmd_leaf(pmd) && !IS_ALIGNED(addr, PMD_SIZE);
+}
+
+/*
+ * An early section keeps the memmap of the part of it that goes, so only
+ * a section that was added back frees memmap, and a 2M vmemmap block
+ * holds the memmap of a whole section.
+ */
+static bool memmap_edge_splits_leaf(unsigned long edge_pfn,
+				    unsigned long section_pfn)
+{
+	if (early_section(__pfn_to_section(section_pfn)))
+		return false;
+	return addr_splits_kernel_leaf((unsigned long)pfn_to_page(edge_pfn));
+}
+
+/*
+ * Removing a range clears every leaf it touches whole, so the linear map
+ * leaves at its edges are split first, as for a permission change. The
+ * vmemmap is never split.
+ */
+int arch_prepare_remove_subsections(u64 start, u64 size)
+{
+	unsigned long start_pfn = PHYS_PFN(start);
+	unsigned long end_pfn = PHYS_PFN(start + size);
+
+	if (memmap_edge_splits_leaf(start_pfn, start_pfn) ||
+	    memmap_edge_splits_leaf(end_pfn, end_pfn - 1))
+		return -EBUSY;
+
+	return split_linear_range(start, size);
+}
+#endif
+
+/*
+ * A user that hot-removed memory for good, so that no stray pointer
+ * reaches it, may still need a few of its pages at their linear map
+ * address. They are mapped with pages only: removing a range clears any
+ * leaf it touches whole, so a leaf must never cover more than the range.
+ */
+void __ref map_linear_range(phys_addr_t start, phys_addr_t size)
+{
+	pgprot_t prot = PAGE_KERNEL;
+
+	create_linear_mapping_range(start, start + size, PAGE_SIZE, &prot);
+	flush_tlb_all();
+}
+
+void __ref unmap_linear_range(phys_addr_t start, phys_addr_t size)
+{
+	remove_linear_mapping(start, size);
+	flush_tlb_all();
 }
 #endif /* CONFIG_MEMORY_HOTPLUG */

@@ -7,5 +7,7 @@ obj-$(CONFIG_KVM) += kvm/
 
 obj-$(CONFIG_ARCH_SUPPORTS_KEXEC_PURGATORY) += purgatory/
 
+obj-$(CONFIG_MULTIKERNEL) += multikernel/
+
 # for cleaning
 subdir- += boot

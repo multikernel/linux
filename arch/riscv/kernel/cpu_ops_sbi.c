@@ -10,6 +10,7 @@
 #include <linux/sched/task_stack.h>
 #include <asm/cpu_ops.h>
 #include <asm/cpu_ops_sbi.h>
+#include <asm/multikernel.h>
 #include <asm/sbi.h>
 #include <asm/smp.h>
 
@@ -23,8 +24,8 @@ const struct cpu_operations cpu_ops_sbi;
  */
 static struct sbi_hart_boot_data boot_data[NR_CPUS];
 
-static int sbi_hsm_hart_start(unsigned long hartid, unsigned long saddr,
-			      unsigned long priv)
+int sbi_hsm_hart_start(unsigned long hartid, unsigned long saddr,
+		       unsigned long priv)
 {
 	struct sbiret ret;
 
@@ -49,7 +50,7 @@ static int sbi_hsm_hart_stop(void)
 		return 0;
 }
 
-static int sbi_hsm_hart_get_status(unsigned long hartid)
+int sbi_hsm_hart_get_status(unsigned long hartid)
 {
 	struct sbiret ret;
 
@@ -76,6 +77,7 @@ static int sbi_cpu_start(unsigned int cpuid, struct task_struct *tidle)
 	/* Make sure boot data is updated */
 	smp_mb();
 	hsm_data = __pa(bdata);
+	mk_wrap_hart_entry(cpuid, &boot_addr, &hsm_data);
 	return sbi_hsm_hart_start(hartid, boot_addr, hsm_data);
 }
 

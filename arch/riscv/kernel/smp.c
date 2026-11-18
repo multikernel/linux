@@ -27,6 +27,7 @@
 #include <asm/tlbflush.h>
 #include <asm/cacheflush.h>
 #include <asm/cpu_ops.h>
+#include <asm/multikernel.h>
 
 enum ipi_message_type {
 	IPI_RESCHEDULE,
@@ -82,6 +83,7 @@ int riscv_hartid_to_cpuid(unsigned long hartid)
 static void ipi_stop(void)
 {
 	set_cpu_online(smp_processor_id(), false);
+	mk_stop_this_cpu();
 	while (1)
 		wait_for_interrupt();
 }

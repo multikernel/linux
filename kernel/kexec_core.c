@@ -1679,8 +1679,9 @@ int multikernel_kexec_by_id(int mk_id)
 	if (!mk_cpu_set_empty(instance->cpus)) {
 		mk_phys_cpu_t phys_cpu = mk_cpu_set_first(instance->cpus);
 
+		/* Only a CPU this kernel booted has a logical number */
 		cpu = arch_cpu_from_physical_id(phys_cpu);
-		if (cpu < 0) {
+		if (cpu < 0 && !mk_arch_cpu_unclaimed(phys_cpu)) {
 			pr_err("Physical CPU %llu not found in logical CPU map\n", phys_cpu);
 			rc = -EINVAL;
 			goto unlock;

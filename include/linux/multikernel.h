@@ -1301,6 +1301,32 @@ void mk_arch_register_cpu(mk_phys_cpu_t phys_id);
 /* Machine RAM this kernel may be handed later, before memory is laid out */
 void mk_arch_register_ram(phys_addr_t start, u64 size);
 
+/*
+ * An unclaimed CPU is one firmware lets this kernel start, but which this
+ * kernel never booted and has no logical CPU number for: a core of
+ * another kind than its own, on a machine that has more than one. It is
+ * in the pool from the moment the pool exists, never leaves it, and can
+ * be handed to an instance like any other pool CPU.
+ *
+ * mk_arch_pool_discover() adds every such CPU to @found. Finding out
+ * about one may mean starting it, so what was found is kept.
+ */
+int mk_arch_pool_discover(struct mk_cpu_set *found);
+bool mk_arch_cpu_unclaimed(mk_phys_cpu_t phys_cpu);
+
+/*
+ * One kernel runs on CPUs of one kind only, so an instance's CPUs are
+ * all of one kind. Kinds are numbered as the architecture comes across
+ * them: 0 is the kind of the CPUs this kernel runs on, and the only one
+ * where every CPU is alike.
+ */
+unsigned int mk_arch_cpu_kind(mk_phys_cpu_t phys_cpu);
+
+static inline bool mk_cpus_same_kind(mk_phys_cpu_t a, mk_phys_cpu_t b)
+{
+	return mk_arch_cpu_kind(a) == mk_arch_cpu_kind(b);
+}
+
 /* Park the calling CPU in the pool wait loop; never returns */
 void __noreturn mk_enter_pool_state(void *info);
 
