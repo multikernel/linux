@@ -439,24 +439,6 @@ struct mk_pending_msg *mk_msg_pending_add(u32 msg_type, u32 operation, u64 resou
 void mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id, int result);
 int mk_msg_pending_wait(struct mk_pending_msg *pending, unsigned long timeout_ms);
 
-/**
- * Convenience functions for common message types
- */
-
-/* I/O interrupt forwarding */
-static inline int mk_send_irq_forward(int instance_id, u32 irq_number,
-				      u32 vector, u32 device_id, u32 flags)
-{
-	struct mk_io_irq_payload payload = {
-		.irq_number = irq_number,
-		.vector = vector,
-		.device_id = device_id,
-		.flags = flags
-	};
-	return mk_send_message(instance_id, MK_MSG_IO, MK_IO_IRQ_FORWARD,
-			       &payload, sizeof(payload));
-}
-
 /* CPU resource management - these wait for operation to complete */
 int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags);
 int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id);
@@ -535,20 +517,6 @@ bool mk_pool_empty(void);
 int mk_pool_for_each_chunk(int (*fn)(struct mk_pool_chunk *, void *), void *data);
 bool mk_pool_cpus_returned(void);
 
-/**
- * struct mk_pool_chunk_range - a pool chunk copied out of the chunk list
- * @start: physical base of the chunk
- * @size: chunk size in bytes
- * @node: NUMA node the chunk lives on
- */
-struct mk_pool_chunk_range {
-	phys_addr_t start;
-	size_t size;
-	int node;
-};
-
-int mk_pool_snapshot_chunks(struct mk_pool_chunk_range *out, int max);
-
 /*
  * Pool park area: on architectures that park pool CPUs in software, the
  * park loop and its page tables live in pool memory and pin the chunks
@@ -596,7 +564,6 @@ extern void multikernel_destroy_instance_pool(void *pool_handle);
 extern phys_addr_t multikernel_instance_alloc(void *pool_handle, size_t size, size_t align,
 					      phys_addr_t min, phys_addr_t max);
 extern void multikernel_instance_free(void *pool_handle, phys_addr_t addr, size_t size);
-extern size_t multikernel_instance_pool_avail(void *pool_handle);
 
 /**
  * Multikernel Instance States
@@ -848,20 +815,6 @@ int mk_dt_parse(const void *dtb_data, size_t dtb_size,
 		struct mk_dt_config *config);
 
 /**
- * mk_dt_validate() - Validate parsed device tree configuration
- * @config: Configuration to validate
- *
- * Validates that the parsed memory regions are reasonable and
- * compatible with the current system state. Checks for:
- * - Region alignment
- * - Availability in multikernel pool
- * - No overlaps between regions
- *
- * Returns 0 if valid, negative error code on validation failure.
- */
-int mk_dt_validate(const struct mk_dt_config *config);
-
-/**
  * mk_dt_config_init() - Initialize a device tree configuration
  * @config: Configuration structure to initialize
  *
@@ -878,29 +831,6 @@ void mk_dt_config_init(struct mk_dt_config *config);
 void mk_dt_config_free(struct mk_dt_config *config);
 
 /**
- * mk_dt_get_property_size() - Get size of a specific property
- * @dtb_data: Device tree blob
- * @dtb_size: Size of DTB
- * @property: Property name (e.g., "linux,multikernel-memory")
- *
- * Helper function to determine the size of a property before parsing.
- * Useful for validation and memory allocation.
- *
- * Returns property size in bytes, or -ENOENT if not found.
- */
-int mk_dt_get_property_size(const void *dtb_data, size_t dtb_size,
-			    const char *property);
-
-/**
- * mk_dt_print_config() - Print configuration for debugging
- * @config: Configuration to print
- *
- * Prints the parsed configuration in a human-readable format
- * for debugging purposes.
- */
-void mk_dt_print_config(const struct mk_dt_config *config);
-
-/**
  * Sysfs Interface Functions
  */
 
@@ -913,13 +843,6 @@ void mk_dt_print_config(const struct mk_dt_config *config);
  * Returns 0 on success, negative error code on failure.
  */
 int mk_kernfs_init(void);
-
-/**
- * mk_kernfs_cleanup() - Cleanup multikernel kernfs interface
- *
- * Removes all kernfs entries and cleans up resources.
- */
-void mk_kernfs_cleanup(void);
 
 /**
  * mk_instance_find_by_name() - Find an existing instance by name
@@ -996,7 +919,6 @@ void mk_instance_mem_free(struct mk_instance *instance, void *virt_addr, size_t 
  * String conversion helpers
  */
 const char *mk_state_to_string(enum mk_instance_state state);
-enum mk_instance_state mk_string_to_state(const char *str);
 
 /**
  * Kexec Integration Functions

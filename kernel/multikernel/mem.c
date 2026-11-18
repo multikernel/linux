@@ -225,7 +225,6 @@ size_t mk_pool_avail_bytes(void)
  * @data: opaque argument passed to @fn
  *
  * @fn runs under the pool mutex, so it must not allocate from the pool.
- * Use mk_pool_snapshot_chunks() when the walk needs pool memory.
  *
  * Returns 0 or the first non-zero callback return value.
  */
@@ -245,40 +244,6 @@ int mk_pool_for_each_chunk(int (*fn)(struct mk_pool_chunk *, void *), void *data
 	}
 	mutex_unlock(&mk_pool->mem_lock);
 	return ret;
-}
-
-/**
- * mk_pool_snapshot_chunks() - Copy the chunk list into a caller-owned array
- * @out: array to fill, may be NULL when @max is 0
- * @max: entries available in @out
- *
- * Returns the number of chunks in the pool. Nothing is written when that
- * exceeds @max, so a caller sizes its array by calling with @max 0 first
- * and retries if the pool grew in between.
- */
-int mk_pool_snapshot_chunks(struct mk_pool_chunk_range *out, int max)
-{
-	struct mk_pool_chunk *chunk;
-	int n = 0;
-
-	if (!mk_pool)
-		return 0;
-
-	mutex_lock(&mk_pool->mem_lock);
-	list_for_each_entry(chunk, &mk_pool->chunks, list)
-		n++;
-
-	if (n <= max) {
-		n = 0;
-		list_for_each_entry(chunk, &mk_pool->chunks, list) {
-			out[n].start = chunk->res.start;
-			out[n].size = resource_size(&chunk->res);
-			out[n].node = chunk->node;
-			n++;
-		}
-	}
-	mutex_unlock(&mk_pool->mem_lock);
-	return n;
 }
 
 /**
@@ -461,22 +426,6 @@ void multikernel_instance_free(void *pool_handle, phys_addr_t addr, size_t size)
 
 	gen_pool_free(instance_pool, (unsigned long)addr, size);
 	pr_debug("Instance pool freed %zu bytes at 0x%llx\n", size, (unsigned long long)addr);
-}
-
-/**
- * multikernel_instance_pool_avail() - Get available space in instance pool
- * @pool_handle: Handle returned by multikernel_create_instance_pool()
- *
- * Returns available bytes in the instance pool
- */
-size_t multikernel_instance_pool_avail(void *pool_handle)
-{
-	struct gen_pool *instance_pool = (struct gen_pool *)pool_handle;
-
-	if (!instance_pool)
-		return 0;
-
-	return gen_pool_avail(instance_pool);
 }
 
 /*

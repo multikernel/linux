@@ -1046,49 +1046,6 @@ unsigned long mk_get_identity_cr3(struct mk_ident_pgtable *pgt)
 	return pgt ? pgt->pgd_phys : 0;
 }
 
-struct mk_restore_params {
-	unsigned long cr3;
-	unsigned long gs_base;
-	unsigned long stack;
-	unsigned long entry;
-};
-
-static void __noreturn __naked mk_restore_handler(void *info)
-{
-	asm volatile (
-		"movq (%%rdi), %%rax\n\t"       /* cr3 = params->cr3 */
-		"movq %%rax, %%cr3\n\t"
-		"movl $0xc0000101, %%ecx\n\t"   /* MSR_GS_BASE */
-		"movq 8(%%rdi), %%rax\n\t"      /* gs_base = params->gs_base */
-		"movq %%rax, %%rdx\n\t"
-		"shrq $32, %%rdx\n\t"
-		"wrmsr\n\t"
-		"movq 16(%%rdi), %%rsp\n\t"     /* stack = params->stack */
-		"movq 24(%%rdi), %%rax\n\t"     /* entry = params->entry */
-		ANNOTATE_RETPOLINE_SAFE "\n\t"
-		"jmpq *%%rax\n\t"
-		:
-		:
-		: "memory"
-	);
-	unreachable();
-}
-
-int multikernel_restore_ap(unsigned int cpu, unsigned long cr3,
-			   unsigned long gs_base, unsigned long stack,
-			   unsigned long entry)
-{
-	struct mk_restore_params params = {
-		.cr3 = cr3,
-		.gs_base = gs_base,
-		.stack = stack,
-		.entry = entry,
-	};
-
-	return smp_call_function_single(cpu, mk_restore_handler, &params, 0);
-}
-EXPORT_SYMBOL_GPL(multikernel_restore_ap);
-
 /*
  * halt/poweroff/reboot in a spawn kernel must not go through the native
  * machine ops: native_machine_halt() disables the local APICs, which

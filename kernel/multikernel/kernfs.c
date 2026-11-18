@@ -93,17 +93,6 @@ const char *mk_state_to_string(enum mk_instance_state state)
 	return "unknown";
 }
 
-enum mk_instance_state mk_string_to_state(const char *str)
-{
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(mk_state_strings); i++) {
-		if (sysfs_streq(str, mk_state_strings[i]))
-			return i;
-	}
-	return MK_STATE_FAILED;  /* Invalid input */
-}
-
 /**
  * Kernfs file operations for instance attributes
  */
@@ -607,41 +596,4 @@ int mk_kernfs_init(void)
 
 	pr_info("Multikernel filesystem initialized. Mount with: mount -t multikernel none /sys/fs/multikernel\n");
 	return 0;
-}
-
-void mk_kernfs_cleanup(void)
-{
-	struct mk_instance *instance, *tmp;
-
-	/* Remove all instances */
-	mutex_lock(&mk_instance_mutex);
-	list_for_each_entry_safe(instance, tmp, &mk_instance_list, list) {
-		list_del(&instance->list);
-		idr_remove(&mk_instance_idr, instance->id);
-		mk_instance_put(instance);
-	}
-	mutex_unlock(&mk_instance_mutex);
-
-	/* Clean up IDR */
-	idr_destroy(&mk_instance_idr);
-
-	/* Remove sysfs mount point */
-	sysfs_remove_mount_point(fs_kobj, "multikernel");
-
-	/* Unregister filesystem */
-	unregister_filesystem(&mk_fs_type);
-
-	/* Remove kernfs directory */
-	if (mk_root_kn) {
-		kernfs_remove(mk_root_kn);
-		mk_root_kn = NULL;
-	}
-
-	/* Destroy kernfs root */
-	if (mk_kernfs_root) {
-		kernfs_destroy_root(mk_kernfs_root);
-		mk_kernfs_root = NULL;
-	}
-
-	pr_info("Multikernel filesystem cleaned up\n");
 }

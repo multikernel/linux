@@ -220,11 +220,6 @@ void *mk_setup_trampoline(struct mk_instance *instance,
 bool mk_starts_from_cell(u32 apicid);
 int mk_start_from_cell(u32 apicid, unsigned int cpu);
 
-/* Restore AP to spawn context (used by hibernation/switch) */
-int multikernel_restore_ap(unsigned int cpu, unsigned long cr3,
-			   unsigned long gs_base, unsigned long stack,
-			   unsigned long entry);
-
 /* NMI on an offline pool CPU: honor a pending force halt */
 #ifdef CONFIG_MULTIKERNEL
 void mk_nmi_offline_park(void);

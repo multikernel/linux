@@ -1513,33 +1513,6 @@ static int mk_overlay_apply(const void *dtbo_data, size_t dtbo_size)
 	return tx->id;
 }
 
-static int mk_overlay_remove_tx(struct mk_overlay_tx *tx)
-{
-	int ret = 0;
-
-	lockdep_assert_held(&mk_overlay_mutex);
-
-	pr_info("Removing overlay transaction %d\n", tx->id);
-
-	ret = mk_overlay_parse_and_rollback(tx, tx->dtbo_data);
-
-	if (ret < 0) {
-		pr_err("Failed to rollback overlay transaction %d: %d\n", tx->id, ret);
-		/* Continue with cleanup even if rollback failed */
-	} else {
-		pr_info("Overlay transaction %d rolled back successfully\n", tx->id);
-	}
-
-	tx->status = MK_OVERLAY_TX_REMOVED;
-
-	list_del(&tx->list);
-	/* The whole overlays directory goes away with the caller */
-	kfree(tx->dtbo_data);
-	kfree(tx);
-
-	return 0;
-}
-
 /**
  * mk_overlay_new_write - Handle writes to /overlays/new
  *
@@ -1670,22 +1643,4 @@ int mk_overlay_init(void)
 
 	pr_info("Multikernel overlay subsystem initialized\n");
 	return 0;
-}
-
-void mk_overlay_exit(void)
-{
-	struct mk_overlay_tx *tx, *tmp;
-
-	pr_info("Cleaning up multikernel overlay subsystem\n");
-
-	mutex_lock(&mk_overlay_mutex);
-	list_for_each_entry_safe(tx, tmp, &mk_overlay_tx_list, list) {
-		mk_overlay_remove_tx(tx);
-	}
-	mutex_unlock(&mk_overlay_mutex);
-
-	if (mk_overlay_root_kn) {
-		kernfs_remove(mk_overlay_root_kn);
-		mk_overlay_root_kn = NULL;
-	}
 }
