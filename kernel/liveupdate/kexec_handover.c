@@ -1277,11 +1277,6 @@ static const void *kho_get_fdt(void)
 	return kho_in.fdt_phys ? phys_to_virt(kho_in.fdt_phys) : NULL;
 }
 
-phys_addr_t kho_get_fdt_phys(void)
-{
-	return kho_in.fdt_phys;
-}
-
 /**
  * is_kho_boot - check if current kernel was booted via KHO-enabled
  * kexec

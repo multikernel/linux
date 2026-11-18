@@ -41,9 +41,6 @@ struct kimage;
 
 void kho_populate(phys_addr_t fdt_phys, u64 fdt_len, phys_addr_t scratch_phys,
 		  u64 scratch_len);
-
-/* KHO FDT access */
-phys_addr_t kho_get_fdt_phys(void);
 #else
 static inline bool kho_is_enabled(void)
 {
@@ -118,11 +115,6 @@ static inline void kho_memory_init(void) { }
 static inline void kho_populate(phys_addr_t fdt_phys, u64 fdt_len,
 				phys_addr_t scratch_phys, u64 scratch_len)
 {
-}
-
-static inline phys_addr_t kho_get_fdt_phys(void)
-{
-	return 0;
 }
 #endif /* CONFIG_KEXEC_HANDOVER */
 
