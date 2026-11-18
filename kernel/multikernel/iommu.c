@@ -14,8 +14,14 @@
  * behind the device. The device works untranslated, and cannot reach
  * anything else.
  * The domain follows the grant as memory is added and removed, and goes
- * away with the lease. Everything here is called with the lease held, so
- * the domain attached to the device is the lease's.
+ * away with the lease.
+ *
+ * The IOMMU cannot tell the functions of an IOMMU group apart, so they
+ * share one domain and one instance. The first lease to be granted
+ * attaches the domain, once every function of the group is the
+ * instance's, and the first lease to end takes it away, which blocks the
+ * whole group before any function of it is reset. Each lease has a lock
+ * of its own, so mk_iommu_lock is what keeps the domain in place here.
  *
  * Outside a lease the device's DMA belongs to mk_pciback, which holds
  * every function this kernel let go of, and the device sits in the
@@ -30,9 +36,13 @@
 #include <linux/dma-map-ops.h>
 #include <linux/iommu.h>
 #include <linux/multikernel.h>
+#include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/slab.h>
 
 #include "internal.h"
+
+static DEFINE_MUTEX(mk_iommu_lock);
 
 static int mk_iommu_prot(struct pci_dev *pdev)
 {
@@ -40,16 +50,17 @@ static int mk_iommu_prot(struct pci_dev *pdev)
 	       (dev_is_dma_coherent(&pdev->dev) ? IOMMU_CACHE : 0);
 }
 
-/* The domain of the lease on @pdev, or NULL for a device without an IOMMU */
+/*
+ * The domain the leases on the group of @pdev share, or NULL while the
+ * group is blocked: before the first of them, and once one of them ended.
+ */
 static struct iommu_domain *mk_iommu_domain(struct pci_dev *pdev)
 {
-	struct iommu_domain *domain;
+	struct iommu_domain *domain = iommu_get_domain_for_dev(&pdev->dev);
 
-	if (!device_iommu_mapped(&pdev->dev))
-		return NULL;
+	lockdep_assert_held(&mk_iommu_lock);
 
-	domain = iommu_get_domain_for_dev(&pdev->dev);
-	if (WARN_ON_ONCE(!domain || domain->type != IOMMU_DOMAIN_UNMANAGED))
+	if (!domain || domain->type != IOMMU_DOMAIN_UNMANAGED)
 		return NULL;
 	return domain;
 }
@@ -57,10 +68,11 @@ static struct iommu_domain *mk_iommu_domain(struct pci_dev *pdev)
 /**
  * mk_iommu_claim - Take the DMA of a function this kernel let go of
  * @pdev: The function
- * @owner: Its holder, which is never an instance
+ * @owner: Its holder, which is never an instance, and is the same for
+ *	   every function of an IOMMU group
  *
  * Leaves the function in the blocking domain until a lease attaches a
- * domain of its own.
+ * domain.
  *
  * Returns: 0 on success, or a negative error code
  */
@@ -81,16 +93,182 @@ void mk_iommu_unclaim(struct pci_dev *pdev)
 		iommu_device_release_dma_owner(&pdev->dev);
 }
 
-/* The claim keeps the device in the blocking domain from here on */
+static int mk_iommu_count(struct device *dev, void *data)
+{
+	unsigned int *count = data;
+
+	++*count;
+	return 0;
+}
+
+/**
+ * mk_iommu_group_shared - Whether a function shares its DMA with others
+ * @pdev: The function
+ *
+ * One that does is lent with the rest of its IOMMU group or not at all,
+ * which leaves no way to add it to a running instance, or to take it back
+ * from one.
+ */
+bool mk_iommu_group_shared(struct pci_dev *pdev)
+{
+	struct iommu_group *group = iommu_group_get(&pdev->dev);
+	unsigned int count = 0;
+
+	if (!group)
+		return false;
+	iommu_group_for_each_dev(group, &count, mk_iommu_count);
+	iommu_group_put(group);
+	return count > 1;
+}
+
+struct mk_iommu_members {
+	struct device *but;
+	struct device **devs;
+	unsigned int nr;
+	unsigned int max;
+};
+
+static int mk_iommu_collect_unbound(struct device *dev, void *data)
+{
+	struct mk_iommu_members *members = data;
+
+	if (members->nr == members->max)
+		return -ENOSPC;
+	if (dev != members->but && !dev->driver)
+		members->devs[members->nr++] = get_device(dev);
+	return 0;
+}
+
+/**
+ * mk_iommu_reprobe_group - Let the rest of a function's IOMMU group find
+ * its drivers
+ * @pdev: A function mk_pciback just took, or just let go of
+ *
+ * An IOMMU group has one DMA owner, while its functions change hands one
+ * at a time. One that went ahead of the owner was left without a driver:
+ * mk_pciback could not claim it next to a driver of this kernel, nor a
+ * driver of this kernel use it next to the claim.
+ */
+void mk_iommu_reprobe_group(struct pci_dev *pdev)
+{
+	struct iommu_group *group = iommu_group_get(&pdev->dev);
+	struct mk_iommu_members members = { .but = &pdev->dev };
+	unsigned int i;
+
+	if (!group)
+		return;
+
+	iommu_group_for_each_dev(group, &members.max, mk_iommu_count);
+	members.devs = kzalloc_objs(*members.devs, members.max);
+	if (members.devs) {
+		iommu_group_for_each_dev(group, &members, mk_iommu_collect_unbound);
+		/* Probing takes the group's lock */
+		for (i = 0; i < members.nr; i++) {
+			if (device_attach(members.devs[i]) < 0)
+				dev_warn(members.devs[i], "no driver took it with its IOMMU group\n");
+			put_device(members.devs[i]);
+		}
+		kfree(members.devs);
+	}
+	iommu_group_put(group);
+}
+
+struct mk_iommu_grant {
+	struct mk_instance *instance;
+	struct pci_dev *pdev;
+};
+
+/* A hot added function is not in its instance's list until the instance took it */
+static int mk_iommu_check_member(struct device *dev, void *data)
+{
+	const struct mk_iommu_grant *grant = data;
+	const struct mk_pci_device *mine;
+	struct pci_dev *pdev;
+
+	if (dev == &grant->pdev->dev)
+		return 0;
+	if (!dev_is_pci(dev))
+		return -EXDEV;
+	pdev = to_pci_dev(dev);
+
+	list_for_each_entry(mine, &grant->instance->pci_devices, list) {
+		if (mine->domain == pci_domain_nr(pdev->bus) &&
+		    mine->bus == pdev->bus->number &&
+		    PCI_DEVFN(mine->slot, mine->func) == pdev->devfn)
+			return 0;
+	}
+	return -EXDEV;
+}
+
+static struct iommu_domain *mk_iommu_domain_alloc(struct mk_instance *instance,
+						  struct pci_dev *pdev)
+{
+	struct mk_memory_region *region;
+	struct iommu_domain *domain;
+	int ret;
+
+	domain = iommu_paging_domain_alloc(&pdev->dev);
+	if (IS_ERR(domain))
+		return domain;
+
+	list_for_each_entry(region, &instance->memory_regions, list) {
+		ret = iommu_map(domain, region->res.start, region->res.start,
+				resource_size(&region->res), mk_iommu_prot(pdev),
+				GFP_KERNEL);
+		if (ret) {
+			iommu_domain_free(domain);
+			return ERR_PTR(ret);
+		}
+	}
+	return domain;
+}
+
+/*
+ * A function that joins the group later cannot be told apart either. The
+ * claim keeps the drivers of this kernel off it, so nothing drives it.
+ */
+static int mk_iommu_attach(struct mk_instance *instance, struct pci_dev *pdev,
+			   struct iommu_group *group)
+{
+	struct mk_iommu_grant grant = { .instance = instance, .pdev = pdev };
+	struct iommu_domain *domain;
+	int ret;
+
+	guard(mutex)(&mk_iommu_lock);
+
+	ret = iommu_group_for_each_dev(group, &grant, mk_iommu_check_member);
+	if (ret)
+		return ret;
+
+	/* The rest of the group is the instance's, and so is its domain */
+	if (mk_iommu_domain(pdev))
+		return 0;
+
+	domain = mk_iommu_domain_alloc(instance, pdev);
+	if (IS_ERR(domain))
+		return PTR_ERR(domain);
+
+	ret = iommu_attach_group(domain, group);
+	if (ret)
+		iommu_domain_free(domain);
+	return ret;
+}
+
+/* The claim keeps the group in the blocking domain from here on */
 static void mk_iommu_unconfine(void *data)
 {
 	struct pci_dev *pdev = data;
-	struct iommu_domain *domain = mk_iommu_domain(pdev);
+	struct iommu_group *group = iommu_group_get(&pdev->dev);
+	struct iommu_domain *domain;
 
-	if (!domain)
-		return;
-	iommu_detach_device(domain, &pdev->dev);
-	iommu_domain_free(domain);
+	scoped_guard(mutex, &mk_iommu_lock) {
+		domain = mk_iommu_domain(pdev);
+		if (domain) {
+			iommu_detach_group(domain, group);
+			iommu_domain_free(domain);
+		}
+	}
+	iommu_group_put(group);
 }
 
 /**
@@ -98,15 +276,16 @@ static void mk_iommu_unconfine(void *data)
  * @instance: Instance being granted the device
  * @pdev: The device, which mk_iommu_claim() took
  *
- * Confined until the lease ends.
+ * Confined until the lease ends, or the lease of another function of its
+ * IOMMU group does.
  *
  * Returns: 0, or a negative error code, in which case the instance must
- * not have the device: it would either fault or roam
+ * not have the device: it would either fault or roam. -EXDEV if the
+ * instance does not have all of the device's IOMMU group.
  */
 int mk_iommu_confine(struct mk_instance *instance, struct pci_dev *pdev)
 {
-	struct mk_memory_region *region;
-	struct iommu_domain *domain;
+	struct iommu_group *group;
 	int ret;
 
 	if (!device_iommu_mapped(&pdev->dev)) {
@@ -115,31 +294,16 @@ int mk_iommu_confine(struct mk_instance *instance, struct pci_dev *pdev)
 		return 0;
 	}
 
-	domain = iommu_paging_domain_alloc(&pdev->dev);
-	if (IS_ERR(domain)) {
-		ret = PTR_ERR(domain);
-		goto err;
+	group = iommu_group_get(&pdev->dev);
+	ret = mk_iommu_attach(instance, pdev, group);
+	iommu_group_put(group);
+	if (ret) {
+		pci_err(pdev, "DMA not confined to instance %d: %d\n",
+			instance->id, ret);
+		return ret;
 	}
-
-	list_for_each_entry(region, &instance->memory_regions, list) {
-		ret = iommu_map(domain, region->res.start, region->res.start,
-				resource_size(&region->res), mk_iommu_prot(pdev),
-				GFP_KERNEL);
-		if (ret)
-			goto free;
-	}
-
-	ret = iommu_attach_device(domain, &pdev->dev);
-	if (ret)
-		goto free;
 
 	return devm_add_action_or_reset(&pdev->dev, mk_iommu_unconfine, pdev);
-
-free:
-	iommu_domain_free(domain);
-err:
-	pci_err(pdev, "DMA not confined to instance %d: %d\n", instance->id, ret);
-	return ret;
 }
 
 /**
@@ -149,15 +313,24 @@ err:
  *
  * Allowed until the lease ends, with the domain.
  *
- * Returns: 0 on success, or a negative error code
+ * Returns: 0 on success, or a negative error code, -ENODEV if the lease of
+ * another function of the IOMMU group ended and took the domain away
  */
 int mk_iommu_allow_msi(struct pci_dev *pdev, phys_addr_t doorbell)
 {
-	struct iommu_domain *domain = mk_iommu_domain(pdev);
 	phys_addr_t page = doorbell & PAGE_MASK;
+	struct iommu_domain *domain;
 
-	/* A MAP that failed after opening it opened it already */
-	if (!domain || iommu_iova_to_phys(domain, page) == page)
+	if (!device_iommu_mapped(&pdev->dev))
+		return 0;
+
+	guard(mutex)(&mk_iommu_lock);
+	domain = mk_iommu_domain(pdev);
+	if (!domain)
+		return -ENODEV;
+
+	/* A MAP that failed after opening it, or another function, opened it already */
+	if (iommu_iova_to_phys(domain, page) == page)
 		return 0;
 
 	return iommu_map(domain, page, page, PAGE_SIZE,
@@ -170,14 +343,25 @@ int mk_iommu_allow_msi(struct pci_dev *pdev, phys_addr_t doorbell)
  * @start: Physical address of the range
  * @size: Size of the range
  *
- * Returns: 0 on success, or a negative error code
+ * Returns: 0 on success, or a negative error code, -ENODEV if the lease of
+ * another function of the IOMMU group ended and took the domain away
  */
 int mk_iommu_map(struct pci_dev *pdev, phys_addr_t start, size_t size)
 {
-	struct iommu_domain *domain = mk_iommu_domain(pdev);
+	struct iommu_domain *domain;
 
-	if (!domain)
+	if (!device_iommu_mapped(&pdev->dev))
 		return 0;
+
+	guard(mutex)(&mk_iommu_lock);
+	domain = mk_iommu_domain(pdev);
+	if (!domain)
+		return -ENODEV;
+
+	/* Ranges are mapped whole, this one for another function of the group */
+	if (iommu_iova_to_phys(domain, start) == start)
+		return 0;
+
 	return iommu_map(domain, start, start, size, mk_iommu_prot(pdev),
 			 GFP_KERNEL);
 }
@@ -190,8 +374,13 @@ int mk_iommu_map(struct pci_dev *pdev, phys_addr_t start, size_t size)
  */
 void mk_iommu_unmap(struct pci_dev *pdev, phys_addr_t start, size_t size)
 {
-	struct iommu_domain *domain = mk_iommu_domain(pdev);
+	struct iommu_domain *domain;
 
+	if (!device_iommu_mapped(&pdev->dev))
+		return;
+
+	guard(mutex)(&mk_iommu_lock);
+	domain = mk_iommu_domain(pdev);
 	if (domain)
 		iommu_unmap(domain, start, size);
 }

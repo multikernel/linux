@@ -1741,6 +1741,12 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 		goto out;
 	}
 
+	if (mk_iommu_group_shared(pdev)) {
+		pci_err(pdev, "shares an IOMMU group, which an instance has from its start or not at all\n");
+		ret = -EOPNOTSUPP;
+		goto put;
+	}
+
 	/* The instance probes the function as soon as it hears of it */
 	ret = mk_lease_grant(target_instance, pdev);
 	if (ret) {
@@ -1846,6 +1852,17 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 		ret = mk_instance_remove_pci_device(target_instance, domain, bus, devfn);
 		goto out;
 	}
+
+	/* Fencing it would block the rest of its IOMMU group under the instance */
+	pdev = pci_get_domain_bus_and_slot(domain, bus, devfn);
+	if (pdev && mk_iommu_group_shared(pdev)) {
+		pci_err(pdev, "shares an IOMMU group, which stays with instance %d until it stops\n",
+			instance_id);
+		pci_dev_put(pdev);
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+	pci_dev_put(pdev);
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_DEVICE_REMOVE, resource_id);
 	if (!pending) {

@@ -185,6 +185,8 @@ static inline void mk_instance_unmap_devices(struct mk_instance *instance,
 #ifdef CONFIG_MULTIKERNEL_IOMMU
 int mk_iommu_claim(struct pci_dev *pdev, void *owner);
 void mk_iommu_unclaim(struct pci_dev *pdev);
+bool mk_iommu_group_shared(struct pci_dev *pdev);
+void mk_iommu_reprobe_group(struct pci_dev *pdev);
 int mk_iommu_confine(struct mk_instance *instance, struct pci_dev *pdev);
 int mk_iommu_allow_msi(struct pci_dev *pdev, phys_addr_t doorbell);
 int mk_iommu_map(struct pci_dev *pdev, phys_addr_t start, size_t size);
@@ -195,6 +197,13 @@ static inline int mk_iommu_claim(struct pci_dev *pdev, void *owner)
 	return 0;
 }
 static inline void mk_iommu_unclaim(struct pci_dev *pdev)
+{
+}
+static inline bool mk_iommu_group_shared(struct pci_dev *pdev)
+{
+	return false;
+}
+static inline void mk_iommu_reprobe_group(struct pci_dev *pdev)
 {
 }
 static inline int mk_iommu_confine(struct mk_instance *instance,

@@ -69,8 +69,11 @@ static int mk_lease_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	lease->pdev = pdev;
 	mutex_init(&lease->lock);
 
-	/* The owner is this record: no instance, which may be freed and reused */
-	ret = mk_iommu_claim(pdev, lease);
+	/*
+	 * One owner for every function, as an IOMMU group has one. No
+	 * instance, which may be freed and reused.
+	 */
+	ret = mk_iommu_claim(pdev, &mk_lease_driver);
 	if (ret) {
 		kfree(lease);
 		return ret;
@@ -142,7 +145,10 @@ int mk_lease_bind(struct pci_dev *pdev)
 	if (ret)
 		return ret;
 
-	return device_driver_attach(&mk_lease_driver.driver, &pdev->dev);
+	ret = device_driver_attach(&mk_lease_driver.driver, &pdev->dev);
+	if (!ret)
+		mk_iommu_reprobe_group(pdev);
+	return ret;
 }
 
 /**
@@ -166,6 +172,7 @@ int mk_lease_unbind(struct pci_dev *pdev)
 	}
 
 	device_release_driver(&pdev->dev);
+	mk_iommu_reprobe_group(pdev);
 	return 0;
 }
 
