@@ -10,6 +10,7 @@
 #include <linux/sched.h>
 #include <linux/ftrace.h>
 #include <linux/suspend.h>
+#include <linux/multikernel.h>
 #include <asm/kvm_host.h>
 #include <asm/thread_info.h>
 #include <asm/ptrace.h>
@@ -538,5 +539,9 @@ void asm_offsets(void)
 	DEFINE(SBI_EXT_FWFT_SET, SBI_EXT_FWFT_SET);
 	DEFINE(SBI_FWFT_SHADOW_STACK, SBI_FWFT_SHADOW_STACK);
 	DEFINE(SBI_FWFT_SET_FLAG_LOCK, SBI_FWFT_SET_FLAG_LOCK);
+#endif
+#ifdef CONFIG_MULTIKERNEL
+	OFFSET(MK_INSTANCE_IPI_DATA, mk_instance, ipi_data);
+	OFFSET(MK_SHARED_FORCE_HALT, mk_shared_data, force_halt);
 #endif
 }

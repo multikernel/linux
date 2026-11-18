@@ -37,6 +37,7 @@ extern struct list_head mk_unclaimed_harts;
 
 int mk_hsm_start(mk_phys_cpu_t hartid, phys_addr_t entry, phys_addr_t opaque);
 int mk_wait_hart_stopped(mk_phys_cpu_t hartid);
+int mk_sse_stop_hart(mk_phys_cpu_t hartid);
 
 bool mk_imsic_file_taken(phys_addr_t file);
 unsigned int mk_imsic_free_files(u64 *files, unsigned int max,
