@@ -2,3 +2,4 @@
 
 obj-y += spawn.o entry.o dtb.o imsic.o
 obj-y += discover.o probe.o isa.o hart_node.o
+obj-y += sse.o sse-entry.o
