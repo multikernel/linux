@@ -124,6 +124,7 @@ static inline int mk_dt_emit_pci_buses(void *fdt)
 /* lease.c */
 struct pci_dev;
 #ifdef CONFIG_PCI
+bool mk_lease_held(struct pci_dev *pdev);
 bool mk_lease_driven(struct pci_dev *pdev);
 int mk_lease_bind(struct pci_dev *pdev);
 int mk_lease_unbind(struct pci_dev *pdev);

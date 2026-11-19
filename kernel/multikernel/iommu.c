@@ -18,10 +18,14 @@
  *
  * The IOMMU cannot tell the functions of an IOMMU group apart, so they
  * share one domain and one instance. The first lease to be granted
- * attaches the domain, once every function of the group is the
- * instance's, and the first lease to end takes it away, which blocks the
- * whole group before any function of it is reset. Each lease has a lock
- * of its own, so mk_iommu_lock is what keeps the domain in place here.
+ * attaches the domain, once every function of the group that mk_pciback
+ * holds is the instance's, and the first lease to end takes it away,
+ * which blocks the whole group before any function of it is reset. Each
+ * lease has a lock of its own, so mk_iommu_lock is what keeps the domain
+ * in place here.
+ *
+ * What this kernel keeps in a group, the bridge above its functions for
+ * one, is never lent and does not count.
  *
  * Outside a lease the device's DMA belongs to mk_pciback, which holds
  * every function this kernel let go of, and the device sits in the
@@ -101,24 +105,29 @@ static int mk_iommu_count(struct device *dev, void *data)
 	return 0;
 }
 
+static int mk_iommu_other_held(struct device *dev, void *data)
+{
+	return dev != data && dev_is_pci(dev) && mk_lease_held(to_pci_dev(dev));
+}
+
 /**
  * mk_iommu_group_shared - Whether a function shares its DMA with others
+ * that can be lent
  * @pdev: The function
  *
- * One that does is lent with the rest of its IOMMU group or not at all,
- * which leaves no way to add it to a running instance, or to take it back
- * from one.
+ * One that does is lent with them or not at all, which leaves no way to
+ * add it to a running instance, or to take it back from one.
  */
 bool mk_iommu_group_shared(struct pci_dev *pdev)
 {
 	struct iommu_group *group = iommu_group_get(&pdev->dev);
-	unsigned int count = 0;
+	bool shared;
 
 	if (!group)
 		return false;
-	iommu_group_for_each_dev(group, &count, mk_iommu_count);
+	shared = iommu_group_for_each_dev(group, &pdev->dev, mk_iommu_other_held);
 	iommu_group_put(group);
-	return count > 1;
+	return shared;
 }
 
 struct mk_iommu_members {
@@ -178,18 +187,26 @@ struct mk_iommu_grant {
 	struct pci_dev *pdev;
 };
 
-/* A hot added function is not in its instance's list until the instance took it */
+/*
+ * What this kernel kept in the group does no DMA, or mk_pciback could
+ * not have claimed the group: a bridge under its port driver, a function
+ * without a driver. Only what mk_pciback holds can be another
+ * instance's.
+ *
+ * A hot added function is not in its instance's list until the instance
+ * took it.
+ */
 static int mk_iommu_check_member(struct device *dev, void *data)
 {
 	const struct mk_iommu_grant *grant = data;
 	const struct mk_pci_device *mine;
 	struct pci_dev *pdev;
 
-	if (dev == &grant->pdev->dev)
+	if (dev == &grant->pdev->dev || !dev_is_pci(dev))
 		return 0;
-	if (!dev_is_pci(dev))
-		return -EXDEV;
 	pdev = to_pci_dev(dev);
+	if (!mk_lease_held(pdev))
+		return 0;
 
 	list_for_each_entry(mine, &grant->instance->pci_devices, list) {
 		if (mine->domain == pci_domain_nr(pdev->bus) &&
@@ -225,7 +242,7 @@ static struct iommu_domain *mk_iommu_domain_alloc(struct mk_instance *instance,
 
 /*
  * A function that joins the group later cannot be told apart either. The
- * claim keeps the drivers of this kernel off it, so nothing drives it.
+ * claim keeps the drivers of this kernel that do DMA off it.
  */
 static int mk_iommu_attach(struct mk_instance *instance, struct pci_dev *pdev,
 			   struct iommu_group *group)
@@ -280,8 +297,9 @@ static void mk_iommu_unconfine(void *data)
  * IOMMU group does.
  *
  * Returns: 0, or a negative error code, in which case the instance must
- * not have the device: it would either fault or roam. -EXDEV if the
- * instance does not have all of the device's IOMMU group.
+ * not have the device: it would either fault or roam. -EXDEV if
+ * mk_pciback holds a function of the device's IOMMU group that is not the
+ * instance's.
  */
 int mk_iommu_confine(struct mk_instance *instance, struct pci_dev *pdev)
 {

@@ -52,6 +52,12 @@ static struct mk_lease *mk_lease_of(struct pci_dev *pdev)
 	return pci_get_drvdata(pdev);
 }
 
+/* Whether this kernel let go of the function, lent or not */
+bool mk_lease_held(struct pci_dev *pdev)
+{
+	return mk_lease_of(pdev);
+}
+
 /* Whether a driver of this kernel has the function, which it then cannot lend */
 bool mk_lease_driven(struct pci_dev *pdev)
 {
@@ -128,12 +134,19 @@ static struct pci_driver mk_lease_driver = {
  * mk_lease_bind - Hold a function this kernel no longer drives
  * @pdev: The function, with no driver bound
  *
- * Returns: 0 on success, -EBUSY if another driver has it, or another
- * negative error code
+ * Returns: 0 on success, -EBUSY if another driver has it, -EINVAL for a
+ * bridge, or another negative error code
  */
 int mk_lease_bind(struct pci_dev *pdev)
 {
 	int ret;
+
+	/*
+	 * A bridge stays with this kernel, as the ones above every lent
+	 * function do: an instance sees each of its buses as a root.
+	 */
+	if (pci_is_bridge(pdev))
+		return -EINVAL;
 
 	if (mk_lease_of(pdev))
 		return 0;

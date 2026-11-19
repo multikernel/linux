@@ -847,6 +847,14 @@ static int mk_do_device_remove(u16 domain, u8 bus, u8 devfn)
 		return -ENODEV;
 	}
 
+	/* Never lent, so its driver stays */
+	if (pci_is_bridge(pdev)) {
+		pr_err("Multikernel hotplug: %04x:%02x:%02x.%x is a bridge\n",
+		       domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
+		pci_dev_put(pdev);
+		return -EINVAL;
+	}
+
 	if (pdev->dev.driver) {
 		strscpy(prev_driver, pdev->dev.driver->name, sizeof(prev_driver));
 		pr_info("Multikernel hotplug: Unbinding device from %s\n", prev_driver);
