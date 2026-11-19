@@ -1334,6 +1334,47 @@ u64 intel_irq_remap_msi_source(struct pci_dev *pdev)
 	return irte.high;
 }
 
+static bool irte_source_passes(const struct irte *irte, u16 rid)
+{
+	switch (irte->svt) {
+	case SVT_VERIFY_SID_SQ:
+		return irte->sq != SQ_ALL_16 || irte->sid == rid;
+	case SVT_VERIFY_BUS:
+		return PCI_BUS_NUM(rid) >= PCI_BUS_NUM(irte->sid) &&
+		       PCI_BUS_NUM(rid) <= (irte->sid & 0xff);
+	}
+	return true;
+}
+
+/**
+ * intel_irq_remap_msi_source_grouped - Whether a function's source
+ * verification passes its IOMMU group only
+ * @pdev: the function
+ *
+ * Behind a bridge that takes over requester IDs, the entries of @pdev
+ * verify the bridge's alias or its bus, which every function behind the
+ * bridge passes. Those share the IOMMU group of @pdev. Functions whose
+ * aliases only share a bus may not.
+ *
+ * Return: false if a function of another group passes for @pdev.
+ */
+bool intel_irq_remap_msi_source_grouped(struct pci_dev *pdev)
+{
+	struct pci_dev *other = NULL;
+	struct irte irte = {};
+
+	set_msi_sid(&irte, pdev);
+	for_each_pci_dev(other) {
+		if (pci_domain_nr(other->bus) == pci_domain_nr(pdev->bus) &&
+		    other->dev.iommu_group != pdev->dev.iommu_group &&
+		    irte_source_passes(&irte, pci_dev_id(other))) {
+			pci_dev_put(other);
+			return false;
+		}
+	}
+	return true;
+}
+
 /**
  * intel_irq_remap_msi_device - The function an entry's source verification names
  * @base: register base of the unit

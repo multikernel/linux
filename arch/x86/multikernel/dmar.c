@@ -18,6 +18,10 @@
  * An entry names a function in its source verification, and is written only
  * while that function is leased to the spawn. It is part of the lease: when
  * the lease ends, the entries naming the function are cleared.
+ *
+ * What the unit verifies is the host's to say. A spawn does not have the
+ * bridges above its functions, so it names a function by its own
+ * requester ID, also where a bridge replaces that ID on the way up.
  */
 
 #define pr_fmt(fmt) "mk_dmar: " fmt
@@ -211,9 +215,13 @@ int mk_dmar_irte_apply(struct mk_instance *instance,
 	pdev = intel_irq_remap_msi_device(req->unit, req->high);
 	if (pdev)
 		lease = mk_lease_lock(instance, pdev);
-	/* A DMA alias names another function than the one it stands for */
-	if (lease && intel_irq_remap_msi_source(pdev) == req->high)
-		ret = mk_irte_apply(instance, req);
+	/* An alias is the instance's only if nothing but its group passes for it */
+	if (lease && intel_irq_remap_msi_source_grouped(pdev)) {
+		struct mk_irte_payload entry = *req;
+
+		entry.high = intel_irq_remap_msi_source(pdev);
+		ret = mk_irte_apply(instance, &entry);
+	}
 	if (lease)
 		mk_lease_unlock(lease);
 	pci_dev_put(pdev);

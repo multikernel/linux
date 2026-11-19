@@ -168,6 +168,7 @@ void intel_irq_remap_release(u64 base, u32 first, unsigned int order);
 int intel_irq_remap_write(u64 base, u32 index, u32 mask, u64 low, u64 high);
 int intel_irq_remap_msi_dest(u64 low, u32 *apicid);
 u64 intel_irq_remap_msi_source(struct pci_dev *pdev);
+bool intel_irq_remap_msi_source_grouped(struct pci_dev *pdev);
 struct pci_dev *intel_irq_remap_msi_device(u64 base, u64 high);
 void intel_irq_remap_clear_source(u64 base, u32 first, u32 count, u64 high);
 #else
@@ -193,6 +194,10 @@ static inline int intel_irq_remap_msi_dest(u64 low, u32 *apicid)
 static inline u64 intel_irq_remap_msi_source(struct pci_dev *pdev)
 {
 	return 0;
+}
+static inline bool intel_irq_remap_msi_source_grouped(struct pci_dev *pdev)
+{
+	return false;
 }
 static inline struct pci_dev *intel_irq_remap_msi_device(u64 base, u64 high)
 {
