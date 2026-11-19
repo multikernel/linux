@@ -1013,6 +1013,7 @@ static inline void mk_pcifront_host_fenced(void)
 #endif
 
 bool mk_host_fenced(void);
+void mk_arch_promote(void);
 int mk_arch_iommu_claim(u64 base);
 void mk_arch_instance_destroy(struct mk_instance *instance);
 
