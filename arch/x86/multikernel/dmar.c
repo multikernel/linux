@@ -1,24 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * The host's VT-d units, as a spawn sees them:
+ * The host's VT-d units, as a spawn sees them under
+ * /chosen/multikernel,iommus (iommu.c):
  *
- *   /chosen/multikernel,iommus {
- *       #address-cells = <2>; #size-cells = <2>;
- *       iommu@fed90000 {
- *           compatible = "multikernel,vtd";
- *           reg = <base size>;
- *           linux,pci-domain = <0>;
- *           numa-node-id = <0>;			if known
- *           multikernel,irte-block = <first count>;	if it remaps
- *       };
+ *   iommu@fed90000 {
+ *       compatible = "multikernel,vtd";
+ *       reg = <base size>;
+ *       linux,pci-domain = <0>;
+ *       numa-node-id = <0>;			if known
+ *       multikernel,irte-block = <first count>;	if it remaps
  *   };
- *
- * and each PCI function node names its unit in multikernel,iommu-base.
  *
  * A unit has one interrupt remapping table, the host's, so the host lends
  * each spawn a block of it. The spawn composes its entries there; the host
- * checks and writes them. Writes may come from irqchip callbacks with
- * interrupts off, so the spawn polls.
+ * checks and writes them (iommu.c).
  *
  * An entry names a function in its source verification, and is written only
  * while that function is leased to the spawn. It is part of the lease: when
@@ -35,20 +30,10 @@
 #include <linux/slab.h>
 #include <asm/multikernel.h>
 
+#include "iommu.h"
+
 /* 256 entries per spawn and unit, in an aligned block */
 #define MK_IRTE_ORDER		8
-#define MK_IOMMUS_PATH		"/chosen/multikernel,iommus"
-
-struct mk_irte_payload {
-	u64 seq;
-	u64 unit;		/* register base of the VT-d unit */
-	u64 low;
-	u64 high;
-	u32 index;
-	u32 mask;		/* with a zero entry: clear 1 << mask entries */
-	int result;		/* ACK: 0 or -errno */
-	int sender_instance_id;
-};
 
 struct mk_irte_block {
 	struct list_head list;
@@ -133,28 +118,14 @@ static int mk_dt_emit_unit(void *fdt, struct mk_instance *instance,
 	return ret ? ret : fdt_end_node(fdt);
 }
 
-int mk_arch_manifest_chosen(void *fdt, struct mk_instance *instance)
+int mk_dmar_emit_units(void *fdt, struct mk_instance *instance)
 {
 	struct dmar_unit_desc unit;
-	int i, ret;
+	int i, ret = 0;
 
-	if (dmar_unit_get(0, &unit))
-		return 0;
-	ret = fdt_begin_node(fdt, "multikernel,iommus");
-	if (!ret)
-		ret = fdt_property_u32(fdt, "#address-cells", 2);
-	if (!ret)
-		ret = fdt_property_u32(fdt, "#size-cells", 2);
 	for (i = 0; !ret && !dmar_unit_get(i, &unit); i++)
 		ret = mk_dt_emit_unit(fdt, instance, &unit);
-	return ret ? ret : fdt_end_node(fdt);
-}
-
-u64 mk_arch_pci_iommu(struct pci_dev *pdev)
-{
-	u64 base;
-
-	return dmar_device_unit(pdev, &base) ? 0 : base;
+	return ret;
 }
 
 void mk_arch_instance_destroy(struct mk_instance *instance)
@@ -194,7 +165,7 @@ static void mk_irte_unlend(void *data)
 	kfree(lent);
 }
 
-int mk_arch_lease_grant(struct mk_instance *instance, struct pci_dev *pdev)
+int mk_dmar_lease_grant(struct mk_instance *instance, struct pci_dev *pdev)
 {
 	struct mk_irte_lent *lent;
 
@@ -223,8 +194,8 @@ static int mk_irte_apply(struct mk_instance *instance, const struct mk_irte_payl
 }
 
 /* Only for a function leased to @instance, at its own CPUs, and while the lease holds */
-static int mk_irte_check_and_apply(struct mk_instance *instance,
-				   const struct mk_irte_payload *req)
+int mk_dmar_irte_apply(struct mk_instance *instance,
+			const struct mk_irte_payload *req)
 {
 	struct mk_lease *lease = NULL;
 	struct pci_dev *pdev;
@@ -247,38 +218,6 @@ static int mk_irte_check_and_apply(struct mk_instance *instance,
 		mk_lease_unlock(lease);
 	pci_dev_put(pdev);
 	return ret;
-}
-
-struct mk_irte_work {
-	struct work_struct work;
-	struct mk_irte_payload req;
-};
-
-/* The lease is a mutex, so requests are answered in process context */
-static void mk_irte_work_fn(struct work_struct *work)
-{
-	struct mk_irte_work *w = container_of(work, struct mk_irte_work, work);
-	struct mk_irte_payload *req = &w->req;
-	struct mk_instance *instance = mk_instance_find(req->sender_instance_id);
-
-	if (instance) {
-		req->result = mk_irte_check_and_apply(instance, req);
-		req->sender_instance_id = mk_self->id;
-		mk_send_message_to(instance, MK_MSG_IO, MK_IO_IRTE_ACK, req, sizeof(*req));
-		mk_instance_put(instance);
-	}
-	kfree(w);
-}
-
-static void mk_irte_write_request(const struct mk_irte_payload *req)
-{
-	struct mk_irte_work *w = kzalloc_obj(*w, GFP_ATOMIC);
-
-	if (!w)
-		return;
-	w->req = *req;
-	INIT_WORK(&w->work, mk_irte_work_fn);
-	schedule_work(&w->work);
 }
 
 /* The @i-th unit, or with @i < 0 the one at @base */
@@ -338,50 +277,6 @@ static int mk_irte_block(u64 unit, u32 *first, u32 *count)
 	return ret ? -ENODEV : 0;
 }
 
-static int mk_irte_write(u64 unit, u32 index, u32 mask, u64 low, u64 high)
-{
-	struct mk_irte_payload req = {
-		.seq = mk_request_seq(),
-		.unit = unit,
-		.low = low,
-		.high = high,
-		.index = index,
-		.mask = mask,
-		.sender_instance_id = mk_self->id,
-	};
-	struct mk_irte_payload ack;
-	struct mk_instance *host;
-	int ret;
-
-	/* The entry is in this kernel's table, live once it claims the unit */
-	if (mk_host_fenced())
-		return 0;
-	host = READ_ONCE(host_instance);
-	if (!host)
-		return -ENODEV;
-	ret = mk_request_sync(host, MK_MSG_IO, MK_IO_IRTE_WRITE, req.seq,
-			      &req, sizeof(req), &ack, sizeof(ack));
-	return ret ? ret : ack.result;
-}
-
-static void mk_irte_msg_handler(struct mk_instance *from, u32 msg_type, u32 subtype,
-				void *payload, u32 payload_len, void *ctx)
-{
-	struct mk_irte_payload *p = payload;
-
-	if (payload_len < sizeof(*p))
-		return;
-
-	switch (subtype) {
-	case MK_IO_IRTE_WRITE:
-		mk_irte_write_request(p);
-		break;
-	case MK_IO_IRTE_ACK:
-		mk_request_answer(p->seq, p, sizeof(*p));
-		break;
-	}
-}
-
 static const struct dmar_foreign_ops mk_dmar_foreign_ops = {
 	.unit		= mk_dmar_unit,
 	.device_unit	= mk_dmar_device_unit,
@@ -394,13 +289,7 @@ void __init mk_dmar_init(void)
 	dmar_set_foreign_ops(&mk_dmar_foreign_ops);
 }
 
-int mk_arch_iommu_claim(u64 base)
+int mk_dmar_claim(u64 base)
 {
 	return intel_iommu_claim(base);
 }
-
-static int __init mk_irte_init(void)
-{
-	return mk_register_msg_handler(MK_MSG_IO, mk_irte_msg_handler, NULL);
-}
-fs_initcall(mk_irte_init);
