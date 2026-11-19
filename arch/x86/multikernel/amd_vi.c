@@ -20,8 +20,12 @@
  * the entries of a function it was lent and the host writes them where it
  * says: @high of the request is the device ID, @low the vector and above
  * it the APIC ID, or zero to clear the entry. The table is cleared when
- * the lease ends. A function remapped under another's device ID shares
- * that one's table and is refused.
+ * the lease ends.
+ *
+ * Functions remapped under one device ID, behind a bridge that takes over
+ * requester IDs for one, share a table. The map tells a spawn so, and it
+ * picks their entries apart. They are written only where all of them
+ * share an IOMMU group, which is lent to one instance.
  */
 
 #define pr_fmt(fmt) "mk_amd_vi: " fmt
@@ -203,6 +207,24 @@ static int mk_amd_vi_segment(u64 base)
 	return -ENODEV;
 }
 
+/* Whether the table of @devid at @unit is that of the IOMMU group of @pdev alone */
+static bool mk_amd_vi_table_grouped(struct pci_dev *pdev, u64 unit, u16 devid)
+{
+	struct pci_dev *other = NULL;
+	u16 remapped;
+	u64 base;
+
+	for_each_pci_dev(other) {
+		if (other->dev.iommu_group != pdev->dev.iommu_group &&
+		    !amd_iommu_device_unit(other, &base, &remapped) &&
+		    base == unit && remapped == devid) {
+			pci_dev_put(other);
+			return false;
+		}
+	}
+	return true;
+}
+
 /* Only for a function leased to @instance, at its own CPUs, and while the lease holds */
 int mk_amd_vi_irte_apply(struct mk_instance *instance,
 			 const struct mk_irte_payload *req)
@@ -228,7 +250,8 @@ int mk_amd_vi_irte_apply(struct mk_instance *instance,
 	lease = mk_lease_lock(instance, pdev);
 	if (lease) {
 		if (!amd_iommu_device_unit(pdev, &base, &devid) &&
-		    base == req->unit && devid == req->high)
+		    base == req->unit &&
+		    mk_amd_vi_table_grouped(pdev, base, devid))
 			ret = amd_iommu_irte_write(pdev, req->index, vector, apicid);
 		mk_lease_unlock(lease);
 	}
