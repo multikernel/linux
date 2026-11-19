@@ -12,6 +12,7 @@
 #include <asm/amd/node.h>
 #include <asm/hpet.h>
 #include <asm/pci_x86.h>
+#include <asm/x86_init.h>
 
 static void pci_fixup_i450nx(struct pci_dev *d)
 {
@@ -357,6 +358,10 @@ static void pci_fixup_video(struct pci_dev *pdev)
 	struct pci_bus *bus;
 	u16 config;
 	struct resource *res;
+
+	/* The shadow is a copy in legacy BIOS RAM, which not every platform has */
+	if (!x86_platform.legacy.map_isa_ram)
+		return;
 
 	/* Is VGA routed to us? */
 	bus = pdev->bus;
