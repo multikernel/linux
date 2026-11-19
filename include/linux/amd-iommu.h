@@ -57,6 +57,11 @@ extern int amd_iommu_update_ga(void *data, int cpu, bool ga_log_intr);
 extern int amd_iommu_activate_guest_mode(void *data, int cpu, bool ga_log_intr);
 extern int amd_iommu_deactivate_guest_mode(void *data);
 
+/* Remapping entries of a function lent to another kernel */
+int amd_iommu_irte_write(struct pci_dev *pdev, unsigned int index, u8 vector,
+			 u32 apicid);
+void amd_iommu_irte_release(struct pci_dev *pdev);
+
 #else /* defined(CONFIG_AMD_IOMMU) && defined(CONFIG_IRQ_REMAP) */
 
 static inline int
@@ -78,6 +83,16 @@ static inline int amd_iommu_activate_guest_mode(void *data, int cpu, bool ga_log
 static inline int amd_iommu_deactivate_guest_mode(void *data)
 {
 	return 0;
+}
+
+static inline int amd_iommu_irte_write(struct pci_dev *pdev, unsigned int index,
+				       u8 vector, u32 apicid)
+{
+	return -ENODEV;
+}
+
+static inline void amd_iommu_irte_release(struct pci_dev *pdev)
+{
 }
 #endif /* defined(CONFIG_AMD_IOMMU) && defined(CONFIG_IRQ_REMAP) */
 
