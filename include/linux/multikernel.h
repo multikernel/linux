@@ -1257,6 +1257,9 @@ int mk_arch_release_instance(struct mk_instance *instance);
 int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
 int mk_arch_fence_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
 
+/* Whether a kernel that died of a hardware error named this CPU as broken */
+bool mk_arch_cpu_faulty(mk_phys_cpu_t phys_cpu);
+
 /*
  * Wait until every CPU an instance owns is parked. Its kernel image may
  * only be overwritten once this succeeds: a CPU still executing that

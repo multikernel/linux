@@ -46,6 +46,13 @@ int mk_overlay_rmdir(struct kernfs_node *kn);
 /* ipi.c */
 int mk_arm_force_halt(struct mk_instance *instance);
 
+/* fault.c */
+#ifdef CONFIG_OF
+void mk_fault_publish(void);
+#else
+static inline void mk_fault_publish(void) { }
+#endif
+
 /* hotplug.c */
 int mk_hotplug_init(void);
 void mk_hotplug_cleanup(void);

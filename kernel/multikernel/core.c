@@ -2094,6 +2094,7 @@ int multikernel_force_halt_by_id(int mk_id)
 	if (instance == host_instance) {
 		ret = mk_fence_host(instance, targets);
 		if (!ret) {
+			mk_fault_publish();
 			mk_pcifront_host_fenced();
 			mk_promote(instance);
 		}
