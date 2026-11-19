@@ -5,3 +5,4 @@
 
 obj-y += spawn.o park.o direct_boot.o head_64.o e820.o iommu.o
 obj-$(CONFIG_DMAR_TABLE) += dmar.o
+obj-$(CONFIG_AMD_IOMMU) += amd_vi.o

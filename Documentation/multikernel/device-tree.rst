@@ -216,7 +216,7 @@ only the boot handoff knows::
         multikernel,host-ipi-pages = <...>;
         multikernel,host-ipi-cpu = <...>;           /* the host CPU its doorbell rings, u64 */
 
-        multikernel,iommus {                        /* the host's VT-d units, on x86 */
+        multikernel,iommus {                        /* the host's IOMMUs, on x86 */
             #address-cells = <2>;
             #size-cells = <2>;
             iommu@fed90000 {
@@ -225,6 +225,14 @@ only the boot handoff knows::
                 linux,pci-domain = <0>;
                 numa-node-id = <0>;                 /* when the host knows it */
                 multikernel,irte-block = <0x100 0x100>; /* first, count; if it remaps */
+            };
+            iommu@fedc0000 {                        /* or, on AMD */
+                compatible = "multikernel,amd-vi";
+                reg = <0x0 0xfedc0000  0x0 0x4000>;
+                linux,pci-domain = <0>;
+                multikernel,irq-remap;              /* if it remaps */
+                multikernel,capability = <0x190b0040>; /* of its PCI function */
+                multikernel,msi-map = <0 0x900 0x900 1>; /* domain, rid, devid, count */
             };
         };
     };
@@ -249,7 +257,12 @@ What a spawn does with its tree:
 * on x86, registers each ``multikernel,vtd`` unit as driven by the host,
   and composes the interrupt remapping entries of its devices in the
   unit's ``multikernel,irte-block``, which the host checks against the
-  lease and writes. A device names its unit in ``multikernel,iommu-base``.
+  lease and writes. A device names its unit in ``multikernel,iommu-base``;
+* on x86, registers each ``multikernel,amd-vi`` unit as driven by the host,
+  with what ``multikernel,msi-map`` says of the functions behind it, and
+  remaps the interrupts of its devices in tables of its own. The host
+  writes each entry into the table the unit has loaded, once it has checked
+  the lease and the CPU. It passes the node on to its own spawns unchanged.
 
 The pool-CPUs list registers every CPU the instance might be handed later,
 because a kernel can only online a CPU whose physical id it enumerated at

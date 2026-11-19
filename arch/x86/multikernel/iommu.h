@@ -54,4 +54,30 @@ static inline int mk_dmar_claim(u64 base)
 }
 #endif
 
+#ifdef CONFIG_AMD_IOMMU
+bool mk_amd_vi_units(void);
+int mk_amd_vi_emit_units(void *fdt);
+int mk_amd_vi_irte_apply(struct mk_instance *instance,
+			 const struct mk_irte_payload *req);
+int mk_amd_vi_lease_grant(struct pci_dev *pdev);
+#else
+static inline bool mk_amd_vi_units(void)
+{
+	return false;
+}
+static inline int mk_amd_vi_emit_units(void *fdt)
+{
+	return 0;
+}
+static inline int mk_amd_vi_irte_apply(struct mk_instance *instance,
+				       const struct mk_irte_payload *req)
+{
+	return -ENODEV;
+}
+static inline int mk_amd_vi_lease_grant(struct pci_dev *pdev)
+{
+	return 0;
+}
+#endif
+
 #endif /* _ARCH_X86_MULTIKERNEL_IOMMU_H */

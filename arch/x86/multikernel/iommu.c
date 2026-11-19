@@ -23,9 +23,10 @@
  * its tables.
  *
  * What a unit's node says and what an entry holds is the vendor's: VT-d in
- * dmar.c.
+ * dmar.c, AMD-Vi in amd_vi.c.
  */
 
+#include <linux/amd-iommu.h>
 #include <linux/dmar.h>
 #include <linux/init.h>
 #include <linux/libfdt.h>
@@ -37,12 +38,19 @@
 
 #include "iommu.h"
 
-int mk_arch_manifest_chosen(void *fdt, struct mk_instance *instance)
+/* A machine has units of one vendor */
+static bool mk_iommu_vtd(void)
 {
 	struct dmar_unit_desc vtd;
+
+	return !dmar_unit_get(0, &vtd);
+}
+
+int mk_arch_manifest_chosen(void *fdt, struct mk_instance *instance)
+{
 	int ret;
 
-	if (dmar_unit_get(0, &vtd))
+	if (!mk_iommu_vtd() && !mk_amd_vi_units())
 		return 0;
 	ret = fdt_begin_node(fdt, "multikernel,iommus");
 	if (!ret)
@@ -51,19 +59,26 @@ int mk_arch_manifest_chosen(void *fdt, struct mk_instance *instance)
 		ret = fdt_property_u32(fdt, "#size-cells", 2);
 	if (!ret)
 		ret = mk_dmar_emit_units(fdt, instance);
+	if (!ret)
+		ret = mk_amd_vi_emit_units(fdt);
 	return ret ? ret : fdt_end_node(fdt);
 }
 
 u64 mk_arch_pci_iommu(struct pci_dev *pdev)
 {
+	u16 devid;
 	u64 base;
 
-	return dmar_device_unit(pdev, &base) ? 0 : base;
+	if (dmar_device_unit(pdev, &base) &&
+	    amd_iommu_device_unit(pdev, &base, &devid))
+		return 0;
+	return base;
 }
 
 int mk_arch_lease_grant(struct mk_instance *instance, struct pci_dev *pdev)
 {
-	return mk_dmar_lease_grant(instance, pdev);
+	return mk_iommu_vtd() ? mk_dmar_lease_grant(instance, pdev) :
+				mk_amd_vi_lease_grant(pdev);
 }
 
 int mk_arch_iommu_claim(u64 base)
@@ -119,7 +134,8 @@ static void mk_irte_work_fn(struct work_struct *work)
 	struct mk_instance *instance = mk_instance_find(req->sender_instance_id);
 
 	if (instance) {
-		req->result = mk_dmar_irte_apply(instance, req);
+		req->result = mk_iommu_vtd() ? mk_dmar_irte_apply(instance, req) :
+					       mk_amd_vi_irte_apply(instance, req);
 		req->sender_instance_id = mk_self->id;
 		mk_send_message_to(instance, MK_MSG_IO, MK_IO_IRTE_ACK, req, sizeof(*req));
 		mk_instance_put(instance);

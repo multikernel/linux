@@ -237,6 +237,14 @@ static inline void mk_dmar_init(void)
 }
 #endif
 
+#if defined(CONFIG_MULTIKERNEL) && defined(CONFIG_AMD_IOMMU)
+void mk_amd_vi_init(void);
+#else
+static inline void mk_amd_vi_init(void)
+{
+}
+#endif
+
 #endif /* __ASSEMBLY__ */
 
 #endif /* _ASM_X86_MULTIKERNEL_H */
