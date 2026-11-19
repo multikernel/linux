@@ -8,20 +8,43 @@
 #ifndef _ASM_X86_AMD_IOMMU_H
 #define _ASM_X86_AMD_IOMMU_H
 
+#include <linux/errno.h>
 #include <linux/types.h>
 
 struct amd_iommu;
+struct pci_dev;
+
+/* An IOMMU this kernel drives, as another kernel needs to know it */
+struct amd_iommu_unit_desc {
+	u64	base;		/* register base	*/
+	u64	size;		/* size of register set */
+	u16	segment;	/* PCI segment		*/
+	bool	irq_remap;	/* remaps the interrupts of the devices behind it */
+	u32	cap;		/* capability header of its PCI function */
+};
 
 #ifdef CONFIG_AMD_IOMMU
 
 struct task_struct;
-struct pci_dev;
 
 extern void amd_iommu_detect(void);
+int amd_iommu_unit_get(int i, struct amd_iommu_unit_desc *desc);
+int amd_iommu_device_unit(struct pci_dev *pdev, u64 *base, u16 *devid);
 
 #else /* CONFIG_AMD_IOMMU */
 
 static inline void amd_iommu_detect(void) { }
+
+static inline int amd_iommu_unit_get(int i, struct amd_iommu_unit_desc *desc)
+{
+	return -ENOENT;
+}
+
+static inline int amd_iommu_device_unit(struct pci_dev *pdev, u64 *base,
+					u16 *devid)
+{
+	return -ENODEV;
+}
 
 #endif /* CONFIG_AMD_IOMMU */
 

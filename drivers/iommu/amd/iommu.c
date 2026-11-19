@@ -367,6 +367,47 @@ static struct amd_iommu *rlookup_amd_iommu(struct device *dev)
 	return __rlookup_amd_iommu(seg, PCI_SBDF_TO_DEVID(devid));
 }
 
+/**
+ * amd_iommu_unit_get - Describe the @i-th IOMMU this kernel drives
+ * @i: index of the IOMMU
+ * @desc: filled with its description
+ *
+ * Return: 0, or -ENOENT past the last IOMMU.
+ */
+int amd_iommu_unit_get(int i, struct amd_iommu_unit_desc *desc)
+{
+	struct amd_iommu *iommu = get_amd_iommu(i);
+
+	if (!iommu)
+		return -ENOENT;
+	desc->base = iommu->mmio_phys;
+	desc->size = iommu->mmio_phys_end;
+	desc->segment = iommu->pci_seg->id;
+	desc->irq_remap = amd_iommu_irq_remap;
+	desc->cap = iommu->cap;
+	return 0;
+}
+
+/**
+ * amd_iommu_device_unit - The IOMMU @pdev sits behind
+ * @pdev: the device
+ * @base: filled with the register base of the IOMMU
+ * @devid: filled with the device ID the interrupts of @pdev are remapped
+ *	   under, which the firmware may have aliased to another device's
+ *
+ * Return: 0, or -ENODEV when no IOMMU covers @pdev.
+ */
+int amd_iommu_device_unit(struct pci_dev *pdev, u64 *base, u16 *devid)
+{
+	struct amd_iommu *iommu = rlookup_amd_iommu(&pdev->dev);
+
+	if (!iommu)
+		return -ENODEV;
+	*base = iommu->mmio_phys;
+	*devid = iommu->pci_seg->alias_table[pci_dev_id(pdev)];
+	return 0;
+}
+
 static struct iommu_dev_data *alloc_dev_data(struct amd_iommu *iommu, u16 devid)
 {
 	struct iommu_dev_data *dev_data;
