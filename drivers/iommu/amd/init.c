@@ -3504,9 +3504,309 @@ static int __init iommu_go_to_state(enum iommu_init_state state)
 }
 
 #ifdef CONFIG_IRQ_REMAP
+/*
+ * IOMMUs that another kernel drives, which this kernel knows of from that
+ * kernel rather than from an IVRS. They are registered with tables of this
+ * kernel's own that no IOMMU loads, and its functions are attached and
+ * their interrupts remapped there as usual. Meanwhile the owner writes the
+ * same remapping entries into the table that is loaded, nothing here
+ * writes a register, and commands are dropped. amd_iommu_claim() makes
+ * this kernel's tables the loaded ones once the owner is gone.
+ */
+const struct amd_iommu_foreign_ops *amd_iommu_foreign __ro_after_init;
+
+void __init amd_iommu_set_foreign_ops(const struct amd_iommu_foreign_ops *ops)
+{
+	amd_iommu_foreign = ops;
+}
+
+/*
+ * The device table of a foreign segment. Until a function is attached to a
+ * domain here it does no DMA, and where interrupts are remapped none gets
+ * through until the function has a remapping table: the data of an MSI the
+ * owner composed is an index, which must not reach an APIC as a vector.
+ */
+static struct amd_iommu_pci_seg *__init foreign_pci_segment(u16 id, u16 last_bdf,
+							    bool irq_remap)
+{
+	struct amd_iommu_pci_seg *pci_seg;
+	u32 devid;
+
+	for_each_pci_segment(pci_seg)
+		if (pci_seg->id == id)
+			return pci_seg;
+
+	pci_seg = kzalloc_obj(*pci_seg);
+	if (!pci_seg)
+		return NULL;
+	pci_seg->id = id;
+	pci_seg->last_bdf = last_bdf;
+	pci_seg->dev_table_size =
+		max(roundup_pow_of_two((last_bdf + 1) * DEV_TABLE_ENTRY_SIZE),
+		    SZ_4K);
+	init_llist_head(&pci_seg->dev_data_list);
+	INIT_LIST_HEAD(&pci_seg->unity_map);
+
+	if (alloc_dev_table(pci_seg) || alloc_alias_table(pci_seg) ||
+	    alloc_rlookup_table(pci_seg) || alloc_irq_lookup_table(pci_seg)) {
+		free_irq_lookup_table(pci_seg);
+		free_rlookup_table(pci_seg);
+		free_alias_table(pci_seg);
+		free_dev_table(pci_seg);
+		kfree(pci_seg);
+		return NULL;
+	}
+	for (devid = 0; devid <= last_bdf; devid++) {
+		set_dte_bit(&pci_seg->dev_table[devid], DEV_ENTRY_VALID);
+		set_dte_bit(&pci_seg->dev_table[devid], DEV_ENTRY_TRANSLATION);
+		if (irq_remap)
+			set_dte_bit(&pci_seg->dev_table[devid], DEV_ENTRY_IRQ_TBL_EN);
+	}
+	list_add_tail(&pci_seg->list, &amd_iommu_pci_seg_list);
+	return pci_seg;
+}
+
+/*
+ * What the IVHD says at boot, from the IOMMU itself. The format of the
+ * remapping entries is the one the owner runs, as both tables hold the
+ * same destinations. No guest page tables and no page requests: both need
+ * the IOMMU's own PCI function, which this kernel does not have.
+ */
+static int __init foreign_features(struct amd_iommu *iommu)
+{
+	u64 ctrl = readq(iommu->mmio_base + MMIO_CONTROL_OFFSET);
+	bool ga = ctrl & BIT_ULL(CONTROL_GA_EN);
+	u8 hats;
+
+	iommu->features = readq(iommu->mmio_base + MMIO_EXT_FEATURES);
+	iommu->features2 = readq(iommu->mmio_base + MMIO_EXT_FEATURES2);
+
+	if (!list_empty(&amd_iommu_list)) {
+		if (AMD_IOMMU_GUEST_IR_GA(amd_iommu_guest_ir) != ga)
+			return -EOPNOTSUPP;
+		if ((iommu->features & ~(FEATURE_GT | FEATURE_PPR)) != amd_iommu_efr ||
+		    iommu->features2 != amd_iommu_efr2)
+			pr_warn("iommu at %llx: features differ from the first, which are used\n",
+				iommu->mmio_phys);
+		return 0;
+	}
+	amd_iommu_efr = iommu->features & ~(FEATURE_GT | FEATURE_PPR);
+	amd_iommu_efr2 = iommu->features2;
+	amd_iommu_guest_ir = ga ? AMD_IOMMU_GUEST_IR_LEGACY_GA :
+				  AMD_IOMMU_GUEST_IR_LEGACY;
+	if (ga && (ctrl & BIT_ULL(CONTROL_XT_EN)))
+		amd_iommu_xt_mode = IRQ_REMAP_X2APIC_MODE;
+
+	hats = FIELD_GET(FEATURE_HATS, amd_iommu_efr);
+	if (hats == 0x3)
+		amd_iommu_pgtable = PD_MODE_NONE;
+	else
+		amd_iommu_hpt_level = hats + PAGE_MODE_4_LEVEL;
+	return 0;
+}
+
+static int __init foreign_add(const struct amd_iommu_unit_desc *desc, u16 last_bdf)
+{
+	struct amd_iommu_pci_seg *pci_seg;
+	struct amd_iommu_unit_map range;
+	struct amd_iommu *iommu;
+	int i, j, ret;
+
+	if (amd_iommus_present >= MAX_IOMMUS)
+		return -ENOSPC;
+	pci_seg = foreign_pci_segment(desc->segment, last_bdf, desc->irq_remap);
+	if (!pci_seg)
+		return -ENOMEM;
+	iommu = kzalloc_obj(*iommu);
+	if (!iommu)
+		return -ENOMEM;
+	raw_spin_lock_init(&iommu->lock);
+	iommu->foreign = true;
+	iommu->pci_seg = pci_seg;
+	iommu->cap = desc->cap;
+	iommu->mmio_phys = desc->base;
+	iommu->mmio_phys_end = desc->size;
+	iommu->mmio_base = iommu_map_mmio_space(desc->base, desc->size);
+	if (!iommu->mmio_base) {
+		kfree(iommu);
+		return -ENOMEM;
+	}
+	ret = foreign_features(iommu);
+	if (!ret)
+		ret = alloc_iommu_buffers(iommu);
+	if (ret) {
+		free_iommu_buffers(iommu);
+		iommu_unmap_mmio_space(iommu);
+		kfree(iommu);
+		return ret;
+	}
+	if (iommu->cap & BIT(IOMMU_CAP_NPCACHE)) {
+		iommu_set_dma_strict();
+		amd_iommu_np_cache = true;
+	}
+#ifdef CONFIG_IRQ_REMAP
+	iommu->irte_ops = AMD_IOMMU_GUEST_IR_GA(amd_iommu_guest_ir) ?
+			  &irte_128_ops : &irte_32_ops;
+#endif
+
+	for (i = 0; !amd_iommu_foreign->map(desc->base, i, &range); i++) {
+		if (range.rid + range.count - 1 > pci_seg->last_bdf ||
+		    range.devid + range.count - 1 > pci_seg->last_bdf)
+			continue;
+		for (j = 0; j < range.count; j++) {
+			pci_seg->alias_table[range.rid + j] = range.devid + j;
+			pci_seg->rlookup_table[range.rid + j] = iommu;
+			pci_seg->rlookup_table[range.devid + j] = iommu;
+		}
+	}
+	iommu->index = amd_iommus_present++;
+	list_add_tail(&iommu->list, &amd_iommu_list);
+	pr_info("iommu%d at %llx: driven by another kernel\n", iommu->index,
+		desc->base);
+	return 0;
+}
+
+/* The highest device ID behind any IOMMU of a segment, rounded to its bus */
+static u16 __init foreign_last_bdf(u16 segment)
+{
+	struct amd_iommu_unit_desc desc;
+	struct amd_iommu_unit_map range;
+	u32 last = 0;
+	int i, j;
+
+	for (i = 0; !amd_iommu_foreign->unit(i, &desc); i++) {
+		if (desc.segment != segment)
+			continue;
+		for (j = 0; !amd_iommu_foreign->map(desc.base, j, &range); j++)
+			last = max3(last, (u32)range.rid + range.count - 1,
+				    (u32)range.devid + range.count - 1);
+	}
+	return min(last | 0xff, 0xffff);
+}
+
+/* Interrupts are remapped here only if every IOMMU remaps them */
+static int __init amd_iommu_foreign_setup(void)
+{
+	static int done __initdata = 1;
+	struct amd_iommu_unit_desc desc;
+	bool irq_remap = true;
+	int i, ret;
+
+	if (done <= 0)
+		return done;
+	for (i = 0; !amd_iommu_foreign->unit(i, &desc); i++) {
+		ret = foreign_add(&desc, foreign_last_bdf(desc.segment));
+		if (ret) {
+			pr_err("iommu at %llx: cannot be taken over: %d\n",
+			       desc.base, ret);
+			irq_remap = false;
+		}
+		irq_remap &= desc.irq_remap;
+	}
+	amd_iommu_irq_remap = irq_remap && !list_empty(&amd_iommu_list);
+	done = list_empty(&amd_iommu_list) ? -ENODEV : 0;
+	return done;
+}
+
+/* IOAPICs, and the device IDs they interrupt under, stay with the owner */
+static int __init amd_iommu_prepare_foreign(void)
+{
+	int ret = amd_iommu_foreign_setup();
+
+	if (ret)
+		return ret;
+	if (amd_iommu_irq_remap && nr_ioapics) {
+		pr_info("Not remapping interrupts beside foreign IOAPICs\n");
+		amd_iommu_irq_remap = false;
+	}
+	return amd_iommu_irq_remap ? 0 : -ENODEV;
+}
+
+/*
+ * Once the PCI buses are there and before a driver binds, as
+ * pci_iommu_init() does for the IOMMUs of this kernel's own.
+ */
+static int __init amd_iommu_foreign_init(void)
+{
+	struct amd_iommu *iommu;
+
+	if (!amd_iommu_foreign || amd_iommu_foreign_setup())
+		return 0;
+
+	amd_iommu_init_identity_domain();
+	for_each_iommu(iommu) {
+		if (irq_remapping_enabled && amd_iommu_create_irq_domain(iommu))
+			pr_err("iommu%d: no interrupt remapping domain\n",
+			       iommu->index);
+		iommu_device_sysfs_add(&iommu->iommu, NULL, amd_iommu_groups,
+				       "ivhd%d", iommu->index);
+		iommu_device_register(&iommu->iommu, &amd_iommu_ops, NULL);
+	}
+	return 0;
+}
+rootfs_initcall(amd_iommu_foreign_init);
+
+/**
+ * amd_iommu_claim - Take over an IOMMU whose owner is gone
+ * @base: register base of the IOMMU
+ *
+ * Loads this kernel's device table into the IOMMU, with a command buffer
+ * and an event log of its own. The IOMMU is never turned off on the way:
+ * a function attached here is translated and remapped by the owner's
+ * tables up to the switch and by this kernel's after, which hold the same
+ * for it. Any other function loses its DMA and its interrupts.
+ *
+ * Nothing takes the IOMMU's own interrupt, so the event log is not read.
+ *
+ * Return: 0, also for an IOMMU this kernel drives already, or -ENODEV.
+ */
+int amd_iommu_claim(u64 base)
+{
+	static DEFINE_MUTEX(claim_lock);
+	struct amd_iommu *iommu;
+
+	guard(mutex)(&claim_lock);
+
+	for_each_iommu(iommu)
+		if (iommu->mmio_phys == base)
+			break;
+	if (list_entry_is_head(iommu, &amd_iommu_list, list))
+		return -ENODEV;
+	if (!iommu->foreign)
+		return 0;
+
+	iommu_feature_disable(iommu, CONTROL_CMDBUF_EN);
+	iommu_feature_disable(iommu, CONTROL_EVT_INT_EN);
+	iommu_feature_disable(iommu, CONTROL_EVT_LOG_EN);
+	iommu_feature_disable(iommu, CONTROL_GALOG_EN);
+	iommu_feature_disable(iommu, CONTROL_GAINT_EN);
+	iommu_feature_disable(iommu, CONTROL_PPRLOG_EN);
+	iommu_feature_disable(iommu, CONTROL_PPRINT_EN);
+	iommu_disable_irtcachedis(iommu);
+
+	iommu_enable_command_buffer(iommu);
+	iommu_enable_event_buffer(iommu);
+	iommu_enable_irtcachedis(iommu);
+	iommu_enable_2k_int(iommu);
+	iommu_set_device_table(iommu);
+	iommu_enable(iommu);
+
+	/* A command dropped until here is covered by the flush that follows */
+	scoped_guard(raw_spinlock_irqsave, &iommu->lock)
+		iommu->foreign = false;
+	amd_iommu_flush_all_caches(iommu);
+
+	pr_info("iommu%d at %llx: taken over, DMA translated%s\n", iommu->index,
+		base, amd_iommu_irq_remap ? " and interrupts remapped" : "");
+	return 0;
+}
+
 int __init amd_iommu_prepare(void)
 {
 	int ret;
+
+	if (amd_iommu_foreign)
+		return amd_iommu_prepare_foreign();
 
 	amd_iommu_irq_remap = true;
 
@@ -3523,6 +3823,12 @@ int __init amd_iommu_enable(void)
 {
 	int ret;
 
+	/* The owner has them enabled, in the mode amd_iommu_prepare() read */
+	if (amd_iommu_foreign) {
+		irq_remapping_enabled = 1;
+		return amd_iommu_xt_mode;
+	}
+
 	ret = iommu_go_to_state(IOMMU_ENABLED);
 	if (ret)
 		return ret;
@@ -3533,11 +3839,18 @@ int __init amd_iommu_enable(void)
 
 void amd_iommu_disable(void)
 {
+	/* Others may still interrupt through an IOMMU this kernel shares */
+	if (amd_iommu_foreign)
+		return;
+
 	amd_iommu_suspend(NULL);
 }
 
 int amd_iommu_reenable(int mode)
 {
+	if (amd_iommu_foreign)
+		return 0;
+
 	amd_iommu_resume(NULL);
 
 	return 0;

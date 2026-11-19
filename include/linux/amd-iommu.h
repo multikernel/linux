@@ -23,6 +23,23 @@ struct amd_iommu_unit_desc {
 	u32	cap;		/* capability header of its PCI function */
 };
 
+/* @count functions from @rid on, whose interrupts are remapped as @devid on */
+struct amd_iommu_unit_map {
+	u16	rid;
+	u16	devid;
+	u16	count;
+};
+
+/* How a kernel learns of the IOMMUs another kernel drives, and writes to them */
+struct amd_iommu_foreign_ops {
+	/* The @i-th IOMMU, or -ENOENT past the last */
+	int (*unit)(int i, struct amd_iommu_unit_desc *desc);
+	/* The @i-th range of functions behind the IOMMU at @base, or -ENOENT */
+	int (*map)(u64 base, int i, struct amd_iommu_unit_map *range);
+	/* Have the owner deliver an entry of @devid to @vector, or clear it with 0 */
+	int (*irte_write)(u64 base, u16 devid, u32 index, u8 vector, u32 apicid);
+};
+
 #ifdef CONFIG_AMD_IOMMU
 
 struct task_struct;
@@ -30,6 +47,8 @@ struct task_struct;
 extern void amd_iommu_detect(void);
 int amd_iommu_unit_get(int i, struct amd_iommu_unit_desc *desc);
 int amd_iommu_device_unit(struct pci_dev *pdev, u64 *base, u16 *devid);
+void amd_iommu_set_foreign_ops(const struct amd_iommu_foreign_ops *ops);
+int amd_iommu_claim(u64 base);
 
 #else /* CONFIG_AMD_IOMMU */
 
@@ -42,6 +61,15 @@ static inline int amd_iommu_unit_get(int i, struct amd_iommu_unit_desc *desc)
 
 static inline int amd_iommu_device_unit(struct pci_dev *pdev, u64 *base,
 					u16 *devid)
+{
+	return -ENODEV;
+}
+
+static inline void amd_iommu_set_foreign_ops(const struct amd_iommu_foreign_ops *ops)
+{
+}
+
+static inline int amd_iommu_claim(u64 base)
 {
 	return -ENODEV;
 }

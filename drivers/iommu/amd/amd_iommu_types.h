@@ -720,6 +720,9 @@ struct amd_iommu {
 	/* true if disable irte caching */
 	bool irtcachedis_enabled;
 
+	/* Another kernel drives it until amd_iommu_claim() */
+	bool foreign;
+
 	/* Handle for IOMMU core code */
 	struct iommu_device iommu;
 

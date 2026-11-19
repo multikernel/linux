@@ -40,6 +40,7 @@ int amd_iommu_reenable(int mode);
 int amd_iommu_enable_faulting(unsigned int cpu);
 extern int amd_iommu_guest_ir;
 extern int amd_iommu_xt_mode;
+extern const struct amd_iommu_foreign_ops *amd_iommu_foreign;
 extern enum protection_domain_mode amd_iommu_pgtable;
 extern int amd_iommu_gpt_level;
 extern u8 amd_iommu_hpt_level;

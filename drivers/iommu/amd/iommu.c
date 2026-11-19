@@ -1426,6 +1426,10 @@ static int __iommu_queue_command_sync(struct amd_iommu *iommu,
 	unsigned int count = 0;
 	u32 left, next_tail;
 
+	/* The command buffer is its owner's; amd_iommu_claim() flushes it all */
+	if (iommu->foreign)
+		return 0;
+
 	next_tail = (iommu->cmd_buf_tail + sizeof(*cmd)) % CMD_BUFFER_SIZE;
 again:
 	left      = (iommu->cmd_buf_head - next_tail) % CMD_BUFFER_SIZE;
@@ -3164,6 +3168,10 @@ static int amd_iommu_def_domain_type(struct device *dev)
 	if (!dev_data)
 		return 0;
 
+	/* Its owner lends a device with its memory mapped 1:1 */
+	if (get_amd_iommu_from_dev(dev)->foreign)
+		return IOMMU_DOMAIN_IDENTITY;
+
 	/* Always use DMA domain for untrusted device */
 	if (dev_is_pci(dev) && to_pci_dev(dev)->untrusted)
 		return IOMMU_DOMAIN_DMA;
@@ -3227,7 +3235,7 @@ static void iommu_flush_irt_and_complete(struct amd_iommu *iommu, u16 devid)
 	unsigned long flags;
 	struct iommu_cmd cmd, cmd2;
 
-	if (iommu->irtcachedis_enabled)
+	if (iommu->irtcachedis_enabled || iommu->foreign)
 		return;
 
 	build_inv_irt(&cmd, devid);
@@ -3499,10 +3507,39 @@ static int __modify_irte_ga(struct amd_iommu *iommu, u16 devid, int index,
 	return 0;
 }
 
+/*
+ * The owner's table first, which is the one the IOMMU has loaded: an entry
+ * it refuses is not delivered. This kernel's table holds the same, for
+ * amd_iommu_claim().
+ */
+static int foreign_irte_write(struct amd_iommu *iommu, u16 devid, int index,
+			      u8 vector, u32 apicid)
+{
+	int ret;
+
+	if (!iommu->foreign)
+		return 0;
+	ret = amd_iommu_foreign->irte_write(iommu->mmio_phys, devid, index,
+					    vector, apicid);
+	if (ret)
+		pr_warn_ratelimited("%04x:%02x:%02x.%x: owner refused entry %d: %d\n",
+				    iommu->pci_seg->id, PCI_BUS_NUM(devid),
+				    PCI_SLOT(devid), PCI_FUNC(devid), index, ret);
+	return ret;
+}
+
 static int modify_irte_ga(struct amd_iommu *iommu, u16 devid, int index,
 			  struct irte_ga *irte)
 {
+	u32 apicid = irte->lo.fields_remap.destination |
+		     (u32)irte->hi.fields.destination << 24;
 	int ret;
+
+	ret = foreign_irte_write(iommu, devid, index,
+				 irte->lo.fields_remap.valid ?
+				 irte->hi.fields.vector : 0, apicid);
+	if (ret)
+		return ret;
 
 	ret = __modify_irte_ga(iommu, devid, index, irte);
 	if (ret)
@@ -3518,6 +3555,13 @@ static int modify_irte(struct amd_iommu *iommu,
 {
 	struct irq_remap_table *table;
 	unsigned long flags;
+	int ret;
+
+	ret = foreign_irte_write(iommu, devid, index,
+				 irte->fields.valid ? irte->fields.vector : 0,
+				 irte->fields.destination);
+	if (ret)
+		return ret;
 
 	table = get_irq_table(iommu, devid);
 	if (!table)
@@ -3540,6 +3584,8 @@ static void free_irte(struct amd_iommu *iommu, u16 devid, int index)
 	table = get_irq_table(iommu, devid);
 	if (!table)
 		return;
+
+	foreign_irte_write(iommu, devid, index, 0, 0);
 
 	raw_spin_lock_irqsave(&table->lock, flags);
 	iommu->irte_ops->clear_allocated(table, index);
@@ -4234,7 +4280,7 @@ static struct amd_iommu *irte_unit(struct pci_dev *pdev, u16 *devid,
 	if (!amd_iommu_irq_remap)
 		return NULL;
 	iommu = rlookup_amd_iommu(&pdev->dev);
-	if (!iommu)
+	if (!iommu || iommu->foreign)
 		return NULL;
 	*devid = PCI_SBDF_TO_DEVID(get_device_sbdf_id(&pdev->dev));
 	dev_data = search_dev_data(iommu, *devid);
