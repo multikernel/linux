@@ -21,10 +21,11 @@
  * Writes are filtered, after xen-pciback: the instance owns what the
  * function does, while the lending kernel keeps what places it on the
  * fabric. BARs stay where they were assigned and only appear to size,
- * and the header outside the Command register and a few scratch fields
- * is read only. Beyond the header, only the capabilities a driver
- * programs to run the function are writable: MSI, MSI-X, power
- * management, the vendor-specific ones, and part of Device Control.
+ * though the instance decides when the ROM is decoded, and the header
+ * outside the Command register and a few scratch fields is read only.
+ * Beyond the header, only the capabilities a driver programs to run the
+ * function are writable: MSI, MSI-X, power management, the
+ * vendor-specific ones, and part of Device Control.
  * Everything else, ACS, Resizable BAR, ATS, AER, SR-IOV and whatever
  * the spec adds next, decides how the function sits on the fabric and
  * behind the IOMMU, which the instance must not change.
@@ -80,6 +81,7 @@ struct mk_pciback_dev {
 	struct mk_instance *instance;
 	struct pci_dev *pdev;
 	unsigned long sizing;	/* BARs written with something else than their value */
+	u32 rom_mask;		/* What the ROM BAR reads back while it is sized */
 	struct {
 		u16 start;
 		u16 end;
@@ -176,14 +178,14 @@ static u64 mk_pciback_size_mask(const struct resource *res)
  * What a BAR reads back while it is being sized: the size of the
  * resource this kernel found behind it, with the type bits of @cur.
  */
-static u32 mk_pciback_bar_sized(const struct pci_dev *pdev, int slot, u32 cur)
+static u32 mk_pciback_bar_sized(const struct mk_pciback_dev *d, int slot, u32 cur)
 {
+	const struct pci_dev *pdev = d->pdev;
 	u64 mask;
 	int i;
 
 	if (slot == MK_PCIBACK_ROM)
-		return mk_pciback_size_mask(&pdev->resource[PCI_ROM_RESOURCE]) &
-		       PCI_ROM_ADDRESS_MASK;
+		return d->rom_mask;
 
 	/* The upper half of a 64-bit BAR sizes with its lower half */
 	for (i = 0; i < slot; i++) {
@@ -252,18 +254,21 @@ static int mk_pciback_filtered_read(struct mk_pciback_dev *d, int where,
 
 	ret = mk_pciback_read(d->pdev, where, size, val);
 	if (!ret && size == 4 && slot >= 0 && test_bit(slot, &d->sizing))
-		*val = mk_pciback_bar_sized(d->pdev, slot, *val);
+		*val = mk_pciback_bar_sized(d, slot, *val);
 	return ret;
 }
 
 /*
- * A BAR is never written. Sizing writes all ones and then puts back what
+ * A BAR is never moved. Sizing writes all ones and then puts back what
  * was there, so anything but the BAR's value starts a sizing, which the
- * value ends. Placement is the lending kernel's.
+ * value ends. Placement is the lending kernel's, but whether the ROM is
+ * decoded there is the instance's, like the decoding of the other BARs
+ * in the Command register.
  */
 static int mk_pciback_bar_write(struct mk_pciback_dev *d, int where, int size,
 				u32 val, int slot)
 {
+	u32 own = slot == MK_PCIBACK_ROM ? PCI_ROM_ADDRESS_ENABLE : 0;
 	u32 cur;
 	int ret;
 
@@ -274,11 +279,15 @@ static int mk_pciback_bar_write(struct mk_pciback_dev *d, int where, int size,
 	if (ret)
 		return ret;
 
-	if (val == cur)
-		clear_bit(slot, &d->sizing);
-	else
+	if ((val ^ cur) & ~own) {
 		set_bit(slot, &d->sizing);
-	return PCIBIOS_SUCCESSFUL;
+		return PCIBIOS_SUCCESSFUL;
+	}
+
+	clear_bit(slot, &d->sizing);
+	if (val == cur)
+		return PCIBIOS_SUCCESSFUL;
+	return mk_pciback_write(d->pdev, where, 4, val);
 }
 
 /* A write to what is not the instance's own is dropped, as if read only */
@@ -431,12 +440,48 @@ static void mk_pciback_msg_handler(struct mk_instance *from, u32 msg_type, u32 s
 	}
 }
 
+/*
+ * The ROM resource of a boot video card describes the copy the firmware
+ * left in RAM, so the ROM behind the BAR has to be sized there.
+ */
+static u32 mk_pciback_rom_mask(struct pci_dev *pdev)
+{
+	const struct resource *res = &pdev->resource[PCI_ROM_RESOURCE];
+	u32 cur, mask;
+
+	if (pdev->hdr_type != PCI_HEADER_TYPE_NORMAL)
+		return 0;
+	if (!(res->flags & IORESOURCE_ROM_SHADOW))
+		return mk_pciback_size_mask(res) & PCI_ROM_ADDRESS_MASK;
+
+	pci_read_config_dword(pdev, PCI_ROM_ADDRESS, &cur);
+	pci_write_config_dword(pdev, PCI_ROM_ADDRESS, PCI_ROM_ADDRESS_MASK);
+	pci_read_config_dword(pdev, PCI_ROM_ADDRESS, &mask);
+	pci_write_config_dword(pdev, PCI_ROM_ADDRESS, cur);
+	return mask & PCI_ROM_ADDRESS_MASK;
+}
+
+/* Some functions share a decoder between the ROM and their BARs */
+static void mk_pciback_rom_off(struct pci_dev *pdev)
+{
+	u32 rom;
+
+	if (pdev->hdr_type != PCI_HEADER_TYPE_NORMAL)
+		return;
+
+	pci_read_config_dword(pdev, PCI_ROM_ADDRESS, &rom);
+	if (rom & PCI_ROM_ADDRESS_ENABLE)
+		pci_write_config_dword(pdev, PCI_ROM_ADDRESS,
+				       rom & ~PCI_ROM_ADDRESS_ENABLE);
+}
+
 static void mk_pciback_unlend(void *data)
 {
 	struct mk_pciback_dev *d = data;
 
 	scoped_guard(raw_spinlock_irqsave, &mk_pciback_lock)
 		list_del(&d->list);
+	mk_pciback_rom_off(d->pdev);
 	mk_pciback_put(d);
 }
 
@@ -515,6 +560,7 @@ int mk_pciback_lend(struct mk_instance *instance, struct pci_dev *pdev)
 	refcount_set(&d->ref, 1);
 	d->pdev = pci_dev_get(pdev);
 	mk_pciback_find_caps(d);
+	d->rom_mask = mk_pciback_rom_mask(pdev);
 	d->instance = mk_instance_get(instance);
 
 	scoped_guard(raw_spinlock_irqsave, &mk_pciback_lock)
