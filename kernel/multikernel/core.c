@@ -1993,6 +1993,11 @@ static int mk_fence_host(struct mk_instance *instance,
 	return 0;
 }
 
+/* An architecture's part in becoming the root of the machine */
+void __weak mk_arch_promote(void)
+{
+}
+
 /*
  * A fenced host is gone for good, which leaves this kernel the root of
  * the machine. It takes ID 0, as a host booted there has it, and the
@@ -2006,6 +2011,7 @@ static void mk_promote(struct mk_instance *host)
 	int old_id;
 
 	mk_instance_set_state(host, MK_STATE_FENCED);
+	mk_arch_promote();
 	/* While the host still has the ID its connections were made to */
 	mk_instance_notify_stopped(host);
 
