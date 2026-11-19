@@ -351,3 +351,23 @@ void mk_park_this_cpu(void)
 	park(mk_park->park_cr3, mk_park->cells_phys + index * PAGE_SIZE,
 	     mk_park->code_phys, boot_cpu_has(X86_FEATURE_MWAIT));
 }
+
+/*
+ * Mark a CPU as broken, for every kernel that inherits the table. Called
+ * from a panic, so without the park lock: this kernel does not live long
+ * enough to free the table under the caller.
+ */
+void mk_park_mark_faulty(u32 apic_id)
+{
+	int index = mk_park_index(apic_id);
+
+	if (index >= 0)
+		WRITE_ONCE(mk_park_cell(index)->faulty, 1);
+}
+
+bool mk_park_faulty(u32 apic_id)
+{
+	int index = mk_park_index(apic_id);
+
+	return index >= 0 && READ_ONCE(mk_park_cell(index)->faulty);
+}

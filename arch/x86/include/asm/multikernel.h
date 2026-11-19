@@ -123,6 +123,10 @@ struct mk_park_table {
  * and leaving the park loop is a single atomic step, as is publishing
  * one only to a CPU that is parked. The rest of the page is the CPU's
  * own descriptor tables and fault stack while parked.
+ *
+ * faulty is set by a kernel that dies of a hardware error which condemns
+ * this CPU, and stays set: the table outlives every kernel, so each one
+ * after it knows without being told.
  */
 struct mk_park_cell {
 	union {
@@ -133,7 +137,8 @@ struct mk_park_cell {
 		u64 word;
 	};
 	u64 arg[6];
-	u64 reserved;
+	u32 faulty;
+	u32 reserved;
 	u8 gdt[16];
 	u64 gdt_entries[4];
 	u8 idt[16];
@@ -161,6 +166,8 @@ int mk_park_wait(u32 apic_id);
 void mk_park_this_cpu(void);
 bool mk_park_parked(u32 apic_id);
 bool mk_park_ready(void);
+void mk_park_mark_faulty(u32 apic_id);
+bool mk_park_faulty(u32 apic_id);
 
 /* Page table helpers the park table shares with spawn */
 struct mk_ident_pgtable *mk_build_arena_pgtable(void *arena, int pages);

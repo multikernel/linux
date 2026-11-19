@@ -376,6 +376,11 @@ int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 	return mk_park_wait((u32)phys_cpu);
 }
 
+bool mk_arch_cpu_faulty(mk_phys_cpu_t phys_cpu)
+{
+	return mk_park_faulty((u32)phys_cpu);
+}
+
 /**
  * mk_repark_instance_to_host - See every CPU an instance started parked
  * @instance: Instance being torn down
