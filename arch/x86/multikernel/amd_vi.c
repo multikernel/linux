@@ -324,3 +324,8 @@ void __init mk_amd_vi_init(void)
 {
 	amd_iommu_set_foreign_ops(&mk_amd_vi_foreign_ops);
 }
+
+int mk_amd_vi_claim(u64 base)
+{
+	return amd_iommu_claim(base);
+}

@@ -60,6 +60,7 @@ int mk_amd_vi_emit_units(void *fdt);
 int mk_amd_vi_irte_apply(struct mk_instance *instance,
 			 const struct mk_irte_payload *req);
 int mk_amd_vi_lease_grant(struct pci_dev *pdev);
+int mk_amd_vi_claim(u64 base);
 #else
 static inline bool mk_amd_vi_units(void)
 {
@@ -77,6 +78,10 @@ static inline int mk_amd_vi_irte_apply(struct mk_instance *instance,
 static inline int mk_amd_vi_lease_grant(struct pci_dev *pdev)
 {
 	return 0;
+}
+static inline int mk_amd_vi_claim(u64 base)
+{
+	return -ENODEV;
 }
 #endif
 

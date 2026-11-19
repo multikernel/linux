@@ -83,7 +83,9 @@ int mk_arch_lease_grant(struct mk_instance *instance, struct pci_dev *pdev)
 
 int mk_arch_iommu_claim(u64 base)
 {
-	return mk_dmar_claim(base);
+	int ret = mk_dmar_claim(base);
+
+	return ret == -ENODEV ? mk_amd_vi_claim(base) : ret;
 }
 
 /**

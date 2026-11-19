@@ -262,7 +262,8 @@ What a spawn does with its tree:
   with what ``multikernel,msi-map`` says of the functions behind it, and
   remaps the interrupts of its devices in tables of its own. The host
   writes each entry into the table the unit has loaded, once it has checked
-  the lease and the CPU. It passes the node on to its own spawns unchanged.
+  the lease and the CPU. A spawn that takes over has the unit load its
+  tables. It passes the node on to its own spawns unchanged.
 
 The pool-CPUs list registers every CPU the instance might be handed later,
 because a kernel can only online a CPU whose physical id it enumerated at
