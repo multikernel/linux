@@ -116,6 +116,13 @@ a boot tree carries:
     ``-EPERM``, and sets up no LPIs of its own: the redistributors of its
     CPUs keep the LPI tables the host enabled them with.
 
+The one exception is the takeover. A tenant that has fenced its host
+disables every SPI in the distributor, the extended range included: it
+maps none of them, and the host may have left some enabled for devices
+that nobody drives any more. A level-triggered one would otherwise be
+taken again as soon as it was deactivated, for ever, by whichever CPU it
+is routed to, in that kernel or in a spawn that runs there later.
+
 The **doorbell** of the message ring is SGI 7. All eight non-secure SGIs
 are in use on arm64, so with ``CONFIG_MULTIKERNEL`` it takes the place of
 the KGDB roundup IPI, and KGDB falls back to its generic roundup.

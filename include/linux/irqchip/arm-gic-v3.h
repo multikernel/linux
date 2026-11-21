@@ -640,6 +640,7 @@ int its_lpi_memreserve_init(void);
 int its_cpu_init(void);
 int gic_v3_send_sgi_to_mpidr(u64 mpidr, unsigned int sgi);
 void gic_v3_cpu_leave(void);
+void gic_v3_disable_spis(void);
 
 int its_foreign_map(void *owner, struct irq_domain *domain, u32 dev_id,
 		    u32 event, u32 nvecs, unsigned int cpu,

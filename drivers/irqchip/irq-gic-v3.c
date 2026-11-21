@@ -947,6 +947,31 @@ static int __init gic_tenant_check_dist(void)
 	return 0;
 }
 
+/**
+ * gic_v3_disable_spis - Disable every SPI once a tenant's host is gone
+ *
+ * Called as a tenant takes over from the host it fenced. The SPIs the host
+ * enabled for its devices stay enabled, and nobody drives those devices any
+ * more: a level-triggered one would be taken again as soon as it is
+ * deactivated, for ever, by whichever CPU it is routed to. A tenant maps no
+ * SPIs, so it disables them all, the extended range included. Outside
+ * tenant mode this does nothing.
+ */
+void gic_v3_disable_spis(void)
+{
+	void __iomem *base = gic_data.dist_base;
+	unsigned int i;
+
+	if (!gic_data.tenant)
+		return;
+
+	for (i = 32; i < GIC_LINE_NR; i += 32)
+		writel_relaxed(~0U, base + GICD_ICENABLER + i / 8);
+	for (i = 0; i < GIC_ESPI_NR; i += 32)
+		writel_relaxed(~0U, base + GICD_ICENABLERnE + i / 8);
+	gic_dist_wait_for_rwp();
+}
+
 static void __init gic_dist_init(void)
 {
 	unsigned int i;

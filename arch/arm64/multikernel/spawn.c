@@ -184,6 +184,12 @@ int mk_arch_fence_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 	return ret;
 }
 
+/* A fenced host's SPIs are nobody's: see gic_v3_disable_spis() */
+void mk_arch_promote(void)
+{
+	gic_v3_disable_spis();
+}
+
 /*
  * The receiving end. A force halt is announced in the shared ring area
  * before the SGIs go out, and only a kernel this one has a relationship
