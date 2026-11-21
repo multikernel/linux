@@ -22,6 +22,7 @@
 #include <linux/ioport.h>
 #include <linux/libfdt.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/sort.h>
 #include <linux/unaligned.h>
 #include <linux/multikernel.h>
@@ -289,6 +290,37 @@ static int __init mk_inherit_preserved(void)
 	return 0;
 }
 core_initcall(mk_inherit_preserved);
+
+/*
+ * A reserved-memory region without no-map is still System RAM, so a
+ * successor would adopt it with the rest of the host's memory and hand
+ * it out. What firmware set it aside for, a log for the next boot for
+ * one, outlives this kernel. Keep every region with a static reg from
+ * the spawns: a reusable one is memory any kernel may use, and one
+ * placed at boot has no reg.
+ */
+static int __init mk_preserve_reserved_memory(void)
+{
+	struct device_node *parent __free(device_node) =
+		of_find_node_by_path("/reserved-memory");
+	struct resource res;
+	int i, ret;
+
+	if (!parent)
+		return 0;
+
+	for_each_available_child_of_node_scoped(parent, child) {
+		if (of_property_read_bool(child, "reusable"))
+			continue;
+		for (i = 0; !of_address_to_resource(child, i, &res); i++) {
+			ret = mk_preserve_range(res.start, resource_size(&res));
+			if (ret)
+				return ret;
+		}
+	}
+	return 0;
+}
+early_initcall(mk_preserve_reserved_memory);
 
 struct mk_reserved_ranges {
 	u64 *pair;
