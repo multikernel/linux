@@ -752,12 +752,14 @@ static void *bzImage64_load(struct kimage *image, char *kernel,
 		goto out_free_params;
 
 	/* For multikernel, setup custom e820 map */
+#ifdef CONFIG_MULTIKERNEL
 	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
 		image->arch.mk_boot_params = bootparam_load_addr;
 		ret = mk_e820_fill(image->mk_instance, params);
 		if (ret)
 			goto out_free_params;
 	}
+#endif
 
 	/* Allocate loader specific data */
 	ldata = kzalloc_obj(struct bzimage64_data);
