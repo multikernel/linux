@@ -70,6 +70,7 @@ struct device_node *mk_of_pci_node(u16 domain, u8 bus, u8 devfn)
 	return NULL;
 }
 
+#ifdef CONFIG_PCI
 static bool mk_of_pci_driven(struct device_node *np)
 {
 	struct device *dev = bus_find_device_by_of_node(&pci_bus_type, np);
@@ -81,6 +82,12 @@ static bool mk_of_pci_driven(struct device_node *np)
 	put_device(dev);
 	return driven;
 }
+#else
+static bool mk_of_pci_driven(struct device_node *np)
+{
+	return false;
+}
+#endif
 
 /**
  * mk_of_pci_node_free - Whether a node's function is free to lend
