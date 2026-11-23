@@ -1730,10 +1730,12 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	rc = mk_manifest_finalize(mk_image);
-	if (rc)
-		pr_warn("Manifest finalization failed: %d\n", rc);
-	else
-		pr_info("Manifest finalized for multikernel instance\n");
+	if (rc) {
+		pr_err("Instance %d has no boot tree, refusing to start it: %d\n",
+		       mk_id, rc);
+		goto unlock;
+	}
+	pr_info("Manifest finalized for multikernel instance\n");
 
 	rc = mk_instance_start(instance, mk_image, cpu);
 
