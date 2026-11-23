@@ -1767,6 +1767,24 @@ static void mk_halted_work_fn(struct work_struct *work)
 	kfree(aw);
 }
 
+/*
+ * A kernel may only report its own halt. It is told apart by the ring the
+ * notice came in on, not by the ID it wrote into the notice: the notice
+ * stays in memory the sender can still write, so act on from->id only.
+ */
+static bool mk_halt_notice_from(struct mk_instance *from,
+				struct mk_resource_ack *ack)
+{
+	u64 id = READ_ONCE(ack->resource_id);
+
+	if (from != host_instance && id == from->id)
+		return true;
+
+	pr_warn_ratelimited("Instance %d reported the halt of instance %llu, ignored\n",
+			    from->id, id);
+	return false;
+}
+
 static void mk_system_msg_handler(struct mk_instance *from, u32 msg_type, u32 subtype,
 				  void *payload, u32 payload_len, void *ctx)
 {
@@ -1804,13 +1822,15 @@ static void mk_system_msg_handler(struct mk_instance *from, u32 msg_type, u32 su
 
 		if (payload_len < sizeof(*ack))
 			return;
+		if (!mk_halt_notice_from(from, ack))
+			return;
 		/*
 		 * Reply to a shutdown this kernel requested: wake the
 		 * requester, which waits for the instance's CPUs to park
 		 * and settles its state itself.
 		 */
 		mk_msg_pending_complete(MK_MSG_SYSTEM, MK_SYS_SHUTDOWN,
-					ack->resource_id, ack->result);
+					from->id, ack->result);
 		break;
 	}
 	case MK_SYS_HALTED: {
@@ -1818,6 +1838,8 @@ static void mk_system_msg_handler(struct mk_instance *from, u32 msg_type, u32 su
 		struct mk_halted_work *aw;
 
 		if (payload_len < sizeof(*ack))
+			return;
+		if (!mk_halt_notice_from(from, ack))
 			return;
 
 		/*
@@ -1832,7 +1854,7 @@ static void mk_system_msg_handler(struct mk_instance *from, u32 msg_type, u32 su
 			break;
 
 		INIT_WORK(&aw->work, mk_halted_work_fn);
-		aw->instance_id = ack->resource_id;
+		aw->instance_id = from->id;
 		schedule_work(&aw->work);
 		break;
 	}
