@@ -78,6 +78,7 @@ static struct mktty_host_conn *mktty_find_conn(int instance_id)
 static int mktty_host_open(struct inode *inode, struct file *filp)
 {
 	struct mktty_host_conn *conn;
+	unsigned long flags;
 
 	conn = kzalloc(sizeof(*conn), GFP_KERNEL);
 	if (!conn)
@@ -95,9 +96,9 @@ static int mktty_host_open(struct inode *inode, struct file *filp)
 	conn->rx_head = 0;
 	conn->rx_tail = 0;
 
-	spin_lock(&mktty_host_conns_lock);
+	spin_lock_irqsave(&mktty_host_conns_lock, flags);
 	list_add(&conn->list, &mktty_host_conns);
-	spin_unlock(&mktty_host_conns_lock);
+	spin_unlock_irqrestore(&mktty_host_conns_lock, flags);
 
 	filp->private_data = conn;
 	return 0;
@@ -106,10 +107,11 @@ static int mktty_host_open(struct inode *inode, struct file *filp)
 static int mktty_host_release(struct inode *inode, struct file *filp)
 {
 	struct mktty_host_conn *conn = filp->private_data;
+	unsigned long flags;
 
-	spin_lock(&mktty_host_conns_lock);
+	spin_lock_irqsave(&mktty_host_conns_lock, flags);
 	list_del(&conn->list);
-	spin_unlock(&mktty_host_conns_lock);
+	spin_unlock_irqrestore(&mktty_host_conns_lock, flags);
 
 	kfree(conn->rx_buf);
 	kfree(conn);
