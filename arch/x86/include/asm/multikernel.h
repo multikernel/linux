@@ -40,6 +40,9 @@ struct mk_instance_arch {
 	struct mk_ident_pgtable *ident_pgt;
 	void *trampoline_va;
 };
+
+struct mk_shared_arch {
+};
 #endif
 
 /*

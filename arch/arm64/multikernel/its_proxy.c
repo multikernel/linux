@@ -53,6 +53,11 @@
 #define MK_MSI_MOVE_TIMEOUT_US	USEC_PER_SEC
 #define MK_MSI_MOVE_POLL_US	10
 
+/* MK_MSG_IO subtypes: MSI routing through the host */
+#define MK_IO_MSI_MAP		(MK_MSG_IO + 5)	/* Route a device's MSI to one of my CPUs */
+#define MK_IO_MSI_ACK		(MK_MSG_IO + 6)	/* Answer: the interrupt number, or an error */
+#define MK_IO_MSI_MOVE		(MK_MSG_IO + 7)	/* Move a routed MSI to another of my CPUs */
+
 /*
  * @rid is the device as the instance sees it on its PCI bus, @event the
  * MSI data it will write.

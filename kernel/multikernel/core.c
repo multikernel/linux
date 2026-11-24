@@ -1958,24 +1958,6 @@ static int mk_force_halt_targets(struct mk_instance *instance,
 	return 0;
 }
 
-/*
- * A CPU's dense index into a per-CPU table in the shared area: its rank
- * in the sorted list of every possible physical CPU id. Both kernels
- * compute it from the same cpu_possible set, so they agree without
- * sharing a physical-id-to-slot map, and the table stays CPU-count
- * sized whatever the ids are.
- */
-int mk_cpu_rank(mk_phys_cpu_t phys)
-{
-	int cpu, rank = 0;
-
-	for_each_possible_cpu(cpu)
-		if (arch_cpu_physical_id(cpu) < phys)
-			rank++;
-	return rank;
-}
-EXPORT_SYMBOL_GPL(mk_cpu_rank);
-
 int __weak mk_arch_pool_discover(struct mk_cpu_set *found)
 {
 	return 0;

@@ -15,6 +15,20 @@
  */
 struct mk_instance_arch {
 };
+
+/* CPUs a table indexed by a CPU's rank among the possible CPUs has room for */
+#define MK_CPU_RANK_MAX 512
+
+struct mk_shared_arch {
+	/*
+	 * CPUs that SDEI can stop, written by each CPU for itself: set once
+	 * the stop event can reach it, cleared before it stops being
+	 * reachable. A force halt only signals the event to the CPUs set
+	 * here, because a request to any other CPU may leave it unable to
+	 * take the stop interrupt as well. See sdei.c.
+	 */
+	u8 fw_stop[MK_CPU_RANK_MAX];
+};
 #endif
 
 /* Physical CPU IDs are MPIDR affinity values, as in the logical map */

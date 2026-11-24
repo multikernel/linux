@@ -36,6 +36,22 @@
 
 static DEFINE_PER_CPU(u8 *, mk_fw_stop);
 
+/*
+ * A CPU's index into fw_stop[]: its rank in the sorted list of every
+ * possible MPIDR. A host and its instances enumerate the same CPUs as
+ * possible, so they agree without sharing a map from MPIDR to slot, and
+ * the table stays CPU-count sized whatever the MPIDRs are.
+ */
+static int mk_cpu_rank(u64 mpidr)
+{
+	int cpu, rank = 0;
+
+	for_each_possible_cpu(cpu)
+		if (arch_cpu_physical_id(cpu) < mpidr)
+			rank++;
+	return rank;
+}
+
 #ifdef CONFIG_ACPI
 static bool mk_acpi_has_sdei(void)
 {
@@ -110,7 +126,7 @@ int mk_sdei_stop_cpu(struct mk_instance *instance, u64 mpidr)
 	int rank = mk_cpu_rank(mpidr);
 	int ret;
 
-	if (!sd || rank >= MK_CPU_RANK_MAX || !READ_ONCE(sd->fw_stop[rank]))
+	if (!sd || rank >= MK_CPU_RANK_MAX || !READ_ONCE(sd->arch.fw_stop[rank]))
 		return -ENODEV;
 
 	ret = sdei_event_signal(MK_SDEI_STOP_EVENT, mpidr);
@@ -150,7 +166,7 @@ static int mk_sdei_cpu_up(unsigned int cpu)
 	int rank = mk_cpu_rank(arch_cpu_physical_id(cpu));
 
 	if (sd && rank < MK_CPU_RANK_MAX)
-		this_cpu_write(mk_fw_stop, &sd->fw_stop[rank]);
+		this_cpu_write(mk_fw_stop, &sd->arch.fw_stop[rank]);
 	mk_sdei_set_reachable(true);
 	return 0;
 }

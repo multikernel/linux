@@ -22,6 +22,9 @@
 #else
 struct mk_instance_arch {
 };
+
+struct mk_shared_arch {
+};
 #endif
 
 /**
@@ -104,9 +107,6 @@ struct mk_ipi_ring {
 /* Room the manifest leaves for a user-provided host tree */
 #define MK_HOST_TREE_MAX SZ_128K
 
-/* CPUs a per-CPU table indexed by mk_cpu_rank() has room for */
-#define MK_CPU_RANK_MAX 512
-
 /*
  * Shared with one child instance. Each ring has producers in one kernel
  * only, so a kernel that dies mid-send can wedge nothing but its own link,
@@ -123,15 +123,8 @@ struct mk_shared_data {
 	 * CPUs the first one missed.
 	 */
 	u32 force_halt;
-	/*
-	 * CPUs that firmware can stop out of band, indexed by mk_cpu_rank()
-	 * and written by each CPU for itself: set once the architecture's
-	 * firmware stop event can reach it, cleared before it stops being
-	 * reachable. A force halt only asks firmware to stop the CPUs set
-	 * here, because a request to any other CPU may leave it unable to
-	 * take the stop interrupt as well.
-	 */
-	u8 fw_stop[MK_CPU_RANK_MAX];
+	/* What the architecture's kernels tell each other, last as its size is theirs */
+	struct mk_shared_arch arch;
 };
 
 struct mk_instance;
@@ -211,17 +204,11 @@ void mk_ipi_rx_del(struct mk_instance *instance);
 #define MK_MSG_NETWORK      0x5000
 #define MK_MSG_PCI          0x6000
 
-/* I/O interrupt forwarding subtypes */
-#define MK_IO_IRQ_FORWARD   (MK_MSG_IO + 1)
-#define MK_IO_IRQ_BALANCE   (MK_MSG_IO + 2)
-#define MK_IO_IRQ_MASK      (MK_MSG_IO + 3)
-#define MK_IO_IRQ_UNMASK    (MK_MSG_IO + 4)
-/* MSI routing through the host, where the arch needs it: payload is the arch's */
-#define MK_IO_MSI_MAP       (MK_MSG_IO + 5)  /* Route a device's MSI to one of my CPUs */
-#define MK_IO_MSI_ACK       (MK_MSG_IO + 6)  /* Answer: the interrupt number, or an error */
-#define MK_IO_MSI_MOVE      (MK_MSG_IO + 7)  /* Move a routed MSI to another of my CPUs */
-#define MK_IO_IRTE_WRITE    (MK_MSG_IO + 8)  /* Write a remapping entry I composed */
-#define MK_IO_IRTE_ACK      (MK_MSG_IO + 9)  /* Answer: 0 or an error */
+/*
+ * MK_MSG_IO is the architecture's: how an instance has its host route
+ * its interrupts depends on the interrupt controller, so the subtypes
+ * and their payloads are defined by the architecture that uses them.
+ */
 
 /* Resource management subtypes */
 #define MK_RES_CPU_ADD      (MK_MSG_RESOURCE + 1)
@@ -234,7 +221,6 @@ void mk_ipi_rx_del(struct mk_instance *instance);
 #define MK_RES_ACK          (MK_MSG_RESOURCE + 0x100)  /* Response/acknowledgment */
 
 /* System management subtypes */
-#define MK_SYS_HEARTBEAT    (MK_MSG_SYSTEM + 1)
 #define MK_SYS_SHUTDOWN     (MK_MSG_SYSTEM + 2)
 #define MK_SYS_SHUTDOWN_ACK (MK_MSG_SYSTEM + 3)
 #define MK_SYS_HALTED       (MK_MSG_SYSTEM + 4)  /* Voluntary halt notification */
@@ -263,47 +249,25 @@ struct mk_message {
  * Payload structures for specific message types
  */
 
-/* I/O interrupt forwarding */
-struct mk_io_irq_payload {
-	u32 irq_number;         /* Hardware IRQ number */
-	u32 vector;             /* Interrupt vector */
-	u32 device_id;          /* Device identifier (optional) */
-	u32 flags;              /* Control flags (priority, etc.) */
-};
-
-/* IRQ control flags */
-#define MK_IRQ_HIGH_PRIORITY    0x01
-#define MK_IRQ_LOW_LATENCY      0x02
-#define MK_IRQ_EDGE_TRIGGERED   0x04
-#define MK_IRQ_LEVEL_TRIGGERED  0x08
-
 /* CPU resource operations */
 struct mk_cpu_resource_payload {
 	u64 cpu_id;             /* Physical CPU ID */
 	u32 numa_node;          /* NUMA node (optional) */
-	u32 flags;              /* CPU capabilities/attributes */
+	u32 flags;              /* Reserved */
 	int sender_instance_id; /* Sender instance ID for ACK */
 };
-
-/* CPU capability flags */
-#define MK_CPU_HAS_AVX512       0x01
-#define MK_CPU_HAS_TSX          0x02
-#define MK_CPU_HYPERTHREAD      0x04
 
 /* Memory resource operations */
 struct mk_mem_resource_payload {
 	u64 start_pfn;          /* Starting page frame number */
 	u64 nr_pages;           /* Number of pages */
 	u32 numa_node;          /* NUMA node */
-	u32 mem_type;           /* Memory type (normal/DMA/etc.) */
+	u32 mem_type;           /* MK_MEM_* */
 	int sender_instance_id; /* Sender instance ID for ACK */
 };
 
-/* Memory types */
+/* Memory types: onlined for the kernel's own use, or as movable without it */
 #define MK_MEM_NORMAL           0x01
-#define MK_MEM_DMA              0x02
-#define MK_MEM_DMA32            0x04
-#define MK_MEM_HIGHMEM          0x08
 
 /*
  * A PCI bus as a root bus of another kernel: its windows as the cells of
@@ -583,8 +547,6 @@ enum mk_instance_state {
  * spawned instance's id (1, 2, etc.) until it fences its host and
  * takes 0.
  */
-int mk_cpu_rank(mk_phys_cpu_t phys);
-
 extern struct mk_instance *mk_self;
 
 /**

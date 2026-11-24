@@ -47,6 +47,9 @@ struct mk_instance_arch {
 	struct mk_boot_record boot;
 };
 
+struct mk_shared_arch {
+};
+
 /* Have a hart this kernel starts for itself enter through mk_hart_entry */
 void mk_wrap_hart_entry(unsigned int cpu, unsigned long *entry,
 			unsigned long *opaque);

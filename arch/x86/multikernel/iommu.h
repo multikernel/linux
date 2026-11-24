@@ -10,6 +10,10 @@ struct pci_dev;
 
 #define MK_IOMMUS_PATH		"/chosen/multikernel,iommus"
 
+/* MK_MSG_IO subtypes: interrupt remapping through the host */
+#define MK_IO_IRTE_WRITE	(MK_MSG_IO + 8)	/* Write a remapping entry I composed */
+#define MK_IO_IRTE_ACK		(MK_MSG_IO + 9)	/* Answer: 0 or an error */
+
 /*
  * MK_IO_IRTE_WRITE and its MK_IO_IRTE_ACK: have the host write an interrupt
  * remapping entry of a unit. What @low and @high hold is the vendor's.
