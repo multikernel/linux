@@ -205,10 +205,6 @@ void mk_set_spawn_context(struct mk_spawn_context *ctx,
 			  unsigned long kernel_entry,
 			  unsigned long park_table);
 
-/* Trigger spawn on a pool CPU */
-int mk_spawn_cpu(struct mk_instance *instance, int cpu,
-		 struct mk_spawn_context *ctx);
-
 /* Initialize boot context tracking in spawn kernel */
 void mk_init_boot_context(phys_addr_t ctx_phys);
 

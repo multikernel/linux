@@ -929,8 +929,7 @@ const char *mk_state_to_string(enum mk_instance_state state);
  */
 
 struct kimage;
-int mk_instance_start(struct mk_instance *instance, struct kimage *image,
-		      int cpu);
+int mk_instance_start(struct mk_instance *instance, struct kimage *image);
 
 /*
  * The declarations below are referenced from always-built code (kexec,
@@ -1272,15 +1271,15 @@ void mk_force_stop_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
 
 /*
  * Build the boot state for @instance from the loaded @image and start
- * its boot CPU (a parked pool CPU, given as a logical CPU number). On
- * success the arch keeps its spawn resources in the instance so a
- * re-spawn can reuse them; mk_arch_release_instance() frees them when
- * the instance's memory is torn down.
+ * its boot CPU, the first CPU it owns, which is parked. Called with
+ * mk_park_lock held. The arch keeps its spawn resources in the instance
+ * so a re-spawn can reuse them; mk_arch_release_instance() frees them
+ * when the instance's memory is torn down, once every CPU the instance
+ * started is parked again.
  */
 struct kimage;
-int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
-			   int cpu);
-int mk_arch_release_instance(struct mk_instance *instance);
+int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance);
+void mk_arch_release_instance(struct mk_instance *instance);
 
 /* Verify one of an instance's CPUs has reached its park loop */
 int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
@@ -1295,12 +1294,5 @@ bool mk_arch_cpu_faulty(mk_phys_cpu_t phys_cpu);
  * image when it is rewritten takes the machine down with it.
  */
 int mk_instance_confirm_parked(struct mk_instance *instance);
-
-/* Return an instance's parked CPUs to the host slot before teardown */
-int mk_repark_instance_to_host(struct mk_instance *instance);
-
-/* Move one parked CPU between the host pool and a live instance */
-int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
-int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
 
 #endif /* _LINUX_MULTIKERNEL_H */

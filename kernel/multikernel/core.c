@@ -438,7 +438,6 @@ struct mk_instance *mk_instance_find(int mk_id)
  * mk_instance_start - Start an instance from its freshly copied image
  * @instance: The instance, not running
  * @image: Its kernel image, ready to boot
- * @cpu: Logical CPU it boots on
  *
  * Gives the instance what it reaches from its first instruction on, its
  * rings and leases on its PCI functions, then starts it. The leases end
@@ -447,8 +446,7 @@ struct mk_instance *mk_instance_find(int mk_id)
  *
  * Returns 0 once the instance runs, or a negative error code.
  */
-int mk_instance_start(struct mk_instance *instance, struct kimage *image,
-		      int cpu)
+int mk_instance_start(struct mk_instance *instance, struct kimage *image)
 {
 	int ret;
 
@@ -476,7 +474,7 @@ int mk_instance_start(struct mk_instance *instance, struct kimage *image,
 		return ret;
 	}
 
-	ret = mk_arch_spawn_instance(image, instance, cpu);
+	ret = mk_instance_start_boot_cpu(instance, image);
 	if (ret) {
 		mk_instance_fence_devices(instance);
 		mk_ipi_rx_del(instance);
@@ -1367,10 +1365,10 @@ void mk_instance_free_memory(struct mk_instance *instance)
 	 * The arch's boot structures are all carved from the control block,
 	 * so they are returned to the pool as one allocation rather than
 	 * individually. Freeing them piecemeal would punch holes in the
-	 * block's bitmap and leave the rest of it allocated. The arch first
-	 * waits for every CPU the instance started to park.
+	 * block's bitmap and leave the rest of it allocated. Every CPU the
+	 * instance started has to be parked first.
 	 */
-	if (instance->instance_pool && mk_arch_release_instance(instance)) {
+	if (instance->instance_pool && mk_instance_release_spawn_state(instance)) {
 		/*
 		 * A CPU never parked: it may still run this instance's
 		 * kernel. Handing the memory back would let the next

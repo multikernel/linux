@@ -209,14 +209,6 @@ void mk_foreign_cpu_stop(void)
 	mk_enter_pool_state(NULL);
 }
 
-static struct mk_cpu_set *mk_started_set(struct mk_instance *instance)
-{
-	if (!instance->cpus_started)
-		instance->cpus_started = mk_cpu_set_alloc();
-
-	return instance->cpus_started;
-}
-
 /*
  * The spawn reads these with the MMU and caches off, so what the host
  * wrote through its cacheable mapping has to be in memory by then.
@@ -255,35 +247,18 @@ static int mk_clean_image_to_poc(struct kimage *image)
  * mk_arch_spawn_instance - Start an instance's boot CPU on its image
  * @image: Loaded kimage for the instance
  * @instance: Instance being spawned
- * @cpu: Logical CPU, off in the pool, to boot the instance on
  *
- * Once the boot CPU runs, the instance's kernel may turn on any other CPU
- * it was given without telling the host, so all of them count as started
- * from here on and have to be seen off again before the image is reused.
+ * The boot CPU, the first the instance owns, is off in the pool.
  */
-int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
-			   int cpu)
+int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance)
 {
-	struct mk_cpu_set *started = mk_started_set(instance);
-	mk_phys_cpu_t mpidr = arch_cpu_physical_id(cpu);
-	mk_phys_cpu_t phys_cpu;
-	unsigned int i;
+	mk_phys_cpu_t mpidr = mk_cpu_set_first(instance->cpus);
 	int ret;
-
-	if (!mk_pool)
-		return -ENODEV;
 
 	if (!image->arch.dtb_mem) {
 		pr_err("Instance %d has no boot device tree\n", instance->id);
 		return -EINVAL;
 	}
-
-	/* Make the adds below infallible before anything runs */
-	if (!started)
-		return -ENOMEM;
-	ret = mk_cpu_set_reserve(started, mk_cpu_set_count(instance->cpus));
-	if (ret)
-		return ret;
 
 	ret = mk_build_boot_dtb(image, instance);
 	if (ret) {
@@ -296,45 +271,16 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 	if (ret)
 		return ret;
 
-	guard(mutex)(&mk_park_lock);
-
 	ret = psci_cpu_on_context(mpidr, image->start, image->arch.dtb_mem);
-	if (ret) {
+	if (ret)
 		pr_err("CPU_ON of CPU 0x%llx for instance %d failed: %d\n",
 		       mpidr, instance->id, ret);
-		return ret;
-	}
-
-	mk_cpu_set_for_each(i, phys_cpu, instance->cpus)
-		mk_cpu_set_add(started, phys_cpu);
-
-	return 0;
+	return ret;
 }
 
-/**
- * mk_arch_release_instance - Let go of an instance's CPUs before teardown
- * @instance: Instance being torn down
- *
- * Fails if a CPU is still on: it may be executing the instance's image,
- * so the caller must keep the instance's memory alive.
- */
-int mk_arch_release_instance(struct mk_instance *instance)
+/* What CPU_ON is given lives in the kimage, so there is nothing to free */
+void mk_arch_release_instance(struct mk_instance *instance)
 {
-	int ret;
-
-	ret = mk_repark_instance_to_host(instance);
-	if (ret) {
-		char buf[256];
-
-		mk_cpu_set_format(buf, sizeof(buf), instance->cpus_started);
-		pr_err("Instance %d (%s): CPUs %s are not off, keeping its memory\n",
-		       instance->id, instance->name, buf);
-		return ret;
-	}
-
-	mk_cpu_set_free(instance->cpus_started);
-	instance->cpus_started = NULL;
-	return 0;
 }
 
 /**
@@ -342,90 +288,12 @@ int mk_arch_release_instance(struct mk_instance *instance)
  * @instance: Instance the CPU belongs to
  * @phys_cpu: MPIDR of the CPU
  *
- * Returns 0 once firmware reports the CPU off.
+ * An off CPU belongs to whoever turns it on next, so there is nothing to
+ * move. Returns 0 once firmware reports the CPU off.
  */
 int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {
 	return mk_wait_cpu_off(phys_cpu);
-}
-
-/**
- * mk_repark_instance_to_host - Return an instance's CPUs to the pool
- * @instance: Instance being torn down
- *
- * An off CPU belongs to whoever turns it on next, so there is nothing to
- * move. What is left to do is to see every started CPU off; one that is
- * not stays tracked, and the caller must not free the instance's memory.
- */
-int mk_repark_instance_to_host(struct mk_instance *instance)
-{
-	struct mk_cpu_set *started = instance->cpus_started;
-	unsigned int i;
-	int failed = 0;
-
-	if (mk_cpu_set_empty(started))
-		return 0;
-
-	guard(mutex)(&mk_park_lock);
-
-	/* Back to front, so deleting never shifts entries yet to be visited */
-	for (i = mk_cpu_set_count(started); i-- > 0; ) {
-		mk_phys_cpu_t phys_cpu = started->ids[i];
-
-		if (mk_wait_cpu_off(phys_cpu))
-			failed++;
-		else
-			mk_cpu_set_del(started, phys_cpu);
-	}
-
-	return failed ? -ETIMEDOUT : 0;
-}
-
-/**
- * mk_repark_cpu_to_instance - Hand one pool CPU to a live instance
- * @instance: Running instance the CPU is being hot-added to
- * @phys_cpu: MPIDR of the CPU
- *
- * The instance's kernel turns the CPU on by itself; the host only starts
- * counting it among the CPUs that kernel may be running on.
- */
-int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
-{
-	struct mk_cpu_set *started = mk_started_set(instance);
-
-	if (!started)
-		return -ENOMEM;
-
-	guard(mutex)(&mk_park_lock);
-
-	if (mk_cpu_set_contains(started, phys_cpu))
-		return 0;
-
-	return mk_cpu_set_add(started, phys_cpu);
-}
-
-/**
- * mk_repark_cpu_to_host - Take one CPU back from an instance
- * @instance: Instance the CPU was removed from
- * @phys_cpu: MPIDR of the CPU
- *
- * The instance's kernel reports the CPU offline before the CPU has
- * reached firmware. Turning it on elsewhere only works once it is off,
- * so wait for that; until then it stays accounted to the instance.
- */
-int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
-{
-	int ret;
-
-	guard(mutex)(&mk_park_lock);
-
-	if (!mk_cpu_set_contains(instance->cpus_started, phys_cpu))
-		return 0;
-
-	ret = mk_wait_cpu_off(phys_cpu);
-	if (!ret)
-		mk_cpu_set_del(instance->cpus_started, phys_cpu);
-	return ret;
 }
 
 int mk_arch_pool_map(phys_addr_t start, size_t size)

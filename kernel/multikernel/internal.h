@@ -48,6 +48,13 @@ void mk_arm_force_halt(struct mk_instance *instance);
 int mk_instance_alloc_ring(struct mk_instance *instance);
 void mk_instance_free_ring(struct mk_instance *instance);
 
+/* park.c */
+int mk_instance_start_boot_cpu(struct mk_instance *instance,
+			       struct kimage *image);
+int mk_instance_release_spawn_state(struct mk_instance *instance);
+int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
+int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
+
 /* fault.c */
 #ifdef CONFIG_OF
 void mk_fault_publish(void);

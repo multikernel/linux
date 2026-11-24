@@ -270,49 +270,23 @@ void mk_force_stop_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 	mk_arch_send_ipi(phys_cpu);
 }
 
-static struct mk_cpu_set *mk_started_set(struct mk_instance *instance)
-{
-	if (!instance->cpus_started)
-		instance->cpus_started = mk_cpu_set_alloc();
-
-	return instance->cpus_started;
-}
-
 /**
  * mk_arch_spawn_instance - Start an instance's boot hart on its image
  * @image: Loaded kimage for the instance
  * @instance: Instance being spawned
- * @cpu: Unused: the boot hart is the first the instance owns, which
- *       need not be a CPU of this kernel
  *
- * Once the boot hart runs, the instance's kernel may start any other hart
- * it was given without telling the host, so all of them count as started
- * from here on and have to be seen stopped again before the image is
- * reused.
+ * The boot hart is the first the instance owns, which need not be a CPU
+ * of this kernel.
  */
-int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
-			   int cpu)
+int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance)
 {
-	struct mk_cpu_set *started = mk_started_set(instance);
 	mk_phys_cpu_t hartid = mk_cpu_set_first(instance->cpus);
-	mk_phys_cpu_t phys_cpu;
-	unsigned int i;
 	int ret;
-
-	if (!mk_pool)
-		return -ENODEV;
 
 	if (!image->arch.fdt_addr) {
 		pr_err("Instance %d has no boot device tree\n", instance->id);
 		return -EINVAL;
 	}
-
-	/* Make the adds below infallible before anything runs */
-	if (!started)
-		return -ENOMEM;
-	ret = mk_cpu_set_reserve(started, mk_cpu_set_count(instance->cpus));
-	if (ret)
-		return ret;
 
 	ret = mk_build_boot_dtb(image, instance);
 	if (ret) {
@@ -321,49 +295,20 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 		return ret;
 	}
 
-	guard(mutex)(&mk_park_lock);
-
 	instance->arch.boot.a1 = image->arch.fdt_addr;
 	instance->arch.boot.entry = image->start;
 	/* What the hart reads first must be in memory before it starts */
 	mb();
 	ret = mk_hsm_start(hartid, mk_entry_pa, __pa(&instance->arch.boot));
-	if (ret) {
+	if (ret)
 		pr_err("HART_START of hart %llu for instance %d failed: %d\n",
 		       hartid, instance->id, ret);
-		return ret;
-	}
-
-	mk_cpu_set_for_each(i, phys_cpu, instance->cpus)
-		mk_cpu_set_add(started, phys_cpu);
-
-	return 0;
+	return ret;
 }
 
-/**
- * mk_arch_release_instance - Let go of an instance's harts before teardown
- * @instance: Instance being torn down
- *
- * Fails if a hart is still started: it may be executing the instance's
- * image, so the caller must keep the instance's memory alive.
- */
-int mk_arch_release_instance(struct mk_instance *instance)
+/* The boot record is part of the instance, so there is nothing to free */
+void mk_arch_release_instance(struct mk_instance *instance)
 {
-	int ret;
-
-	ret = mk_repark_instance_to_host(instance);
-	if (ret) {
-		char buf[256];
-
-		mk_cpu_set_format(buf, sizeof(buf), instance->cpus_started);
-		pr_err("Instance %d (%s): harts %s are not stopped, keeping its memory\n",
-		       instance->id, instance->name, buf);
-		return ret;
-	}
-
-	mk_cpu_set_free(instance->cpus_started);
-	instance->cpus_started = NULL;
-	return 0;
 }
 
 /**
@@ -371,91 +316,12 @@ int mk_arch_release_instance(struct mk_instance *instance)
  * @instance: Instance the hart belongs to
  * @phys_cpu: Hart ID
  *
- * Returns 0 once firmware reports the hart stopped.
+ * A stopped hart belongs to whoever starts it next, so there is nothing
+ * to move. Returns 0 once firmware reports the hart stopped.
  */
 int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {
 	return mk_wait_hart_stopped(phys_cpu);
-}
-
-/**
- * mk_repark_instance_to_host - Return an instance's harts to the pool
- * @instance: Instance being torn down
- *
- * A stopped hart belongs to whoever starts it next, so there is nothing
- * to move. What is left to do is to see every started hart stopped; one
- * that is not stays tracked, and the caller must not free the instance's
- * memory.
- */
-int mk_repark_instance_to_host(struct mk_instance *instance)
-{
-	struct mk_cpu_set *started = instance->cpus_started;
-	unsigned int i;
-	int failed = 0;
-
-	if (mk_cpu_set_empty(started))
-		return 0;
-
-	guard(mutex)(&mk_park_lock);
-
-	/* Back to front, so deleting never shifts entries yet to be visited */
-	for (i = mk_cpu_set_count(started); i-- > 0; ) {
-		mk_phys_cpu_t phys_cpu = started->ids[i];
-
-		if (mk_wait_hart_stopped(phys_cpu))
-			failed++;
-		else
-			mk_cpu_set_del(started, phys_cpu);
-	}
-
-	return failed ? -ETIMEDOUT : 0;
-}
-
-/**
- * mk_repark_cpu_to_instance - Hand one pool hart to a live instance
- * @instance: Running instance the hart is being hot-added to
- * @phys_cpu: Hart ID
- *
- * The instance's kernel starts the hart by itself; the host only starts
- * counting it among the harts that kernel may be running on.
- */
-int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
-{
-	struct mk_cpu_set *started = mk_started_set(instance);
-
-	if (!started)
-		return -ENOMEM;
-
-	guard(mutex)(&mk_park_lock);
-
-	if (mk_cpu_set_contains(started, phys_cpu))
-		return 0;
-
-	return mk_cpu_set_add(started, phys_cpu);
-}
-
-/**
- * mk_repark_cpu_to_host - Take one hart back from an instance
- * @instance: Instance the hart was removed from
- * @phys_cpu: Hart ID
- *
- * The instance's kernel reports the hart offline before the hart has
- * reached firmware. Starting it elsewhere only works once it is stopped,
- * so wait for that; until then it stays accounted to the instance.
- */
-int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
-{
-	int ret;
-
-	guard(mutex)(&mk_park_lock);
-
-	if (!mk_cpu_set_contains(instance->cpus_started, phys_cpu))
-		return 0;
-
-	ret = mk_wait_hart_stopped(phys_cpu);
-	if (!ret)
-		mk_cpu_set_del(instance->cpus_started, phys_cpu);
-	return ret;
 }
 
 int mk_arch_pool_map(phys_addr_t start, size_t size)

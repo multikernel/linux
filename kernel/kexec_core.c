@@ -1738,7 +1738,7 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 	pr_info("Manifest finalized for multikernel instance\n");
 
-	rc = mk_instance_start(instance, mk_image, cpu);
+	rc = mk_instance_start(instance, mk_image);
 
 unlock:
 	kexec_unlock();

@@ -120,59 +120,28 @@ void mk_set_spawn_context(struct mk_spawn_context *ctx,
 	ctx->park_table = park_table;
 }
 
-/* The CPUs started for an instance and not seen parked since */
-static struct mk_cpu_set *mk_started_set(struct mk_instance *instance)
-{
-	if (!instance->cpus_started)
-		instance->cpus_started = mk_cpu_set_alloc();
-
-	return instance->cpus_started;
-}
-
 /*
- * Boot the instance on @cpu, which waits in its park cell like every
- * CPU the instance owns. The instance's kernel starts the others from
- * their cells without telling the host, so all of them count as started
- * from here on and have to be seen parked before the image is reused.
+ * Boot the instance on its first CPU, which waits in its park cell like
+ * every CPU the instance owns.
  */
-int mk_spawn_cpu(struct mk_instance *instance, int cpu,
-		 struct mk_spawn_context *ctx)
+static int mk_spawn_cpu(struct mk_instance *instance,
+			struct mk_spawn_context *ctx)
 {
-	struct mk_cpu_set *started = mk_started_set(instance);
-	u32 apic_id = per_cpu(x86_cpu_to_apicid, cpu);
+	u32 apic_id = mk_cpu_set_first(instance->cpus);
 	const u64 args[] = {
 		ctx->identity_cr3,
 		virt_to_phys(&ctx->bp),
 		ctx->kernel_entry,
 		virt_to_phys(instance->arch.trampoline_va),
 	};
-	mk_phys_cpu_t phys_cpu;
-	unsigned int i;
-	int ret;
 
-	/* Make the adds below infallible before anything runs */
-	if (!started)
-		return -ENOMEM;
-	ret = mk_cpu_set_reserve(started, mk_cpu_set_count(instance->cpus));
-	if (ret)
-		return ret;
-
-	guard(mutex)(&mk_park_lock);
-
-	ret = mk_park_dispatch(apic_id, MK_PARK_CMD_BOOT, args, ARRAY_SIZE(args));
-	if (ret)
-		return ret;
-
-	mk_cpu_set_for_each(i, phys_cpu, instance->cpus)
-		mk_cpu_set_add(started, phys_cpu);
-	return 0;
+	return mk_park_dispatch(apic_id, MK_PARK_CMD_BOOT, args, ARRAY_SIZE(args));
 }
 
 /**
  * mk_arch_spawn_instance - Build boot state and start an instance's boot CPU
  * @image: Loaded kimage for the instance
  * @instance: Instance being spawned
- * @cpu: Logical CPU, currently parked in the pool, to boot the instance on
  *
  * Builds or reuses the identity page tables, trampoline and spawn
  * context, stamps in the boot parameters the loader prepared, and
@@ -186,14 +155,14 @@ int mk_spawn_cpu(struct mk_instance *instance, int cpu,
  * where this attempt stopped; everything is returned to the pool together
  * when the instance's memory is torn down.
  */
-int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
-			   int cpu)
+int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance)
 {
+	int cpu = arch_cpu_from_physical_id(mk_cpu_set_first(instance->cpus));
 	phys_addr_t code_phys = mk_park_code_phys();
 	struct boot_params *src_bp;
 	int ret;
 
-	if (!code_phys)
+	if (!code_phys || cpu < 0)
 		return -ENODEV;
 
 	if (!instance->arch.ident_pgt) {
@@ -288,86 +257,23 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
 	instance->arch.spawn_ctx->boot_apic_hz =
 		(unsigned long)lapic_timer_period * HZ;
 
-	return mk_spawn_cpu(instance, cpu, instance->arch.spawn_ctx);
+	return mk_spawn_cpu(instance, instance->arch.spawn_ctx);
 }
 
 /**
  * mk_arch_release_instance - Free an instance's spawn resources
- * @instance: Instance being torn down
+ * @instance: Instance being torn down, every CPU it started parked
  *
- * Waits for every CPU the instance started to park, then frees the
- * identity page tables. The trampoline and spawn context are carved
- * from the instance's control block, which the caller returns to the
- * pool as one allocation; only the pointers are cleared here.
- *
- * Fails without releasing anything if a CPU never parked: it may still
- * run the instance's kernel, so the caller must keep its memory alive.
+ * Frees the identity page tables. The trampoline and spawn context are
+ * carved from the instance's control block, which the caller returns to
+ * the pool as one allocation; only the pointers are cleared here.
  */
-int mk_arch_release_instance(struct mk_instance *instance)
+void mk_arch_release_instance(struct mk_instance *instance)
 {
-	int ret;
-
-	ret = mk_repark_instance_to_host(instance);
-	if (ret) {
-		char buf[256];
-
-		mk_cpu_set_format(buf, sizeof(buf), instance->cpus_started);
-		pr_err("Instance %d (%s): CPUs %s never parked, keeping spawn resources\n",
-		       instance->id, instance->name, buf);
-		return ret;
-	}
-
-	mk_cpu_set_free(instance->cpus_started);
-	instance->cpus_started = NULL;
-
 	mk_free_identity_pgtable(instance->arch.ident_pgt);
 	instance->arch.ident_pgt = NULL;
 	instance->arch.trampoline_va = NULL;
 	instance->arch.spawn_ctx = NULL;
-	return 0;
-}
-
-/**
- * mk_repark_cpu_to_instance - Hand one parked pool CPU to a live instance
- * @instance: Running instance the CPU is being hot-added to
- * @phys_cpu: Physical (APIC) ID of the CPU
- *
- * The CPU stays in its cell, where the instance's kernel starts it; the
- * host only starts counting it among the CPUs that kernel may run on.
- */
-int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
-{
-	struct mk_cpu_set *started = mk_started_set(instance);
-
-	if (!started)
-		return -ENOMEM;
-
-	guard(mutex)(&mk_park_lock);
-
-	return mk_cpu_set_add(started, phys_cpu);
-}
-
-/**
- * mk_repark_cpu_to_host - Take one CPU back from an instance
- * @instance: Instance the CPU was removed from
- * @phys_cpu: Physical (APIC) ID of the CPU
- *
- * The instance's kernel reports the CPU offline before the CPU reaches
- * its cell; until it has, it stays accounted to the instance.
- */
-int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
-{
-	int ret;
-
-	guard(mutex)(&mk_park_lock);
-
-	if (!mk_cpu_set_contains(instance->cpus_started, phys_cpu))
-		return 0;
-
-	ret = mk_park_wait((u32)phys_cpu);
-	if (!ret)
-		mk_cpu_set_del(instance->cpus_started, phys_cpu);
-	return ret;
 }
 
 /* 0 once @phys_cpu waits in its cell, whichever kernel parked it */
@@ -379,37 +285,6 @@ int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 bool mk_arch_cpu_faulty(mk_phys_cpu_t phys_cpu)
 {
 	return mk_park_faulty((u32)phys_cpu);
-}
-
-/**
- * mk_repark_instance_to_host - See every CPU an instance started parked
- * @instance: Instance being torn down
- *
- * A CPU that does not park stays tracked, and the caller must not free
- * the instance's memory.
- */
-int mk_repark_instance_to_host(struct mk_instance *instance)
-{
-	struct mk_cpu_set *started = instance->cpus_started;
-	unsigned int i;
-	int failed = 0;
-
-	if (mk_cpu_set_empty(started))
-		return 0;
-
-	guard(mutex)(&mk_park_lock);
-
-	/* Back to front, so deleting never shifts entries yet to be visited */
-	for (i = mk_cpu_set_count(started); i-- > 0; ) {
-		mk_phys_cpu_t phys_cpu = started->ids[i];
-
-		if (mk_park_wait((u32)phys_cpu))
-			failed++;
-		else
-			mk_cpu_set_del(started, phys_cpu);
-	}
-
-	return failed ? -ETIMEDOUT : 0;
 }
 
 /**
