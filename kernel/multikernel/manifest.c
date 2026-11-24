@@ -9,10 +9,11 @@
  * directions. The spawn's OF core unflattens it like a tree from a
  * bootloader, so everything in it is read with the usual of_* helpers.
  *
- * The manifest travels on multikernel's own boot channel (a dedicated
- * setup_data type on x86, pointing at the tree), separate from KHO: a
- * spawn kernel may use the real KHO channel for its own live update
- * within its partition.
+ * The manifest travels on multikernel's own boot channel, separate from
+ * KHO: a spawn kernel may use the real KHO channel for its own live
+ * update within its partition. On x86 a dedicated setup_data type points
+ * at the tree. Where a kernel boots from a device tree, that tree is the
+ * manifest with the architecture's boot nodes added, see boot_dtb.c.
  */
 
 #include <linux/kernel.h>
@@ -77,7 +78,7 @@ static void __init mk_register_ram_from_host_tree(const void *fdt)
  * @fdt_len: Size of the manifest FDT
  *
  * Called during early boot from the arch's boot data parsing (x86
- * setup_data) or the generic device tree scan. Validates the blob and
+ * setup_data) or with the boot tree itself. Validates the blob and
  * records its location for the instance restore path.
  */
 void __init mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)

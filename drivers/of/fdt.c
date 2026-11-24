@@ -26,7 +26,6 @@
 #include <linux/sysfs.h>
 #include <linux/random.h>
 #include <linux/kexec_handover.h>
-#include <linux/multikernel.h>
 
 #include <asm/setup.h>  /* for COMMAND_LINE_SIZE */
 #include <asm/page.h>
@@ -938,24 +937,6 @@ static void __init early_init_dt_check_kho(void)
 	kho_populate(fdt_start, fdt_size, scratch_start, scratch_size);
 }
 
-/**
- * early_init_dt_check_multikernel - Find the multikernel manifest in DT
- */
-static void __init early_init_dt_check_multikernel(void)
-{
-	unsigned long node = chosen_node_offset;
-	u64 fdt_start, fdt_size;
-
-	if (!IS_ENABLED(CONFIG_MULTIKERNEL) || (long)node < 0)
-		return;
-
-	if (!of_flat_dt_get_addr_size(node, "linux,multikernel-fdt",
-				      &fdt_start, &fdt_size))
-		return;
-
-	mk_manifest_populate(fdt_start, fdt_size);
-}
-
 #ifdef CONFIG_SERIAL_EARLYCON
 
 int __init early_init_dt_scan_chosen_stdout(void)
@@ -1251,7 +1232,6 @@ void __init early_init_dt_scan_nodes(void)
 
 	/* Handle kexec handover */
 	early_init_dt_check_kho();
-	early_init_dt_check_multikernel();
 }
 
 bool __init early_init_dt_scan(void *dt_virt, phys_addr_t dt_phys)

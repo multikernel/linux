@@ -14,7 +14,6 @@
 #include <linux/kexec.h>
 #include <linux/memblock.h>
 #include <linux/libfdt.h>
-#include <linux/multikernel.h>
 #include <linux/of.h>
 #include <linux/of_fdt.h>
 #include <linux/random.h>
@@ -295,28 +294,6 @@ static int kho_add_chosen(const struct kimage *image, void *fdt, int chosen_node
 }
 
 /*
- * The multikernel manifest travels on its own /chosen property, distinct
- * from KHO's: a spawn kernel may later use the real KHO channel for its
- * own live update within its partition, so the two must not share.
- */
-static int mk_add_chosen(const struct kimage *image, void *fdt, int chosen_node)
-{
-	int ret;
-
-	ret = fdt_delprop(fdt, chosen_node, "linux,multikernel-fdt");
-	if (ret && ret != -FDT_ERR_NOTFOUND)
-		return ret;
-
-	if (!IS_ENABLED(CONFIG_MULTIKERNEL) ||
-	    image->type != KEXEC_TYPE_MULTIKERNEL)
-		return 0;
-
-	return fdt_appendprop_addrrange(fdt, 0, chosen_node,
-					"linux,multikernel-fdt",
-					image->mk_instance->manifest_phys, PAGE_SIZE);
-}
-
-/*
  * of_kexec_alloc_and_setup_fdt - Alloc and setup a new Flattened Device Tree
  *
  * @image:		kexec image being loaded.
@@ -468,11 +445,6 @@ void *of_kexec_alloc_and_setup_fdt(const struct kimage *image,
 
 	/* Add kho metadata if this is a KHO image */
 	ret = kho_add_chosen(image, fdt, chosen_node);
-	if (ret)
-		goto out;
-
-	/* Add the manifest reference if this is a multikernel image */
-	ret = mk_add_chosen(image, fdt, chosen_node);
 	if (ret)
 		goto out;
 
