@@ -273,19 +273,23 @@ static void mktty_host_ipi_handler(struct mk_ipi_data *data, struct mk_instance 
 	struct mktty_host_conn *conn;
 	unsigned long flags;
 	size_t i, space;
+	u32 len;
 
 	if (data->data_size < sizeof(*msg) - MKTTY_MAX_DATA)
 		return;
 	if (msg->type != MKTTY_MSG_OUTPUT)
 		return;
-	if (msg->len > MKTTY_MAX_DATA)
+
+	/* The sender can still write the slot: bound the copy that is used */
+	len = READ_ONCE(msg->len);
+	if (len > MKTTY_MAX_DATA)
 		return;
 
 	spin_lock_irqsave(&mktty_host_conns_lock, flags);
 	conn = mktty_find_conn(msg->console_id);
 	if (conn) {
 		spin_lock(&conn->rx_lock);
-		for (i = 0; i < msg->len; i++) {
+		for (i = 0; i < len; i++) {
 			space = (conn->rx_tail - conn->rx_head - 1 + MKTTY_RX_BUF_SIZE) % MKTTY_RX_BUF_SIZE;
 			if (space == 0)
 				break;
@@ -430,17 +434,21 @@ static void mktty_spawn_ipi_handler(struct mk_ipi_data *data, struct mk_instance
 {
 	struct mktty_message *msg = (struct mktty_message *)data->buffer;
 	struct tty_struct *tty;
+	u32 len;
 
 	if (data->data_size < sizeof(*msg) - MKTTY_MAX_DATA)
 		return;
 	if (msg->type != MKTTY_MSG_INPUT)
 		return;
-	if (msg->len > MKTTY_MAX_DATA)
+
+	/* The sender can still write the slot: bound the copy that is used */
+	len = READ_ONCE(msg->len);
+	if (len > MKTTY_MAX_DATA)
 		return;
 
 	tty = tty_port_tty_get(&mktty_spawn.port);
 	if (tty) {
-		tty_insert_flip_string(&mktty_spawn.port, msg->data, msg->len);
+		tty_insert_flip_string(&mktty_spawn.port, msg->data, len);
 		tty_flip_buffer_push(&mktty_spawn.port);
 		tty_kref_put(tty);
 	}
