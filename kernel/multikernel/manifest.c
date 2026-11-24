@@ -26,6 +26,7 @@
 #include <linux/sort.h>
 #include <linux/unaligned.h>
 #include <linux/multikernel.h>
+#include <linux/multikernel_fw_park.h>
 
 #include "internal.h"
 
@@ -65,7 +66,7 @@ static void __init mk_register_ram_from_host_tree(const void *fdt)
 			continue;
 		reg = fdt_getprop(fdt, node, "reg", &len);
 		if (reg && len == 2 * sizeof(u64))
-			mk_arch_register_ram(get_unaligned_be64(reg),
+			mk_register_ram(get_unaligned_be64(reg),
 					     get_unaligned_be64(reg + sizeof(u64)));
 	}
 }

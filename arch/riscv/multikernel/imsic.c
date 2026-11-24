@@ -22,6 +22,7 @@
 #include <linux/irqdomain.h>
 #include <linux/libfdt.h>
 #include <linux/multikernel.h>
+#include <linux/multikernel_fw_park.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_irq.h>

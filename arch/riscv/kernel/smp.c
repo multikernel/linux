@@ -27,6 +27,7 @@
 #include <asm/tlbflush.h>
 #include <asm/cacheflush.h>
 #include <asm/cpu_ops.h>
+#include <linux/multikernel_fw_park.h>
 #include <asm/multikernel.h>
 
 enum ipi_message_type {

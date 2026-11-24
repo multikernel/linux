@@ -28,41 +28,10 @@ static inline int arch_cpu_from_physical_id(u64 phys_id)
 	return get_logical_index(phys_id);
 }
 
-/*
- * The ways down. Stock arm64 leaves stopped CPUs in a WFI loop inside the
- * kernel image; a multikernel kernel returns them to firmware instead,
- * where another kernel can turn them on. The halt returns on a host.
- */
 #ifdef CONFIG_MULTIKERNEL
-void mk_spawn_machine_halt(void);
-void mk_stop_this_cpu(void);
-
 /* A stop IPI from another kernel: its force halt, or not ours to obey */
 void mk_foreign_cpu_stop(void);
-
-/* The boot tree is the manifest when another kernel wrote it */
-void mk_spawn_accept_boot_tree(phys_addr_t dt_phys);
-
-/* Where the linear map starts: @dram_start, or lower for RAM registered to come */
-phys_addr_t mk_linear_map_start(phys_addr_t dram_start);
 #else
-static inline phys_addr_t mk_linear_map_start(phys_addr_t dram_start)
-{
-	return dram_start;
-}
-
-static inline void mk_spawn_accept_boot_tree(phys_addr_t dt_phys)
-{
-}
-
-static inline void mk_spawn_machine_halt(void)
-{
-}
-
-static inline void mk_stop_this_cpu(void)
-{
-}
-
 static inline void mk_foreign_cpu_stop(void)
 {
 }
@@ -80,14 +49,6 @@ int mk_msi_proxy_map(u32 domain, u32 rid, u32 event, u64 phys_cpu,
 int mk_msi_proxy_move(u32 domain, u32 rid, u32 event, u64 phys_cpu);
 void mk_msi_proxy_unmap(u32 domain, u32 rid);
 #endif
-
-/*
- * Room for an instance's boot device tree, a segment of its kimage: the
- * manifest (MK_MANIFEST_SIZE) with the arm64 boot nodes on top. The tree
- * is rebuilt in place on every spawn, as the memory grant can have
- * changed since the load.
- */
-#define MK_BOOT_DTB_SIZE	SZ_512K
 
 /* Nothing of arm64's lives in the control block, so it is never allocated */
 #define MK_CTRL_BLOCK_SIZE	PAGE_SIZE

@@ -29,7 +29,7 @@
 #include <asm/cacheflush.h>
 #include <asm/cpufeature.h>
 #include <asm/early_ioremap.h>
-#include <asm/multikernel.h>
+#include <linux/multikernel_fw_park.h>
 #include <asm/pgtable.h>
 #include <asm/setup.h>
 #include <asm/set_memory.h>

@@ -40,7 +40,7 @@
 #include <asm/kernel-pgtable.h>
 #include <asm/kvm_host.h>
 #include <asm/memory.h>
-#include <asm/multikernel.h>
+#include <linux/multikernel_fw_park.h>
 #include <asm/numa.h>
 #include <asm/rsi.h>
 #include <asm/sections.h>

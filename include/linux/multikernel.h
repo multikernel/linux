@@ -1230,9 +1230,6 @@ void mk_arch_send_ipi(mk_phys_cpu_t phys_cpu);
 /* Enumerate a pool CPU in this kernel's topology during early boot */
 void mk_arch_register_cpu(mk_phys_cpu_t phys_id);
 
-/* Machine RAM this kernel may be handed later, before memory is laid out */
-void mk_arch_register_ram(phys_addr_t start, u64 size);
-
 /*
  * An unclaimed CPU is one firmware lets this kernel start, but which this
  * kernel never booted and has no logical CPU number for: a core of

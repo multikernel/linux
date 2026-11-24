@@ -28,7 +28,7 @@
 #include <asm/io.h>
 #include <asm/kasan.h>
 #include <asm/module.h>
-#include <asm/multikernel.h>
+#include <linux/multikernel_fw_park.h>
 #include <asm/numa.h>
 #include <asm/pgtable.h>
 #include <asm/sections.h>

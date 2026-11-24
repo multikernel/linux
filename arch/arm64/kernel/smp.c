@@ -46,6 +46,7 @@
 #include <asm/daifflags.h>
 #include <asm/kvm_mmu.h>
 #include <asm/mmu_context.h>
+#include <linux/multikernel_fw_park.h>
 #include <asm/multikernel.h>
 #include <asm/numa.h>
 #include <asm/processor.h>

@@ -1095,6 +1095,9 @@ config ARCH_SUPPORTS_MULTIKERNEL
 	depends on HOTPLUG_CPU
 	depends on !RISCV_M_MODE
 
+config MULTIKERNEL_FW_PARK
+	def_bool MULTIKERNEL
+
 config ARCH_SUPPORTS_CRASH_DUMP
 	def_bool y
 

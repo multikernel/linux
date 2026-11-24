@@ -51,35 +51,12 @@ struct mk_instance_arch {
 void mk_wrap_hart_entry(unsigned int cpu, unsigned long *entry,
 			unsigned long *opaque);
 
-/*
- * The ways down. Stock RISC-V resets the whole machine through SBI SRST
- * and leaves stopped harts in a WFI loop inside the kernel image; a
- * multikernel kernel stops its harts through SBI HSM instead, where
- * another kernel can start them. The halt returns on a host.
- */
-void mk_spawn_machine_halt(void);
-void mk_stop_this_cpu(void);
-
-/* The boot tree is the manifest when another kernel wrote it */
-void mk_spawn_accept_boot_tree(phys_addr_t dt_phys);
-
 /* A supervisor software interrupt, which another kernel's doorbell is */
 void mk_handle_doorbell(void);
 
-/* Where the linear map starts: @dram_start, or lower for RAM registered to come */
-phys_addr_t mk_linear_map_start(phys_addr_t dram_start);
 #else
-static inline void mk_spawn_accept_boot_tree(phys_addr_t dt_phys)
-{
-}
-
 static inline void mk_handle_doorbell(void)
 {
-}
-
-static inline phys_addr_t mk_linear_map_start(phys_addr_t dram_start)
-{
-	return dram_start;
 }
 
 static inline void mk_wrap_hart_entry(unsigned int cpu, unsigned long *entry,
@@ -87,25 +64,10 @@ static inline void mk_wrap_hart_entry(unsigned int cpu, unsigned long *entry,
 {
 }
 
-static inline void mk_spawn_machine_halt(void)
-{
-}
-
-static inline void mk_stop_this_cpu(void)
-{
-}
 #endif
 
 /* Nothing of RISC-V's lives in the control block, so it is never allocated */
 #define MK_CTRL_BLOCK_SIZE	PAGE_SIZE
-
-/*
- * Room for an instance's boot device tree, a segment of its kimage: the
- * manifest (MK_MANIFEST_SIZE) with the RISC-V boot nodes on top. The tree
- * is rebuilt in place on every spawn, as the memory grant can have
- * changed since the load.
- */
-#define MK_BOOT_DTB_SIZE	SZ_512K
 
 #endif /* !__ASSEMBLY__ */
 

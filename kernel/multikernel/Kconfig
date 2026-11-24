@@ -10,6 +10,11 @@ config ARCH_SUPPORTS_MULTIKERNEL
 config ARCH_HAS_MK_HOST_PARK
 	bool
 
+# The arch's firmware holds parked CPUs (PSCI, SBI HSM) and its kernels
+# boot from a device tree
+config MULTIKERNEL_FW_PARK
+	bool
+
 config MULTIKERNEL
 	bool "Multikernel support"
 	depends on ARCH_SUPPORTS_MULTIKERNEL

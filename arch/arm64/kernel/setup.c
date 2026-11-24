@@ -54,7 +54,7 @@
 #include <asm/efi.h>
 #include <asm/xen/hypervisor.h>
 #include <asm/mmu_context.h>
-#include <asm/multikernel.h>
+#include <linux/multikernel_fw_park.h>
 
 static int num_standard_resources;
 static struct resource *standard_resources;

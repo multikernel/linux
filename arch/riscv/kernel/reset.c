@@ -5,7 +5,7 @@
 
 #include <linux/reboot.h>
 #include <linux/pm.h>
-#include <asm/multikernel.h>
+#include <linux/multikernel_fw_park.h>
 
 static void default_power_off(void)
 {

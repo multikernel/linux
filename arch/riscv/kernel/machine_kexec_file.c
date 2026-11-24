@@ -16,7 +16,7 @@
 #include <linux/vmalloc.h>
 #include <asm/setup.h>
 #include <asm/insn.h>
-#include <asm/multikernel.h>
+#include <linux/multikernel_fw_park.h>
 
 const struct kexec_file_ops * const kexec_file_loaders[] = {
 	&elf_kexec_ops,

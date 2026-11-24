@@ -52,7 +52,7 @@
 #include <asm/gcs.h>
 #include <asm/mmu_context.h>
 #include <asm/mte.h>
-#include <asm/multikernel.h>
+#include <linux/multikernel_fw_park.h>
 #include <asm/processor.h>
 #include <asm/pointer_auth.h>
 #include <asm/stacktrace.h>

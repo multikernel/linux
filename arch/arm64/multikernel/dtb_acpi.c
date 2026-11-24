@@ -17,6 +17,7 @@
 #include <linux/irqchip/arm-gic-v3.h>
 #include <linux/libfdt.h>
 #include <linux/multikernel.h>
+#include <linux/multikernel_fw_park.h>
 #include <linux/pci.h>
 #include <linux/pci-acpi.h>
 #include <linux/pci-ecam.h>

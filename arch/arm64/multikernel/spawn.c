@@ -21,6 +21,7 @@
 #include <linux/kexec.h>
 #include <linux/libfdt.h>
 #include <linux/multikernel.h>
+#include <linux/multikernel_fw_park.h>
 #include <linux/of_fdt.h>
 #include <linux/panic.h>
 #include <linux/psci.h>
@@ -54,29 +55,6 @@ void __init mk_arch_register_cpu(mk_phys_cpu_t phys_id)
 {
 }
 
-static phys_addr_t mk_ram_start __initdata = PHYS_ADDR_MAX;
-
-/* Hot-added RAM must fall inside the linear map, which starts at boot */
-void __init mk_arch_register_ram(phys_addr_t start, u64 size)
-{
-	if (size)
-		mk_ram_start = min(mk_ram_start, start);
-}
-
-phys_addr_t __init mk_linear_map_start(phys_addr_t dram_start)
-{
-	return min(dram_start, mk_ram_start);
-}
-
-void __init mk_spawn_accept_boot_tree(phys_addr_t dt_phys)
-{
-	if (!initial_boot_params ||
-	    !of_flat_dt_is_compatible(of_get_flat_dt_root(), MK_FDT_COMPATIBLE))
-		return;
-
-	mk_manifest_populate(dt_phys, fdt_totalsize(initial_boot_params));
-}
-
 /*
  * Return the calling CPU to firmware. The boot CPU is no exception: the
  * host's CPUs are on, so it is never the last one firmware knows about.
@@ -97,37 +75,6 @@ void __noreturn mk_enter_pool_state(void *info)
 	pr_crit("CPU%u could not be turned off, the host cannot reuse it\n", cpu);
 	cpu_park_loop();
 }
-
-void mk_spawn_machine_halt(void)
-{
-	if (mk_spawned())
-		mk_halt_to_pool();
-}
-
-/*
- * A spawn's image is about to be overwritten, and a host's CPUs are what
- * a backup kernel takes over once it has fenced the host: firmware hands
- * out only CPUs that are off. A kernel outside any multikernel keeps the
- * stock WFI loop.
- */
-void mk_stop_this_cpu(void)
-{
-	if (mk_self)
-		mk_enter_pool_state(NULL);
-}
-
-/*
- * A panicked spawn kernel spinning in the panic loop holds its CPUs
- * hostage. "Reboot on panic" is mk_spawn_machine_halt() here, which
- * notifies the host and turns the CPUs off, so make it the default.
- */
-static int __init mk_spawn_reboot_init(void)
-{
-	if (mk_spawned() && !panic_timeout)
-		panic_timeout = -1;
-	return 0;
-}
-core_initcall(mk_spawn_reboot_init);
 
 static int mk_wait_cpu_off(mk_phys_cpu_t mpidr)
 {
@@ -255,17 +202,10 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance)
 	mk_phys_cpu_t mpidr = mk_cpu_set_first(instance->cpus);
 	int ret;
 
-	if (!image->arch.dtb_mem) {
-		pr_err("Instance %d has no boot device tree\n", instance->id);
-		return -EINVAL;
-	}
-
-	ret = mk_build_boot_dtb(image, instance);
-	if (ret) {
-		pr_err("No boot device tree for instance %d: %d\n",
-		       instance->id, ret);
+	ret = mk_build_boot_dtb(image, instance, image->arch.dtb_mem,
+				image->arch.dtb, mk_dtb_add_arch_nodes);
+	if (ret)
 		return ret;
-	}
 
 	ret = mk_clean_image_to_poc(image);
 	if (ret)

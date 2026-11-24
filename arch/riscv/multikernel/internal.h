@@ -43,13 +43,12 @@ bool mk_imsic_file_taken(phys_addr_t file);
 unsigned int mk_imsic_free_files(u64 *files, unsigned int max,
 				 unsigned int nr_harts);
 
-int mk_build_boot_dtb(struct kimage *image, struct mk_instance *instance);
+int mk_dtb_add_arch_nodes(void *fdt, struct mk_instance *instance);
 
 /*
  * Helpers that add to a boot tree return libfdt error codes only, which
  * share their values with errnos and must not be mixed with them.
  */
-int mk_dtb_set_reg(void *fdt, int node, const u64 *pairs, int nr);
 int mk_dtb_copy_node(void *fdt, int parent, struct device_node *np);
 int mk_dtb_add_imsic(void *fdt);
 

@@ -21,7 +21,7 @@
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/vmalloc.h>
-#include <asm/multikernel.h>
+#include <linux/multikernel_fw_park.h>
 
 const struct kexec_file_ops * const kexec_file_loaders[] = {
 	&kexec_image_ops,

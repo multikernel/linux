@@ -1625,6 +1625,9 @@ config ARCH_SUPPORTS_KEXEC_HANDOVER
 config ARCH_SUPPORTS_MULTIKERNEL
 	def_bool ARM_PSCI_FW && KEXEC_FILE && HOTPLUG_CPU
 
+config MULTIKERNEL_FW_PARK
+	def_bool MULTIKERNEL
+
 # An ITS has one command queue, so the host maps MSIs for its instances
 config MULTIKERNEL_ITS_PROXY
 	def_bool MULTIKERNEL && ARM_GIC_V3_ITS && PCI_MSI

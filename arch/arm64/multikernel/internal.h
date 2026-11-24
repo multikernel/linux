@@ -12,9 +12,7 @@ struct mk_instance;
 #define MK_GIC_PPI		1
 #define MK_GIC_PHANDLE		1
 
-int mk_build_boot_dtb(struct kimage *image, struct mk_instance *instance);
-
-int mk_dtb_set_reg(void *fdt, int node, const u64 *pairs, int nr);
+int mk_dtb_add_arch_nodes(void *fdt, struct mk_instance *instance);
 
 /* The MSI proxy of the instance's PCI root buses */
 int mk_dtb_add_pci(void *fdt);
