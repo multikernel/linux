@@ -20,6 +20,7 @@
 
 #include <linux/init.h>
 #include <linux/iopoll.h>
+#include <linux/ioport.h>
 #include <linux/mm.h>
 #include <linux/multikernel.h>
 #include <linux/overflow.h>
@@ -67,6 +68,34 @@ static struct mk_park_cell *mk_park_cell(int index)
 	return (struct mk_park_cell *)__va(mk_park->cells_phys) + index;
 }
 
+/*
+ * The table pins its pool chunk for as long as a CPU may wait in it, and
+ * /proc/iomem is where user space learns which chunks it can hand back.
+ */
+static struct resource mk_park_res = {
+	.name = "Multikernel Park Table",
+	.flags = IORESOURCE_MEM,
+};
+
+static void mk_park_res_publish(void)
+{
+	phys_addr_t phys = __pa(mk_park);
+	struct resource *chunk;
+
+	if (mk_park_res.parent)
+		return;
+
+	/* An inherited table may lie outside what this kernel pools */
+	chunk = mk_pool_chunk_resource(phys);
+	if (!chunk)
+		return;
+
+	mk_park_res.start = phys;
+	mk_park_res.end = phys + mk_park->size - 1;
+	if (insert_resource(chunk, &mk_park_res))
+		pr_warn("mk_park: park table missing from /proc/iomem\n");
+}
+
 static int mk_park_code_exec(phys_addr_t code_phys)
 {
 	unsigned long va = (unsigned long)__va(code_phys);
@@ -96,8 +125,10 @@ int mk_park_table_create(void)
 
 	lockdep_assert_held(&mk_park_lock);
 
-	if (mk_park)
+	if (mk_park) {
+		mk_park_res_publish();
 		return 0;
+	}
 	if (WARN_ON_ONCE(code > PAGE_SIZE))
 		return -E2BIG;
 
@@ -144,6 +175,7 @@ int mk_park_table_create(void)
 
 	mk_park = t;
 	mk_park_pgt = pgt;
+	mk_park_res_publish();
 	pr_info("mk_park: park table at %pa, %u cells\n", &phys, nr);
 	return 0;
 
@@ -181,6 +213,9 @@ int mk_park_table_destroy(void)
 		if (READ_ONCE(mk_park_cell(i)->state) == MK_PARK_PARKED)
 			return -EBUSY;
 	}
+
+	if (mk_park_res.parent)
+		release_resource(&mk_park_res);
 
 	code_va = (unsigned long)__va(mk_park->code_phys);
 	WARN_ON_ONCE(set_memory_nx(code_va, 1) || set_memory_rw(code_va, 1));
