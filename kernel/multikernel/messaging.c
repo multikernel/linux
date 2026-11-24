@@ -52,6 +52,7 @@ static void mk_message_type_ipi_callback(struct mk_ipi_data *data, struct mk_ins
 	u32 msg_type, msg_subtype;
 	void *payload;
 	u32 payload_len;
+	size_t data_size;
 
 	if (!type_handler || !type_handler->msg_handler) {
 		pr_warn("Multikernel message received but no handler registered\n");
@@ -65,25 +66,31 @@ static void mk_message_type_ipi_callback(struct mk_ipi_data *data, struct mk_ins
 		return;
 	}
 
+	/*
+	 * The slot is shared memory its sender can still write: check and
+	 * use one copy of each size, or the payload can run past the slot.
+	 */
+	data_size = READ_ONCE(data->data_size);
+
 	/* Ensure we have at least a message header */
-	if (data->data_size < sizeof(struct mk_message)) {
-		pr_warn("Multikernel message too small: %zu bytes\n", data->data_size);
+	if (data_size < sizeof(struct mk_message) || data_size > MK_MAX_DATA_SIZE) {
+		pr_warn("Multikernel message size invalid: %zu bytes\n", data_size);
 		return;
 	}
 
 	msg = (struct mk_message *)data->buffer;
+	payload_len = READ_ONCE(msg->payload_len);
 
 	/* Validate message structure */
-	if (msg->payload_len > (data->data_size - sizeof(struct mk_message))) {
+	if (payload_len > data_size - sizeof(struct mk_message)) {
 		pr_warn("Multikernel message payload length invalid: %u > %zu\n",
-			msg->payload_len, data->data_size - sizeof(struct mk_message));
+			payload_len, data_size - sizeof(struct mk_message));
 		return;
 	}
 
 	msg_type = msg->msg_type;
 	msg_subtype = msg->msg_subtype;
-	payload = msg->payload_len > 0 ? msg->payload : NULL;
-	payload_len = msg->payload_len;
+	payload = payload_len > 0 ? msg->payload : NULL;
 
 	pr_debug("Multikernel message received: type=0x%x, subtype=0x%x, len=%u from CPU %llu\n",
 		 msg_type, msg_subtype, payload_len, data->sender_cpu);
