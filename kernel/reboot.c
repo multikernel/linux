@@ -806,18 +806,24 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 		ret = kernel_kexec();
 		break;
 	case LINUX_REBOOT_CMD_MULTIKERNEL:
-		if (copy_from_user(&boot_args, arg, sizeof(boot_args)))
-			return -EFAULT;
+		if (copy_from_user(&boot_args, arg, sizeof(boot_args))) {
+			ret = -EFAULT;
+			break;
+		}
 		ret = multikernel_kexec_by_id(boot_args.mk_id);
 		break;
 	case LINUX_REBOOT_CMD_MULTIKERNEL_HALT:
-		if (copy_from_user(&boot_args, arg, sizeof(boot_args)))
-			return -EFAULT;
+		if (copy_from_user(&boot_args, arg, sizeof(boot_args))) {
+			ret = -EFAULT;
+			break;
+		}
 		ret = multikernel_halt_by_id(boot_args.mk_id);
 		break;
 	case LINUX_REBOOT_CMD_MULTIKERNEL_HALT_FORCE:
-		if (copy_from_user(&boot_args, arg, sizeof(boot_args)))
-			return -EFAULT;
+		if (copy_from_user(&boot_args, arg, sizeof(boot_args))) {
+			ret = -EFAULT;
+			break;
+		}
 		ret = multikernel_force_halt_by_id(boot_args.mk_id);
 		break;
 #endif
