@@ -195,18 +195,17 @@ static void mk_instance_track_dump(struct mk_instance *instance,
 }
 
 /**
- * mk_instance_alloc_boot_pages() - Allocate the pages a spawn boots with
+ * mk_instance_alloc_manifest() - Allocate the page a spawn's boot tree goes in
  * @instance: Host-side instance being loaded
  *
- * The manifest page and the IPI ring live as long as the instance, across
- * loads, unloads and re-spawns. Allocating them again is a no-op.
+ * The page lives as long as the instance, across loads, unloads and
+ * re-spawns. Allocating it again is a no-op.
  *
  * Returns 0 on success, -ENOMEM on failure.
  */
-int mk_instance_alloc_boot_pages(struct mk_instance *instance)
+int mk_instance_alloc_manifest(struct mk_instance *instance)
 {
-	struct page *manifest, *ring;
-	unsigned int ring_order = get_order(sizeof(struct mk_shared_data));
+	struct page *manifest;
 
 	if (instance->manifest_phys)
 		return 0;
@@ -214,29 +213,18 @@ int mk_instance_alloc_boot_pages(struct mk_instance *instance)
 	manifest = alloc_pages(GFP_KERNEL | __GFP_ZERO, get_order(MK_MANIFEST_SIZE));
 	if (!manifest)
 		return -ENOMEM;
-	ring = alloc_pages(GFP_KERNEL | __GFP_ZERO, ring_order);
-	if (!ring) {
-		__free_pages(manifest, get_order(MK_MANIFEST_SIZE));
-		return -ENOMEM;
-	}
 
-	instance->ipi_phys = page_to_phys(ring);
-	instance->ipi_pages = PAGE_ALIGN(sizeof(struct mk_shared_data)) >> PAGE_SHIFT;
 	instance->manifest_phys = page_to_phys(manifest);
 	return 0;
 }
 
-static void mk_instance_free_boot_pages(struct mk_instance *instance)
+static void mk_instance_free_manifest(struct mk_instance *instance)
 {
 	if (!instance->manifest_phys)
 		return;
 
-	__free_pages(phys_to_page(instance->ipi_phys),
-		     get_order(sizeof(struct mk_shared_data)));
 	__free_pages(phys_to_page(instance->manifest_phys),
 		     get_order(MK_MANIFEST_SIZE));
-	instance->ipi_data = NULL;
-	instance->ipi_phys = 0;
 	instance->manifest_phys = 0;
 }
 
@@ -252,7 +240,8 @@ static void mk_instance_release(struct kref *kref)
 	mk_instance_free_memory(instance);
 	/* After the memory, which is where the CPUs are seen off */
 	mk_instance_return_pci_devices(instance);
-	mk_instance_free_boot_pages(instance);
+	mk_instance_free_manifest(instance);
+	mk_instance_free_ring(instance);
 
 	mk_instance_track_dump(instance, instance->state, MK_STATE_READY);
 	kfree(instance->host_tree);
@@ -377,6 +366,7 @@ void mk_instance_free(struct mk_instance *instance)
 		list_del(&plat_dev->list);
 		kfree(plat_dev);
 	}
+	mk_instance_free_ring(instance);
 	kfree(instance->host_tree);
 	kfree(instance->framebuffer);
 	mk_cpu_set_free(instance->cpus);
@@ -2141,9 +2131,7 @@ int multikernel_force_halt_by_id(int mk_id)
 
 	pr_info("Force halting multikernel instance %d via NMI\n", mk_id);
 
-	ret = mk_arm_force_halt(instance);
-	if (ret)
-		pr_err("Failed to arm force-halt marker: %d (sending NMI anyway)\n", ret);
+	mk_arm_force_halt(instance);
 
 	if (instance == host_instance) {
 		ret = mk_fence_host(instance, targets);

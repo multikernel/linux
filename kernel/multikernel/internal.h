@@ -44,7 +44,9 @@ int mk_overlay_init(void);
 int mk_overlay_rmdir(struct kernfs_node *kn);
 
 /* ipi.c */
-int mk_arm_force_halt(struct mk_instance *instance);
+void mk_arm_force_halt(struct mk_instance *instance);
+int mk_instance_alloc_ring(struct mk_instance *instance);
+void mk_instance_free_ring(struct mk_instance *instance);
 
 /* fault.c */
 #ifdef CONFIG_OF

@@ -719,7 +719,8 @@ struct mk_instance {
 	/*
 	 * IPI communication buffer. ipi_data is set only while the ring can
 	 * be addressed: always for this kernel's own records, and on the host
-	 * while an image is loaded for the instance.
+	 * while an image is loaded for the instance. A child has a ring,
+	 * allocated as it is created, only if its chosen node asked for one.
 	 */
 	struct mk_shared_data *ipi_data; /* IPI shared memory buffer (virtual address) */
 	phys_addr_t ipi_phys;           /* IPI buffer physical address */
@@ -860,7 +861,7 @@ struct mk_instance *mk_instance_find_by_name(const char *name);
  * Returns the instance pointer for convenience.
  */
 struct mk_instance *mk_instance_get(struct mk_instance *instance);
-int mk_instance_alloc_boot_pages(struct mk_instance *instance);
+int mk_instance_alloc_manifest(struct mk_instance *instance);
 
 /**
  * mk_halt_to_pool() - Halt this spawn kernel, returning its CPUs to the pool
@@ -1139,6 +1140,7 @@ static inline bool mk_spawned(void)
 #define MK_DT_RESOURCE_CPUS     "cpus"
 #define MK_DT_RESOURCE_DEVICES  "devices"
 #define MK_DT_RESOURCE_NUMA     "numa-nodes"
+#define MK_DT_IPI_BUFFER        "multikernel,ipi-buffer"
 
 /**
  * Manifest Integration Functions

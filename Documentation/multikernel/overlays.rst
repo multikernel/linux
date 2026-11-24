@@ -105,6 +105,10 @@ Operation Sections
 
     Subnodes:
       - ``resources``: initial allocation for the instance
+      - ``chosen``: what the instance boots with (optional). An empty
+        ``multikernel,ipi-buffer`` property asks for a message ring to
+        the host; an instance without it is a static partition that no
+        kernel can message, see ``device-tree.rst``.
 
     ``resources`` properties:
       - ``memory-bytes``: amount of pool memory to give the instance (u64)

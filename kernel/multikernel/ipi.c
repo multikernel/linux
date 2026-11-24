@@ -66,6 +66,47 @@ void mk_ipi_rx_del(struct mk_instance *instance)
 }
 
 /**
+ * mk_instance_alloc_ring() - Allocate the message ring of an instance
+ * @instance: Record of a kernel this one is the parent of, or its own
+ *
+ * The ring lives as long as the record, across loads, unloads and
+ * re-spawns. Allocating it again is a no-op.
+ *
+ * Returns 0 on success, -ENOMEM on failure.
+ */
+int mk_instance_alloc_ring(struct mk_instance *instance)
+{
+	struct page *ring;
+
+	if (instance->ipi_phys)
+		return 0;
+
+	ring = alloc_pages(GFP_KERNEL | __GFP_ZERO,
+			   get_order(sizeof(struct mk_shared_data)));
+	if (!ring)
+		return -ENOMEM;
+
+	instance->ipi_phys = page_to_phys(ring);
+	instance->ipi_pages = PAGE_ALIGN(sizeof(struct mk_shared_data)) >> PAGE_SHIFT;
+	return 0;
+}
+
+/**
+ * mk_instance_free_ring() - Free the message ring of an instance, if any
+ * @instance: Record that is going away
+ */
+void mk_instance_free_ring(struct mk_instance *instance)
+{
+	if (!instance->ipi_phys)
+		return;
+
+	__free_pages(phys_to_page(instance->ipi_phys),
+		     get_order(sizeof(struct mk_shared_data)));
+	instance->ipi_data = NULL;
+	instance->ipi_phys = 0;
+}
+
+/**
  * multikernel_register_handler - Register a callback for multikernel IPI
  * @callback: Function to call when IPI is received
  * @ctx: Context pointer passed to the callback
@@ -141,19 +182,19 @@ EXPORT_SYMBOL(multikernel_unregister_handler);
  * for the next run, which is what makes the NMI rescue idempotent: a
  * repeat force halt still reaches CPUs an earlier one missed.
  *
- * Returns 0 on success, -ENODEV if the instance has no shared IPI area.
+ * An instance without a ring has no marker: it takes an NMI none of its
+ * own sources claims as the demand, see mk_has_pending_shutdown().
  */
-int mk_arm_force_halt(struct mk_instance *instance)
+void mk_arm_force_halt(struct mk_instance *instance)
 {
 	struct mk_shared_data *ipi_data = READ_ONCE(instance->ipi_data);
 
 	if (!ipi_data)
-		return -ENODEV;
+		return;
 
 	WRITE_ONCE(ipi_data->force_halt, 1);
 	/* The marker must be visible before the NMIs that test it */
 	smp_wmb();
-	return 0;
 }
 
 /**

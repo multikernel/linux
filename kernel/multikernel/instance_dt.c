@@ -204,15 +204,14 @@ static int __init mk_restore_instance_cpus(struct mk_dt_config *config)
 /* Allocate this kernel's own IPI inbox and record where it lives */
 static int __init mk_instance_alloc_ipi(struct mk_instance *instance)
 {
-	instance->ipi_data = (struct mk_shared_data *)__get_free_pages(
-		GFP_KERNEL | __GFP_ZERO, get_order(sizeof(struct mk_shared_data)));
-	if (!instance->ipi_data) {
+	int ret = mk_instance_alloc_ring(instance);
+
+	if (ret) {
 		pr_err("Failed to allocate IPI buffer for instance %d\n",
 		       instance->id);
-		return -ENOMEM;
+		return ret;
 	}
-	instance->ipi_phys = virt_to_phys(instance->ipi_data);
-	instance->ipi_pages = (sizeof(struct mk_shared_data) + PAGE_SIZE - 1) / PAGE_SIZE;
+	instance->ipi_data = phys_to_virt(instance->ipi_phys);
 
 	pr_info("Allocated IPI buffer for instance %d: phys=0x%llx, pages=%u\n",
 		instance->id, (unsigned long long)instance->ipi_phys,
@@ -220,11 +219,15 @@ static int __init mk_instance_alloc_ipi(struct mk_instance *instance)
 	return 0;
 }
 
-static void __init mk_instance_free_ipi(struct mk_instance *instance)
+/* Let go of a ring another kernel allocated, before the record is freed */
+static void __init mk_instance_unmap_ipi(struct mk_instance *instance)
 {
-	free_pages((unsigned long)instance->ipi_data,
-		   get_order(sizeof(struct mk_shared_data)));
+	if (!instance->ipi_data)
+		return;
+
+	memunmap(instance->ipi_data);
 	instance->ipi_data = NULL;
+	instance->ipi_phys = 0;
 }
 
 static int __init mk_copy_platform_devices(const struct mk_dt_config *config,
@@ -350,7 +353,7 @@ static int __init mk_restore_host_instance(void)
 	hi->ipi_pages = host_ipi_pages;
 
 	if (mk_instance_publish(hi)) {
-		memunmap(hi->ipi_data);
+		mk_instance_unmap_ipi(hi);
 		goto err_free;
 	}
 	/* The host is running, or this kernel would not be */
@@ -412,8 +415,6 @@ int __init mk_instance_restore_from_manifest(void)
 		if (!ret)
 			ret = mk_instance_publish(instance);
 		if (ret) {
-			if (instance->ipi_data)
-				mk_instance_free_ipi(instance);
 			mk_instance_free(instance);
 			return ret;
 		}
@@ -490,8 +491,7 @@ int __init mk_instance_restore_from_manifest(void)
 
 	ret = mk_instance_publish(instance);
 	if (ret) {
-		if (instance->ipi_data)
-			memunmap(instance->ipi_data);
+		mk_instance_unmap_ipi(instance);
 		goto cleanup_instance;
 	}
 

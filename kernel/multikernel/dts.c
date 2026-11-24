@@ -1367,24 +1367,34 @@ static int mk_dt_store_framebuffer(const void *src, int node,
 }
 
 /*
- * The boot handoff user space asked for: a chosen node holding a
- * multikernel,host-tree subtree and a simple-framebuffer framebuffer
- * node, either optional, which the spawn boots with under its own
- * /chosen.
+ * The boot handoff user space asked for: a chosen node holding an empty
+ * multikernel,ipi-buffer property, a multikernel,host-tree subtree and a
+ * simple-framebuffer framebuffer node, each optional, which the spawn
+ * boots with under its own /chosen. The property asks for a message ring,
+ * allocated here; the boot tree says where it is.
  */
 int mk_dt_parse_chosen(const void *fdt, int chosen_node,
 		       struct mk_instance *instance)
 {
-	int node;
+	int node, prop, ret;
 
-	if (fdt_first_property_offset(fdt, chosen_node) >= 0) {
-		pr_err("Instance '%s': chosen carries properties; only multikernel,host-tree and framebuffer nodes are accepted\n",
-		       instance->name);
-		return -EINVAL;
+	fdt_for_each_property_offset(prop, fdt, chosen_node) {
+		const char *name;
+		int len;
+
+		fdt_getprop_by_offset(fdt, prop, &name, &len);
+		if (!name || strcmp(name, MK_DT_IPI_BUFFER) || len) {
+			pr_err("Instance '%s': unsupported chosen property '%s'; only an empty %s is accepted\n",
+			       instance->name, name ? name : "?",
+			       MK_DT_IPI_BUFFER);
+			return -EINVAL;
+		}
+		ret = mk_instance_alloc_ring(instance);
+		if (ret)
+			return ret;
 	}
 	fdt_for_each_subnode(node, fdt, chosen_node) {
 		const char *name = fdt_get_name(fdt, node, NULL);
-		int ret;
 
 		if (name && !strcmp(name, "multikernel,host-tree")) {
 			ret = mk_dt_store_host_tree(fdt, node, instance);
@@ -1440,7 +1450,9 @@ static int mk_dt_emit_requested_chosen(void *fdt, void *data)
 	struct mk_instance *instance = data;
 	int ret = 0;
 
-	if (instance->host_tree)
+	if (instance->ipi_phys)
+		ret = fdt_property(fdt, MK_DT_IPI_BUFFER, NULL, 0);
+	if (!ret && instance->host_tree)
 		ret = mk_dt_emit_host_tree(fdt, instance);
 	if (!ret)
 		ret = mk_dt_emit_framebuffer(fdt, instance);
@@ -1450,10 +1462,12 @@ static int mk_dt_emit_requested_chosen(void *fdt, void *data)
 static int mk_dt_emit_instance(struct mk_instance *instance, void *fdt,
 			       size_t size)
 {
-	if (instance->host_tree || instance->framebuffer)
-		return mk_dt_emit_tree(instance, fdt, size,
-				       mk_dt_emit_requested_chosen, instance);
-	return mk_dt_emit_tree(instance, fdt, size, NULL, NULL);
+	/* A child reads back the chosen node it was created with */
+	if (instance == mk_self)
+		return mk_dt_emit_tree(instance, fdt, size, NULL, NULL);
+
+	return mk_dt_emit_tree(instance, fdt, size,
+			       mk_dt_emit_requested_chosen, instance);
 }
 
 /**

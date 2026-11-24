@@ -422,7 +422,7 @@ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 		image->mk_instance = instance;
 		image->mk_id = mk_id;
 
-		ret = mk_instance_alloc_boot_pages(instance);
+		ret = mk_instance_alloc_manifest(instance);
 		if (ret)
 			goto out_free_image;
 	}
@@ -622,7 +622,9 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 	if (image && image->type == KEXEC_TYPE_MULTIKERNEL) {
 		/* Publish only a complete image to exec, unload and IPI */
 		image->mk_instance->kimage = image;
-		image->mk_instance->ipi_data = phys_to_virt(image->mk_instance->ipi_phys);
+		if (image->mk_instance->ipi_phys)
+			image->mk_instance->ipi_data =
+				phys_to_virt(image->mk_instance->ipi_phys);
 		mk_instance_set_state(image->mk_instance, MK_STATE_LOADED);
 		kimage_add_to_list(image);
 		image = NULL; /* Don't free the new image */

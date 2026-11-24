@@ -129,7 +129,13 @@ instance owns. The root is the instance, named by ``model``::
             devices { ... };                        /* platform devices only */
         };
         pci@0,9 { ... };
+        chosen {
+            multikernel,ipi-buffer;                 /* it asked for a message ring */
+        };
     };
+
+``chosen`` holds what the instance was created with and will boot with; it
+is empty for an instance that asked for nothing.
 
 Devices
 =======
@@ -210,7 +216,7 @@ only the boot handoff knows::
 
     chosen {
         multikernel,pool-cpus = <...>;              /* CPUs it may receive later, u64 each */
-        multikernel,ipi-buffer = <0x0 0x7800000>;   /* its message ring */
+        multikernel,ipi-buffer = <0x0 0x7800000>;   /* its message ring, if it asked for one */
         multikernel,ipi-pages = <65>;
         multikernel,host-ipi-buffer = <...>;        /* the host's ring */
         multikernel,host-ipi-pages = <...>;
@@ -236,6 +242,17 @@ only the boot handoff knows::
             };
         };
     };
+
+The message ring is optional. An instance gets one only if the ``chosen``
+node of its ``instance-create`` carries an empty ``multikernel,ipi-buffer``
+property, which the host replaces with the address of the ring it
+allocated. Without it the host allocates no ring and the boot tree has
+neither property: no kernel can send the instance a message and it can
+send none, so it cannot be resized or asked to shut down, PCI functions
+lent to it do not work, and it does not tell the host when it halts. It
+is a static partition, and the only thing the host can still do to it is force it
+down. A kernel without a ring takes an NMI that none of its own sources
+claims as that demand.
 
 On x86 the ``SETUP_MULTIKERNEL`` setup_data entry points at the page and
 names it as the boot DTB; the pointer rather than a copy is what lets the

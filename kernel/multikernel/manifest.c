@@ -355,8 +355,8 @@ static int mk_manifest_add_reserved(void *fdt, struct kimage *image)
 	if (mk_self->ipi_data)
 		ret = mk_reserved_add(&r, mk_self->ipi_phys,
 				      (u64)mk_self->ipi_pages << PAGE_SHIFT);
-	/* This instance's own ring and boot tree */
-	if (!ret)
+	/* This instance's own ring, if it has one, and boot tree */
+	if (!ret && image->mk_instance->ipi_phys)
 		ret = mk_reserved_add(&r, image->mk_instance->ipi_phys,
 				      (u64)image->mk_instance->ipi_pages << PAGE_SHIFT);
 	if (!ret)
@@ -367,10 +367,11 @@ static int mk_manifest_add_reserved(void *fdt, struct kimage *image)
 	list_for_each_entry(other, &mk_instance_list, list) {
 		if (ret)
 			break;
-		if (other == mk_self || !other->ipi_data)
+		if (other == mk_self)
 			continue;
-		ret = mk_reserved_add(&r, other->ipi_phys,
-				      (u64)other->ipi_pages << PAGE_SHIFT);
+		if (other->ipi_data)
+			ret = mk_reserved_add(&r, other->ipi_phys,
+					      (u64)other->ipi_pages << PAGE_SHIFT);
 		if (!ret && other->manifest_phys)
 			ret = mk_reserved_add(&r, other->manifest_phys,
 					      MK_MANIFEST_SIZE);
@@ -446,13 +447,15 @@ static int mk_manifest_chosen(void *fdt, void *data)
 			return ret;
 	}
 
-	ret = fdt_property_u64(fdt, "multikernel,ipi-buffer",
-			       (u64)image->mk_instance->ipi_phys);
-	if (!ret)
-		ret = fdt_property_u32(fdt, "multikernel,ipi-pages",
-				       image->mk_instance->ipi_pages);
-	if (ret)
-		return ret;
+	if (image->mk_instance->ipi_phys) {
+		ret = fdt_property_u64(fdt, MK_DT_IPI_BUFFER,
+				       (u64)image->mk_instance->ipi_phys);
+		if (!ret)
+			ret = fdt_property_u32(fdt, "multikernel,ipi-pages",
+					       image->mk_instance->ipi_pages);
+		if (ret)
+			return ret;
+	}
 
 	/* Without these, the framebuffer's reg does not translate */
 	if (ctx->instance->framebuffer) {
