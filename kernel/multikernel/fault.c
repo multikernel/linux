@@ -26,11 +26,6 @@
 
 #define MK_FAULTS_NODE "multikernel,faults"
 
-bool __weak mk_arch_cpu_faulty(mk_phys_cpu_t phys_cpu)
-{
-	return false;
-}
-
 /**
  * mk_fault_publish - Show the machine's faulty CPUs in the device tree
  *

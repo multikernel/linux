@@ -279,7 +279,7 @@ void mk_arch_release_instance(struct mk_instance *instance)
 }
 
 /* 0 once @phys_cpu waits in its cell, whichever kernel parked it */
-int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
+int mk_arch_confirm_parked(mk_phys_cpu_t phys_cpu)
 {
 	return mk_park_wait((u32)phys_cpu);
 }
@@ -853,13 +853,13 @@ int mk_arch_pool_chunk_added(phys_addr_t start, size_t size)
 }
 
 /**
- * mk_pool_park_setup() - Set up pool parking
+ * mk_arch_pool_park_setup() - Set up pool parking
  *
  * Called when the baseline is applied, once the memory pool exists.
  * Builds the park table in pool memory, unless this kernel inherited
  * one from the kernel that spawned it.
  */
-int mk_pool_park_setup(void)
+int mk_arch_pool_park_setup(void)
 {
 	if (!mk_pool)
 		return -ENODEV;
@@ -873,7 +873,7 @@ int mk_pool_park_setup(void)
 }
 
 /* The park table, which no later kernel may hand out, as base,size pairs */
-int mk_pool_park_regions(u64 *pairs, int max)
+int mk_arch_pool_park_regions(u64 *pairs, int max)
 {
 	guard(mutex)(&mk_park_lock);
 
@@ -881,7 +881,7 @@ int mk_pool_park_regions(u64 *pairs, int max)
 }
 
 /* Does the park table live in this range? */
-bool mk_pool_park_uses(phys_addr_t start, size_t size)
+bool mk_arch_pool_park_uses(phys_addr_t start, size_t size)
 {
 	guard(mutex)(&mk_park_lock);
 
@@ -889,7 +889,7 @@ bool mk_pool_park_uses(phys_addr_t start, size_t size)
 }
 
 /**
- * mk_pool_park_teardown() - Return the park table to the pool
+ * mk_arch_pool_park_teardown() - Return the park table to the pool
  *
  * The table is pool memory, so the chunk holding it cannot be removed
  * while it exists, and it may only go while no CPU waits in it. The
@@ -898,7 +898,7 @@ bool mk_pool_park_uses(phys_addr_t start, size_t size)
  * Returns 0 if there was nothing to tear down, -EBUSY if a CPU may still
  * be parked.
  */
-int mk_pool_park_teardown(void)
+int mk_arch_pool_park_teardown(void)
 {
 	if (!mk_pool)
 		return 0;
@@ -950,7 +950,7 @@ static void __noreturn mk_machine_restart(char *cmd)
  */
 static void __noreturn mk_stop_this_cpu(void)
 {
-	mk_enter_pool_state(NULL);
+	mk_arch_enter_pool_state(NULL);
 }
 
 static int __init mk_spawn_reboot_init(void)

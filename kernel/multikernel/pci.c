@@ -122,29 +122,6 @@ u64 mk_pci_ecam_window(const struct resource *res, u64 first,
 	return res->start + offset;
 }
 
-/**
- * mk_arch_pci_bus_ecam - The ECAM window of a bus firmware other than a
- * device tree describes
- * @bus: A bus of this kernel
- *
- * Returns: the physical address of the bus's 1MB window, or 0 if none
- */
-u64 __weak mk_arch_pci_bus_ecam(struct pci_bus *bus)
-{
-	return 0;
-}
-
-/**
- * mk_arch_pci_iommu - The IOMMU unit a function of this kernel sits behind
- * @pdev: The function
- *
- * Returns: the unit's register base, or 0 if none
- */
-u64 __weak mk_arch_pci_iommu(struct pci_dev *pdev)
-{
-	return 0;
-}
-
 /* Bridges whose reg is an ECAM region, read with the generic accessors */
 static const struct of_device_id mk_pci_ecam_bridges[] = {
 	{ .compatible = "pci-host-ecam-generic" },

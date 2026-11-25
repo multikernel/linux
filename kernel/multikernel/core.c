@@ -540,7 +540,7 @@ int mk_instance_confirm_parked(struct mk_instance *instance)
 
 	/* Empty until the instance first ran, so nothing of it is executing */
 	mk_cpu_set_for_each(i, phys_cpu, instance->cpus_started) {
-		ret = mk_arch_confirm_parked(instance, phys_cpu);
+		ret = mk_arch_confirm_parked(phys_cpu);
 		if (ret) {
 			pr_err("Instance %d (%s): CPU %llu is not parked: %d\n",
 			       instance->id, instance->name, phys_cpu, ret);
@@ -1673,10 +1673,10 @@ static void __noreturn mk_notify_down_and_park(u32 subtype)
 
 	/*
 	 * Enter pool state: every CPU parks where the host can re-spawn
-	 * it later. Use wait=0 since mk_enter_pool_state() never returns.
+	 * it later. Use wait=0 since mk_arch_enter_pool_state() never returns.
 	 */
-	smp_call_function(mk_enter_pool_state, NULL, 0);
-	mk_enter_pool_state(NULL);
+	smp_call_function(mk_arch_enter_pool_state, NULL, 0);
+	mk_arch_enter_pool_state(NULL);
 }
 
 /* Set once the parent has asked this kernel to shut down */
@@ -1958,28 +1958,6 @@ static int mk_force_halt_targets(struct mk_instance *instance,
 	return 0;
 }
 
-int __weak mk_arch_pool_discover(struct mk_cpu_set *found)
-{
-	return 0;
-}
-
-bool __weak mk_arch_cpu_unclaimed(mk_phys_cpu_t phys_cpu)
-{
-	return false;
-}
-
-unsigned int __weak mk_arch_cpu_kind(mk_phys_cpu_t phys_cpu)
-{
-	return 0;
-}
-
-int __weak mk_arch_fence_cpu(struct mk_instance *instance,
-			     mk_phys_cpu_t phys_cpu)
-{
-	mk_force_stop_cpu(instance, phys_cpu);
-	return mk_arch_confirm_parked(instance, phys_cpu);
-}
-
 /*
  * Stop the fence targets one at a time. A target that never parks leaves
  * the fence incomplete: -ETIMEDOUT, so this kernel never takes over a
@@ -2009,11 +1987,6 @@ static int mk_fence_host(struct mk_instance *instance,
 		mk_cpu_set_count(targets),
 		ktime_ms_delta(ktime_get(), start));
 	return 0;
-}
-
-/* An architecture's part in becoming the root of the machine */
-void __weak mk_arch_promote(void)
-{
 }
 
 /*
@@ -2123,7 +2096,7 @@ int multikernel_force_halt_by_id(int mk_id)
 	} else {
 		/* A child parks on its own context and settles as a graceful halt does */
 		mk_cpu_set_for_each(i, phys_cpu, targets) {
-			mk_force_stop_cpu(instance, phys_cpu);
+			mk_arch_force_stop_cpu(instance, phys_cpu);
 			cpu_count++;
 		}
 		pr_info("Sent NMI to %d CPUs in instance %d\n", cpu_count, mk_id);

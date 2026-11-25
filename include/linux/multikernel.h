@@ -470,8 +470,6 @@ int mk_pool_mem_claim(phys_addr_t start, size_t size, int node);
 int mk_pool_mem_shrink(phys_addr_t start, size_t size);
 int mk_pool_map(phys_addr_t start, size_t size);
 void mk_pool_unmap(phys_addr_t start, size_t size);
-int mk_arch_pool_map(phys_addr_t start, size_t size);
-void mk_arch_pool_unmap(phys_addr_t start, size_t size);
 extern phys_addr_t multikernel_alloc(size_t size, int node);
 extern void multikernel_free(phys_addr_t addr, size_t size);
 struct resource *mk_pool_chunk_resource(phys_addr_t addr);
@@ -480,46 +478,6 @@ size_t mk_pool_avail_bytes(void);
 bool mk_pool_empty(void);
 int mk_pool_for_each_chunk(int (*fn)(struct mk_pool_chunk *, void *), void *data);
 bool mk_pool_cpus_returned(void);
-
-/*
- * Pool park area: on architectures that park pool CPUs in software, the
- * park loop and its page tables live in pool memory and pin the chunks
- * they occupy. Architectures whose firmware holds parked CPUs (PSCI, SBI
- * HSM) have no such area and use the stubs.
- */
-#ifdef CONFIG_ARCH_HAS_MK_HOST_PARK
-int mk_pool_park_setup(void);
-int mk_arch_pool_chunk_added(phys_addr_t start, size_t size);
-bool mk_pool_park_uses(phys_addr_t start, size_t size);
-int mk_pool_park_teardown(void);
-/* The memory parked CPUs run on, as base,size pairs */
-int mk_pool_park_regions(u64 *pairs, int max);
-#else
-static inline int mk_pool_park_setup(void)
-{
-	return 0;
-}
-
-static inline int mk_arch_pool_chunk_added(phys_addr_t start, size_t size)
-{
-	return 0;
-}
-
-static inline bool mk_pool_park_uses(phys_addr_t start, size_t size)
-{
-	return false;
-}
-
-static inline int mk_pool_park_teardown(void)
-{
-	return 0;
-}
-
-static inline int mk_pool_park_regions(u64 *pairs, int max)
-{
-	return 0;
-}
-#endif
 
 /* Per-instance memory pool management */
 extern void *multikernel_create_instance_pool(int instance_id, size_t pool_size,
@@ -931,12 +889,8 @@ int mk_unregister_stop_notifier(struct notifier_block *nb);
 struct resource;
 u64 mk_pci_ecam_window(const struct resource *res, u64 first,
 		       unsigned int busnr);
-u64 mk_arch_pci_bus_ecam(struct pci_bus *bus);
-u64 mk_arch_pci_iommu(struct pci_dev *pdev);
 
 /* PCI buses of a spawn kernel, config space reached through its host */
-struct pci_host_bridge;
-int mk_arch_pcifront_prepare(struct pci_host_bridge *bridge, int domain);
 #if defined(CONFIG_PCI) && defined(CONFIG_OF)
 int mk_pcifront_init(void);
 int mk_pcifront_config(unsigned int domain, unsigned int bus,
@@ -975,9 +929,6 @@ static inline void mk_pcifront_host_fenced(void)
 #endif
 
 bool mk_host_fenced(void);
-void mk_arch_promote(void);
-int mk_arch_iommu_claim(u64 base);
-void mk_arch_instance_destroy(struct mk_instance *instance);
 
 /*
  * PCI functions this kernel let go of, held for instances. A lease gives
@@ -990,8 +941,6 @@ struct mk_lease *mk_lease_lock(struct mk_instance *instance,
 			       struct pci_dev *pdev);
 void mk_lease_unlock(struct mk_lease *lease);
 int mk_lease_allow_msi(struct mk_lease *lease, phys_addr_t doorbell);
-/* Called as a lease is granted; devres actions on @pdev end with the lease */
-int mk_arch_lease_grant(struct mk_instance *instance, struct pci_dev *pdev);
 
 /* Kimage-based access to the instance memory pool */
 void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align,
@@ -1010,9 +959,6 @@ void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len);
 
 /* True in a kernel another kernel spawned, i.e. one that booted with a manifest */
 bool mk_spawned(void);
-
-/* Arch properties of a spawn's /chosen */
-int mk_arch_manifest_chosen(void *fdt, struct mk_instance *instance);
 
 /* Build the manifest for a spawn (host, kexec path) */
 int mk_manifest_finalize(struct kimage *image);
@@ -1168,22 +1114,37 @@ void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
 /**
  * Architecture interface
  *
- * Everything below is implemented per architecture. An architecture that
- * selects ARCH_SUPPORTS_MULTIKERNEL must provide these functions, plus,
- * through <asm/multikernel.h>:
+ * What an architecture that selects ARCH_SUPPORTS_MULTIKERNEL provides.
+ * Everything named mk_arch_*() or arch_*() is the architecture's, and
+ * nothing else is.
+ *
+ * Through <asm/multikernel.h>:
  *
  *  - arch_cpu_physical_id() / arch_cpu_from_physical_id(): translate
  *    between logical CPU numbers and the physical CPU IDs (APIC ID,
- *    MPIDR, hartid) that name CPUs across kernel instances.
+ *    MPIDR, hartid) that name CPUs across kernel instances. The second
+ *    returns a negative error code for a CPU this kernel has no number
+ *    for.
  *  - MK_CTRL_BLOCK_SIZE: size of the per-instance control block that
  *    holds the arch's boot structures (spawn context, trampolines, page
  *    tables), carved from instance memory and reserved from the spawn
  *    kernel's allocator.
  *  - struct mk_instance_arch: the arch's per-instance spawn state
- *    (boot context, trampolines, park area), opaque to the core.
- *  - CONFIG_ARCH_HAS_MK_HOST_PARK and the pool park functions declared
- *    with the pool chunk API above, for architectures that park CPUs in
- *    software rather than in firmware.
+ *    (boot context, trampolines), opaque to the core.
+ *  - struct mk_shared_arch: what the arch's kernels tell each other in
+ *    the area their message rings live in, opaque to the core.
+ *
+ * An architecture whose firmware holds parked CPUs and whose kernels boot
+ * from a device tree also sets MULTIKERNEL_FW_PARK, and gets the common
+ * part of both from <linux/multikernel_fw_park.h>.
+ */
+struct kimage;
+struct pci_bus;
+struct pci_dev;
+struct pci_host_bridge;
+
+/*
+ * Required
  */
 
 /* Doorbell for the message ring: IPI a CPU owned by another kernel */
@@ -1191,6 +1152,42 @@ void mk_arch_send_ipi(mk_phys_cpu_t phys_cpu);
 
 /* Enumerate a pool CPU in this kernel's topology during early boot */
 void mk_arch_register_cpu(mk_phys_cpu_t phys_id);
+
+/* Park the calling CPU where another kernel can start it; never returns */
+void __noreturn mk_arch_enter_pool_state(void *info);
+
+/*
+ * Make a CPU of another instance park, whatever its kernel is doing (NMI
+ * on x86, SDEI or pseudo-NMI on arm64, SSE on riscv). It may fail to
+ * reach a CPU where the architecture has nothing that gets through;
+ * mk_arch_confirm_parked() tells, and a graceful shutdown works without.
+ */
+void mk_arch_force_stop_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
+
+/*
+ * Build the boot state for @instance from the loaded @image and start
+ * its boot CPU, the first CPU it owns, which is parked. Called with
+ * mk_park_lock held. The arch keeps its spawn resources in the instance
+ * so a re-spawn can reuse them; mk_arch_release_instance() frees them
+ * when the instance's memory is torn down, once every CPU the instance
+ * started is parked again.
+ */
+int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance);
+void mk_arch_release_instance(struct mk_instance *instance);
+
+/* 0 once a CPU has parked, whichever kernel it ran */
+int mk_arch_confirm_parked(mk_phys_cpu_t phys_cpu);
+
+/*
+ * Map part of the pool, which is hot-removed from this kernel, back at
+ * its direct-map address, and unmap it again. See mk_pool_map().
+ */
+int mk_arch_pool_map(phys_addr_t start, size_t size);
+void mk_arch_pool_unmap(phys_addr_t start, size_t size);
+
+/*
+ * Optional, with the defaults of kernel/multikernel/arch.c
+ */
 
 /*
  * An unclaimed CPU is one firmware lets this kernel start, but which this
@@ -1218,34 +1215,88 @@ static inline bool mk_cpus_same_kind(mk_phys_cpu_t a, mk_phys_cpu_t b)
 	return mk_arch_cpu_kind(a) == mk_arch_cpu_kind(b);
 }
 
-/* Park the calling CPU in the pool wait loop; never returns */
-void __noreturn mk_enter_pool_state(void *info);
-
-/*
- * Forcible stop of another instance's CPUs (NMI on x86, SDEI or
- * pseudo-NMI on arm64). Registration may fail where the architecture
- * has nothing suitable; graceful shutdown must keep working without it.
- */
-void mk_force_stop_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
-
-/*
- * Build the boot state for @instance from the loaded @image and start
- * its boot CPU, the first CPU it owns, which is parked. Called with
- * mk_park_lock held. The arch keeps its spawn resources in the instance
- * so a re-spawn can reuse them; mk_arch_release_instance() frees them
- * when the instance's memory is torn down, once every CPU the instance
- * started is parked again.
- */
-struct kimage;
-int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance);
-void mk_arch_release_instance(struct mk_instance *instance);
-
-/* Verify one of an instance's CPUs has reached its park loop */
-int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
-int mk_arch_fence_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
-
 /* Whether a kernel that died of a hardware error named this CPU as broken */
 bool mk_arch_cpu_faulty(mk_phys_cpu_t phys_cpu);
+
+/*
+ * Stop one CPU of a host being fenced and see it parked. The default
+ * is mk_arch_force_stop_cpu() and mk_arch_confirm_parked().
+ */
+int mk_arch_fence_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
+
+/* The arch's part in becoming the root of the machine, its host fenced */
+void mk_arch_promote(void);
+
+/* An instance is being destroyed */
+void mk_arch_instance_destroy(struct mk_instance *instance);
+
+/* Arch properties of a spawn's /chosen; returns a libfdt error code */
+int mk_arch_manifest_chosen(void *fdt, struct mk_instance *instance);
+
+/* Take over an IOMMU unit of this kernel's fenced host, by its register base */
+int mk_arch_iommu_claim(u64 base);
+
+/* Called as a lease is granted; devres actions on @pdev end with the lease */
+int mk_arch_lease_grant(struct mk_instance *instance, struct pci_dev *pdev);
+
+/*
+ * The physical address of the 1MB ECAM window of a bus that firmware
+ * other than a device tree describes, or 0 if none
+ */
+u64 mk_arch_pci_bus_ecam(struct pci_bus *bus);
+
+/* The register base of the IOMMU unit a function sits behind, or 0 if none */
+u64 mk_arch_pci_iommu(struct pci_dev *pdev);
+
+/*
+ * Arch part of setting up a root bus of a spawn kernel, its bridge not
+ * yet registered. An architecture whose PCI code expects its own sysdata
+ * on a root bus provides it here, and one whose MSIs leave through a
+ * domain of its own ties the bridge to it.
+ */
+int mk_arch_pcifront_prepare(struct pci_host_bridge *bridge, int domain);
+
+/*
+ * With ARCH_HAS_MK_HOST_PARK: the pool park area
+ *
+ * On architectures that park pool CPUs in software, the park loop and
+ * its page tables live in pool memory and pin the chunks they occupy.
+ * Architectures whose firmware holds parked CPUs have no such area and
+ * use the stubs.
+ */
+#ifdef CONFIG_ARCH_HAS_MK_HOST_PARK
+int mk_arch_pool_park_setup(void);
+int mk_arch_pool_chunk_added(phys_addr_t start, size_t size);
+bool mk_arch_pool_park_uses(phys_addr_t start, size_t size);
+int mk_arch_pool_park_teardown(void);
+/* The memory parked CPUs run on, as base,size pairs */
+int mk_arch_pool_park_regions(u64 *pairs, int max);
+#else
+static inline int mk_arch_pool_park_setup(void)
+{
+	return 0;
+}
+
+static inline int mk_arch_pool_chunk_added(phys_addr_t start, size_t size)
+{
+	return 0;
+}
+
+static inline bool mk_arch_pool_park_uses(phys_addr_t start, size_t size)
+{
+	return false;
+}
+
+static inline int mk_arch_pool_park_teardown(void)
+{
+	return 0;
+}
+
+static inline int mk_arch_pool_park_regions(u64 *pairs, int max)
+{
+	return 0;
+}
+#endif
 
 /*
  * Wait until every CPU an instance owns is parked. Its kernel image may

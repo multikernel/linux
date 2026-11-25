@@ -21,6 +21,7 @@
 #ifndef __ASSEMBLY__
 
 #include <linux/build_bug.h>
+#include <linux/errno.h>
 #include <linux/stddef.h>
 #include <linux/types.h>
 #include <linux/cpumask.h>
@@ -63,7 +64,7 @@ static inline int arch_cpu_from_physical_id(u64 phys_id)
 		if (arch_cpu_physical_id(cpu) == phys_id)
 			return cpu;
 	}
-	return -1;
+	return -ENOENT;
 }
 
 /*

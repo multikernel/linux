@@ -703,13 +703,13 @@ static int mk_overlay_pool_mem_remove(struct mk_overlay_tx *tx, u64 base,
 	 * that matches no chunk at all never costs the pool its park area.
 	 */
 	ret = mk_pool_mem_shrink(base, size);
-	if (ret != -EBUSY || !mk_pool_park_uses(base, size)) {
+	if (ret != -EBUSY || !mk_arch_pool_park_uses(base, size)) {
 		if (ret)
 			pr_err("Failed to resize the pool: %d\n", ret);
 		return ret;
 	}
 
-	ret = mk_pool_park_teardown();
+	ret = mk_arch_pool_park_teardown();
 	if (ret) {
 		pr_err("Overlay tx%d: chunk 0x%llx+0x%llx holds the pool park area; return every pool CPU first (%d)\n",
 		       tx->id, base, size, ret);
@@ -720,13 +720,13 @@ static int mk_overlay_pool_mem_remove(struct mk_overlay_tx *tx, u64 base,
 	if (ret) {
 		pr_err("Failed to resize the pool: %d\n", ret);
 		/* The chunk stayed, so the pool must get its park area back */
-		if (mk_pool_park_setup())
+		if (mk_arch_pool_park_setup())
 			pr_err("Overlay tx%d: the pool park area could not be rebuilt; a memory-add will retry\n",
 			       tx->id);
 		return ret;
 	}
 
-	ret = mk_pool_park_setup();
+	ret = mk_arch_pool_park_setup();
 	if (ret == -ENODEV)		/* nothing left to park in */
 		return 0;
 	if (ret)
@@ -957,11 +957,6 @@ static int mk_overlay_op_device(struct mk_overlay_tx *tx, const void *fdt,
 	}
 
 	return 0;
-}
-
-int __weak mk_arch_iommu_claim(u64 base)
-{
-	return -EOPNOTSUPP;
 }
 
 /* Nothing to undo: no host is left to hand a unit back to */

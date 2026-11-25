@@ -34,7 +34,7 @@ void mk_spawn_machine_halt(void)
 void mk_stop_this_cpu(void)
 {
 	if (mk_self)
-		mk_enter_pool_state(NULL);
+		mk_arch_enter_pool_state(NULL);
 }
 
 /*

@@ -454,7 +454,7 @@ static void mk_baseline_discover_cpus(void)
 	mk_cpu_set_for_each(i, cpu_id, found) {
 		if (mk_baseline_pool_holds(cpu_id))
 			continue;
-		ret = mk_arch_confirm_parked(NULL, cpu_id) ?:
+		ret = mk_arch_confirm_parked(cpu_id) ?:
 		      mk_cpu_set_add(mk_pool->cpus, cpu_id);
 		if (ret)
 			pr_err("Baseline: unclaimed CPU %llu stays out of the pool: %d\n",
@@ -610,7 +610,7 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 		goto out;
 	}
 
-	ret = mk_pool_park_setup();
+	ret = mk_arch_pool_park_setup();
 	if (ret) {
 		pr_err("Baseline pool park setup failed: %d\n", ret);
 		goto out;

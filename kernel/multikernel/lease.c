@@ -189,11 +189,6 @@ int mk_lease_unbind(struct pci_dev *pdev)
 	return 0;
 }
 
-int __weak mk_arch_lease_grant(struct mk_instance *instance, struct pci_dev *pdev)
-{
-	return 0;
-}
-
 /**
  * mk_lease_grant - Give an instance a function until mk_lease_fence()
  * @instance: The instance, about to start or running

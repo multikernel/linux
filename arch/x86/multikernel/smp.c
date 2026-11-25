@@ -61,7 +61,7 @@ void mk_arch_send_ipi(u64 phys_cpu)
  * on bare metal). Keep the APIC itself enabled for IPI delivery so that
  * re-spawn wakeup works. Then loop in HLT waiting for spawn signals.
  */
-void __noreturn mk_enter_pool_state(void *info)
+void __noreturn mk_arch_enter_pool_state(void *info)
 {
 	apic_write(APIC_LVTT, APIC_LVT_MASKED);
 	apic_write(APIC_LVTTHMR, APIC_LVT_MASKED);
@@ -98,7 +98,7 @@ static void __noreturn mk_force_stop(struct pt_regs *regs)
 
 	mk_save_stop_regs(regs);
 	cpu_emergency_disable_virtualization();
-	mk_enter_pool_state(NULL);
+	mk_arch_enter_pool_state(NULL);
 }
 
 /*
@@ -142,7 +142,7 @@ void noinstr mk_nmi_offline_park(void)
 	instrumentation_begin();
 	if (mk_park_ready() && mk_has_pending_shutdown()) {
 		cpu_emergency_disable_virtualization();
-		mk_enter_pool_state(NULL);
+		mk_arch_enter_pool_state(NULL);
 	}
 	instrumentation_end();
 }
@@ -171,7 +171,7 @@ static int __init mk_register_force_stop(void)
 device_initcall(mk_register_force_stop);
 
 /**
- * mk_force_stop_cpu - Send NMI to a specific CPU to force it to stop
+ * mk_arch_force_stop_cpu - Send NMI to a specific CPU to force it to stop
  * @instance: Instance the CPU belongs to
  * @phys_cpu: Physical CPU ID to stop
  *
@@ -181,7 +181,7 @@ device_initcall(mk_register_force_stop);
  * through it silently dropped the NMI for CPUs it missed. The ICR must
  * drain first, or back-to-back sends lose all but the first on xAPIC.
  */
-void mk_force_stop_cpu(struct mk_instance *instance, u64 phys_cpu)
+void mk_arch_force_stop_cpu(struct mk_instance *instance, u64 phys_cpu)
 {
 	safe_apic_wait_icr_idle();
 	apic_icr_write(APIC_DM_NMI | APIC_DEST_PHYSICAL, (u32)phys_cpu);

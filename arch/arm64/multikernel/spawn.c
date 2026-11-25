@@ -59,7 +59,7 @@ void __init mk_arch_register_cpu(mk_phys_cpu_t phys_id)
  * Return the calling CPU to firmware. The boot CPU is no exception: the
  * host's CPUs are on, so it is never the last one firmware knows about.
  */
-void __noreturn mk_enter_pool_state(void *info)
+void __noreturn mk_arch_enter_pool_state(void *info)
 {
 	unsigned int cpu = smp_processor_id();
 	const struct cpu_operations *ops = get_cpu_ops(cpu);
@@ -96,7 +96,7 @@ static int mk_wait_cpu_off(mk_phys_cpu_t mpidr)
  * IPI_CPU_STOP_NMI a kernel running with pseudo-NMIs takes it even with
  * interrupts masked, and to any other kernel it is an ordinary SGI.
  */
-void mk_force_stop_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
+void mk_arch_force_stop_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {
 	int ret;
 
@@ -153,7 +153,7 @@ void mk_foreign_cpu_stop(void)
 	}
 
 	set_cpu_online(smp_processor_id(), false);
-	mk_enter_pool_state(NULL);
+	mk_arch_enter_pool_state(NULL);
 }
 
 /*
@@ -225,13 +225,12 @@ void mk_arch_release_instance(struct mk_instance *instance)
 
 /**
  * mk_arch_confirm_parked - Verify a CPU has left the instance's kernel
- * @instance: Instance the CPU belongs to
  * @phys_cpu: MPIDR of the CPU
  *
  * An off CPU belongs to whoever turns it on next, so there is nothing to
  * move. Returns 0 once firmware reports the CPU off.
  */
-int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
+int mk_arch_confirm_parked(mk_phys_cpu_t phys_cpu)
 {
 	return mk_wait_cpu_off(phys_cpu);
 }

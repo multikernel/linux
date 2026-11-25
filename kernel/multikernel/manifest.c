@@ -391,7 +391,7 @@ static int mk_manifest_add_reserved(void *fdt, struct kimage *image)
 	n_preserved = r.n - first_preserved;
 
 	if (!ret) {
-		int pairs = mk_pool_park_regions(r.pair + 2 * r.n, r.cap - r.n);
+		int pairs = mk_arch_pool_park_regions(r.pair + 2 * r.n, r.cap - r.n);
 
 		if (pairs < 0)
 			ret = pairs;
@@ -419,11 +419,6 @@ struct mk_manifest_ctx {
 	struct kimage *image;
 	struct mk_instance *instance;
 };
-
-int __weak mk_arch_manifest_chosen(void *fdt, struct mk_instance *instance)
-{
-	return 0;
-}
 
 static int mk_manifest_chosen(void *fdt, void *data)
 {

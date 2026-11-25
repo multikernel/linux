@@ -89,7 +89,7 @@ static int mk_instance_confirm_all_parked(struct mk_instance *instance)
 	for (i = mk_cpu_set_count(started); i-- > 0; ) {
 		mk_phys_cpu_t phys_cpu = started->ids[i];
 
-		if (mk_arch_confirm_parked(instance, phys_cpu))
+		if (mk_arch_confirm_parked(phys_cpu))
 			failed++;
 		else
 			mk_cpu_set_del(started, phys_cpu);
@@ -164,7 +164,7 @@ int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 	if (!mk_cpu_set_contains(instance->cpus_started, phys_cpu))
 		return 0;
 
-	ret = mk_arch_confirm_parked(instance, phys_cpu);
+	ret = mk_arch_confirm_parked(phys_cpu);
 	if (!ret)
 		mk_cpu_set_del(instance->cpus_started, phys_cpu);
 	return ret;

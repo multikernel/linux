@@ -261,20 +261,6 @@ static struct pci_ops mk_pcifront_ops = {
 	.write = mk_pcifront_write,
 };
 
-/**
- * mk_arch_pcifront_prepare - Arch part of setting up a root bus
- * @bridge: The host bridge, not yet registered
- * @domain: Its PCI domain
- *
- * An architecture whose PCI code expects its own sysdata on a root bus
- * provides it here, and one whose MSIs leave through a domain of its own
- * ties the bridge to it.
- */
-int __weak mk_arch_pcifront_prepare(struct pci_host_bridge *bridge, int domain)
-{
-	return 0;
-}
-
 static void mk_pcifront_add_windows(struct device_node *np,
 				    struct pci_host_bridge *bridge)
 {

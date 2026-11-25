@@ -130,7 +130,7 @@ void mk_handle_doorbell(void)
 		pr_emerg("CPU%u: forcibly stopped by another kernel\n",
 			 smp_processor_id());
 		set_cpu_online(smp_processor_id(), false);
-		mk_enter_pool_state(NULL);
+		mk_arch_enter_pool_state(NULL);
 	}
 
 	generic_multikernel_interrupt();
@@ -178,7 +178,7 @@ int mk_hsm_start(mk_phys_cpu_t hartid, phys_addr_t entry,
  * Return the calling hart to firmware. The boot hart is no exception: the
  * host's harts are started, so it is never the last one firmware knows of.
  */
-void __noreturn mk_enter_pool_state(void *info)
+void __noreturn mk_arch_enter_pool_state(void *info)
 {
 	local_irq_disable();
 
@@ -200,7 +200,7 @@ void __noreturn mk_enter_pool_state(void *info)
  * hart neither reaches never reports STOPPED, and the host keeps the
  * instance's memory rather than overwrite code it may run.
  */
-void mk_force_stop_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
+void mk_arch_force_stop_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {
 	int ret = mk_sse_stop_hart(phys_cpu);
 
@@ -248,13 +248,12 @@ void mk_arch_release_instance(struct mk_instance *instance)
 
 /**
  * mk_arch_confirm_parked - Verify a hart has left the instance's kernel
- * @instance: Instance the hart belongs to
  * @phys_cpu: Hart ID
  *
  * A stopped hart belongs to whoever starts it next, so there is nothing
  * to move. Returns 0 once firmware reports the hart stopped.
  */
-int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
+int mk_arch_confirm_parked(mk_phys_cpu_t phys_cpu)
 {
 	return mk_wait_hart_stopped(phys_cpu);
 }
