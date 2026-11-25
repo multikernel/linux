@@ -166,6 +166,27 @@ static bool mk_imsic_host_entry(struct device_node *np, unsigned int i,
 	return file->addr;
 }
 
+/* A device interrupts a hart by writing into the hart's file */
+phys_addr_t mk_arch_cpu_msi_doorbell(mk_phys_cpu_t hartid)
+{
+	const struct imsic_global_config *imsic = imsic_get_global_config();
+	const struct mk_hart *hart;
+	int cpu;
+
+	if (!imsic)
+		return 0;
+
+	cpu = riscv_hartid_to_cpuid(hartid);
+	if (cpu >= 0)
+		return per_cpu_ptr(imsic->local, cpu)->msi_pa;
+
+	mk_for_each_unclaimed_hart(hart) {
+		if (hart->hartid == hartid)
+			return hart->file;
+	}
+	return 0;
+}
+
 /*
  * Give the instance's IMSIC the files of the harts the host's node
  * leaves out. A driver finds a hart's file by counting through reg, so
