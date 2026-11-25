@@ -193,12 +193,13 @@ void __noreturn mk_arch_enter_pool_state(void *info)
 /*
  * SBI cannot stop another hart, so a kernel that no longer answers is
  * made to stop its harts itself: the force-halt marker is armed before
- * this is called, and each hart is made to look at it. An SSE event does
- * that whatever the hart has masked. The doorbell does it for a hart
- * that takes interrupts, which is all there is without SSE in firmware,
- * and what reaches a kernel too young to have registered the event. A
- * hart neither reaches never reports STOPPED, and the host keeps the
- * instance's memory rather than overwrite code it may run.
+ * this is called, and each hart is made to look at it. A spawn without a
+ * ring has no marker, and takes the SSE event itself as the demand. An
+ * SSE event reaches the hart whatever it has masked. The doorbell reaches
+ * a hart that takes interrupts, which is all there is without SSE in
+ * firmware, and what reaches a kernel too young to have registered the
+ * event. A hart neither reaches never reports STOPPED, and the host
+ * keeps the instance's memory rather than overwrite code it may run.
  */
 void mk_arch_force_stop_cpu(struct mk_instance *instance, mk_phys_cpu_t phys_cpu)
 {

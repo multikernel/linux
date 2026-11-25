@@ -59,8 +59,9 @@ static int mk_sse_cpu_up(unsigned int cpu)
 
 	mk_sse_forget();
 
+	/* mk_sse_stop() gets the argument in a7: a spawn may have no ring */
 	err = mk_sse_call(SBI_SSE_EVENT_REGISTER, MK_SSE_STOP_EVENT,
-			  (unsigned long)mk_sse_stop, 0);
+			  (unsigned long)mk_sse_stop, mk_spawned());
 	if (!err)
 		err = mk_sse_call(SBI_SSE_EVENT_ENABLE, MK_SSE_STOP_EVENT, 0, 0);
 	if (!err) {
