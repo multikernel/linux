@@ -19,7 +19,7 @@ config MULTIKERNEL
 	bool "Multikernel support"
 	depends on ARCH_SUPPORTS_MULTIKERNEL
 	depends on HOTPLUG_CPU
-	depends on KEXEC_CORE
+	depends on KEXEC_FILE
 	depends on MEMORY_HOTPLUG
 	depends on MEMORY_HOTREMOVE
 	depends on CONTIG_ALLOC

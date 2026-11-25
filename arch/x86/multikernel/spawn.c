@@ -48,6 +48,8 @@
 #include <asm/realmode.h>
 #include <asm/cpu_entry_area.h>
 #include <linux/objtool.h>
+
+#include "internal.h"
 #include <linux/annotate.h>
 
 /*

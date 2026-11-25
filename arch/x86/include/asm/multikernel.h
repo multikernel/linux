@@ -151,42 +151,24 @@ struct mk_park_cell {
 static_assert(offsetof(struct mk_park_cell, gdt) == 64);
 static_assert(sizeof(struct mk_park_cell) == PAGE_SIZE);
 
-/* Cell park loop, copied once into the park table's code page */
-extern char mk_cell_park_start[];
-extern char mk_cell_park_end[];
+struct pt_regs;
 
-struct mk_ident_pgtable;
-
-int mk_park_table_create(void);
-int mk_park_table_destroy(void);
-void mk_park_table_set_boot(phys_addr_t phys);
-phys_addr_t mk_park_table_phys(void);
-bool mk_park_table_uses(phys_addr_t start, size_t size);
-int mk_park_table_regions(u64 *pairs, int max);
-phys_addr_t mk_park_code_phys(void);
-int mk_park_dispatch(u32 apic_id, u32 cmd, const u64 *args, unsigned int nargs);
-int mk_park_wait(u32 apic_id);
+/* The park table as the rest of the x86 kernel uses it */
 void mk_park_this_cpu(void);
-bool mk_park_parked(u32 apic_id);
 bool mk_park_ready(void);
-void mk_park_mark_faulty(u32 apic_id);
-bool mk_park_faulty(u32 apic_id);
 
-/* Page table helpers the park table shares with spawn */
-struct mk_ident_pgtable *mk_build_arena_pgtable(void *arena, int pages);
-int mk_add_trampoline_mapping(struct mk_ident_pgtable *pgt,
-			      unsigned long virt, unsigned long phys);
-unsigned long mk_default_page_offset(void);
-
-
-/* Build a spawn E820 table from the instance's current memory grant */
-struct mk_instance;
-struct boot_params;
-int mk_e820_fill(struct mk_instance *instance, struct boot_params *params);
+/* Starting a CPU from its park cell as a secondary */
+bool mk_starts_from_cell(u32 apicid);
+int mk_start_from_cell(u32 apicid, unsigned int cpu);
 
 /* Park a pool CPU leaving this kernel (play_dead path) */
 void __noreturn multikernel_play_dead(void);
 
+/* Build a spawn E820 table from the instance's current memory grant */
+int mk_e820_fill(struct mk_instance *instance, struct boot_params *params);
+
+/* Initialize boot context tracking in spawn kernel */
+void mk_init_boot_context(phys_addr_t ctx_phys);
 
 /*
  * Control block: spawn context, trampoline page and identity page
@@ -196,41 +178,17 @@ void __noreturn multikernel_play_dead(void);
 #define MK_CTRL_PGTABLE_PAGES	64
 #define MK_CTRL_BLOCK_SIZE	(SZ_16K + (3 + MK_CTRL_PGTABLE_PAGES) * PAGE_SIZE)
 
-struct mk_ident_pgtable;
-
-/* Allocate spawn context (includes boot_params) */
-struct mk_spawn_context *mk_alloc_spawn_context(struct mk_instance *instance);
-struct boot_params *mk_spawn_context_boot_params(struct mk_spawn_context *ctx);
-
-/* Set up spawn context for kernel boot */
-void mk_set_spawn_context(struct mk_spawn_context *ctx,
-			  unsigned long identity_cr3,
-			  unsigned long kernel_entry,
-			  unsigned long park_table);
-
-/* Initialize boot context tracking in spawn kernel */
-void mk_init_boot_context(phys_addr_t ctx_phys);
-
-
-/* Identity page table and trampoline setup */
-struct mk_ident_pgtable *mk_build_identity_pgtable(struct mk_instance *instance);
-int mk_ident_map_range(struct mk_ident_pgtable *pgt, unsigned long start,
-		       unsigned long end);
-void mk_free_identity_pgtable(struct mk_ident_pgtable *pgt);
-unsigned long mk_get_identity_cr3(struct mk_ident_pgtable *pgt);
-void *mk_setup_trampoline(struct mk_instance *instance,
-			  struct mk_ident_pgtable *pgt,
-			  unsigned long *phys_out);
-
-/* Starting a CPU from its park cell as a secondary */
-bool mk_starts_from_cell(u32 apicid);
-int mk_start_from_cell(u32 apicid, unsigned int cpu);
-
-/* NMI on an offline pool CPU: honor a pending force halt */
 #ifdef CONFIG_MULTIKERNEL
+/* NMI on an offline pool CPU: honor a pending force halt */
 void mk_nmi_offline_park(void);
+/* Keep a stopping CPU's registers for a backup kernel that wants them */
+void mk_save_stop_regs(struct pt_regs *regs);
 #else
 static inline void mk_nmi_offline_park(void)
+{
+}
+
+static inline void mk_save_stop_regs(struct pt_regs *regs)
 {
 }
 #endif

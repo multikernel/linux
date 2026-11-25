@@ -32,6 +32,8 @@
 #include <asm/cpufeature.h>
 #include <asm/multikernel.h>
 
+#include "internal.h"
+
 typedef void (*mk_cell_park_fn)(unsigned long park_cr3, unsigned long cell_phys,
 				unsigned long code_phys, unsigned long mwait_usable);
 

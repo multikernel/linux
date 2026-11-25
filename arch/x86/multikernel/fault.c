@@ -21,6 +21,8 @@
 #include <asm/multikernel.h>
 #include <asm/msr.h>
 
+#include "internal.h"
+
 /*
  * With SMCA a bank says what it is, whatever the model. A guest is shown
  * no SMCA and cannot ask; a Zen core has its execution unit in bank 5 and
