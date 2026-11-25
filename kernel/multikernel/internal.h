@@ -152,6 +152,8 @@ int mk_instance_map_devices(struct mk_instance *instance, phys_addr_t start,
 			    size_t size);
 void mk_instance_unmap_devices(struct mk_instance *instance,
 			       phys_addr_t start, size_t size);
+int mk_instance_allow_cpu_msi(struct mk_instance *instance, mk_phys_cpu_t cpu);
+void mk_instance_forbid_cpu_msi(struct mk_instance *instance, mk_phys_cpu_t cpu);
 
 /* pciback.c: config space of a leased function, served to its instance */
 int mk_pciback_lend(struct mk_instance *instance, struct pci_dev *pdev);
@@ -191,6 +193,15 @@ static inline int mk_instance_map_devices(struct mk_instance *instance,
 }
 static inline void mk_instance_unmap_devices(struct mk_instance *instance,
 					     phys_addr_t start, size_t size)
+{
+}
+static inline int mk_instance_allow_cpu_msi(struct mk_instance *instance,
+					    mk_phys_cpu_t cpu)
+{
+	return 0;
+}
+static inline void mk_instance_forbid_cpu_msi(struct mk_instance *instance,
+					      mk_phys_cpu_t cpu)
 {
 }
 #endif

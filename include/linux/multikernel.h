@@ -1239,6 +1239,9 @@ int mk_arch_iommu_claim(u64 base);
 /* Called as a lease is granted; devres actions on @pdev end with the lease */
 int mk_arch_lease_grant(struct mk_instance *instance, struct pci_dev *pdev);
 
+/* Where a device writes MSIs for a CPU, or 0 if they reach it some other way */
+phys_addr_t mk_arch_cpu_msi_doorbell(mk_phys_cpu_t phys_cpu);
+
 /*
  * The physical address of the 1MB ECAM window of a bus that firmware
  * other than a device tree describes, or 0 if none

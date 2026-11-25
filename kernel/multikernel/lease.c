@@ -387,6 +387,39 @@ void mk_instance_unmap_devices(struct mk_instance *instance,
 	}
 }
 
+/*
+ * Let the leased functions of a running instance reach a range, memory or
+ * an MSI doorbell. Returns 0, or a negative error code, in which case
+ * none of them reaches it.
+ */
+static int mk_instance_map_leased(struct mk_instance *instance,
+				  phys_addr_t start, size_t size, bool msi)
+{
+	struct mk_pci_device *mine;
+	int ret = 0;
+
+	list_for_each_entry(mine, &instance->pci_devices, list) {
+		struct pci_dev *pdev = mk_lease_find_pdev(mine);
+		struct mk_lease *lease;
+
+		if (!pdev)
+			continue;
+		lease = mk_lease_lock(instance, pdev);
+		if (lease) {
+			ret = msi ? mk_lease_allow_msi(lease, start) :
+				    mk_iommu_map(pdev, start, size);
+			mk_lease_unlock(lease);
+		}
+		pci_dev_put(pdev);
+		if (ret)
+			break;
+	}
+
+	if (ret)
+		mk_instance_unmap_devices(instance, start, size);
+	return ret;
+}
+
 /**
  * mk_instance_map_devices - Let the leased functions of a running instance
  * reach memory it gains
@@ -402,28 +435,43 @@ void mk_instance_unmap_devices(struct mk_instance *instance,
 int mk_instance_map_devices(struct mk_instance *instance, phys_addr_t start,
 			    size_t size)
 {
-	struct mk_pci_device *mine;
-	int ret = 0;
+	return mk_instance_map_leased(instance, start, size, false);
+}
 
-	list_for_each_entry(mine, &instance->pci_devices, list) {
-		struct pci_dev *pdev = mk_lease_find_pdev(mine);
-		struct mk_lease *lease;
+/**
+ * mk_instance_forbid_cpu_msi - Keep the leased functions of a running
+ * instance from interrupting a CPU it lost
+ * @instance: The instance
+ * @cpu: The CPU
+ */
+void mk_instance_forbid_cpu_msi(struct mk_instance *instance, mk_phys_cpu_t cpu)
+{
+	phys_addr_t doorbell = mk_arch_cpu_msi_doorbell(cpu);
 
-		if (!pdev)
-			continue;
-		lease = mk_lease_lock(instance, pdev);
-		if (lease) {
-			ret = mk_iommu_map(pdev, start, size);
-			mk_lease_unlock(lease);
-		}
-		pci_dev_put(pdev);
-		if (ret)
-			break;
-	}
+	if (doorbell)
+		mk_instance_unmap_devices(instance, doorbell & PAGE_MASK,
+					  PAGE_SIZE);
+}
 
-	if (ret)
-		mk_instance_unmap_devices(instance, start, size);
-	return ret;
+/**
+ * mk_instance_allow_cpu_msi - Let the leased functions of a running
+ * instance interrupt a CPU it gains
+ * @instance: The instance
+ * @cpu: The CPU
+ *
+ * To be called before the instance is told about the CPU.
+ *
+ * Returns: 0 on success, or a negative error code, in which case none
+ * of them can
+ */
+int mk_instance_allow_cpu_msi(struct mk_instance *instance, mk_phys_cpu_t cpu)
+{
+	phys_addr_t doorbell = mk_arch_cpu_msi_doorbell(cpu);
+
+	if (!doorbell)
+		return 0;
+	return mk_instance_map_leased(instance, doorbell & PAGE_MASK,
+				      PAGE_SIZE, true);
 }
 
 static int __init mk_lease_init(void)

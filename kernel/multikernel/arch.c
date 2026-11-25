@@ -60,6 +60,11 @@ int __weak mk_arch_lease_grant(struct mk_instance *instance, struct pci_dev *pde
 	return 0;
 }
 
+phys_addr_t __weak mk_arch_cpu_msi_doorbell(mk_phys_cpu_t phys_cpu)
+{
+	return 0;
+}
+
 u64 __weak mk_arch_pci_bus_ecam(struct pci_bus *bus)
 {
 	return 0;
