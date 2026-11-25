@@ -1419,6 +1419,7 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 		goto out;
 	}
 
+	mk_instance_forbid_cpu_msi(target_instance, cpu_id);
 	mk_cpu_set_del(target_instance->cpus, cpu_id);
 	mk_cpu_set_add(mk_pool->cpus, cpu_id);
 
@@ -1496,6 +1497,11 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 		goto out;
 	}
 
+	/* The instance may aim MSIs at the CPU as soon as it has it */
+	ret = mk_instance_allow_cpu_msi(target_instance, cpu_id);
+	if (ret)
+		goto out;
+
 	/*
 	 * The CPU is parked on the host slot, where the spawn kernel's
 	 * secondary wakeup cannot reach it. Point it at the instance's
@@ -1505,14 +1511,14 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 	if (ret < 0) {
 		pr_err("Multikernel hotplug: Failed to repark CPU %llu to instance %d: %d\n",
 		       cpu_id, instance_id, ret);
-		goto out;
+		goto forbid;
 	}
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_CPU_ADD, cpu_id);
 	if (!pending) {
 		mk_repark_cpu_to_host(target_instance, cpu_id);
 		ret = -ENOMEM;
-		goto out;
+		goto forbid;
 	}
 
 	ret = mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_CPU_ADD,
@@ -1520,7 +1526,7 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 	if (ret < 0) {
 		mk_msg_pending_wait(pending, 0);  /* Immediate cleanup */
 		mk_repark_cpu_to_host(target_instance, cpu_id);
-		goto out;
+		goto forbid;
 	}
 
 	ret = mk_msg_pending_wait(pending, 10000);
@@ -1532,7 +1538,7 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 		 * watching the context and this times out harmlessly.
 		 */
 		mk_repark_cpu_to_host(target_instance, cpu_id);
-		goto out;
+		goto forbid;
 	}
 
 	if (mk_cpu_set_add(target_instance->cpus, cpu_id))
@@ -1541,6 +1547,9 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 	mk_cpu_set_del(mk_pool->cpus, cpu_id);
 
 	ret = 0;
+	goto out;
+forbid:
+	mk_instance_forbid_cpu_msi(target_instance, cpu_id);
 out:
 	mk_instance_put(target_instance);
 	return ret;

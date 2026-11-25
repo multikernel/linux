@@ -10,11 +10,12 @@
  *
  * So while an instance holds a lease on a device (lease.c), the device is
  * attached to a domain of its own that maps the instance's memory grant
- * onto itself, and once the instance maps an MSI, the doorbell of the ITS
+ * onto itself, the MSI doorbells of the instance's CPUs where they have
+ * their own, and once the instance maps an MSI, the doorbell of the ITS
  * behind the device. The device works untranslated, and cannot reach
  * anything else.
- * The domain follows the grant as memory is added and removed, and goes
- * away with the lease.
+ * The domain follows the grant as memory and CPUs are added and removed,
+ * and goes away with the lease.
  *
  * The IOMMU cannot tell the functions of an IOMMU group apart, so they
  * share one domain and one instance. The first lease to be granted
@@ -304,6 +305,9 @@ static void mk_iommu_unconfine(void *data)
 int mk_iommu_confine(struct mk_instance *instance, struct pci_dev *pdev)
 {
 	struct iommu_group *group;
+	mk_phys_cpu_t cpu;
+	phys_addr_t doorbell;
+	unsigned int i;
 	int ret;
 
 	if (!device_iommu_mapped(&pdev->dev)) {
@@ -321,7 +325,19 @@ int mk_iommu_confine(struct mk_instance *instance, struct pci_dev *pdev)
 		return ret;
 	}
 
-	return devm_add_action_or_reset(&pdev->dev, mk_iommu_unconfine, pdev);
+	ret = devm_add_action_or_reset(&pdev->dev, mk_iommu_unconfine, pdev);
+	if (ret)
+		return ret;
+
+	mk_cpu_set_for_each(i, cpu, instance->cpus) {
+		doorbell = mk_arch_cpu_msi_doorbell(cpu);
+		if (!doorbell)
+			continue;
+		ret = mk_iommu_allow_msi(pdev, doorbell);
+		if (ret)
+			return ret;
+	}
+	return 0;
 }
 
 /**
