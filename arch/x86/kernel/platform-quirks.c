@@ -229,6 +229,11 @@ void __init x86_early_init_platform_quirks(void)
 		 * to the legacy BIOS area and find them only on some hosts.
 		 */
 		x86_init.resources.dmi_setup = x86_init_noop;
+		/*
+		 * So are the option ROMs: the scan reads the legacy area
+		 * of the host and names what it finds in /proc/iomem.
+		 */
+		x86_init.resources.probe_roms = x86_init_noop;
 		x86_platform.realmode_reserve = x86_init_noop;
 		x86_platform.realmode_init = x86_init_noop;
 		/*
