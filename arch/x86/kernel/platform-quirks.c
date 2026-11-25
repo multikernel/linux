@@ -223,6 +223,12 @@ void __init x86_early_init_platform_quirks(void)
 		 */
 		x86_init.timers.timer_init = x86_init_noop;
 		x86_init.timers.wallclock_init = x86_init_noop;
+		/*
+		 * The firmware tables are the host's and outside this
+		 * instance's memory. Without EFI the scan would fall back
+		 * to the legacy BIOS area and find them only on some hosts.
+		 */
+		x86_init.resources.dmi_setup = x86_init_noop;
 		x86_platform.realmode_reserve = x86_init_noop;
 		x86_platform.realmode_init = x86_init_noop;
 		/*
