@@ -146,8 +146,10 @@ PCI devices
     host should use the device.
 
 IOMMU
-    Not supported yet. A spawn hands physical addresses to its devices,
-    and their DMA is unrestricted.
+    A device behind an IOMMU reaches only the instance's memory, and
+    the IMSIC files of the instance's harts for its MSIs. Both follow
+    memory and harts as they are added to and removed from the running
+    instance. A device without an IOMMU has unrestricted DMA.
 
 OpenSBI Domains
 ===============
