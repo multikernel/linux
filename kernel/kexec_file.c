@@ -512,6 +512,14 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 				goto out;
 			}
 
+			/* Its segments hold the kernel that is running there */
+			if (READ_ONCE(mk_image->mk_instance->state) == MK_STATE_ACTIVE) {
+				pr_err("Multikernel instance %d is running, halt it before unloading\n",
+				       mk_id);
+				ret = -EBUSY;
+				goto out;
+			}
+
 			pr_info("Unloading kernel from multikernel instance %d\n", mk_id);
 			kimage_remove_from_list(mk_image);
 			image = mk_image;
@@ -529,6 +537,18 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 				pr_err("Multikernel instance %d already has an associated kimage\n", mk_id);
 				mk_instance_put(instance);
 				ret = -EBUSY;
+				goto out;
+			}
+
+			/*
+			 * A CPU of the previous run may still execute in the
+			 * memory the new image is about to be copied into.
+			 */
+			ret = mk_instance_confirm_parked(instance);
+			if (ret) {
+				pr_err("Multikernel instance %d still has running CPUs, refusing to load\n",
+				       mk_id);
+				mk_instance_put(instance);
 				goto out;
 			}
 		}
