@@ -26,6 +26,7 @@ config MULTIKERNEL
 	depends on OF_EARLY_FLATTREE
 	select LIBFDT
 	select OF_DYNAMIC
+	select SECURITY
 	help
 	  Enable multikernel support, which allows running multiple kernel
 	  instances simultaneously with resource isolation and inter-kernel

@@ -131,6 +131,9 @@ TEST(correct_lsm_list_modules)
 		case LSM_ID_IPE:
 			name = "ipe";
 			break;
+		case LSM_ID_MULTIKERNEL:
+			name = "multikernel";
+			break;
 		default:
 			name = "INVALID";
 			break;
