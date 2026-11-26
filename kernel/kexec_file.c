@@ -869,46 +869,6 @@ static int kexec_alloc_contig(struct kexec_buf *kbuf)
 	return 0;
 }
 
-static int kexec_alloc_multikernel(struct kexec_buf *kbuf)
-{
-	void *virt_addr;
-	phys_addr_t phys_addr;
-
-	pr_info("kexec_alloc_multikernel: called for segment size=0x%lx, buf_min=0x%lx, buf_max=0x%lx, align=0x%lx\n",
-		kbuf->memsz, kbuf->buf_min, kbuf->buf_max, kbuf->buf_align);
-
-	virt_addr = mk_kimage_alloc(kbuf->image, kbuf->memsz, kbuf->buf_align,
-				    kbuf->buf_min, kbuf->buf_max);
-	if (!virt_addr) {
-		pr_info("Failed to allocate %lu bytes from multikernel instance pool (align=0x%lx, min=0x%lx, max=0x%lx)\n",
-			kbuf->memsz, kbuf->buf_align, kbuf->buf_min, kbuf->buf_max);
-		return -ENOMEM;
-	}
-
-	phys_addr = virt_to_phys(virt_addr);
-
-	if (kimage_is_destination_range(kbuf->image, phys_addr, phys_addr + kbuf->memsz - 1)) {
-		pr_info("Multikernel allocation conflicts with existing segments: 0x%llx+0x%lx\n",
-			 (unsigned long long)phys_addr, kbuf->memsz);
-		mk_kimage_free(kbuf->image, virt_addr, kbuf->memsz);
-		return -EBUSY;
-	}
-
-	/*
-	 * Only pick the destination here. The caller's buffer stays the
-	 * source, and kimage_load_segment() copies it in, exactly like
-	 * ordinary kexec. Keeping the two apart is what lets an instance be
-	 * booted more than once: booting consumes the destination copy, so
-	 * every spawn re-runs the copy from the pristine source.
-	 */
-	kbuf->mem = phys_addr;
-
-	pr_info("Allocated %lu bytes from multikernel pool at 0x%llx\n",
-		 kbuf->memsz, (unsigned long long)phys_addr);
-
-	return 0;
-}
-
 /**
  * kexec_drop_segments - drop the segments added after the first @nr
  * @image: image whose segments to drop

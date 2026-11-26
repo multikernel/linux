@@ -10,7 +10,6 @@ struct kimage *do_kimage_alloc_init(void);
 int sanity_check_segment_list(struct kimage *image);
 void kimage_free_page_list(struct list_head *list);
 void kimage_free(struct kimage *image);
-void kimage_free_multikernel(struct kimage *image);
 int kimage_load_segment(struct kimage *image, int idx);
 void kimage_terminate(struct kimage *image);
 int kimage_is_destination_range(struct kimage *image,
@@ -42,6 +41,22 @@ static inline void kimage_file_post_load_cleanup(struct kimage *image) { }
 #endif /* CONFIG_KEXEC_FILE */
 
 struct kexec_buf;
+
+#ifdef CONFIG_MULTIKERNEL
+int kexec_alloc_multikernel(struct kexec_buf *kbuf);
+int kimage_load_multikernel_segment(struct kimage *image, int idx);
+void kimage_free_multikernel(struct kimage *image);
+#else
+static inline int kexec_alloc_multikernel(struct kexec_buf *kbuf)
+{
+	return -EOPNOTSUPP;
+}
+static inline int kimage_load_multikernel_segment(struct kimage *image, int idx)
+{
+	return -EOPNOTSUPP;
+}
+static inline void kimage_free_multikernel(struct kimage *image) { }
+#endif /* CONFIG_MULTIKERNEL */
 
 #ifdef CONFIG_KEXEC_HANDOVER
 int kho_locate_mem_hole(struct kexec_buf *kbuf,
