@@ -437,9 +437,6 @@ struct kimage {
 	unsigned long dm_crypt_keys_addr;
 	unsigned long dm_crypt_keys_sz;
 
-	/* For multikernel support: linked list node */
-	struct list_head list;
-
 	/* Multikernel unique ID (0 = current kernel, >0 = multikernel images) */
 	int mk_id;
 
@@ -561,15 +558,6 @@ extern bool kexec_file_dbg_print;
 
 extern void *kimage_map_segment(struct kimage *image, int idx);
 extern void kimage_unmap_segment(void *buffer);
-
-/* Multikernel support functions */
-extern struct kimage *kimage_find_by_type(int type);
-extern void kimage_add_to_list(struct kimage *image);
-extern void kimage_remove_from_list(struct kimage *image);
-extern void kimage_update_compat_pointers(struct kimage *new_image, int type);
-extern void kimage_list_lock(void);
-extern void kimage_list_unlock(void);
-extern void kimage_list_multikernel_images(void);
 #else /* !CONFIG_KEXEC_CORE */
 struct pt_regs;
 struct task_struct;

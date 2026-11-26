@@ -477,13 +477,13 @@ static void update_crash_elfcorehdr(struct kimage *image, struct memory_notify *
 	ptr = __va(mem);
 	if (ptr) {
 		/* Temporarily invalidate the crash image while it is replaced */
-		kimage_update_compat_pointers(NULL, KEXEC_TYPE_CRASH);
+		xchg(&kexec_crash_image, NULL);
 
 		/* Replace the old elfcorehdr with newly prepared elfcorehdr */
 		memcpy((void *)ptr, elfbuf, elfsz);
 
 		/* The crash image is now valid once again */
-		kimage_update_compat_pointers(image, KEXEC_TYPE_CRASH);
+		xchg(&kexec_crash_image, image);
 	}
 out:
 	kvfree(cmem);
@@ -537,14 +537,14 @@ static void update_crash_fdt(struct kimage *image)
 	fdt = __va((void *)image->segment[fdt_index].mem);
 
 	/* Temporarily invalidate the crash image while it is replaced */
-	kimage_update_compat_pointers(NULL, KEXEC_TYPE_CRASH);
+	xchg(&kexec_crash_image, NULL);
 
 	/* update FDT to reflect changes in CPU resources */
 	if (update_cpus_node(fdt))
 		pr_err("Failed to update crash FDT");
 
 	/* The crash image is now valid once again */
-	kimage_update_compat_pointers(image, KEXEC_TYPE_CRASH);
+	xchg(&kexec_crash_image, image);
 }
 
 int arch_crash_hotplug_support(struct kimage *image, unsigned long kexec_flags)

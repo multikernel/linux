@@ -101,33 +101,10 @@ int kexec_image_post_load_cleanup_default(struct kimage *image)
 	return image->fops->cleanup(image->image_loader_data);
 }
 
-void kimage_file_free_cmdline(struct kimage *image)
-{
-	kfree(image->cmdline_buf);
-	image->cmdline_buf = NULL;
-}
-
-/* The command line without its terminating NUL, or NULL if there is none */
-const char *kimage_file_cmdline(struct kimage *image, unsigned long *len)
-{
-	unsigned long n = image->cmdline_buf_len;
-
-	if (!image->cmdline_buf || !n)
-		return NULL;
-	if (image->cmdline_buf[n - 1] == '\0')
-		n--;
-	if (!n)
-		return NULL;
-	*len = n;
-	return image->cmdline_buf;
-}
-
 /*
  * Free up memory used by kernel, initrd, and command line. This is temporary
  * memory allocation which is not needed any more after these buffers have
  * been loaded into separate segments and have been copied elsewhere.
- *
- * Note: cmdline_buf is kept so it can be displayed in /proc/kimage.
  */
 void kimage_file_post_load_cleanup(struct kimage *image)
 {
@@ -138,6 +115,9 @@ void kimage_file_post_load_cleanup(struct kimage *image)
 
 	vfree(image->initrd_buf);
 	image->initrd_buf = NULL;
+
+	kfree(image->cmdline_buf);
+	image->cmdline_buf = NULL;
 
 	vfree(pi->purgatory_buf);
 	pi->purgatory_buf = NULL;
@@ -461,7 +441,6 @@ out_free_post_load_bufs:
 out_free_image:
 	if (image->type == KEXEC_TYPE_MULTIKERNEL)
 		kimage_free_multikernel(image);
-	kimage_file_free_cmdline(image);
 	kfree(image);
 	return ret;
 }
@@ -521,7 +500,6 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 			}
 
 			pr_info("Unloading kernel from multikernel instance %d\n", mk_id);
-			kimage_remove_from_list(mk_image);
 			image = mk_image;
 			ret = 0;
 			goto out;
@@ -552,8 +530,6 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 				goto out;
 			}
 		}
-	} else if (flags & KEXEC_FILE_UNLOAD) {
-		goto exchange;
 	}
 
 #ifdef CONFIG_CRASH_DUMP
@@ -565,18 +541,16 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 #endif
 		dest_image = &kexec_image;
 
+	if (flags & KEXEC_FILE_UNLOAD)
+		goto exchange;
+
 	/*
 	 * In case of crash, new kernel gets loaded in reserved region. It is
 	 * same memory where old crash kernel might be loaded. Free any
 	 * current crash dump kernel before we corrupt it.
 	 */
-	if (flags & KEXEC_FILE_ON_CRASH) {
-		struct kimage *old_crash_image = xchg(&kexec_crash_image, NULL);
-		if (old_crash_image) {
-			kimage_remove_from_list(old_crash_image);
-			kimage_free(old_crash_image);
-		}
-	}
+	if (flags & KEXEC_FILE_ON_CRASH)
+		kimage_free(xchg(&kexec_crash_image, NULL));
 
 	/* Consumes the instance reference, on failure too */
 	ret = kimage_file_alloc_init(&image, kernel_fd, initrd_fd, cmdline_ptr,
@@ -646,35 +620,12 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 			image->mk_instance->ipi_data =
 				phys_to_virt(image->mk_instance->ipi_phys);
 		mk_instance_set_state(image->mk_instance, MK_STATE_LOADED);
-		kimage_add_to_list(image);
 		image = NULL; /* Don't free the new image */
 		goto out;
 	}
 
 exchange:
-	if (image_type == KEXEC_TYPE_CRASH) {
-		struct kimage *old_image = xchg(&kexec_crash_image, image);
-		if (old_image) {
-			kimage_remove_from_list(old_image);
-			kimage_free(old_image);
-		}
-		if (image) {
-			kimage_add_to_list(image);
-			kimage_update_compat_pointers(image, KEXEC_TYPE_CRASH);
-		}
-		image = NULL; /* Don't free the new image */
-	} else {
-		struct kimage *old_image = xchg(&kexec_image, image);
-		if (old_image) {
-			kimage_remove_from_list(old_image);
-			kimage_free(old_image);
-		}
-		if (image) {
-			kimage_add_to_list(image);
-			kimage_update_compat_pointers(image, KEXEC_TYPE_DEFAULT);
-		}
-		image = NULL; /* Don't free the new image */
-	}
+	image = xchg(dest_image, image);
 out:
 #ifdef CONFIG_CRASH_DUMP
 	if ((flags & KEXEC_FILE_ON_CRASH) && kexec_crash_image)

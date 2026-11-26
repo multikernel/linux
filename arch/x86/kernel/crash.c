@@ -564,9 +564,9 @@ void arch_crash_handle_hotplug_event(struct kimage *image, void *arg)
 	 * Temporarily invalidate the crash image while the
 	 * elfcorehdr is updated.
 	 */
-	kimage_update_compat_pointers(NULL, KEXEC_TYPE_CRASH);
+	xchg(&kexec_crash_image, NULL);
 	memcpy_flushcache(old_elfcorehdr, elfbuf, elfsz);
-	kimage_update_compat_pointers(image, KEXEC_TYPE_CRASH);
+	xchg(&kexec_crash_image, image);
 	kunmap_local(old_elfcorehdr);
 	pr_debug("updated elfcorehdr\n");
 

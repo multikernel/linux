@@ -114,19 +114,7 @@ static int do_kexec_load(unsigned long entry, unsigned long nr_segments,
 
 	if (nr_segments == 0) {
 		/* Uninstall image */
-		if (flags & KEXEC_ON_CRASH) {
-			struct kimage *old_image = xchg(&kexec_crash_image, NULL);
-			if (old_image) {
-				kimage_remove_from_list(old_image);
-				kimage_free(old_image);
-			}
-		} else {
-			struct kimage *old_image = xchg(&kexec_image, NULL);
-			if (old_image) {
-				kimage_remove_from_list(old_image);
-				kimage_free(old_image);
-			}
-		}
+		kimage_free(xchg(dest_image, NULL));
 		ret = 0;
 		goto out_unlock;
 	}
@@ -136,11 +124,7 @@ static int do_kexec_load(unsigned long entry, unsigned long nr_segments,
 		 * crashes.  Free any current crash dump kernel before
 		 * we corrupt it.
 		 */
-		struct kimage *old_crash_image = xchg(&kexec_crash_image, NULL);
-		if (old_crash_image) {
-			kimage_remove_from_list(old_crash_image);
-			kimage_free(old_crash_image);
-		}
+		kimage_free(xchg(&kexec_crash_image, NULL));
 	}
 
 	ret = kimage_alloc_init(&image, entry, nr_segments, segments, flags);
@@ -180,29 +164,7 @@ static int do_kexec_load(unsigned long entry, unsigned long nr_segments,
 		goto out;
 
 	/* Install the new kernel and uninstall the old */
-	if (flags & KEXEC_ON_CRASH) {
-		struct kimage *old_image = xchg(&kexec_crash_image, image);
-		if (old_image) {
-			kimage_remove_from_list(old_image);
-			kimage_free(old_image);
-		}
-		if (image) {
-			kimage_add_to_list(image);
-			kimage_update_compat_pointers(image, KEXEC_TYPE_CRASH);
-		}
-		image = NULL; /* Don't free the new image */
-	} else {
-		struct kimage *old_image = xchg(&kexec_image, image);
-		if (old_image) {
-			kimage_remove_from_list(old_image);
-			kimage_free(old_image);
-		}
-		if (image) {
-			kimage_add_to_list(image);
-			kimage_update_compat_pointers(image, KEXEC_TYPE_DEFAULT);
-		}
-		image = NULL; /* Don't free the new image */
-	}
+	image = xchg(dest_image, image);
 
 out:
 #ifdef CONFIG_CRASH_DUMP

@@ -13,8 +13,6 @@
 #include <linux/slab.h>
 #include <linux/fs.h>
 #include <linux/kexec.h>
-#include <linux/proc_fs.h>
-#include <linux/seq_file.h>
 #include <linux/mutex.h>
 #include <linux/list.h>
 #include <linux/liveupdate.h>
@@ -64,10 +62,6 @@ atomic_t __kexec_lock = ATOMIC_INIT(0);
 bool kexec_in_progress = false;
 
 bool kexec_file_dbg_print;
-
-/* Linked list of dynamically allocated kimages */
-static LIST_HEAD(kexec_image_list);
-static DEFINE_MUTEX(kexec_image_mutex);
 
 /*
  * When kexec transitions to the new kernel there is a one-to-one
@@ -260,9 +254,6 @@ struct kimage *do_kimage_alloc_init(void)
 
 	/* Initialize the list of unusable pages */
 	INIT_LIST_HEAD(&image->unusable_pages);
-
-	/* Initialize the list node for multikernel support */
-	INIT_LIST_HEAD(&image->list);
 
 	image->mk_id = 0;
 	image->mk_instance = NULL;
@@ -626,13 +617,6 @@ void kimage_free(struct kimage *image)
 	if (!image)
 		return;
 
-	/* Remove from linked list and update compatibility pointers */
-	kimage_remove_from_list(image);
-	if (image == kexec_image)
-		kimage_update_compat_pointers(NULL, KEXEC_TYPE_DEFAULT);
-	else if (image == kexec_crash_image)
-		kimage_update_compat_pointers(NULL, KEXEC_TYPE_CRASH);
-
 	if (image->type == KEXEC_TYPE_MULTIKERNEL)
 		kimage_free_multikernel(image);
 
@@ -675,10 +659,8 @@ void kimage_free(struct kimage *image)
 	 * Free up any temporary buffers allocated. This might hit if
 	 * error occurred much later after buffer allocation.
 	 */
-	if (image->file_mode) {
-		kimage_file_free_cmdline(image);
+	if (image->file_mode)
 		kimage_file_post_load_cleanup(image);
-	}
 
 	kfree(image);
 }
@@ -1155,57 +1137,6 @@ void kimage_unmap_segment(void *segment_buffer)
 		vunmap(segment_buffer);
 }
 
-void kimage_add_to_list(struct kimage *image)
-{
-	mutex_lock(&kexec_image_mutex);
-	list_add_tail(&image->list, &kexec_image_list);
-	mutex_unlock(&kexec_image_mutex);
-}
-
-void kimage_remove_from_list(struct kimage *image)
-{
-	mutex_lock(&kexec_image_mutex);
-	if (!list_empty(&image->list))
-		list_del_init(&image->list);
-	mutex_unlock(&kexec_image_mutex);
-}
-
-struct kimage *kimage_find_by_type(int type)
-{
-	struct kimage *image;
-
-	mutex_lock(&kexec_image_mutex);
-	list_for_each_entry(image, &kexec_image_list, list) {
-		if (image->type == type) {
-			mutex_unlock(&kexec_image_mutex);
-			return image;
-		}
-	}
-	mutex_unlock(&kexec_image_mutex);
-	return NULL;
-}
-
-void kimage_update_compat_pointers(struct kimage *new_image, int type)
-{
-	mutex_lock(&kexec_image_mutex);
-	if (type == KEXEC_TYPE_CRASH) {
-		kexec_crash_image = new_image;
-	} else if (type == KEXEC_TYPE_DEFAULT) {
-		kexec_image = new_image;
-	}
-	mutex_unlock(&kexec_image_mutex);
-}
-
-void kimage_list_lock(void)
-{
-	mutex_lock(&kexec_image_mutex);
-}
-
-void kimage_list_unlock(void)
-{
-	mutex_unlock(&kexec_image_mutex);
-}
-
 struct kexec_load_limit {
 	/* Mutex protects the limit count. */
 	struct mutex mutex;
@@ -1222,64 +1153,9 @@ static struct kexec_load_limit load_limit_panic = {
 	.limit = -1,
 };
 
-/* Compatibility: maintain pointers to current default and crash images */
 struct kimage *kexec_image;
 struct kimage *kexec_crash_image;
 static int kexec_load_disabled;
-
-/*
- * Proc interface for /proc/kimage
- */
-static int kimage_proc_show(struct seq_file *m, void *v)
-{
-	struct kimage *image;
-	const char *type_names[] = {
-		[KEXEC_TYPE_DEFAULT] = "default",
-		[KEXEC_TYPE_CRASH] = "crash",
-		[KEXEC_TYPE_MULTIKERNEL] = "multikernel"
-	};
-
-	seq_printf(m, "MK_ID  Type        Start Address   Segments  Mode  Cmdline\n");
-	seq_printf(m, "-----  ----------  --------------  --------  ----  -------\n");
-
-	kimage_list_lock();
-	if (!list_empty(&kexec_image_list)) {
-		list_for_each_entry(image, &kexec_image_list, list) {
-			const char *type_name = "unknown";
-
-			if (image->type < ARRAY_SIZE(type_names) && type_names[image->type])
-				type_name = type_names[image->type];
-
-			seq_printf(m, "%5d  %-10s  0x%012lx  %8lu  %-4s  ",
-				image->mk_id, type_name, image->start, image->nr_segments,
-				image->file_mode ? "file" : "sys");
-
-			if (image->file_mode) {
-				unsigned long len;
-				const char *cmdline = kimage_file_cmdline(image, &len);
-
-				if (cmdline)
-					seq_printf(m, "\"%.*s\"", (int)len, cmdline);
-			}
-			seq_printf(m, "\n");
-		}
-	}
-	kimage_list_unlock();
-
-	return 0;
-}
-
-static int kimage_proc_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, kimage_proc_show, NULL);
-}
-
-static const struct proc_ops kimage_proc_ops = {
-	.proc_open	= kimage_proc_open,
-	.proc_read	= seq_read,
-	.proc_lseek	= seq_lseek,
-	.proc_release	= single_release,
-};
 
 #ifdef CONFIG_SYSCTL
 static int kexec_limit_handler(const struct ctl_table *table, int write,
@@ -1351,21 +1227,6 @@ static int __init kexec_core_sysctl_init(void)
 }
 late_initcall(kexec_core_sysctl_init);
 #endif
-
-static int __init kimage_proc_init(void)
-{
-	struct proc_dir_entry *entry;
-
-	entry = proc_create("kimage", 0444, NULL, &kimage_proc_ops);
-	if (!entry) {
-		pr_err("Failed to create /proc/kimage\n");
-		return -ENOMEM;
-	}
-
-	pr_debug("Created /proc/kimage interface\n");
-	return 0;
-}
-late_initcall(kimage_proc_init);
 
 bool kexec_load_permitted(int kexec_image_type)
 {
