@@ -666,6 +666,13 @@ struct mk_instance {
 
 	/* Kexec integration */
 	struct kimage *kimage;          /* Associated kimage object */
+	/*
+	 * The command line its current or last run was started with, when
+	 * the start brought one to replace the image's. NULL when the run
+	 * booted with the image's own. Changes under the kexec lock.
+	 */
+	char *cmdline;
+	unsigned long cmdline_len;  /* With the terminating NUL */
 
 	/* Arch spawn state, reused across re-spawns, freed on pool destroy */
 	struct mk_instance_arch arch;

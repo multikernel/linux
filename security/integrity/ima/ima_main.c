@@ -1158,14 +1158,28 @@ out:
  */
 void ima_kexec_cmdline(int kernel_fd, const void *buf, int size)
 {
-	if (!buf || !size)
-		return;
-
 	CLASS(fd, f)(kernel_fd);
 	if (fd_empty(f))
 		return;
 
-	process_buffer_measurement(file_mnt_idmap(fd_file(f)), file_inode(fd_file(f)),
+	ima_kexec_cmdline_file(fd_file(f), buf, size);
+}
+
+/**
+ * ima_kexec_cmdline_file - measure kexec cmdline boot args
+ * @file: the file the command line is given for
+ * @buf: pointer to buffer
+ * @size: size of buffer
+ *
+ * For a command line that comes with no kernel to load: a multikernel
+ * instance is started with one through the instance's file.
+ */
+void ima_kexec_cmdline_file(struct file *file, const void *buf, int size)
+{
+	if (!buf || !size)
+		return;
+
+	process_buffer_measurement(file_mnt_idmap(file), file_inode(file),
 				   buf, size, "kexec-cmdline", KEXEC_CMDLINE, 0,
 				   NULL, false, NULL, 0);
 }

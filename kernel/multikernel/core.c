@@ -246,6 +246,7 @@ static void mk_instance_release(struct kref *kref)
 	mk_instance_track_dump(instance, instance->state, MK_STATE_READY);
 	kfree(instance->host_tree);
 	kfree(instance->framebuffer);
+	kfree(instance->cmdline);
 	mk_cpu_set_free(instance->cpus);
 	kfree(instance->name);
 	kfree(instance);

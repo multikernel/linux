@@ -630,6 +630,9 @@ static void *bzImage64_load(struct kimage *image, char *kernel,
 	efi_map_sz = efi_get_runtime_map_size();
 	params_cmdline_sz = sizeof(struct boot_params) + cmdline_len +
 				MAX_ELFCOREHDR_STR_LEN;
+	/* A start may bring a command line of its own, of any legal size */
+	if (image->type == KEXEC_TYPE_MULTIKERNEL)
+		params_cmdline_sz += COMMAND_LINE_SIZE;
 	if (image->dm_crypt_keys_addr)
 		params_cmdline_sz += MAX_DMCRYPTKEYS_STR_LEN;
 	params_cmdline_sz = ALIGN(params_cmdline_sz, 16);

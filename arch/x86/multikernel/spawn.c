@@ -44,6 +44,7 @@
 #include <asm/apic.h>
 #include <asm/bootparam.h>
 #include <asm/reboot.h>
+#include <asm/setup.h>
 #include <asm/multikernel.h>
 #include <asm/realmode.h>
 #include <asm/cpu_entry_area.h>
@@ -157,6 +158,28 @@ static int mk_spawn_cpu(struct mk_instance *instance,
  * where this attempt stopped; everything is returned to the pool together
  * when the instance's memory is torn down.
  */
+/*
+ * The loaders put the command line right behind boot_params and leave room
+ * for COMMAND_LINE_SIZE. The segment was just restored from its load-time
+ * copy, so writing here lasts for this run only.
+ */
+static int mk_set_run_cmdline(struct kimage *image,
+			      struct mk_instance *instance)
+{
+	char *dst;
+
+	if (!instance->cmdline)
+		return 0;
+
+	dst = memremap(image->arch.mk_boot_params + sizeof(struct boot_params),
+		       COMMAND_LINE_SIZE, MEMREMAP_WB);
+	if (!dst)
+		return -ENOMEM;
+	memcpy(dst, instance->cmdline, instance->cmdline_len);
+	memunmap(dst);
+	return 0;
+}
+
 int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance)
 {
 	int cpu = arch_cpu_from_physical_id(mk_cpu_set_first(instance->cpus));
@@ -233,6 +256,10 @@ int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance)
 	memcpy(mk_spawn_context_boot_params(instance->arch.spawn_ctx), src_bp,
 	       sizeof(struct boot_params));
 	memunmap(src_bp);
+
+	ret = mk_set_run_cmdline(image, instance);
+	if (ret)
+		return ret;
 
 	/*
 	 * The loader's E820 reflects the grant at load time; regions added

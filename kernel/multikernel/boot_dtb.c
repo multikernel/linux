@@ -80,9 +80,10 @@ static int mk_dtb_add_memory(void *fdt, struct mk_instance *instance)
 	return 0;
 }
 
-static int mk_dtb_add_chosen(void *fdt, const void *loader_fdt)
+static int mk_dtb_add_chosen(void *fdt, const void *loader_fdt,
+			     struct mk_instance *instance)
 {
-	int from, to, i;
+	int from, to, i, ret;
 
 	from = fdt_path_offset(loader_fdt, "/chosen");
 	if (from < 0)
@@ -94,12 +95,20 @@ static int mk_dtb_add_chosen(void *fdt, const void *loader_fdt)
 
 	for (i = 0; i < ARRAY_SIZE(mk_chosen_props); i++) {
 		const void *val;
-		int len, ret;
+		int len;
 
 		val = fdt_getprop(loader_fdt, from, mk_chosen_props[i], &len);
 		if (!val)
 			continue;
 		ret = fdt_setprop(fdt, to, mk_chosen_props[i], val, len);
+		if (ret)
+			return ret;
+	}
+
+	/* This run was started with a command line of its own */
+	if (instance->cmdline) {
+		ret = fdt_setprop(fdt, to, "bootargs", instance->cmdline,
+				  instance->cmdline_len);
 		if (ret)
 			return ret;
 	}
@@ -155,7 +164,7 @@ int mk_build_boot_dtb(struct kimage *image, struct mk_instance *instance,
 	if (!ret)
 		ret = arch_nodes(fdt, instance);
 	if (!ret)
-		ret = mk_dtb_add_chosen(fdt, loader_fdt);
+		ret = mk_dtb_add_chosen(fdt, loader_fdt, instance);
 	if (!ret)
 		ret = fdt_pack(fdt);
 	if (ret) {

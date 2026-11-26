@@ -13,12 +13,15 @@
 #include <linux/anon_inodes.h>
 #include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/ima.h>
 #include <linux/io.h>
 #include <linux/kexec.h>
 #include <linux/mm.h>
 #include <linux/multikernel.h>
 #include <linux/sched.h>
 #include <linux/uaccess.h>
+
+#include <asm/setup.h>
 
 #include "kexec_internal.h"
 
@@ -299,8 +302,16 @@ void kimage_free_multikernel(struct kimage *image)
 	image->mk_instance = NULL;
 }
 
-static int multikernel_kexec(struct mk_instance *instance)
+/*
+ * Boot the image loaded for @instance. A @cmdline replaces the one the
+ * image was loaded with, for this run only. It becomes the instance's once
+ * the run has started, and stays the caller's on an error.
+ */
+static int multikernel_kexec(struct mk_instance *instance, char *cmdline,
+			     unsigned long cmdline_len)
 {
+	unsigned long last_cmdline_len;
+	char *last_cmdline;
 	struct kimage *mk_image;
 	int mk_id = instance->id;
 	int cpu = -1;
@@ -388,27 +399,60 @@ static int multikernel_kexec(struct mk_instance *instance)
 	}
 	pr_info("Manifest finalized for multikernel instance\n");
 
+	last_cmdline = instance->cmdline;
+	last_cmdline_len = instance->cmdline_len;
+	instance->cmdline = cmdline;
+	instance->cmdline_len = cmdline_len;
+
 	rc = mk_instance_start(instance, mk_image);
+	if (rc) {
+		/* No run began, so the last one is still the last */
+		instance->cmdline = last_cmdline;
+		instance->cmdline_len = last_cmdline_len;
+	} else {
+		kfree(last_cmdline);
+	}
 
 unlock:
 	kexec_unlock();
 	return rc;
 }
 
-static long kexec_mk_ioctl_start(struct mk_instance *instance,
-				 void __user *uarg)
+static long kexec_mk_ioctl_start(struct file *file, void __user *uarg)
 {
+	struct mk_instance *instance = file->private_data;
 	struct kexec_mk_start start;
+	char *cmdline = NULL;
+	long ret;
 
 	if (copy_from_user(&start, uarg, sizeof(start)))
 		return -EFAULT;
 	if (start.flags || start.pad)
 		return -EINVAL;
-	if (start.cmdline || start.cmdline_len)
-		return -EOPNOTSUPP;
+	if (!start.cmdline != !start.cmdline_len)
+		return -EINVAL;
+
+	if (start.cmdline) {
+		if (start.cmdline_len > COMMAND_LINE_SIZE)
+			return -E2BIG;
+
+		cmdline = memdup_user(u64_to_user_ptr(start.cmdline),
+				      start.cmdline_len);
+		if (IS_ERR(cmdline))
+			return PTR_ERR(cmdline);
+		if (cmdline[start.cmdline_len - 1] != '\0') {
+			kfree(cmdline);
+			return -EINVAL;
+		}
+
+		ima_kexec_cmdline_file(file, cmdline, start.cmdline_len - 1);
+	}
 
 	/* Nothing reports a finished boot yet, so timeout_ms has nothing to bound */
-	return multikernel_kexec(instance);
+	ret = multikernel_kexec(instance, cmdline, start.cmdline_len);
+	if (ret)
+		kfree(cmdline);
+	return ret;
 }
 
 static long kexec_mk_ioctl_halt(struct mk_instance *instance,
@@ -511,7 +555,7 @@ static long kexec_mk_ioctl(struct file *file, unsigned int cmd,
 
 	switch (cmd) {
 	case KEXEC_MK_IOC_START:
-		return kexec_mk_ioctl_start(instance, uarg);
+		return kexec_mk_ioctl_start(file, uarg);
 	case KEXEC_MK_IOC_HALT:
 		return kexec_mk_ioctl_halt(instance, uarg);
 	case KEXEC_MK_IOC_INFO:
