@@ -255,9 +255,6 @@ static inline int arch_check_excluded_range(struct kimage *image,
 #ifdef CONFIG_SIGNED_PE_FILE_VERIFICATION
 int kexec_kernel_verify_pe_sig(const char *kernel, unsigned long kernel_len);
 #endif
-#ifdef CONFIG_KEXEC_VMLINUX_VERIFY_SIG
-int kexec_kernel_verify_appended_sig(const char *kernel, unsigned long kernel_len);
-#endif
 #endif
 
 extern int kexec_add_buffer(struct kexec_buf *kbuf);

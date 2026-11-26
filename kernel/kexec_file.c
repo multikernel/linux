@@ -24,7 +24,6 @@
 #include <linux/elfcore.h>
 #include <linux/kernel.h>
 #include <linux/kernel_read_file.h>
-#include <linux/module_signature.h>
 #include <linux/syscalls.h>
 #include <linux/vmalloc.h>
 #include <linux/dma-map-ops.h>
@@ -157,49 +156,6 @@ int kexec_kernel_verify_pe_sig(const char *kernel, unsigned long kernel_len)
 		ret = verify_pefile_signature(kernel, kernel_len,
 					      VERIFY_USE_PLATFORM_KEYRING,
 					      VERIFYING_KEXEC_PE_SIGNATURE);
-	}
-	return ret;
-}
-#endif
-
-#ifdef CONFIG_KEXEC_VMLINUX_VERIFY_SIG
-/*
- * Verify a PKCS#7 signature appended to a kernel image in the module
- * signature format, as produced by scripts/sign-file. This is for images
- * with no PE wrapper to carry a signature, such as an ELF vmlinux.
- */
-int kexec_kernel_verify_appended_sig(const char *kernel, unsigned long kernel_len)
-{
-	const unsigned long marker_len = sizeof(MODULE_SIG_STRING) - 1;
-	struct module_signature ms;
-	unsigned long sig_len;
-	int ret;
-
-	if (kernel_len <= marker_len + sizeof(ms))
-		return -ENODATA;
-	if (memcmp(kernel + kernel_len - marker_len, MODULE_SIG_STRING, marker_len))
-		return -ENODATA;
-	kernel_len -= marker_len;
-
-	memcpy(&ms, kernel + kernel_len - sizeof(ms), sizeof(ms));
-	ret = mod_check_sig(&ms, kernel_len, "kexec image");
-	if (ret)
-		return ret;
-
-	sig_len = be32_to_cpu(ms.sig_len);
-	kernel_len -= sizeof(ms) + sig_len;
-
-	ret = verify_pkcs7_signature(kernel, kernel_len,
-				     kernel + kernel_len, sig_len,
-				     VERIFY_USE_SECONDARY_KEYRING,
-				     VERIFYING_MODULE_SIGNATURE,
-				     NULL, NULL);
-	if (ret == -ENOKEY && IS_ENABLED(CONFIG_INTEGRITY_PLATFORM_KEYRING)) {
-		ret = verify_pkcs7_signature(kernel, kernel_len,
-					     kernel + kernel_len, sig_len,
-					     VERIFY_USE_PLATFORM_KEYRING,
-					     VERIFYING_MODULE_SIGNATURE,
-					     NULL, NULL);
 	}
 	return ret;
 }
