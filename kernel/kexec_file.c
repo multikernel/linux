@@ -368,18 +368,15 @@ out:
 static int
 kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 		       int initrd_fd, const char __user *cmdline_ptr,
-		       unsigned long cmdline_len, unsigned long flags,
-		       struct mk_instance *instance)
+		       unsigned long cmdline_len, unsigned long flags)
 {
 	int ret;
 	struct kimage *image;
 	bool kexec_on_panic = flags & KEXEC_FILE_ON_CRASH;
 
 	image = do_kimage_alloc_init();
-	if (!image) {
-		mk_instance_put(instance);
+	if (!image)
 		return -ENOMEM;
-	}
 
 	kexec_file_dbg_print = !!(flags & KEXEC_FILE_DEBUG);
 	image->file_mode = 1;
@@ -389,17 +386,11 @@ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 		/* Enable special crash kernel control page alloc policy. */
 		image->control_page = crashk_res.start;
 		image->type = KEXEC_TYPE_CRASH;
-	} else
+	}
 #endif
-	if (instance) {
-		int mk_id = KEXEC_FILE_GET_MK_ID(flags);
 
-		image->type = KEXEC_TYPE_MULTIKERNEL;
-
-		image->mk_instance = instance;
-		image->mk_id = mk_id;
-
-		ret = mk_instance_alloc_manifest(instance);
+	if (flags & KEXEC_FILE_MULTIKERNEL) {
+		ret = kimage_init_multikernel(image, flags);
 		if (ret)
 			goto out_free_image;
 	}
@@ -449,7 +440,6 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 	int image_type = (flags & KEXEC_FILE_ON_CRASH) ?
 			 KEXEC_TYPE_CRASH : KEXEC_TYPE_DEFAULT;
 	struct kimage **dest_image, *image;
-	struct mk_instance *instance = NULL;
 	int ret = 0, i;
 
 	/* We only trust the superuser with rebooting the system. */
@@ -469,64 +459,10 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 	if (!kexec_trylock())
 		return -EBUSY;
 
-	if (flags & KEXEC_FILE_MULTIKERNEL) {
-		int mk_id = KEXEC_FILE_GET_MK_ID(flags);
-
-		if (mk_id <= 0) {
-			pr_err("Invalid multikernel ID %d\n", mk_id);
-			ret = -EINVAL;
-			goto out;
-		}
-
-		if (flags & KEXEC_FILE_UNLOAD) {
-			struct kimage *mk_image;
-
-			mk_image = kimage_find_by_id(mk_id);
-			if (!mk_image) {
-				pr_err("No loaded kernel found for multikernel instance %d\n", mk_id);
-				ret = -ENOENT;
-				goto out;
-			}
-
-			/* Its segments hold the kernel that is running there */
-			if (READ_ONCE(mk_image->mk_instance->state) == MK_STATE_ACTIVE) {
-				pr_err("Multikernel instance %d is running, halt it before unloading\n",
-				       mk_id);
-				ret = -EBUSY;
-				goto out;
-			}
-
-			pr_info("Unloading kernel from multikernel instance %d\n", mk_id);
-			image = mk_image;
-			ret = 0;
-			goto out;
-		} else {
-			instance = mk_instance_find(mk_id);
-			if (!instance) {
-				pr_err("No multikernel instance found with ID %d\n", mk_id);
-				ret = -ENOENT;
-				goto out;
-			}
-
-			if (instance->kimage) {
-				pr_err("Multikernel instance %d already has an associated kimage\n", mk_id);
-				mk_instance_put(instance);
-				ret = -EBUSY;
-				goto out;
-			}
-
-			/*
-			 * A CPU of the previous run may still execute in the
-			 * memory the new image is about to be copied into.
-			 */
-			ret = mk_instance_confirm_parked(instance);
-			if (ret) {
-				pr_err("Multikernel instance %d still has running CPUs, refusing to load\n",
-				       mk_id);
-				mk_instance_put(instance);
-				goto out;
-			}
-		}
+	if ((flags & KEXEC_FILE_MULTIKERNEL) && (flags & KEXEC_FILE_UNLOAD)) {
+		/* Freed below, like any image that is unloaded */
+		ret = kimage_unload_multikernel(flags, &image);
+		goto out;
 	}
 
 #ifdef CONFIG_CRASH_DUMP
@@ -549,9 +485,8 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 	if (flags & KEXEC_FILE_ON_CRASH)
 		kimage_free(xchg(&kexec_crash_image, NULL));
 
-	/* Consumes the instance reference, on failure too */
 	ret = kimage_file_alloc_init(&image, kernel_fd, initrd_fd, cmdline_ptr,
-				     cmdline_len, flags, instance);
+				     cmdline_len, flags);
 	if (ret)
 		goto out;
 
@@ -598,29 +533,19 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 
 	kexec_dprintk("kexec_file_load: type:%u, start:0x%lx head:0x%lx flags:0x%lx\n",
 		      image->type, image->start, image->head, flags);
+
+	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
+		/* It belongs to its instance and replaces no other image */
+		kimage_publish_multikernel(image);
+		image = NULL;
+		goto out;
+	}
+
 	/*
 	 * Free up any temporary buffers allocated which are not needed
 	 * after image has been loaded
 	 */
-	/*
-	 * A multikernel instance is booted more than once and re-copies its
-	 * segments from these buffers on every spawn, so they have to live as
-	 * long as the image does. kimage_free() cleans up instead.
-	 */
-	if (image->type != KEXEC_TYPE_MULTIKERNEL)
-		kimage_file_post_load_cleanup(image);
-
-	if (image && image->type == KEXEC_TYPE_MULTIKERNEL) {
-		/* Publish only a complete image to exec, unload and IPI */
-		image->mk_instance->kimage = image;
-		if (image->mk_instance->ipi_phys)
-			image->mk_instance->ipi_data =
-				phys_to_virt(image->mk_instance->ipi_phys);
-		mk_instance_set_state(image->mk_instance, MK_STATE_LOADED);
-		image = NULL; /* Don't free the new image */
-		goto out;
-	}
-
+	kimage_file_post_load_cleanup(image);
 exchange:
 	image = xchg(dest_image, image);
 out:

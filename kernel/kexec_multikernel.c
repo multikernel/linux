@@ -131,6 +131,112 @@ out:
 	return result;
 }
 
+static int mk_id_from_flags(unsigned long flags)
+{
+	int mk_id = KEXEC_FILE_GET_MK_ID(flags);
+
+	if (mk_id <= 0) {
+		pr_err("Invalid multikernel ID %d\n", mk_id);
+		return -EINVAL;
+	}
+	return mk_id;
+}
+
+/*
+ * Tie a new image to the instance named in @flags. The image holds a
+ * reference on the instance until kimage_free_multikernel().
+ */
+int kimage_init_multikernel(struct kimage *image, unsigned long flags)
+{
+	struct mk_instance *instance;
+	int mk_id, ret;
+
+	mk_id = mk_id_from_flags(flags);
+	if (mk_id < 0)
+		return mk_id;
+
+	instance = mk_instance_find(mk_id);
+	if (!instance) {
+		pr_err("No multikernel instance found with ID %d\n", mk_id);
+		return -ENOENT;
+	}
+
+	if (instance->kimage) {
+		pr_err("Multikernel instance %d already has an associated kimage\n", mk_id);
+		ret = -EBUSY;
+		goto out_put;
+	}
+
+	/*
+	 * A CPU of the previous run may still execute in the memory the new
+	 * image is about to be copied into.
+	 */
+	ret = mk_instance_confirm_parked(instance);
+	if (ret) {
+		pr_err("Multikernel instance %d still has running CPUs, refusing to load\n",
+		       mk_id);
+		goto out_put;
+	}
+
+	ret = mk_instance_alloc_manifest(instance);
+	if (ret)
+		goto out_put;
+
+	image->type = KEXEC_TYPE_MULTIKERNEL;
+	image->mk_instance = instance;
+	image->mk_id = mk_id;
+	return 0;
+
+out_put:
+	mk_instance_put(instance);
+	return ret;
+}
+
+/*
+ * Make a completely loaded image visible to start, unload and IPI.
+ *
+ * Its load-time buffers are not freed here as they are for other images: an
+ * instance is booted more than once and re-copies its segments from them on
+ * every start, so they live until kimage_free_multikernel().
+ */
+void kimage_publish_multikernel(struct kimage *image)
+{
+	struct mk_instance *instance = image->mk_instance;
+
+	instance->kimage = image;
+	if (instance->ipi_phys)
+		instance->ipi_data = phys_to_virt(instance->ipi_phys);
+	mk_instance_set_state(instance, MK_STATE_LOADED);
+}
+
+/* Hand the image of a stopped instance to the caller, which frees it */
+int kimage_unload_multikernel(unsigned long flags, struct kimage **rimage)
+{
+	struct kimage *image;
+	int mk_id;
+
+	mk_id = mk_id_from_flags(flags);
+	if (mk_id < 0)
+		return mk_id;
+
+	image = kimage_find_by_id(mk_id);
+	if (!image) {
+		pr_err("No loaded kernel found for multikernel instance %d\n", mk_id);
+		return -ENOENT;
+	}
+
+	/* Its segments hold the kernel that is running there */
+	if (READ_ONCE(image->mk_instance->state) == MK_STATE_ACTIVE) {
+		pr_err("Multikernel instance %d is running, halt it before unloading\n",
+		       mk_id);
+		return -EBUSY;
+	}
+
+	pr_info("Unloading kernel from multikernel instance %d\n", mk_id);
+	*rimage = image;
+	return 0;
+}
+
 /*
  * Release what a multikernel image holds: its segments in the instance pool,
  * its load-time buffers and its reference on the instance. Also unwinds a
