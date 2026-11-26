@@ -11,7 +11,6 @@
 #include <linux/ctype.h>
 #include <linux/export.h>
 #include <linux/kexec.h>
-#include <linux/multikernel.h>
 #include <linux/kmod.h>
 #include <linux/kmsg_dump.h>
 #include <linux/reboot.h>
@@ -718,10 +717,6 @@ EXPORT_SYMBOL_GPL(kernel_power_off);
 
 DEFINE_MUTEX(system_transition_mutex);
 
-struct multikernel_boot_args {
-	int mk_id;
-};
-
 /*
  * Reboot system call: for obvious reasons only root may call it,
  * and even root needs to set up some magic numbers in the registers
@@ -734,7 +729,6 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 		void __user *, arg)
 {
 	struct pid_namespace *pid_ns = task_active_pid_ns(current);
-	struct multikernel_boot_args boot_args;
 	char buffer[256];
 	int ret = 0;
 
@@ -804,27 +798,6 @@ SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,
 #ifdef CONFIG_KEXEC_CORE
 	case LINUX_REBOOT_CMD_KEXEC:
 		ret = kernel_kexec();
-		break;
-	case LINUX_REBOOT_CMD_MULTIKERNEL:
-		if (copy_from_user(&boot_args, arg, sizeof(boot_args))) {
-			ret = -EFAULT;
-			break;
-		}
-		ret = multikernel_kexec_by_id(boot_args.mk_id);
-		break;
-	case LINUX_REBOOT_CMD_MULTIKERNEL_HALT:
-		if (copy_from_user(&boot_args, arg, sizeof(boot_args))) {
-			ret = -EFAULT;
-			break;
-		}
-		ret = multikernel_halt_by_id(boot_args.mk_id);
-		break;
-	case LINUX_REBOOT_CMD_MULTIKERNEL_HALT_FORCE:
-		if (copy_from_user(&boot_args, arg, sizeof(boot_args))) {
-			ret = -EFAULT;
-			break;
-		}
-		ret = multikernel_force_halt_by_id(boot_args.mk_id);
 		break;
 #endif
 

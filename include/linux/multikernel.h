@@ -865,8 +865,6 @@ struct pci_dev;
 
 #ifdef CONFIG_MULTIKERNEL
 bool multikernel_allow_emergency_restart(void);
-int multikernel_halt_by_id(int mk_id);
-int multikernel_force_halt_by_id(int mk_id);
 bool mk_instance_alive(struct mk_instance *instance);
 int mk_instance_halt(struct mk_instance *instance, unsigned int timeout_ms);
 int mk_instance_force_halt(struct mk_instance *instance);
@@ -976,18 +974,9 @@ static inline bool multikernel_allow_emergency_restart(void)
 {
 	return true;
 }
-static inline int multikernel_halt_by_id(int mk_id)
-{
-	return -ENODEV;
-}
 static inline bool mk_crash_notes_wanted(void)
 {
 	return false;
-}
-
-static inline int multikernel_force_halt_by_id(int mk_id)
-{
-	return -ENODEV;
 }
 static inline struct mk_instance *mk_instance_find(int mk_id)
 {

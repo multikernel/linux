@@ -1651,7 +1651,7 @@ void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size)
  *    - Spawn kernel parks all its CPUs in the pool wait loop
  *    - Works when spawn kernel is responsive
  *
- * 2. Forcible shutdown (NMI-based, multikernel_force_halt_by_id):
+ * 2. Forcible shutdown (NMI-based, mk_instance_force_halt):
  *    - Host sets shutdown flag in shared memory for target CPUs
  *    - Host sends NMI directly to spawn CPUs
  *    - NMI handler checks shared memory marker and stops if flagged
@@ -1936,23 +1936,9 @@ int mk_instance_halt(struct mk_instance *instance, unsigned int timeout_ms)
 	return ret;
 }
 
-int multikernel_halt_by_id(int mk_id)
-{
-	struct mk_instance *instance;
-	int ret;
-
-	instance = mk_instance_find(mk_id);
-	if (!instance)
-		return -ENOENT;
-
-	ret = mk_instance_halt(instance, 30000);
-	mk_instance_put(instance);
-	return ret;
-}
-
 /**
- * multikernel_force_halt_by_id - Forcible shutdown of a multikernel instance via NMI
- * @mk_id: Instance ID to halt
+ * mk_instance_force_halt - Forcible shutdown of a multikernel instance via NMI
+ * @instance: Instance to halt
  *
  * Forces a spawn kernel's CPUs to stop by arming the force-halt marker
  * in the instance's shared IPI area and sending NMIs directly to each
@@ -2136,20 +2122,6 @@ int mk_instance_force_halt(struct mk_instance *instance)
 	}
 
 	mk_cpu_set_free(targets);
-	return ret;
-}
-
-int multikernel_force_halt_by_id(int mk_id)
-{
-	struct mk_instance *instance;
-	int ret;
-
-	instance = mk_instance_find(mk_id);
-	if (!instance)
-		return -ENOENT;
-
-	ret = mk_instance_force_halt(instance);
-	mk_instance_put(instance);
 	return ret;
 }
 

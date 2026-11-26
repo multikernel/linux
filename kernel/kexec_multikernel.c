@@ -239,6 +239,7 @@ static void kimage_unpublish_multikernel(struct kimage *image)
 /* Hand the image of a stopped instance to the caller, which frees it */
 int kimage_unload_multikernel(unsigned long flags, struct kimage **rimage)
 {
+	struct mk_instance *instance;
 	struct kimage *image;
 	int mk_id;
 
@@ -246,7 +247,10 @@ int kimage_unload_multikernel(unsigned long flags, struct kimage **rimage)
 	if (mk_id < 0)
 		return mk_id;
 
-	image = kimage_find_by_id(mk_id);
+	instance = mk_instance_find(mk_id);
+	image = instance ? instance->kimage : NULL;
+	/* The image holds a reference of its own */
+	mk_instance_put(instance);
 	if (!image) {
 		pr_err("No loaded kernel found for multikernel instance %d\n", mk_id);
 		return -ENOENT;
@@ -293,27 +297,6 @@ void kimage_free_multikernel(struct kimage *image)
 	kimage_unpublish_multikernel(image);
 	mk_instance_put(instance);
 	image->mk_instance = NULL;
-}
-
-/*
- * Find a multikernel image by ID using mk_instance lookup
- */
-struct kimage *kimage_find_by_id(int mk_id)
-{
-	struct mk_instance *instance;
-	struct kimage *image = NULL;
-
-	if (mk_id <= 0)
-		return NULL;
-
-	/* Use mk_instance system to find the associated kimage */
-	instance = mk_instance_find(mk_id);
-	if (instance) {
-		image = instance->kimage;
-		mk_instance_put(instance); /* Release reference from find */
-	}
-
-	return image;
 }
 
 static int multikernel_kexec(struct mk_instance *instance)
@@ -409,20 +392,6 @@ static int multikernel_kexec(struct mk_instance *instance)
 
 unlock:
 	kexec_unlock();
-	return rc;
-}
-
-int multikernel_kexec_by_id(int mk_id)
-{
-	struct mk_instance *instance;
-	int rc;
-
-	instance = mk_instance_find(mk_id);
-	if (!instance)
-		return -ENOENT;
-
-	rc = multikernel_kexec(instance);
-	mk_instance_put(instance);
 	return rc;
 }
 
