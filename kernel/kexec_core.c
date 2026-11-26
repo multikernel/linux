@@ -592,33 +592,31 @@ void kimage_free(struct kimage *image)
 	}
 #endif
 
-	if (image->type != KEXEC_TYPE_MULTIKERNEL) {
-		kimage_free_extra_pages(image);
-		for_each_kimage_entry(image, ptr, entry) {
-			if (entry & IND_INDIRECTION) {
-				/* Free the previous indirection page */
-				if (ind & IND_INDIRECTION)
-					kimage_free_entry(ind);
-				/* Save this indirection page until we are
-				 * done with it.
-				 */
-				ind = entry;
-			} else if (entry & IND_SOURCE)
-				kimage_free_entry(entry);
-		}
-		/* Free the final indirection page */
-		if (ind & IND_INDIRECTION)
-			kimage_free_entry(ind);
-
-		/* Free CMA allocations */
-		kimage_free_cma(image);
+	kimage_free_extra_pages(image);
+	for_each_kimage_entry(image, ptr, entry) {
+		if (entry & IND_INDIRECTION) {
+			/* Free the previous indirection page */
+			if (ind & IND_INDIRECTION)
+				kimage_free_entry(ind);
+			/* Save this indirection page until we are
+			 * done with it.
+			 */
+			ind = entry;
+		} else if (entry & IND_SOURCE)
+			kimage_free_entry(entry);
 	}
+	/* Free the final indirection page */
+	if (ind & IND_INDIRECTION)
+		kimage_free_entry(ind);
 
 	/* Handle any machine specific cleanup */
 	machine_kexec_cleanup(image);
 
 	/* Free the kexec control pages... */
 	kimage_free_page_list(&image->control_pages);
+
+	/* Free CMA allocations */
+	kimage_free_cma(image);
 
 	/*
 	 * Free up any temporary buffers allocated. This might hit if
