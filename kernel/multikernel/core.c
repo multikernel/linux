@@ -434,6 +434,21 @@ struct mk_instance *mk_instance_find(int mk_id)
 	return instance;
 }
 
+/*
+ * A holder of a reference asks whether its instance was destroyed
+ * meanwhile. The id alone cannot tell: a later instance may reuse it.
+ */
+bool mk_instance_alive(struct mk_instance *instance)
+{
+	bool alive;
+
+	mutex_lock(&mk_instance_mutex);
+	alive = idr_find(&mk_instance_idr, instance->id) == instance;
+	mutex_unlock(&mk_instance_mutex);
+
+	return alive;
+}
+
 /**
  * mk_instance_start - Start an instance from its freshly copied image
  * @instance: The instance, not running
@@ -1756,6 +1771,24 @@ static void mk_halted_work_fn(struct work_struct *work)
 }
 
 /*
+ * Settle an instance that halted with nobody waiting for it. Deferred to a
+ * workqueue because instance lookup takes a mutex and the CPUs still need
+ * time to reach the park loop, while the notice arrives in IPI context.
+ */
+static void mk_settle_halted_later(struct mk_instance *instance)
+{
+	struct mk_halted_work *aw;
+
+	aw = kmalloc_obj(*aw, GFP_ATOMIC);
+	if (!aw)
+		return;
+
+	INIT_WORK(&aw->work, mk_halted_work_fn);
+	aw->instance_id = instance->id;
+	schedule_work(&aw->work);
+}
+
+/*
  * A kernel may only report its own halt. It is told apart by the ring the
  * notice came in on, not by the ID it wrote into the notice: the notice
  * stays in memory the sender can still write, so act on from->id only.
@@ -1815,35 +1848,24 @@ static void mk_system_msg_handler(struct mk_instance *from, u32 msg_type, u32 su
 		/*
 		 * Reply to a shutdown this kernel requested: wake the
 		 * requester, which waits for the instance's CPUs to park
-		 * and settles its state itself.
+		 * and settles its state itself. A requester that did not
+		 * wait, or gave up, left that to this handler.
 		 */
-		mk_msg_pending_complete(MK_MSG_SYSTEM, MK_SYS_SHUTDOWN,
-					from->id, ack->result);
+		if (!mk_msg_pending_complete(MK_MSG_SYSTEM, MK_SYS_SHUTDOWN,
+					     from->id, ack->result))
+			mk_settle_halted_later(from);
 		break;
 	}
 	case MK_SYS_HALTED: {
 		struct mk_resource_ack *ack = payload;
-		struct mk_halted_work *aw;
 
 		if (payload_len < sizeof(*ack))
 			return;
 		if (!mk_halt_notice_from(from, ack))
 			return;
 
-		/*
-		 * The instance halted itself; nobody is waiting on it, so
-		 * settle its state from here. Deferred to a workqueue
-		 * because instance lookup takes a mutex and the CPUs still
-		 * need time to reach the park loop, while this runs in IPI
-		 * context.
-		 */
-		aw = kmalloc(sizeof(*aw), GFP_ATOMIC);
-		if (!aw)
-			break;
-
-		INIT_WORK(&aw->work, mk_halted_work_fn);
-		aw->instance_id = from->id;
-		schedule_work(&aw->work);
+		/* The instance halted itself; nobody is waiting on it */
+		mk_settle_halted_later(from);
 		break;
 	}
 	default:
@@ -1852,59 +1874,78 @@ static void mk_system_msg_handler(struct mk_instance *from, u32 msg_type, u32 su
 }
 
 /**
- * multikernel_halt_by_id - Graceful shutdown of a multikernel instance
- * @mk_id: Instance ID to halt
+ * mk_instance_halt - Graceful shutdown of a multikernel instance
+ * @instance: Instance to halt
+ * @timeout_ms: How long to wait for it, 0 to only ask
  *
- * Sends a shutdown message to the spawn kernel and waits for acknowledgment.
- * The spawn kernel will stop its own CPUs using native mechanisms.
+ * Sends a shutdown message to the spawn kernel, which stops its own CPUs,
+ * and waits for the acknowledgment. The timeout bounds the wait and nothing
+ * else: a request that was sent stays in effect, and the instance is
+ * settled whenever its acknowledgment arrives.
  *
  * Use when: The spawn kernel is responsive and able to process messages.
  *
- * Returns: 0 on success, negative error code on failure or timeout
+ * Returns: 0 if the instance halted, was asked to with no wait, or was not
+ * running in the first place; -ETIMEDOUT if it is still running, -EINTR if
+ * a signal ended the wait; another negative error code if it could not be
+ * asked.
  */
+int mk_instance_halt(struct mk_instance *instance, unsigned int timeout_ms)
+{
+	struct mk_shutdown_payload payload;
+	struct mk_pending_msg *pending = NULL;
+	int ret;
+
+	if (instance == mk_self)
+		return -EINVAL;
+
+	if (READ_ONCE(instance->state) != MK_STATE_ACTIVE)
+		return 0;
+
+	payload.flags = MK_SHUTDOWN_GRACEFUL;
+	payload.sender_instance_id = mk_self->id;
+
+	if (timeout_ms) {
+		pending = mk_msg_pending_add(MK_MSG_SYSTEM, MK_SYS_SHUTDOWN,
+					     instance->id);
+		if (!pending)
+			return -ENOMEM;
+	}
+
+	ret = mk_send_message_to(instance, MK_MSG_SYSTEM, MK_SYS_SHUTDOWN,
+				 &payload, sizeof(payload));
+	if (ret < 0) {
+		if (pending)
+			mk_msg_pending_wait(pending, 0);
+		return ret;
+	}
+	if (!pending)
+		return 0;
+
+	ret = mk_msg_pending_wait_interruptible(pending, timeout_ms);
+	if (ret == 0) {
+		if (mk_instance_confirm_parked(instance))
+			pr_warn("Multikernel instance %d halted with CPUs unaccounted for\n",
+				instance->id);
+
+		mk_instance_settle_halted(instance);
+		pr_info("Multikernel instance %d halted (graceful)\n",
+			instance->id);
+	}
+
+	return ret;
+}
+
 int multikernel_halt_by_id(int mk_id)
 {
 	struct mk_instance *instance;
-	struct mk_shutdown_payload payload;
-	struct mk_pending_msg *pending;
 	int ret;
 
 	instance = mk_instance_find(mk_id);
 	if (!instance)
 		return -ENOENT;
 
-	if (instance->state != MK_STATE_ACTIVE) {
-		mk_instance_put(instance);
-		return -EINVAL;
-	}
-
-	payload.flags = MK_SHUTDOWN_GRACEFUL;
-	payload.sender_instance_id = mk_self->id;
-
-	pending = mk_msg_pending_add(MK_MSG_SYSTEM, MK_SYS_SHUTDOWN, mk_id);
-	if (!pending) {
-		mk_instance_put(instance);
-		return -ENOMEM;
-	}
-
-	ret = mk_send_message(mk_id, MK_MSG_SYSTEM, MK_SYS_SHUTDOWN,
-			      &payload, sizeof(payload));
-	if (ret < 0) {
-		mk_msg_pending_wait(pending, 0);
-		mk_instance_put(instance);
-		return ret;
-	}
-
-	ret = mk_msg_pending_wait(pending, 30000);
-	if (ret == 0) {
-		if (mk_instance_confirm_parked(instance))
-			pr_warn("Multikernel instance %d halted with CPUs unaccounted for\n",
-				mk_id);
-
-		mk_instance_settle_halted(instance);
-		pr_info("Multikernel instance %d halted (graceful)\n", mk_id);
-	}
-
+	ret = mk_instance_halt(instance, 30000);
 	mk_instance_put(instance);
 	return ret;
 }
@@ -2027,22 +2068,17 @@ static void mk_promote(struct mk_instance *host)
 		old_id);
 }
 
-int multikernel_force_halt_by_id(int mk_id)
+int mk_instance_force_halt(struct mk_instance *instance)
 {
-	struct mk_instance *instance;
 	struct mk_cpu_set *targets;
 	mk_phys_cpu_t phys_cpu;
 	unsigned int i;
+	int mk_id = instance->id;
 	int cpu_count = 0;
 	int ret;
 
-	instance = mk_instance_find(mk_id);
-	if (!instance)
-		return -ENOENT;
-
 	if (instance == mk_self) {
 		pr_err("Cannot force halt this kernel (id %d)\n", mk_id);
-		mk_instance_put(instance);
 		return -EINVAL;
 	}
 
@@ -2056,22 +2092,18 @@ int multikernel_force_halt_by_id(int mk_id)
 	    instance->state != MK_STATE_LOADED) {
 		pr_err("Instance %d not running (state=%d), nothing to force halt\n",
 			mk_id, instance->state);
-		mk_instance_put(instance);
 		return -EINVAL;
 	}
 
 	targets = mk_cpu_set_alloc();
-	if (!targets) {
-		mk_instance_put(instance);
+	if (!targets)
 		return -ENOMEM;
-	}
 	ret = mk_force_halt_targets(instance, targets);
 	if (!ret && mk_cpu_set_empty(targets))
 		ret = -EINVAL;
 	if (ret) {
 		pr_err("Instance %d: no force-halt targets: %d\n", mk_id, ret);
 		mk_cpu_set_free(targets);
-		mk_instance_put(instance);
 		return ret;
 	}
 
@@ -2104,6 +2136,19 @@ int multikernel_force_halt_by_id(int mk_id)
 	}
 
 	mk_cpu_set_free(targets);
+	return ret;
+}
+
+int multikernel_force_halt_by_id(int mk_id)
+{
+	struct mk_instance *instance;
+	int ret;
+
+	instance = mk_instance_find(mk_id);
+	if (!instance)
+		return -ENOENT;
+
+	ret = mk_instance_force_halt(instance);
 	mk_instance_put(instance);
 	return ret;
 }

@@ -20,6 +20,7 @@ struct mk_pending_msg {
 	u32 operation;              /* Operation subtype (e.g., MK_RES_CPU_ADD) */
 	u64 resource_id;            /* Resource identifier (physical CPU ID, PFN, etc.) */
 	int result;                 /* Operation result */
+	bool completed;             /* The answer arrived; under mk_pending_msgs_lock */
 	struct completion done;     /* Completion for waiting */
 	struct list_head list;      /* List linkage */
 };
@@ -142,11 +143,14 @@ struct mk_pending_msg *mk_msg_pending_add(u32 msg_type, u32 operation, u64 resou
  * @result: Operation result (0 = success, negative = error)
  *
  * Called by response handlers to wake up waiting thread
+ *
+ * Returns true if a thread waits for this answer and will act on it.
  */
-void mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id, int result)
+bool mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id, int result)
 {
 	struct mk_pending_msg *pending;
 	unsigned long flags;
+	bool found = false;
 
 	raw_spin_lock_irqsave(&mk_pending_msgs_lock, flags);
 	list_for_each_entry(pending, &mk_pending_msgs, list) {
@@ -154,11 +158,49 @@ void mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id, int r
 		    pending->operation == operation &&
 		    pending->resource_id == resource_id) {
 			pending->result = result;
+			pending->completed = true;
 			complete(&pending->done);
+			found = true;
 			break;
 		}
 	}
 	raw_spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
+
+	return found;
+}
+
+static int __mk_msg_pending_wait(struct mk_pending_msg *pending,
+				 unsigned long timeout_ms, bool interruptible)
+{
+	unsigned long timeout = msecs_to_jiffies(timeout_ms);
+	unsigned long flags;
+	long left = 0;
+	int result;
+
+	if (interruptible)
+		left = wait_for_completion_interruptible_timeout(&pending->done,
+								 timeout);
+	else
+		wait_for_completion_timeout(&pending->done, timeout);
+
+	/*
+	 * An answer that beats the removal was promised a waiter by
+	 * mk_msg_pending_complete(), so it counts even past the timeout.
+	 */
+	raw_spin_lock_irqsave(&mk_pending_msgs_lock, flags);
+	list_del(&pending->list);
+	if (pending->completed)
+		result = pending->result;
+	else
+		result = left < 0 ? -EINTR : -ETIMEDOUT;
+	raw_spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
+
+	if (result == -ETIMEDOUT && timeout_ms)
+		pr_err("Timeout waiting for operation 0x%x on resource %llu\n",
+		       pending->operation, pending->resource_id);
+	kfree(pending);
+
+	return result;
 }
 
 /**
@@ -170,25 +212,14 @@ void mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id, int r
  */
 int mk_msg_pending_wait(struct mk_pending_msg *pending, unsigned long timeout_ms)
 {
-	unsigned long timeout = msecs_to_jiffies(timeout_ms);
-	unsigned long flags;
-	int result;
+	return __mk_msg_pending_wait(pending, timeout_ms, false);
+}
 
-	if (!wait_for_completion_timeout(&pending->done, timeout)) {
-		pr_err("Timeout waiting for operation 0x%x on resource %llu\n",
-		       pending->operation, pending->resource_id);
-		result = -ETIMEDOUT;
-	} else {
-		result = pending->result;
-	}
-
-	/* Remove from list and free */
-	raw_spin_lock_irqsave(&mk_pending_msgs_lock, flags);
-	list_del(&pending->list);
-	raw_spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
-	kfree(pending);
-
-	return result;
+/* As above, and a signal ends the wait with -EINTR */
+int mk_msg_pending_wait_interruptible(struct mk_pending_msg *pending,
+				      unsigned long timeout_ms)
+{
+	return __mk_msg_pending_wait(pending, timeout_ms, true);
 }
 
 /**

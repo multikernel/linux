@@ -400,8 +400,10 @@ int mk_unregister_msg_handler(u32 msg_type, mk_msg_handler_t handler);
 
 /* Pending message tracking for request-response pattern */
 struct mk_pending_msg *mk_msg_pending_add(u32 msg_type, u32 operation, u64 resource_id);
-void mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id, int result);
+bool mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id, int result);
 int mk_msg_pending_wait(struct mk_pending_msg *pending, unsigned long timeout_ms);
+int mk_msg_pending_wait_interruptible(struct mk_pending_msg *pending,
+				      unsigned long timeout_ms);
 
 /* CPU resource management - these wait for operation to complete */
 int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags);
@@ -865,6 +867,9 @@ struct pci_dev;
 bool multikernel_allow_emergency_restart(void);
 int multikernel_halt_by_id(int mk_id);
 int multikernel_force_halt_by_id(int mk_id);
+bool mk_instance_alive(struct mk_instance *instance);
+int mk_instance_halt(struct mk_instance *instance, unsigned int timeout_ms);
+int mk_instance_force_halt(struct mk_instance *instance);
 bool mk_has_pending_shutdown(void);
 bool mk_force_halt_armed(void);
 bool mk_crash_notes_wanted(void);

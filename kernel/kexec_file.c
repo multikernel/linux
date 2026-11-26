@@ -397,12 +397,22 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 	struct kimage **dest_image, *image;
 	int ret = 0, i;
 
+	/* Opening an instance loads nothing, so load restrictions do not apply */
+	if ((flags & KEXEC_FILE_MULTIKERNEL) && (flags & KEXEC_FILE_MK_OPEN)) {
+		if (!capable(CAP_SYS_BOOT))
+			return -EPERM;
+		if (flags & ~(KEXEC_FILE_MULTIKERNEL | KEXEC_FILE_MK_OPEN |
+			      KEXEC_FILE_MK_ID_MASK))
+			return -EINVAL;
+		return kimage_open_multikernel(flags);
+	}
+
 	/* We only trust the superuser with rebooting the system. */
 	if (!kexec_load_permitted(image_type))
 		return -EPERM;
 
 	/* Make sure we have a legal set of flags */
-	if (flags != (flags & KEXEC_FILE_FLAGS))
+	if (flags != (flags & KEXEC_FILE_FLAGS) || (flags & KEXEC_FILE_MK_OPEN))
 		return -EINVAL;
 
 	/* A multikernel image is never a crash kernel */
@@ -491,8 +501,9 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 
 	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
 		/* It belongs to its instance and replaces no other image */
-		kimage_publish_multikernel(image);
-		image = NULL;
+		ret = kimage_publish_multikernel(image);
+		if (ret >= 0)
+			image = NULL;
 		goto out;
 	}
 

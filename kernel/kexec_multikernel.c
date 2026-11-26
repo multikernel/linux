@@ -4,11 +4,15 @@
  *
  * A multikernel image is loaded into the memory pool of its instance instead
  * of being staged for a reboot, and it is booted next to this kernel, any
- * number of times.
+ * number of times. User space drives the instance through a file descriptor
+ * that kexec_file_load() returns.
  */
 
 #define pr_fmt(fmt)	"kexec_multikernel: " fmt
 
+#include <linux/anon_inodes.h>
+#include <linux/file.h>
+#include <linux/fs.h>
 #include <linux/io.h>
 #include <linux/kexec.h>
 #include <linux/mm.h>
@@ -192,21 +196,44 @@ out_put:
 	return ret;
 }
 
+static int kexec_mk_getfd(struct mk_instance *instance);
+
 /*
- * Make a completely loaded image visible to start, unload and IPI.
+ * Make a completely loaded image visible to start, unload and IPI, and
+ * return a file descriptor for its instance. On an error the image is still
+ * the caller's to free.
  *
  * Its load-time buffers are not freed here as they are for other images: an
  * instance is booted more than once and re-copies its segments from them on
  * every start, so they live until kimage_free_multikernel().
  */
-void kimage_publish_multikernel(struct kimage *image)
+int kimage_publish_multikernel(struct kimage *image)
 {
 	struct mk_instance *instance = image->mk_instance;
+	int fd;
+
+	fd = kexec_mk_getfd(instance);
+	if (fd < 0)
+		return fd;
 
 	instance->kimage = image;
 	if (instance->ipi_phys)
 		instance->ipi_data = phys_to_virt(instance->ipi_phys);
 	mk_instance_set_state(instance, MK_STATE_LOADED);
+	return fd;
+}
+
+static void kimage_unpublish_multikernel(struct kimage *image)
+{
+	struct mk_instance *instance = image->mk_instance;
+
+	if (instance->kimage != image)
+		return;
+
+	/* No kernel left to read the ring */
+	instance->ipi_data = NULL;
+	instance->kimage = NULL;
+	mk_instance_set_state(instance, MK_STATE_READY);
 }
 
 /* Hand the image of a stopped instance to the caller, which frees it */
@@ -233,6 +260,8 @@ int kimage_unload_multikernel(unsigned long flags, struct kimage **rimage)
 	}
 
 	pr_info("Unloading kernel from multikernel instance %d\n", mk_id);
+	/* Under the kexec lock, so that no start or ioctl finds it once freed */
+	kimage_unpublish_multikernel(image);
 	*rimage = image;
 	return 0;
 }
@@ -261,12 +290,7 @@ void kimage_free_multikernel(struct kimage *image)
 	/* Load-time buffers were kept as the source for each spawn */
 	kimage_file_post_load_cleanup(image);
 
-	if (instance->kimage == image) {
-		/* No kernel left to read the ring */
-		instance->ipi_data = NULL;
-		instance->kimage = NULL;
-		mk_instance_set_state(instance, MK_STATE_READY);
-	}
+	kimage_unpublish_multikernel(image);
 	mk_instance_put(instance);
 	image->mk_instance = NULL;
 }
@@ -292,24 +316,33 @@ struct kimage *kimage_find_by_id(int mk_id)
 	return image;
 }
 
-int multikernel_kexec_by_id(int mk_id)
+static int multikernel_kexec(struct mk_instance *instance)
 {
 	struct kimage *mk_image;
-	struct mk_instance *instance;
+	int mk_id = instance->id;
 	int cpu = -1;
 	int i, rc;
 
 	if (!kexec_trylock())
 		return -EBUSY;
 
-	mk_image = kimage_find_by_id(mk_id);
-	if (!mk_image) {
-		pr_err("No multikernel image found with ID %d\n", mk_id);
-		rc = -EINVAL;
+	if (!mk_instance_alive(instance)) {
+		rc = -ENODEV;
 		goto unlock;
 	}
 
-	instance = mk_image->mk_instance;
+	mk_image = instance->kimage;
+	if (!mk_image) {
+		pr_err("No multikernel image loaded for instance %d\n", mk_id);
+		rc = -ENOEXEC;
+		goto unlock;
+	}
+
+	if (READ_ONCE(instance->state) == MK_STATE_ACTIVE) {
+		rc = -EBUSY;
+		goto unlock;
+	}
+
 	if (!mk_cpu_set_empty(instance->cpus)) {
 		mk_phys_cpu_t phys_cpu = mk_cpu_set_first(instance->cpus);
 
@@ -377,4 +410,196 @@ int multikernel_kexec_by_id(int mk_id)
 unlock:
 	kexec_unlock();
 	return rc;
+}
+
+int multikernel_kexec_by_id(int mk_id)
+{
+	struct mk_instance *instance;
+	int rc;
+
+	instance = mk_instance_find(mk_id);
+	if (!instance)
+		return -ENOENT;
+
+	rc = multikernel_kexec(instance);
+	mk_instance_put(instance);
+	return rc;
+}
+
+static long kexec_mk_ioctl_start(struct mk_instance *instance,
+				 void __user *uarg)
+{
+	struct kexec_mk_start start;
+
+	if (copy_from_user(&start, uarg, sizeof(start)))
+		return -EFAULT;
+	if (start.flags || start.pad)
+		return -EINVAL;
+	if (start.cmdline || start.cmdline_len)
+		return -EOPNOTSUPP;
+
+	/* Nothing reports a finished boot yet, so timeout_ms has nothing to bound */
+	return multikernel_kexec(instance);
+}
+
+static long kexec_mk_ioctl_halt(struct mk_instance *instance,
+				void __user *uarg)
+{
+	struct kexec_mk_halt halt;
+
+	if (copy_from_user(&halt, uarg, sizeof(halt)))
+		return -EFAULT;
+	if (halt.flags & ~KEXEC_MK_HALT_FORCE)
+		return -EINVAL;
+
+	if (halt.flags & KEXEC_MK_HALT_FORCE)
+		return mk_instance_force_halt(instance);
+
+	return mk_instance_halt(instance, halt.timeout_ms);
+}
+
+static u32 kexec_mk_state(struct mk_instance *instance)
+{
+	switch (READ_ONCE(instance->state)) {
+	case MK_STATE_ACTIVE:
+		return KEXEC_MK_STATE_ACTIVE;
+	case MK_STATE_LOADED:
+		return KEXEC_MK_STATE_LOADED;
+	default:
+		return KEXEC_MK_STATE_READY;
+	}
+}
+
+static long kexec_mk_ioctl_info(struct mk_instance *instance,
+				void __user *uarg)
+{
+	struct kexec_mk_info info = {};
+	u32 usize;
+
+	if (get_user(usize, (u32 __user *)uarg))
+		return -EFAULT;
+	if (usize < KEXEC_MK_INFO_SIZE_VER0)
+		return -EINVAL;
+
+	info.size = sizeof(info);
+	info.state = kexec_mk_state(instance);
+
+	if (copy_to_user(uarg, &info, min_t(size_t, usize, sizeof(info))))
+		return -EFAULT;
+	return 0;
+}
+
+static long kexec_mk_ioctl_cmdline(struct mk_instance *instance,
+				   void __user *uarg)
+{
+	struct kexec_mk_cmdline __user *ucmd = uarg;
+	struct kexec_mk_cmdline cmd;
+	struct kimage *image;
+	char *copy = NULL;
+	u32 len = 1;
+	long ret = 0;
+
+	if (copy_from_user(&cmd, ucmd, sizeof(cmd)))
+		return -EFAULT;
+	if (cmd.flags)
+		return -EINVAL;
+
+	/* An unload frees the image, command line included */
+	if (!kexec_trylock())
+		return -EBUSY;
+	image = instance->kimage;
+	if (!image) {
+		ret = -ENOEXEC;
+	} else if (image->cmdline_buf_len) {
+		len = image->cmdline_buf_len;
+		copy = kmemdup(image->cmdline_buf, len, GFP_KERNEL);
+		if (!copy)
+			ret = -ENOMEM;
+	}
+	kexec_unlock();
+	if (ret)
+		return ret;
+
+	if (put_user(len, &ucmd->len))
+		ret = -EFAULT;
+	else if (cmd.len < len)
+		ret = -EMSGSIZE;
+	else if (copy_to_user(u64_to_user_ptr(cmd.buf), copy ? copy : "", len))
+		ret = -EFAULT;
+
+	kfree(copy);
+	return ret;
+}
+
+static long kexec_mk_ioctl(struct file *file, unsigned int cmd,
+			   unsigned long arg)
+{
+	struct mk_instance *instance = file->private_data;
+	void __user *uarg = (void __user *)arg;
+
+	if (!mk_instance_alive(instance))
+		return -ENODEV;
+
+	switch (cmd) {
+	case KEXEC_MK_IOC_START:
+		return kexec_mk_ioctl_start(instance, uarg);
+	case KEXEC_MK_IOC_HALT:
+		return kexec_mk_ioctl_halt(instance, uarg);
+	case KEXEC_MK_IOC_INFO:
+		return kexec_mk_ioctl_info(instance, uarg);
+	case KEXEC_MK_IOC_CMDLINE:
+		return kexec_mk_ioctl_cmdline(instance, uarg);
+	default:
+		return -ENOTTY;
+	}
+}
+
+static int kexec_mk_release(struct inode *inode, struct file *file)
+{
+	mk_instance_put(file->private_data);
+	return 0;
+}
+
+static const struct file_operations kexec_mk_fops = {
+	.owner		= THIS_MODULE,
+	.unlocked_ioctl	= kexec_mk_ioctl,
+	.compat_ioctl	= compat_ptr_ioctl,
+	.release	= kexec_mk_release,
+	.llseek		= noop_llseek,
+};
+
+/* The fd holds the instance, not its image or its run: see release */
+static int kexec_mk_getfd(struct mk_instance *instance)
+{
+	int fd;
+
+	mk_instance_get(instance);
+	fd = anon_inode_getfd("[mk-instance]", &kexec_mk_fops, instance,
+			      O_RDWR | O_CLOEXEC);
+	if (fd < 0)
+		mk_instance_put(instance);
+	return fd;
+}
+
+/*
+ * Open an instance that exists, with or without an image. A descriptor
+ * names an instance this kernel spawned: there is none for this kernel
+ * itself or for its host.
+ */
+int kimage_open_multikernel(unsigned long flags)
+{
+	struct mk_instance *instance;
+	int fd;
+
+	instance = mk_instance_find(KEXEC_FILE_GET_MK_ID(flags));
+	if (!instance)
+		return -ENOENT;
+
+	if (instance == mk_self || instance == host_instance)
+		fd = -EINVAL;
+	else
+		fd = kexec_mk_getfd(instance);
+
+	mk_instance_put(instance);
+	return fd;
 }
