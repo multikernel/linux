@@ -48,6 +48,7 @@ int kimage_load_multikernel_segment(struct kimage *image, int idx);
 int kimage_init_multikernel(struct kimage *image, unsigned long flags);
 void kimage_publish_multikernel(struct kimage *image);
 int kimage_unload_multikernel(unsigned long flags, struct kimage **rimage);
+void kimage_free_mk_segments(struct kimage *image, unsigned long first);
 void kimage_free_multikernel(struct kimage *image);
 #else
 static inline int kexec_alloc_multikernel(struct kexec_buf *kbuf)
@@ -69,6 +70,8 @@ static inline int kimage_unload_multikernel(unsigned long flags,
 {
 	return -EOPNOTSUPP;
 }
+static inline void kimage_free_mk_segments(struct kimage *image,
+					   unsigned long first) { }
 static inline void kimage_free_multikernel(struct kimage *image) { }
 #endif /* CONFIG_MULTIKERNEL */
 

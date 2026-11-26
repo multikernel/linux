@@ -237,6 +237,16 @@ int kimage_unload_multikernel(unsigned long flags, struct kimage **rimage)
 	return 0;
 }
 
+/* Give the destinations of the segments from @first on back to the instance pool */
+void kimage_free_mk_segments(struct kimage *image, unsigned long first)
+{
+	unsigned long i;
+
+	for (i = first; i < image->nr_segments; i++)
+		mk_kimage_free(image, phys_to_virt(image->segment[i].mem),
+			       image->segment[i].memsz);
+}
+
 /*
  * Release what a multikernel image holds: its segments in the instance pool,
  * its load-time buffers and its reference on the instance. Also unwinds a
@@ -245,11 +255,8 @@ int kimage_unload_multikernel(unsigned long flags, struct kimage **rimage)
 void kimage_free_multikernel(struct kimage *image)
 {
 	struct mk_instance *instance = image->mk_instance;
-	unsigned long i;
 
-	for (i = 0; i < image->nr_segments; i++)
-		mk_kimage_free(image, phys_to_virt(image->segment[i].mem),
-			       image->segment[i].memsz);
+	kimage_free_mk_segments(image, 0);
 
 	/* Load-time buffers were kept as the source for each spawn */
 	kimage_file_post_load_cleanup(image);

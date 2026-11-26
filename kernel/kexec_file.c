@@ -27,7 +27,6 @@
 #include <linux/syscalls.h>
 #include <linux/vmalloc.h>
 #include <linux/dma-map-ops.h>
-#include <linux/multikernel.h>
 #include "kexec_internal.h"
 
 #ifdef CONFIG_KEXEC_SIG
@@ -760,12 +759,9 @@ static int kexec_alloc_contig(struct kexec_buf *kbuf)
  */
 void kexec_drop_segments(struct kimage *image, unsigned long nr)
 {
-	while (image->nr_segments > nr) {
-		struct kexec_segment *seg = &image->segment[--image->nr_segments];
-
-		if (image->type == KEXEC_TYPE_MULTIKERNEL)
-			mk_kimage_free(image, phys_to_virt(seg->mem), seg->memsz);
-	}
+	if (image->type == KEXEC_TYPE_MULTIKERNEL)
+		kimage_free_mk_segments(image, nr);
+	image->nr_segments = nr;
 }
 
 /**
