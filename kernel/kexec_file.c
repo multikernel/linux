@@ -396,9 +396,6 @@ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 
 		image->type = KEXEC_TYPE_MULTIKERNEL;
 
-		pr_info("kexec_file_load: multikernel load - flags=0x%lx, extracted mk_id=%d\n",
-			flags, mk_id);
-
 		image->mk_instance = instance;
 		image->mk_id = mk_id;
 
@@ -584,8 +581,8 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 		struct kexec_segment *ksegment;
 
 		ksegment = &image->segment[i];
-		kexec_dprintk("segment[%d]: kbuf=0x%px buf=0x%p bufsz=0x%zx mem=0x%lx memsz=0x%zx\n",
-			      i, ksegment->kbuf, ksegment->buf, ksegment->bufsz, ksegment->mem,
+		kexec_dprintk("segment[%d]: buf=0x%p bufsz=0x%zx mem=0x%lx memsz=0x%zx\n",
+			      i, ksegment->buf, ksegment->bufsz, ksegment->mem,
 			      ksegment->memsz);
 
 		ret = kimage_load_segment(image, i);
@@ -942,22 +939,12 @@ int kexec_locate_mem_hole(struct kexec_buf *kbuf)
 {
 	int ret;
 
-	pr_info("kexec_locate_mem_hole: called for segment size=0x%lx, mem=0x%lx, image_type=%d\n",
-		kbuf->memsz, kbuf->mem, kbuf->image->type);
-
 	/* Arch knows where to place */
-	if (kbuf->mem != KEXEC_BUF_MEM_UNKNOWN) {
-		pr_info("kexec_locate_mem_hole: memory already specified (0x%lx), skipping allocation\n", kbuf->mem);
+	if (kbuf->mem != KEXEC_BUF_MEM_UNKNOWN)
 		return 0;
-	}
 
-	if (kbuf->image->type == KEXEC_TYPE_MULTIKERNEL) {
-		ret = kexec_alloc_multikernel(kbuf);
-		if (ret) {
-			pr_err("Multikernel allocation failed: cannot fall back to other memory sources\n");
-		}
-		return ret;
-	}
+	if (kbuf->image->type == KEXEC_TYPE_MULTIKERNEL)
+		return kexec_alloc_multikernel(kbuf);
 
 	/*
 	 * If KHO is active, only use KHO scratch memory. All other memory
@@ -1032,9 +1019,6 @@ int kexec_add_buffer(struct kexec_buf *kbuf)
 	ksegment->bufsz = kbuf->bufsz;
 	ksegment->mem = kbuf->mem;
 	ksegment->memsz = kbuf->memsz;
-	pr_info("kexec_add_buffer: segment[%lu] kbuf=0x%px bufsz=0x%zx mem=0x%lx memsz=0x%zx\n",
-		kbuf->image->nr_segments, ksegment->kbuf, ksegment->bufsz,
-		ksegment->mem, ksegment->memsz);
 	kbuf->image->segment_cma[kbuf->image->nr_segments] = kbuf->cma;
 	kbuf->image->nr_segments++;
 	return 0;

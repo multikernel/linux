@@ -42,16 +42,11 @@
 #include <linux/objtool.h>
 #include <linux/kmsg_dump.h>
 #include <linux/multikernel.h>
-#include <linux/kexec_handover.h>
 #include <linux/dma-map-ops.h>
 #include <linux/sysfs.h>
-#include <linux/memblock.h>
 
 #include <asm/page.h>
 #include <asm/sections.h>
-#ifdef CONFIG_X86
-#include <asm/bootparam.h>
-#endif
 
 #include <crypto/hash.h>
 #include "kexec_internal.h"
@@ -254,9 +249,6 @@ struct kimage *do_kimage_alloc_init(void)
 
 	/* Initialize the list of unusable pages */
 	INIT_LIST_HEAD(&image->unusable_pages);
-
-	image->mk_id = 0;
-	image->mk_instance = NULL;
 
 #ifdef CONFIG_CRASH_HOTPLUG
 	image->hp_action = KEXEC_CRASH_HP_NONE;
@@ -469,6 +461,7 @@ static struct page *kimage_alloc_crash_control_pages(struct kimage *image,
 	return pages;
 }
 #endif
+
 
 struct page *kimage_alloc_control_pages(struct kimage *image,
 					 unsigned int order)
