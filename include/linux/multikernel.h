@@ -708,6 +708,7 @@ struct mk_instance {
 	void *host_tree;
 	size_t host_tree_len;
 	bool dumps_host;		/* its host tree carries a vmcore node */
+	bool may_fence;			/* its run was started to fence this kernel */
 	/* A simple-framebuffer node from that chosen node, or NULL */
 	void *framebuffer;
 
@@ -875,6 +876,7 @@ bool multikernel_allow_emergency_restart(void);
 bool mk_instance_alive(struct mk_instance *instance);
 int mk_instance_halt(struct mk_instance *instance, unsigned int timeout_ms);
 int mk_instance_force_halt(struct mk_instance *instance);
+int mk_fence_host(struct mk_instance *host);
 bool mk_has_pending_shutdown(void);
 bool mk_force_halt_armed(void);
 bool mk_crash_notes_wanted(void);
@@ -1049,6 +1051,9 @@ static inline bool mk_spawned(void)
 #define MK_DT_RESOURCE_DEVICES  "devices"
 #define MK_DT_RESOURCE_NUMA     "numa-nodes"
 #define MK_DT_IPI_BUFFER        "multikernel,ipi-buffer"
+/* What the host allows a run, in the /chosen it boots with: MK_BOOT_* */
+#define MK_DT_FLAGS             "multikernel,flags"
+#define MK_BOOT_MAY_FENCE       BIT(0)	/* KEXEC_MK_START_MAY_FENCE */
 
 /**
  * Manifest Integration Functions

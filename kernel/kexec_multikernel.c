@@ -305,10 +305,11 @@ void kimage_free_multikernel(struct kimage *image)
 /*
  * Boot the image loaded for @instance. A @cmdline replaces the one the
  * image was loaded with, for this run only. It becomes the instance's once
- * the run has started, and stays the caller's on an error.
+ * the run has started, and stays the caller's on an error. @may_fence
+ * lets this run fence this kernel, which takes a host tree to be of use.
  */
 static int multikernel_kexec(struct mk_instance *instance, char *cmdline,
-			     unsigned long cmdline_len)
+			     unsigned long cmdline_len, bool may_fence)
 {
 	unsigned long last_cmdline_len;
 	char *last_cmdline;
@@ -391,6 +392,14 @@ static int multikernel_kexec(struct mk_instance *instance, char *cmdline,
 		}
 	}
 
+	if (may_fence && !instance->host_tree) {
+		pr_err("Instance %d has no host tree to take the machine over with\n",
+		       mk_id);
+		rc = -EINVAL;
+		goto unlock;
+	}
+	instance->may_fence = may_fence;
+
 	rc = mk_manifest_finalize(mk_image);
 	if (rc) {
 		pr_err("Instance %d has no boot tree, refusing to start it: %d\n",
@@ -427,7 +436,7 @@ static long kexec_mk_ioctl_start(struct file *file, void __user *uarg)
 
 	if (copy_from_user(&start, uarg, sizeof(start)))
 		return -EFAULT;
-	if (start.flags || start.pad)
+	if ((start.flags & ~KEXEC_MK_START_MAY_FENCE) || start.pad)
 		return -EINVAL;
 	if (!start.cmdline != !start.cmdline_len)
 		return -EINVAL;
@@ -449,7 +458,8 @@ static long kexec_mk_ioctl_start(struct file *file, void __user *uarg)
 	}
 
 	/* Nothing reports a finished boot yet, so timeout_ms has nothing to bound */
-	ret = multikernel_kexec(instance, cmdline, start.cmdline_len);
+	ret = multikernel_kexec(instance, cmdline, start.cmdline_len,
+				start.flags & KEXEC_MK_START_MAY_FENCE);
 	if (ret)
 		kfree(cmdline);
 	return ret;
@@ -553,6 +563,11 @@ static long kexec_mk_ioctl(struct file *file, unsigned int cmd,
 	if (!mk_instance_alive(instance))
 		return -ENODEV;
 
+	/* A spawn fences its host and has no other say over it */
+	if (instance == host_instance)
+		return cmd == KEXEC_MK_IOC_FENCE ?
+		       mk_fence_host(instance) : -EOPNOTSUPP;
+
 	switch (cmd) {
 	case KEXEC_MK_IOC_START:
 		return kexec_mk_ioctl_start(file, uarg);
@@ -562,6 +577,8 @@ static long kexec_mk_ioctl(struct file *file, unsigned int cmd,
 		return kexec_mk_ioctl_info(instance, uarg);
 	case KEXEC_MK_IOC_CMDLINE:
 		return kexec_mk_ioctl_cmdline(instance, uarg);
+	case KEXEC_MK_IOC_FENCE:
+		return -EOPNOTSUPP;
 	default:
 		return -ENOTTY;
 	}
@@ -596,8 +613,9 @@ static int kexec_mk_getfd(struct mk_instance *instance)
 
 /*
  * Open an instance that exists, with or without an image. A descriptor
- * names an instance this kernel spawned: there is none for this kernel
- * itself or for its host.
+ * names an instance this kernel spawned, or the host of a spawn, which
+ * takes KEXEC_MK_IOC_FENCE and nothing else. There is none for this
+ * kernel itself.
  */
 int kimage_open_multikernel(unsigned long flags)
 {
@@ -608,7 +626,7 @@ int kimage_open_multikernel(unsigned long flags)
 	if (!instance)
 		return -ENOENT;
 
-	if (instance == mk_self || instance == host_instance)
+	if (instance == mk_self)
 		fd = -EINVAL;
 	else
 		fd = kexec_mk_getfd(instance);

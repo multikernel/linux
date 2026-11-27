@@ -1959,19 +1959,14 @@ int mk_instance_halt(struct mk_instance *instance, unsigned int timeout_ms)
  * Returns: 0 on success, negative error code on failure
  */
 /*
- * Build the set of physical CPUs a force halt should NMI. For a child
- * it is exactly what the child owns. For the parent we do not know the
- * split between the parent's own CPUs and its free pool, and do not
- * need to: every CPU this kernel does not own is a target, and one
- * already parked in the pool absorbs the extra NMI harmlessly.
+ * Build the set of physical CPUs a fence should NMI. We do not know the
+ * split between the host's own CPUs and its free pool, and do not need
+ * to: every CPU this kernel does not own is a target, and one already
+ * parked in the pool absorbs the extra NMI harmlessly.
  */
-static int mk_force_halt_targets(struct mk_instance *instance,
-				 struct mk_cpu_set *targets)
+static int mk_fence_targets(struct mk_cpu_set *targets)
 {
 	int cpu;
-
-	if (instance != host_instance)
-		return mk_cpu_set_copy(targets, instance->cpus);
 
 	for_each_possible_cpu(cpu) {
 		mk_phys_cpu_t phys = arch_cpu_physical_id(cpu);
@@ -1991,7 +1986,7 @@ static int mk_force_halt_targets(struct mk_instance *instance,
  * the fence incomplete: -ETIMEDOUT, so this kernel never takes over a
  * machine with a CPU possibly still running the dead host.
  */
-static int mk_fence_host(struct mk_instance *instance,
+static int mk_fence_cpus(struct mk_instance *instance,
 			 struct mk_cpu_set *targets)
 {
 	ktime_t start = ktime_get();
@@ -2057,15 +2052,14 @@ static void mk_promote(struct mk_instance *host)
 
 int mk_instance_force_halt(struct mk_instance *instance)
 {
-	struct mk_cpu_set *targets;
 	mk_phys_cpu_t phys_cpu;
 	unsigned int i;
 	int mk_id = instance->id;
 	int cpu_count = 0;
-	int ret;
 
-	if (instance == mk_self) {
-		pr_err("Cannot force halt this kernel (id %d)\n", mk_id);
+	if (instance == mk_self || instance == host_instance) {
+		pr_err("Cannot force halt this kernel or its host (id %d)\n",
+		       mk_id);
 		return -EINVAL;
 	}
 
@@ -2073,7 +2067,7 @@ int mk_instance_force_halt(struct mk_instance *instance)
 	 * LOADED is allowed for the retry case: a previous halt already
 	 * settled the state, but a CPU that missed its NMI is still
 	 * running the old image and kexec refuses to reload it. Without
-	 * a rerun the instance is stuck for good. The parent is ACTIVE.
+	 * a rerun the instance is stuck for good.
 	 */
 	if (instance->state != MK_STATE_ACTIVE &&
 	    instance->state != MK_STATE_LOADED) {
@@ -2082,46 +2076,78 @@ int mk_instance_force_halt(struct mk_instance *instance)
 		return -EINVAL;
 	}
 
-	targets = mk_cpu_set_alloc();
-	if (!targets)
-		return -ENOMEM;
-	ret = mk_force_halt_targets(instance, targets);
-	if (!ret && mk_cpu_set_empty(targets))
-		ret = -EINVAL;
-	if (ret) {
-		pr_err("Instance %d: no force-halt targets: %d\n", mk_id, ret);
-		mk_cpu_set_free(targets);
-		return ret;
+	if (mk_cpu_set_empty(instance->cpus)) {
+		pr_err("Instance %d: no force-halt targets\n", mk_id);
+		return -EINVAL;
 	}
-
-	/*
-	 * The host hears nothing more from here on, this line included: a
-	 * doorbell interrupts a host CPU that is about to be stopped.
-	 */
-	if (instance == host_instance)
-		WRITE_ONCE(instance->silent, true);
 
 	pr_info("Force halting multikernel instance %d via NMI\n", mk_id);
 
 	mk_arm_force_halt(instance);
 
-	if (instance == host_instance) {
-		ret = mk_fence_host(instance, targets);
-		if (!ret) {
-			mk_fault_publish();
-			mk_pcifront_host_fenced();
-			mk_promote(instance);
-		}
-	} else {
-		/* A child parks on its own context and settles as a graceful halt does */
-		mk_cpu_set_for_each(i, phys_cpu, targets) {
-			mk_arch_force_stop_cpu(instance, phys_cpu);
-			cpu_count++;
-		}
-		pr_info("Sent NMI to %d CPUs in instance %d\n", cpu_count, mk_id);
-		mk_instance_settle_halted(instance);
+	/* It parks on its own context and settles as a graceful halt does */
+	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
+		mk_arch_force_stop_cpu(instance, phys_cpu);
+		cpu_count++;
+	}
+	pr_info("Sent NMI to %d CPUs in instance %d\n", cpu_count, mk_id);
+	mk_instance_settle_halted(instance);
+	return 0;
+}
+
+/* The user space of this kernel has no say in the tree it booted with */
+static bool mk_may_fence_host(void)
+{
+	u32 flags = 0;
+
+	of_property_read_u32(of_chosen, MK_DT_FLAGS, &flags);
+	return flags & MK_BOOT_MAY_FENCE;
+}
+
+/**
+ * mk_fence_host - Stop the host for good and take the machine over
+ * @host: The host of this kernel
+ *
+ * Returns 0 once this kernel is the root of the machine, -EPERM if the
+ * host did not start it for that, -ETIMEDOUT if a CPU never parked, in
+ * which case the fence may be repeated.
+ */
+int mk_fence_host(struct mk_instance *host)
+{
+	struct mk_cpu_set *targets;
+	int ret;
+
+	if (!mk_may_fence_host()) {
+		pr_err("The host did not start this kernel to fence it\n");
+		return -EPERM;
 	}
 
+	targets = mk_cpu_set_alloc();
+	if (!targets)
+		return -ENOMEM;
+	ret = mk_fence_targets(targets);
+	if (!ret && mk_cpu_set_empty(targets))
+		ret = -EINVAL;
+	if (ret)
+		goto out;
+
+	/*
+	 * The host hears nothing more from here on, this line included: a
+	 * doorbell interrupts a host CPU that is about to be stopped.
+	 */
+	WRITE_ONCE(host->silent, true);
+
+	pr_info("Fencing the host via NMI\n");
+
+	mk_arm_force_halt(host);
+
+	ret = mk_fence_cpus(host, targets);
+	if (!ret) {
+		mk_fault_publish();
+		mk_pcifront_host_fenced();
+		mk_promote(host);
+	}
+out:
 	mk_cpu_set_free(targets);
 	return ret;
 }

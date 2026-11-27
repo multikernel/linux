@@ -243,6 +243,12 @@ only the boot handoff knows::
         };
     };
 
+``multikernel,flags`` in that ``chosen`` is what the host allows the run,
+and it is there only when a bit is set. The host makes it, and
+``instance-create`` does not take it. Bit 0 lets the spawn fence its host:
+the run was started with ``KEXEC_MK_START_MAY_FENCE``, and only then does
+``KEXEC_MK_IOC_FENCE`` in the spawn do anything but fail with ``EPERM``.
+
 The message ring is optional. An instance gets one only if the ``chosen``
 node of its ``instance-create`` carries an empty ``multikernel,ipi-buffer``
 property, which the host replaces with the address of the ring it

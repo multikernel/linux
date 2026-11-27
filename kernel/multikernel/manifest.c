@@ -465,6 +465,12 @@ static int mk_manifest_chosen(void *fdt, void *data)
 			return ret;
 	}
 
+	if (ctx->instance->may_fence) {
+		ret = fdt_property_u32(fdt, MK_DT_FLAGS, MK_BOOT_MAY_FENCE);
+		if (ret)
+			return ret;
+	}
+
 	ret = mk_arch_manifest_chosen(fdt, ctx->instance);
 	if (ret)
 		return ret;

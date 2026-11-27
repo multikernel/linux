@@ -33,7 +33,9 @@
  * KEXEC_FILE_MK_OPEN : With KEXEC_FILE_MULTIKERNEL, load nothing and only
  *                      return a file descriptor for the instance. The
  *                      kernel and initrd fds and the command line are
- *                      ignored.
+ *                      ignored. In a spawn kernel, the id of its host
+ *                      gives a descriptor that takes KEXEC_MK_IOC_FENCE
+ *                      and nothing else.
  *
  * The upper half is a destination field apart from the flags: the
  * multikernel flag and the instance id.
@@ -58,8 +60,10 @@
  * descriptor is a handle: closing it does nothing to the instance.
  */
 
+#define KEXEC_MK_START_MAY_FENCE	0x00000001	/* this run may fence us */
+
 struct kexec_mk_start {
-	__u32 flags;		/* none yet, must be 0 */
+	__u32 flags;		/* KEXEC_MK_START_* */
 	__u32 timeout_ms;	/* how long to wait for the boot, 0 = do not wait */
 	__u64 cmdline;		/* command line for this run, or 0 */
 	__u32 cmdline_len;	/* its length, with the terminating NUL */
@@ -111,6 +115,12 @@ struct kexec_mk_cmdline {
 #define KEXEC_MK_IOC_HALT	_IOW(KEXEC_MK_IOC_MAGIC, 2, struct kexec_mk_halt)
 #define KEXEC_MK_IOC_INFO	_IOWR(KEXEC_MK_IOC_MAGIC, 3, struct kexec_mk_info)
 #define KEXEC_MK_IOC_CMDLINE	_IOWR(KEXEC_MK_IOC_MAGIC, 5, struct kexec_mk_cmdline)
+/*
+ * On the descriptor of the host only: stop every CPU this kernel does not
+ * own and take the machine over. EPERM unless this run was started with
+ * KEXEC_MK_START_MAY_FENCE, ETIMEDOUT if a CPU never stopped.
+ */
+#define KEXEC_MK_IOC_FENCE	_IO(KEXEC_MK_IOC_MAGIC, 6)
 
 /* These values match the ELF architecture values.
  * Unless there is a good reason that should continue to be the case.
